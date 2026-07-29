@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <future>
+#include <fstream>
 #include <mutex>
 
 int main() {
@@ -55,6 +56,12 @@ int main() {
     assert(decoded->width == 2 && decoded->height == 1 &&
            decoded->stride == 8 && decoded->pixels.size() == 8);
     assert(decoded->pixels[2] == 255 && decoded->pixels[3] == 255);
+    {
+      std::ofstream truncated(iconPath, std::ios::binary | std::ios::trunc);
+      truncated.write("\x89PNG", 4);
+    }
+    assert(!feathercast::runtime::DecodePngIcon(
+        factory.Get(), iconPath, L"corrupt-cache-entry"));
     std::filesystem::remove(iconPath, ec);
   }
 

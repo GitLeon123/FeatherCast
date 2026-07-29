@@ -1,6 +1,7 @@
 #pragma once
 
 #include "extension_protocol.hpp"
+#include "filesystem_semantics.hpp"
 
 #include <algorithm>
 #include <cwctype>
@@ -128,8 +129,17 @@ inline Theme LoadTheme(const std::filesystem::path& path) {
 
 inline bool WriteDefaultTheme(const std::filesystem::path& path) {
   std::error_code ec;
-  if (std::filesystem::exists(path, ec)) return true;
+  const bool exists = std::filesystem::exists(path, ec);
+  const auto presence =
+      feathercast::filesystem_semantics::ClassifyPresence(exists, ec);
+  if (presence == feathercast::filesystem_semantics::Presence::Error) {
+    return false;
+  }
+  if (presence == feathercast::filesystem_semantics::Presence::Present) {
+    return true;
+  }
   std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) return false;
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   if (!file) return false;
   file <<

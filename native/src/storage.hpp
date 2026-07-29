@@ -221,7 +221,9 @@ class Storage {
     return out;
   }
 
-  bool UpdateFileIndex(const std::vector<FileIndexEntry>& entries) {
+  bool UpdateFileIndex(
+      const std::vector<FileIndexEntry>& entries,
+      const std::vector<std::wstring>& preserveContentRoots = {}) {
     if (!db_) return false;
     if (!Exec("BEGIN IMMEDIATE;")) return false;
 
@@ -278,6 +280,12 @@ class Storage {
         return false;
       }
       const auto rowId = sqlite3_column_int64(identity.get(), 0);
+      const bool preserveContent = std::any_of(
+          preserveContentRoots.begin(), preserveContentRoots.end(),
+          [&](const std::wstring& root) {
+            return _wcsicmp(root.c_str(), entry.root.c_str()) == 0;
+          });
+      if (preserveContent) continue;
       sqlite3_reset(removeContent.get());
       sqlite3_clear_bindings(removeContent.get());
       sqlite3_bind_int64(removeContent.get(), 1, rowId);

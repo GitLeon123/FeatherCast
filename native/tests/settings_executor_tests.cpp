@@ -2,6 +2,7 @@
 #include "settings.hpp"
 #include "settings_io.hpp"
 #include "test_framework.hpp"
+#include "theme.hpp"
 
 #include <windows.h>
 
@@ -121,6 +122,14 @@ int main() {
     assert(!futureLoaded.persistenceAllowed);
     assert(futureLoaded.preservedPath.empty());
     assert(std::filesystem::exists(futurePath));
+
+    const auto denied = std::make_error_code(std::errc::permission_denied);
+    assert(feathercast::filesystem_semantics::ClassifyPresence(false, denied) ==
+           feathercast::filesystem_semantics::Presence::Error);
+    assert(feathercast::filesystem_semantics::ClassifyPresence(false, {}) ==
+           feathercast::filesystem_semantics::Presence::Missing);
+    assert(feathercast::filesystem_semantics::ClassifyPresence(true, {}) ==
+           feathercast::filesystem_semantics::Presence::Present);
 
     std::filesystem::remove_all(root, ec);
     assert(!ec);

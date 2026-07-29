@@ -205,6 +205,48 @@ int main() {
   }
 
   {
+    feathercast::storage::FileIndexEntry oldOnline;
+    oldOnline.path = L"C:\\Online\\old.txt";
+    oldOnline.name = L"old.txt";
+    oldOnline.root = L"C:\\Online";
+    oldOnline.lastWriteTime = 1;
+    feathercast::storage::FileIndexEntry oldOffline;
+    oldOffline.path = L"C:\\Offline\\keep.txt";
+    oldOffline.name = L"keep.txt";
+    oldOffline.root = L"C:\\Offline";
+    oldOffline.lastWriteTime = 2;
+    oldOffline.contentText = L"preserved offline content";
+    feathercast::storage::FileIndexEntry removed;
+    removed.path = L"C:\\Removed\\drop.txt";
+    removed.name = L"drop.txt";
+    removed.root = L"C:\\Removed";
+    removed.lastWriteTime = 3;
+    feathercast::storage::FileIndexEntry newOnline;
+    newOnline.path = L"C:\\Online\\new.txt";
+    newOnline.name = L"new.txt";
+    newOnline.root = L"C:\\Online";
+    newOnline.lastWriteTime = 4;
+    newOnline.indexedAt = 100;
+    const auto merged = feathercast::files::MergeFileIndexEntries(
+        {oldOnline, oldOffline, removed}, {newOnline},
+        {L"C:\\Online", L"C:\\Offline"}, {L"C:\\Online"}, 100);
+    assert(merged.size() == 2);
+    assert(std::any_of(merged.begin(), merged.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Online\\new.txt";
+    }));
+    assert(std::any_of(merged.begin(), merged.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Offline\\keep.txt" &&
+             entry.contentText == L"preserved offline content";
+    }));
+    assert(std::none_of(merged.begin(), merged.end(), [](const auto& entry) {
+      return entry.path.find(L"old.txt") != std::wstring::npos ||
+             entry.path.find(L"drop.txt") != std::wstring::npos;
+    }));
+    assert(!feathercast::files::IsFixedLocalIndexRoot(
+        std::filesystem::path(L"\\\\server\\share")));
+  }
+
+  {
     const auto indexedRoot = root / L"indexed-root";
     auto deep = indexedRoot;
     for (int level = 0; level < 6; ++level) {

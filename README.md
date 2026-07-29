@@ -54,6 +54,10 @@ Useful searches include `time`, `date`, `week number`, `unix timestamp`,
 Open the action panel on a window result to arrange it, or on a text result to
 copy or paste its value.
 
+Calculator and conversion expressions are restored when you reopen the overlay.
+The expression is selected so the next typing starts a new one; press `End`,
+`Left`/`Right`, or click in the field first to continue or extend it.
+
 Type `@` to choose a search scope. A complete leading scope token limits the
 query without changing normal root-search ranking. `@files` searches indexed
 names and paths; when local content indexing is enabled, it also adds deduplicated

@@ -34,6 +34,19 @@ struct FileIndexWriteCompleted {
   storage::StorageError error;
 };
 
+struct FileIndexLoaded {
+  std::uint64_t generation = 0;
+  std::vector<storage::FileIndexEntry> entries;
+  storage::StorageError error;
+};
+
+struct FileIndexMerged {
+  std::uint64_t generation = 0;
+  bool succeeded = false;
+  std::vector<storage::FileIndexEntry> entries;
+  storage::StorageError error;
+};
+
 struct ClipboardStored {
   std::optional<storage::ClipboardEntry> entry;
   storage::StorageError error;
@@ -62,6 +75,7 @@ struct WorkerFailed {
 
 using Event =
     std::variant<SettingsSaveCompleted, FileIndexWriteCompleted,
+                 FileIndexLoaded, FileIndexMerged,
                  ClipboardStored, ClipboardLoaded, ClipboardPruned,
                  StorageClearCompleted, WorkerFailed>;
 
@@ -87,6 +101,7 @@ class PersistenceService {
   // the Files scope is not used while preserving the existing synchronous API
   // used by the UI thread for a small, bounded result set.
   std::vector<storage::FileIndexEntry> LoadFileIndex(std::size_t limit);
+  bool LoadFileIndexAsync(std::size_t limit, std::uint64_t generation);
 
   void Start();
   void Stop(bool drainPending = true);
@@ -97,6 +112,10 @@ class PersistenceService {
   bool PruneClipboard(std::size_t limit);
   bool ReplaceFileIndex(std::vector<storage::FileIndexEntry> entries);
   bool UpdateFileIndex(std::vector<storage::FileIndexEntry> entries);
+  bool MergeFileIndex(std::vector<storage::FileIndexEntry> entries,
+                      std::vector<std::wstring> configuredRoots,
+                      std::vector<std::wstring> availableRoots,
+                      std::size_t limit, std::uint64_t generation);
   bool StoreClipboard(std::wstring text, std::wstring preview,
                       long long capturedAt, std::size_t limit);
   bool LoadClipboard(std::size_t limit);

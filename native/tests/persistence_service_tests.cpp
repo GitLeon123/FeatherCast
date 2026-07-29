@@ -55,6 +55,10 @@ int main() {
   assert(service.SaveSettings(settings));
   assert(service.StoreClipboard(L"secret", L"secret", 1, 20));
   assert(service.Clear(feathercast::app::StorageOperationKind::ClearClipboard));
+  const auto loadQueuedAt = std::chrono::steady_clock::now();
+  assert(service.LoadFileIndexAsync(100, 77));
+  assert(std::chrono::steady_clock::now() - loadQueuedAt <
+         std::chrono::milliseconds(100));
 
   {
     std::unique_lock lock(mutex);
@@ -62,6 +66,7 @@ int main() {
       bool saved = false;
       bool stored = false;
       bool cleared = false;
+      bool fileIndexLoaded = false;
       for (const auto& event : events) {
         saved = saved ||
                 (std::holds_alternative<persistence::SettingsSaveCompleted>(
@@ -77,8 +82,12 @@ int main() {
             (std::holds_alternative<persistence::StorageClearCompleted>(
                  event) &&
              std::get<persistence::StorageClearCompleted>(event).succeeded);
+        fileIndexLoaded =
+            fileIndexLoaded ||
+            (std::holds_alternative<persistence::FileIndexLoaded>(event) &&
+             std::get<persistence::FileIndexLoaded>(event).generation == 77);
       }
-      return saved && stored && cleared;
+      return saved && stored && cleared && fileIndexLoaded;
     }));
   }
 

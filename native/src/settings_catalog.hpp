@@ -3,12 +3,14 @@
 #include "app_types.hpp"
 
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace feathercast::settings_catalog {
 
 enum class ControlKind { Toggle, Slider, Decrement, Increment, Action, Custom };
+enum class AccessibleRole { CheckButton, Slider, PushButton };
 enum class Requirement {
   Always,
   PendingShortcut,
@@ -55,6 +57,9 @@ const CategoryDescriptor* FindCategory(app::SettingsCategory category);
 const CategoryDescriptor* FindCategory(app::HitType hit);
 bool Enabled(const SettingDescriptor& descriptor, const CatalogContext& context);
 bool Checked(app::HitType hit, const app::Settings& settings);
+AccessibleRole Role(const SettingDescriptor& descriptor);
+std::wstring AccessibleValue(app::HitType hit,
+                             const app::Settings& settings);
 std::vector<app::HitType> FocusOrder(app::SettingsCategory category,
                                      const CatalogContext& context);
 bool ValidateCatalog(std::wstring* error = nullptr);

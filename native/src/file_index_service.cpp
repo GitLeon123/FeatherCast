@@ -10,6 +10,7 @@
 #include <deque>
 #include <filesystem>
 #include <queue>
+#include <set>
 
 namespace feathercast::files {
 namespace {
@@ -56,6 +57,46 @@ bool FixedLocalRoot(const std::filesystem::path& path) {
 }
 
 }  // namespace
+
+bool IsFixedLocalIndexRoot(const std::filesystem::path& path) {
+  return FixedLocalRoot(path);
+}
+
+std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
+    const std::vector<storage::FileIndexEntry>& previous,
+    std::vector<storage::FileIndexEntry> scanned,
+    const std::vector<std::wstring>& configuredRoots,
+    const std::vector<std::wstring>& availableRoots, std::size_t limit) {
+  auto normalized = [](const std::wstring& value) {
+    std::wstring result =
+        std::filesystem::path(value).lexically_normal().wstring();
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](wchar_t ch) {
+                     return static_cast<wchar_t>(std::towlower(ch));
+                   });
+    return result;
+  };
+  std::set<std::wstring> configured;
+  std::set<std::wstring> available;
+  for (const auto& root : configuredRoots) configured.insert(normalized(root));
+  for (const auto& root : availableRoots) available.insert(normalized(root));
+
+  long long writeGeneration = 0;
+  for (const auto& entry : scanned) {
+    writeGeneration = std::max(writeGeneration, entry.indexedAt);
+  }
+  for (const auto& entry : previous) {
+    const auto root = normalized(entry.root);
+    if (!configured.contains(root) || available.contains(root)) continue;
+    scanned.push_back(entry);
+    writeGeneration = std::max(writeGeneration, entry.indexedAt);
+  }
+  if (writeGeneration == 0) writeGeneration = NowMilliseconds();
+  for (auto& entry : scanned) entry.indexedAt = writeGeneration;
+  std::sort(scanned.begin(), scanned.end(), NewerEntry);
+  if (scanned.size() > limit) scanned.resize(limit);
+  return scanned;
+}
 
 struct FileIndexService::Watcher {
   std::wstring root;
@@ -266,6 +307,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
                                    std::stop_token token) const {
   IndexStatus status;
   status.generation = request.generation;
+  status.configuredRoots = request.roots;
   const long long scan = NowMilliseconds();
   // Keep only the newest `limit` entries while traversing. The previous
   // implementation retained every path and trimmed only after the complete
@@ -283,6 +325,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
       ++status.unavailableRoots;
       continue;
     }
+    status.availableRoots.push_back(root.lexically_normal().wstring());
     std::deque<std::filesystem::path> pending{root};
     while (!pending.empty()) {
       if (token.stop_requested() || !IsCurrent(request.generation)) return status;

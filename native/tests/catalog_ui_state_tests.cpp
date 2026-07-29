@@ -1,10 +1,12 @@
 #include "capability_catalog.hpp"
+#include "accessibility_projection.hpp"
 #include "command_catalog.hpp"
 #include "settings_catalog.hpp"
 #include "result_icons.hpp"
 #include "test_framework.hpp"
 #include "ui_state.hpp"
 #include "ui_renderer.hpp"
+#include "window_activation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -240,6 +242,21 @@ int main() {
   assert(animation);
   assert(animation->kind ==
          feathercast::settings_catalog::ControlKind::Slider);
+  assert(feathercast::settings_catalog::Role(*animation) ==
+         feathercast::settings_catalog::AccessibleRole::Slider);
+  assert(feathercast::settings_catalog::AccessibleValue(
+             feathercast::app::HitType::AnimationLevel, settingValues) ==
+         L"Full");
+  const auto* compactDescriptor = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::CompactToggle);
+  assert(compactDescriptor &&
+         feathercast::settings_catalog::Role(*compactDescriptor) ==
+             feathercast::settings_catalog::AccessibleRole::CheckButton);
+  assert(feathercast::settings_catalog::AccessibleValue(
+             feathercast::app::HitType::CompactToggle, settingValues) == L"On");
+  assert(feathercast::settings_catalog::AccessibleValue(
+             feathercast::app::HitType::OverlayWidthDown, settingValues) ==
+         L"720 DIP");
   const auto generalControls = feathercast::settings_catalog::FocusOrder(
       feathercast::app::SettingsCategory::General, context);
   assert(std::count(generalControls.begin(), generalControls.end(),
@@ -268,6 +285,26 @@ int main() {
   assert((resetEffects & feathercast::ui::Effect(
                              feathercast::ui::UiEffect::RequestSearch)) != 0);
   assert(!overlay.status);
+
+  feathercast::ui::OverlayState resumed;
+  feathercast::ui::OverlayController::ResetForShow(
+      resumed, feathercast::app::View::Search, L"2 + 2", true);
+  assert(resumed.query == L"2 + 2" && resumed.caret == resumed.query.size());
+  const auto resumedSelection =
+      feathercast::ui::OverlayController::SelectionRange(resumed);
+  assert(resumedSelection && resumedSelection->first == 0 &&
+         resumedSelection->second == resumed.query.size());
+  // The first new text starts a fresh expression by replacing the resumed one.
+  feathercast::ui::OverlayController::InsertText(resumed, L"3");
+  assert(resumed.query == L"3");
+
+  // Moving the caret first opts into continuing the resumed expression.
+  feathercast::ui::OverlayController::SetQuery(resumed, L"2 + 2");
+  feathercast::ui::OverlayController::MoveCaret(
+      resumed, resumed.query.size(), false);
+  feathercast::ui::OverlayController::InsertText(resumed, L" + 3");
+  assert(resumed.query == L"2 + 2 + 3");
+
   overlay.status = feathercast::app::StatusMessage{
       feathercast::app::StatusSeverity::Error, L"Previous error"};
   feathercast::ui::OverlayController::SetQuery(overlay, L"terminal");
@@ -336,5 +373,100 @@ int main() {
          settings.pendingShortcut == L"Ctrl+Space");
   feathercast::ui::SettingsController::CancelShortcutRecording(settings);
   assert(settings.pendingShortcut.empty());
+
+  feathercast::ui::OverlayState history;
+  for (int index = 0; index < 40; ++index) {
+    feathercast::ui::OverlayController::InsertText(history, L"x");
+  }
+  assert(history.query.size() == 40 && history.queryUndo.size() == 32);
+  history.imeComposition = L"pending";
+  for (int index = 0; index < 32; ++index) {
+    const auto effects =
+        feathercast::ui::OverlayController::UndoQueryEdit(history);
+    assert(feathercast::ui::HasEffect(
+        effects, feathercast::ui::UiEffect::RequestSearch));
+  }
+  assert(history.query.size() == 8 && history.imeComposition.empty());
+  feathercast::ui::OverlayController::RedoQueryEdit(history);
+  assert(history.query.size() == 9);
+  feathercast::ui::OverlayController::InsertText(history, L"new");
+  assert(!feathercast::ui::OverlayController::CanRedoQueryEdit(history));
+  const auto programmedHistorySize = history.queryUndo.size();
+  feathercast::ui::OverlayController::SetQuery(history, L"programmatic");
+  assert(history.queryUndo.size() == programmedHistorySize);
+
+  const auto discoverEmpty = feathercast::capabilities::EmptyStateDisplay(
+      feathercast::capabilities::EmptyStateAction::Discover);
+  assert(discoverEmpty.isCapability &&
+         discoverEmpty.capability.action.kind ==
+             feathercast::app::CapabilityActionKind::OpenBrowse);
+  const auto privacyEmpty = feathercast::capabilities::EmptyStateDisplay(
+      feathercast::capabilities::EmptyStateAction::FilesPrivacy);
+  assert(privacyEmpty.capability.action.kind ==
+             feathercast::app::CapabilityActionKind::OpenSettings &&
+         privacyEmpty.capability.action.settingsCategory ==
+             feathercast::app::SettingsCategory::Privacy);
+
+  using feathercast::window_activation::ExistingInstanceResult;
+  HWND fakeWindow = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1));
+  unsigned observedTimeout = 0;
+  feathercast::window_activation::ExistingInstanceAdapter instanceAdapter{
+      [&] { return fakeWindow; }, [](HWND) { return true; },
+      [&](HWND, unsigned timeout) {
+        observedTimeout = timeout;
+        return true;
+      }};
+  assert(feathercast::window_activation::ActivateExisting(instanceAdapter,
+                                                           5000) ==
+         ExistingInstanceResult::Activated);
+  assert(observedTimeout == 1000);
+  instanceAdapter.validWindow = [](HWND) { return false; };
+  assert(feathercast::window_activation::ActivateExisting(instanceAdapter) ==
+         ExistingInstanceResult::StaleWindow);
+  instanceAdapter.findWindow = [] { return static_cast<HWND>(nullptr); };
+  assert(feathercast::window_activation::ActivateExisting(instanceAdapter) ==
+         ExistingInstanceResult::NotFound);
+
+  HWND foreground = nullptr;
+  bool attached = false;
+  feathercast::window_activation::FocusAdapter focusAdapter{
+      [](HWND) { return true; }, [](HWND) { return true; }, [](HWND) {},
+      [&] { return foreground; }, [](HWND) { return DWORD{2}; },
+      [] { return DWORD{1}; },
+      [&](DWORD, DWORD, bool enable) {
+        attached = enable;
+        return true;
+      },
+      [](HWND) {},
+      [&](HWND target) {
+        if (attached) foreground = target;
+        return attached;
+      }};
+  assert(feathercast::window_activation::FocusVerified(fakeWindow,
+                                                        focusAdapter));
+  focusAdapter.validWindow = [](HWND) { return false; };
+  assert(!feathercast::window_activation::FocusVerified(fakeWindow,
+                                                         focusAdapter));
+
+  using namespace feathercast::accessibility_projection;
+  static_assert(SearchChild() == 1 && StatusChild() == 2);
+  static_assert(ResultChild(0) == 3 && PreviewChild(4) == 7);
+  const auto loadingStatus =
+      ProjectLiveStatus(false, true, L"", false, false, std::nullopt);
+  assert(loadingStatus.visible && loadingStatus.kind == LiveStatusKind::Loading &&
+         loadingStatus.value == L"Searching...");
+  const auto emptyStatus =
+      ProjectLiveStatus(false, false, L"No results", false, false, std::nullopt);
+  assert(emptyStatus.visible && emptyStatus.kind == LiveStatusKind::Empty);
+  const auto errorStatus = ProjectLiveStatus(
+      false, false, L"", false, false,
+      feathercast::app::StatusMessage{
+          feathercast::app::StatusSeverity::Error, L"Failed"});
+  assert(errorStatus.visible && errorStatus.alert &&
+         errorStatus.kind == LiveStatusKind::Error);
+  const auto previewStatus =
+      ProjectLiveStatus(false, false, L"", true, true, std::nullopt);
+  assert(previewStatus.kind == LiveStatusKind::Preview &&
+         previewStatus.value == L"Preview ready");
   return 0;
 }

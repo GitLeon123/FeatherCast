@@ -19,6 +19,8 @@ cmake --preset windows-x64
 cmake --build --preset release
 ctest --preset release
 cpack --config build-native/CPackConfig.cmake -C Release
+# Full ZIP/NSIS package smoke (including Start menu and uninstall artifacts)
+scripts\package-smoke.ps1 -BuildDirectory build-native -Configuration Release
 ```
 
 Manual release builds must also configure both signer values:

@@ -1,5 +1,6 @@
 #include "calculator.hpp"
 #include "accessibility.hpp"
+#include "accessibility_projection.hpp"
 #include "app_types.hpp"
 #include "audio_volume.hpp"
 #include "background_executor.hpp"
@@ -45,6 +46,7 @@
 #include "ui_state.hpp"
 #include "version.hpp"
 #include "window_layout.hpp"
+#include "window_activation.hpp"
 
 #include <windows.h>
 #include <malloc.h>
@@ -142,7 +144,9 @@ constexpr UINT TIMER_OVERLAY_ACTIVATE = 6;
 constexpr UINT TIMER_PREVIEW_LOAD = 7;
 constexpr UINT TIMER_FILE_SNAPSHOT = 8;
 constexpr UINT TIMER_SHORTCUT_TOGGLE = 9;
+constexpr UINT TIMER_RENDER_RECOVER = 10;
 constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
+constexpr UINT RENDER_RECOVERY_MAX_DELAY_MS = 1000;
 
 enum class OverlayCloseReason {
   ExplicitDismiss,
@@ -1138,10 +1142,8 @@ std::vector<WindowEntry> ListWindows(HWND own) {
   return ctx.windows;
 }
 
-void FocusWindow(HWND hwnd) {
-  if (!hwnd || !IsWindow(hwnd)) return;
-  if (IsIconic(hwnd)) ShowWindowAsync(hwnd, SW_RESTORE);
-  SetForegroundWindow(hwnd);
+bool FocusWindow(HWND hwnd) {
+  return feathercast::window_activation::FocusVerified(hwnd);
 }
 
 feathercast::window_layout::Rect LayoutRect(const RECT& rect) {
@@ -1706,6 +1708,31 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       search.screenRect = screenRect({52, 12, static_cast<float>(client.right) / scale - 94, 50});
       items.push_back(std::move(search));
 
+      Item status;
+      status.name = L"Search status";
+      status.role = ROLE_SYSTEM_STATICTEXT;
+      status.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE;
+      const bool emptyState =
+          flatItems_.empty() ||
+          (flatItems_.size() == 1 && flatItems_.front().isCapability &&
+           flatItems_.front().capability.stableId.starts_with(L"empty:"));
+      const auto projected =
+          feathercast::accessibility_projection::ProjectLiveStatus(
+              fileIndexLoadPending_ &&
+                  feathercast::search_scope::Parse(query_).scope ==
+                      feathercast::search_scope::Scope::Files,
+              SearchPending(), emptyState ? EmptyResultsMessage() : L"",
+              previewOpen_, previewResult_.has_value(), overlayStatus_);
+      status.value = projected.value;
+      status.description = projected.description;
+      if (projected.alert) status.role = ROLE_SYSTEM_ALERT;
+      if (!projected.visible) {
+        status.state |= STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE;
+      }
+      status.screenRect = screenRect(
+          {8, 58, static_cast<float>(client.right) / scale - 8, 86});
+      items.push_back(std::move(status));
+
       float y = kResultsTop -
                 static_cast<float>(overlayVisualScroll_.Value());
       int index = 0;
@@ -1735,6 +1762,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ++index;
         }
       }
+
+      Item preview;
+      preview.name = L"Preview";
+      preview.role = ROLE_SYSTEM_STATICTEXT;
+      preview.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE;
+      if (previewOpen_) {
+        preview.value = previewResult_ ? L"Ready" : L"Loading";
+        preview.description = previewResult_ ? L"Preview content is available."
+                                             : L"Preview content is loading.";
+        preview.screenRect = screenRect(
+            {static_cast<float>(client.right) / scale / 2.0f, kResultsTop,
+             static_cast<float>(client.right) / scale - 8,
+             static_cast<float>(client.bottom) / scale - 8});
+      } else {
+        preview.state |= STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE;
+      }
+      items.push_back(std::move(preview));
       return items;
     }
 
@@ -1762,6 +1806,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (hit == hits_.end()) continue;
       Item setting;
       setting.name = nameFor(type);
+      const auto* descriptor = feathercast::settings_catalog::Find(type);
+      if (descriptor) setting.description = descriptor->description;
+      setting.value = feathercast::settings_catalog::AccessibleValue(type,
+                                                                      settings_);
       const auto category = SettingsCategoryForHit(type);
       setting.defaultAction = category
                                   ? L"Select"
@@ -1770,26 +1818,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                          : L"Activate");
       if (category) {
         setting.role = ROLE_SYSTEM_PAGETAB;
-      } else if (type == HitType::AnimationLevel) {
+      } else if (descriptor && feathercast::settings_catalog::Role(*descriptor) ==
+                                   feathercast::settings_catalog::AccessibleRole::Slider) {
         setting.role = ROLE_SYSTEM_SLIDER;
-        setting.value = std::wstring(
-            feathercast::settings::AnimationLevelLabel(settings_.animationLevel));
         setting.description =
             L"Off, Reduced, or Full. Use arrow keys to adjust.";
       } else {
-        setting.role =
-            type == HitType::StartupToggle ||
-                    type == HitType::UpdateChecksToggle ||
-                    type == HitType::CompactToggle ||
-                    type == HitType::ShowWindowsToggle ||
-                    type == HitType::ShowStoreAppsToggle ||
-                    type == HitType::ClipboardHistoryToggle ||
-                    type == HitType::FileIndexToggle ||
-                    type == HitType::FileContentIndexToggle ||
-                    type == HitType::DiagnosticsToggle ||
-                    type == HitType::AccentToggle
-                ? ROLE_SYSTEM_CHECKBUTTON
-                : ROLE_SYSTEM_PUSHBUTTON;
+        setting.role = descriptor && feathercast::settings_catalog::Role(*descriptor) ==
+                                        feathercast::settings_catalog::AccessibleRole::CheckButton
+                           ? ROLE_SYSTEM_CHECKBUTTON
+                           : ROLE_SYSTEM_PUSHBUTTON;
       }
       setting.state = STATE_SYSTEM_FOCUSABLE;
       if (category) setting.state |= STATE_SYSTEM_SELECTABLE;
@@ -1824,8 +1862,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (hit == hits_.end()) continue;
       Item setting;
       setting.name = nameFor(type);
-      setting.role = ROLE_SYSTEM_PUSHBUTTON;
+      const auto* descriptor = feathercast::settings_catalog::Find(type);
+      if (descriptor) setting.description = descriptor->description;
+      setting.value = feathercast::settings_catalog::AccessibleValue(type,
+                                                                      settings_);
+      setting.role = descriptor && feathercast::settings_catalog::Role(*descriptor) ==
+                                      feathercast::settings_catalog::AccessibleRole::CheckButton
+                         ? ROLE_SYSTEM_CHECKBUTTON
+                         : (descriptor && feathercast::settings_catalog::Role(*descriptor) ==
+                                              feathercast::settings_catalog::AccessibleRole::Slider
+                                ? ROLE_SYSTEM_SLIDER
+                                : ROLE_SYSTEM_PUSHBUTTON);
       setting.state = STATE_SYSTEM_UNAVAILABLE;
+      if (setting.role == ROLE_SYSTEM_CHECKBUTTON && checked(type)) {
+        setting.state |= STATE_SYSTEM_CHECKED;
+      }
       setting.screenRect = screenRect(hit->rect);
       items.push_back(std::move(setting));
     }
@@ -1873,7 +1924,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (hwnd == volumeHwnd_) return 1;
     if (hwnd == hwnd_) {
       if (confirmation_) return confirmationFocus_ + 1;
-      return flatItems_.empty() || SearchPending() ? 1 : selected_ + 2;
+      return flatItems_.empty() || SearchPending() ? 1 : selected_ + 3;
     }
     return settingsFocusIndex_ + 1;
   }
@@ -1889,10 +1940,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       }
-      if (child <= 1) {
+      if (child <= 2) {
         SetFocus(hwnd_);
-      } else if (!SearchPending()) {
-        SelectResult(child - 2, false, true);
+      } else if (!SearchPending() && child <= static_cast<int>(flatItems_.size()) + 2) {
+        SelectResult(child - 3, false, true);
       }
       return;
     }
@@ -1918,7 +1969,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         ActivateConfirmationChoice();
         return;
       }
-      const int index = child - 2;
+      if (child <= 2 || child > static_cast<int>(flatItems_.size()) + 2) return;
+      const int index = child - 3;
       ActivateResultAt(index, false);
       return;
     }
@@ -1995,6 +2047,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             pendingShortcutToggleRequestId_ = 0;
             KillTimer(hwnd_, TIMER_SHORTCUT_TOGGLE);
             DispatchShortcutToggle(requestId);
+          }
+        } else if (wParam == TIMER_RENDER_RECOVER) {
+          KillTimer(hwnd_, TIMER_RENDER_RECOVER);
+          if (renderRecoveryQueued_ &&
+              PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) == FALSE) {
+            renderRecoveryQueued_ = false;
           }
         }
         return 0;
@@ -2211,7 +2269,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         renderRecoveryQueued_ = false;
         // Recreate the shared device stack from a normal app message, never
         // recursively from the failing WM_PAINT call.
-        EnsureGlassDevice();
+        KillTimer(hwnd_, TIMER_RENDER_RECOVER);
+        if (const HRESULT result = EnsureGlassDevice(); FAILED(result)) {
+          ScheduleRenderRecovery(L"device-create", result);
+          return 0;
+        }
         if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
         if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
           InvalidateRect(settingsHwnd_, nullptr, FALSE);
@@ -2275,6 +2337,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       previewScroll_ = 0.0f;
       InvalidateRect(hwnd_, nullptr, FALSE);
       NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT,
+                     static_cast<LONG>(flatItems_.size()) + 3);
     }
     auto decodedIcons = iconEvents_.Drain();
     // Icons are only useful while the search overlay is visible.  Discovery
@@ -2340,6 +2405,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                         : Utf8ToWide(event.error.message);
               }
               OnStorageOperationReady(std::move(result));
+            } else if constexpr (std::is_same_v<
+                                     Event,
+                                     feathercast::persistence::
+                                         FileIndexLoaded>) {
+              if (event.generation != fileIndexLoadGeneration_) return;
+              fileIndexLoadPending_ = false;
+              if (!event.error.message.empty()) {
+                ReportPersistenceFailure(Utf8ToWide(event.error.message));
+                return;
+              }
+              ApplyLoadedFileIndex(std::move(event.entries));
+            } else if constexpr (std::is_same_v<
+                                     Event,
+                                     feathercast::persistence::
+                                         FileIndexMerged>) {
+              if (event.generation != fileIndexGeneration_) return;
+              if (!event.succeeded) {
+                ReportPersistenceFailure(
+                    event.error.message.empty()
+                        ? L"The file index could not be merged."
+                        : Utf8ToWide(event.error.message));
+                return;
+              }
+              ApplyLoadedFileIndex(std::move(event.entries));
             } else if constexpr (
                 std::is_same_v<
                     Event,
@@ -2782,8 +2871,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // Builds the shared Direct3D 11 / Direct2D / DirectComposition device stack. Direct2D
   // renders into a DirectComposition swap chain with premultiplied alpha instead of an
   // opaque HWND surface, so transparent pixels let desktop content show through.
-  bool EnsureGlassDevice() {
-    if (d2dDevice_) return true;
+  HRESULT EnsureGlassDevice() {
+    if (d2dDevice_) return S_OK;
     // A previous partial initialization must never be reused or overwritten.
     dcompDevice_.Reset();
     dxgiFactory_.Reset();
@@ -2807,17 +2896,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                              levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                              d3dDevice_.GetAddressOf(), nullptr, nullptr);
     }
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return hr;
 
     ComPtr<IDXGIDevice> dxgiDevice;
-    if (FAILED(d3dDevice_.As(&dxgiDevice))) return false;
-    if (FAILED(D2D1CreateDevice(dxgiDevice.Get(), nullptr, d2dDevice_.GetAddressOf()))) return false;
+    hr = d3dDevice_.As(&dxgiDevice);
+    if (FAILED(hr)) return hr;
+    hr = D2D1CreateDevice(dxgiDevice.Get(), nullptr, d2dDevice_.GetAddressOf());
+    if (FAILED(hr)) return hr;
 
     ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))) return false;
-    if (FAILED(adapter->GetParent(IID_PPV_ARGS(dxgiFactory_.GetAddressOf())))) return false;
-    if (FAILED(DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(dcompDevice_.GetAddressOf())))) return false;
-    return true;
+    hr = dxgiDevice->GetAdapter(adapter.GetAddressOf());
+    if (FAILED(hr)) return hr;
+    hr = adapter->GetParent(IID_PPV_ARGS(dxgiFactory_.GetAddressOf()));
+    if (FAILED(hr)) return hr;
+    hr = DCompositionCreateDevice(
+        dxgiDevice.Get(), IID_PPV_ARGS(dcompDevice_.GetAddressOf()));
+    if (FAILED(hr)) return hr;
+    return S_OK;
   }
 
   // Tears down the whole device stack (used on device-lost). It is rebuilt lazily.
@@ -2842,6 +2937,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
            result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
   }
 
+  void RecordSuccessfulFrame() {
+    renderRecoveryAttempts_ = 0;
+    if (!forceWarp_) deviceLossCount_ = 0;
+  }
+
   void ScheduleRenderRecovery(const wchar_t* phase, HRESULT result) {
     std::wstring detail = L"phase=" + std::wstring(phase) + L" hr=0x" +
                           ToHex(static_cast<unsigned>(result));
@@ -2852,9 +2952,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     DebugGraphicsLog(detail);
     if (IsDeviceLoss(result) && ++deviceLossCount_ >= 2) forceWarp_ = true;
     DiscardGlassDevice();
-    if (!renderRecoveryQueued_ && hwnd_) {
-      renderRecoveryQueued_ =
-          PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) != FALSE;
+    if (!hwnd_ || renderRecoveryQueued_) return;
+
+    // Retry immediately once, then back off up to one second. The retry count
+    // is reset after a successful Present, so a transient driver hiccup does
+    // not make later recoveries unnecessarily slow.
+    const unsigned retry = std::min(renderRecoveryAttempts_, 5u);
+    if (renderRecoveryAttempts_ < 5) ++renderRecoveryAttempts_;
+    const UINT delay = retry == 0
+                           ? 0
+                           : std::min<UINT>(RENDER_RECOVERY_MAX_DELAY_MS,
+                                            50u << (retry - 1));
+    renderRecoveryQueued_ = true;
+    if (delay == 0) {
+      if (PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) == FALSE) {
+        renderRecoveryQueued_ = false;
+      }
+    } else if (!SetTimer(hwnd_, TIMER_RENDER_RECOVER, delay, nullptr)) {
+      renderRecoveryQueued_ = false;
+      if (PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) == FALSE) {
+        renderRecoveryQueued_ = false;
+      }
     }
   }
 
@@ -2877,9 +2995,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   // Creates the composition swap chain, Direct2D context and DComp visual for a window.
-  bool CreateGlassSurface(GlassSurface& surface, HWND hwnd) {
-    if (surface.dc) return true;
-    if (!EnsureGlassDevice()) return false;
+  // Every COM boundary returns its HRESULT so a failed composition commit cannot
+  // silently leave a visible blur-only window behind.
+  HRESULT CreateGlassSurface(GlassSurface& surface, HWND hwnd) {
+    if (surface.dc) return S_OK;
+    if (!hwnd) return E_INVALIDARG;
+    HRESULT result = EnsureGlassDevice();
+    if (FAILED(result)) return result;
 
     RECT rc{};
     GetClientRect(hwnd, &rc);
@@ -2896,27 +3018,52 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     desc.BufferCount = 2;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-    if (FAILED(dxgiFactory_->CreateSwapChainForComposition(d3dDevice_.Get(), &desc, nullptr,
-                                                           surface.swapChain.GetAddressOf()))) {
+    result = dxgiFactory_->CreateSwapChainForComposition(
+        d3dDevice_.Get(), &desc, nullptr, surface.swapChain.GetAddressOf());
+    if (FAILED(result)) {
       surface.Reset();
-      return false;
+      return result;
     }
-    if (FAILED(d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, surface.dc.GetAddressOf())) ||
-        FAILED(dcompDevice_->CreateTargetForHwnd(hwnd, TRUE, surface.target.GetAddressOf())) ||
-        FAILED(dcompDevice_->CreateVisual(surface.visual.GetAddressOf()))) {
+    result = d2dDevice_->CreateDeviceContext(
+        D2D1_DEVICE_CONTEXT_OPTIONS_NONE, surface.dc.GetAddressOf());
+    if (FAILED(result)) {
       surface.Reset();
-      return false;
+      return result;
     }
-    surface.visual->SetContent(surface.swapChain.Get());
-    surface.target->SetRoot(surface.visual.Get());
-    dcompDevice_->Commit();
+    result = dcompDevice_->CreateTargetForHwnd(
+        hwnd, TRUE, surface.target.GetAddressOf());
+    if (FAILED(result)) {
+      surface.Reset();
+      return result;
+    }
+    result = dcompDevice_->CreateVisual(surface.visual.GetAddressOf());
+    if (FAILED(result)) {
+      surface.Reset();
+      return result;
+    }
+    result = surface.visual->SetContent(surface.swapChain.Get());
+    if (FAILED(result)) {
+      surface.Reset();
+      return result;
+    }
+    result = surface.target->SetRoot(surface.visual.Get());
+    if (FAILED(result)) {
+      surface.Reset();
+      return result;
+    }
+    result = dcompDevice_->Commit();
+    if (FAILED(result)) {
+      surface.Reset();
+      return result;
+    }
 
-    if (FAILED(BindSurfaceTarget(surface, dpi))) {
+    result = BindSurfaceTarget(surface, dpi);
+    if (FAILED(result)) {
       surface.Reset();
-      return false;
+      return result;
     }
     EnsureTextFormats();
-    return true;
+    return S_OK;
   }
 
   // Create and render a surface before its HWND becomes visible. The first
@@ -2927,7 +3074,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool PrewarmGlassSurface(HWND hwnd, GlassSurface& surface) {
     if (!hwnd) return false;
     if (surface.dc) return true;
-    if (!CreateGlassSurface(surface, hwnd)) return false;
+    const HRESULT result = CreateGlassSurface(surface, hwnd);
+    if (FAILED(result)) {
+      ScheduleRenderRecovery(L"surface-prewarm", result);
+      return false;
+    }
     RedrawWindow(hwnd, nullptr, nullptr,
                  RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     return surface.dc != nullptr;
@@ -2952,7 +3103,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (FAILED(bindResult)) {
       surfaceResizeFailed_ = true;
       ScheduleRenderRecovery(L"bind-target", bindResult);
+      return;
     }
+    surfaceResizeFailed_ = false;
   }
 
   void ResetTextFormats() {
@@ -3004,10 +3157,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       theme_.sectionText = theme_.textPrimary;
       theme_.accentFallback = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
     }
-    // Theme, high-contrast and display preference changes invalidate every
-    // device-bound surface as well as all DirectWrite formats.
+    // Preference changes invalidate text formats, but healthy composition
+    // surfaces survive; DPI changes and device failures recreate them.
     ResetTextFormats();
-    DiscardGlassDevice();
     if (!FadeAnimationsAllowed()) {
       SnapAllMotionToTargets();
     } else if (!SpatialAnimationsAllowed()) {
@@ -3366,7 +3518,24 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool EnsureFileIndexLoaded() {
     if (!settings_.fileIndexEnabled || fileIndexLoaded_) return fileIndexLoaded_;
-    const auto entries = persistence_.LoadFileIndex(FileIndexLimit());
+    if (fileIndexLoadPending_) return false;
+    fileIndexLoadPending_ = true;
+    const auto generation = ++fileIndexLoadGeneration_;
+    if (!persistence_.LoadFileIndexAsync(FileIndexLimit(), generation)) {
+      fileIndexLoadPending_ = false;
+      ReportPersistenceFailure(L"The persistence worker is unavailable.");
+    }
+    if (visible_) {
+      NotifyWinEvent(EVENT_OBJECT_SHOW, hwnd_, OBJID_CLIENT, 2);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return false;
+  }
+
+  void ApplyLoadedFileIndex(
+      std::vector<feathercast::storage::FileIndexEntry> entries) {
+    fileIndexLoadPending_ = false;
     std::vector<AppEntry> files;
     files.reserve(entries.size());
     for (const auto& entry : entries) {
@@ -3379,28 +3548,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     fileSearchService_.UpdateFiles(std::move(files));
     fileIndexLoaded_ = true;
     MarkSearchDataChanged();
-    return true;
+    if (visible_) RequestSearch();
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
   }
 
   void OnFileIndexReady(feathercast::files::IndexStatus status) {
     if (!fileIndexServiceStarted_ ||
         !fileIndexService_.IsCurrent(status.generation)) return;
     const auto entryCount = status.entries.size();
-    std::vector<AppEntry> files;
-    files.reserve(status.entries.size());
-    for (const auto& entry : status.entries) {
-      if (!entry.path.empty() && !entry.name.empty()) {
-        files.push_back(FileIndexApp(entry));
-      }
-    }
-    if (!persistence_.UpdateFileIndex(std::move(status.entries))) {
+    if (!persistence_.MergeFileIndex(
+            std::move(status.entries), status.configuredRoots,
+            status.availableRoots, FileIndexLimit(), status.generation)) {
       ReportPersistenceFailure(L"The persistence worker is unavailable.");
     }
-    {
-      std::lock_guard lock(dataMutex_);
-      fileIndex_ = files;
-    }
-    fileSearchService_.UpdateFiles(std::move(files));
     fileIndexStatus_ = std::move(status);
     KillTimer(hwnd_, TIMER_FILE_SNAPSHOT);
     SetTimer(hwnd_, TIMER_FILE_SNAPSHOT, 500, nullptr);
@@ -4058,7 +4218,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool SearchPending() const {
-    return searchPresentation_.Pending();
+    const bool loadingFiles =
+        fileIndexLoadPending_ &&
+        feathercast::search_scope::Parse(query_).scope ==
+            feathercast::search_scope::Scope::Files;
+    return searchPresentation_.Pending() || loadingFiles;
   }
 
   bool ResultsActivationAllowed() const {
@@ -4085,7 +4249,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       RetargetOverlayScroll();
     }
     CancelResultPointerPress();
-    if (visible_) NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 1);
+    if (visible_) {
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 1);
+      NotifyWinEvent(EVENT_OBJECT_SHOW, hwnd_, OBJID_CLIENT, 2);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
+    }
     if (!req.compactClear && !req.empty && !req.actionMode &&
         req.scope == feathercast::search_scope::Scope::All) {
       extensions_.RequestQuery(req.query, req.generation);
@@ -4395,6 +4563,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // UI thread: commit a freshly computed result set to the rendered state.
   void ApplyResults(ResultsCollection result) {
     if (!searchPresentation_.Publish(result.generation)) return;
+    const bool compactAtRest = settings_.compactMode && Trim(query_).empty() &&
+                               browseView_ == BrowseView::None;
+    if (result.flatItems.empty() && !fileIndexLoadPending_ && !actionMode_ &&
+        !compactAtRest) {
+      std::optional<feathercast::capabilities::EmptyStateAction> emptyAction;
+      const auto scope = feathercast::search_scope::Parse(query_).scope;
+      if (browseView_ == BrowseView::Clipboard &&
+          !settings_.clipboardHistoryEnabled) {
+        emptyAction = feathercast::capabilities::EmptyStateAction::ClipboardPrivacy;
+      } else if (browseView_ == BrowseView::None &&
+                 scope == feathercast::search_scope::Scope::Files) {
+        emptyAction = settings_.fileIndexEnabled
+                          ? feathercast::capabilities::EmptyStateAction::
+                                ConfigureIndexedFolders
+                          : feathercast::capabilities::EmptyStateAction::FilesPrivacy;
+      } else if (browseView_ == BrowseView::None &&
+                 scope == feathercast::search_scope::Scope::All &&
+                 appsReady_.load(std::memory_order_acquire)) {
+        emptyAction = feathercast::capabilities::EmptyStateAction::Discover;
+      }
+      if (emptyAction) {
+        auto item = feathercast::capabilities::EmptyStateDisplay(*emptyAction);
+        result.sections.push_back({L"NEXT STEP", {item}});
+        result.flatItems.push_back(std::move(item));
+      }
+    }
     const ResultPositions oldPositions = CaptureResultPositions();
     const bool preserveSelection = query_ == displayedQuery_;
     const std::wstring selectedKey =
@@ -4429,6 +4623,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     }
     displayedQuery_ = query_;
+    if (!actionMode_ && browseView_ == BrowseView::None) {
+      const bool hasProductivityResult =
+          std::any_of(flatItems_.begin(), flatItems_.end(),
+                      [](const DisplayItem& item) {
+                        return item.isCalculator || item.isConversion;
+                      });
+      if (hasProductivityResult) {
+        resumeProductivityQuery_ = query_;
+      } else if (!query_.empty()) {
+        resumeProductivityQuery_.reset();
+      }
+    }
     if (selected_ >= static_cast<int>(flatItems_.size())) selected_ = std::max<int>(0, static_cast<int>(flatItems_.size()) - 1);
     if (!pendingNavigation_.Empty()) {
       feathercast::ui::OverlayController::Select(
@@ -4444,6 +4650,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     SyncSelectionAnimationToTarget();
     ScheduleSelectedPreview();
     NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT, 2);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
   }
 
   // Hand the newest request to the worker, coalescing any unstarted request.
@@ -4845,8 +5053,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
       HideSettings(false);
     }
-    const auto effects =
-        feathercast::ui::OverlayController::ResetForShow(overlayState_, view);
+    const std::optional<std::wstring> resumedQuery =
+        resumeProductivityQuery_;
+    const auto effects = feathercast::ui::OverlayController::ResetForShow(
+        overlayState_, view, resumedQuery.value_or(L""),
+        resumedQuery.has_value());
     const std::uint64_t generation =
         overlayFocusSession_.Begin(GetTickCount64());
     overlayRestoreCandidate_.reset();
@@ -4916,24 +5127,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool ActivateRestoreCandidate(const RestoreCandidate& candidate) {
     if (!ValidateRestoreCandidate(candidate)) return false;
-    if (IsIconic(candidate.hwnd)) ShowWindowAsync(candidate.hwnd, SW_RESTORE);
-    BOOL requested = SetForegroundWindow(candidate.hwnd);
-    bool activated = GetForegroundWindow() == candidate.hwnd;
-    if (!activated) {
-      const DWORD currentThreadId = GetCurrentThreadId();
-      const bool attached =
-          candidate.threadId != currentThreadId &&
-          AttachThreadInput(candidate.threadId, currentThreadId, TRUE) != FALSE;
-      if (attached) {
-        BringWindowToTop(candidate.hwnd);
-        requested = SetForegroundWindow(candidate.hwnd);
-        activated = GetForegroundWindow() == candidate.hwnd;
-        AttachThreadInput(candidate.threadId, currentThreadId, FALSE);
-      }
-    }
+    const bool activated = FocusWindow(candidate.hwnd);
     DebugFocusLog(
         L"restore generation=" + std::to_wstring(candidate.generation) +
-        L" requested=" + std::to_wstring(requested != FALSE) +
         L" verified=" + std::to_wstring(activated));
     return activated;
   }
@@ -4995,6 +5191,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void HideOverlay(OverlayCloseReason reason) {
     if (!visible_) return;
     if (overlayClosing_) return;
+
+    CaptureProductivityQueryForResume();
 
     KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
     const bool restoreFocus = reason == OverlayCloseReason::ExplicitDismiss;
@@ -5173,7 +5371,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ShowWindow(volumeHwnd_, SW_SHOWNORMAL);
     SetWindowPos(volumeHwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    SetForegroundWindow(volumeHwnd_);
+    if (!FocusWindow(volumeHwnd_)) {
+      volumeStatus_ = L"Volume control could not receive focus.";
+    }
     SetActiveWindow(volumeHwnd_);
     SetFocus(volumeHwnd_);
     SetTimer(volumeHwnd_, TIMER_VOLUME_REFRESH, 250, nullptr);
@@ -5194,7 +5394,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     volumeMonitor_ = nullptr;
     volumeStatus_.clear();
     UpdateBackgroundState();
-    if (restoreTarget) FocusWindow(restoreTarget);
+    if (restoreTarget && !FocusWindow(restoreTarget)) {
+      ShowTrayNotification(L"FeatherCast",
+                           L"The previous window could not be focused.");
+    }
   }
 
   void HideVolumeControl(bool restoreFocus) {
@@ -5482,7 +5685,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RedrawWindow(settingsHwnd_, nullptr, nullptr,
                  RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     ShowWindow(settingsHwnd_, SW_SHOW);
-    SetForegroundWindow(settingsHwnd_);
+    if (!FocusWindow(settingsHwnd_)) {
+      SetSettingsStatus(StatusSeverity::Error,
+                        L"Settings could not receive focus.");
+    }
     SetActiveWindow(settingsHwnd_);
     SetFocus(settingsHwnd_);
     UpdateBackgroundState();
@@ -5546,6 +5752,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ExitBrowseView() {
     RestoreNavigationState();
+  }
+
+  void CaptureProductivityQueryForResume() {
+    if (query_.empty()) {
+      if (actionMode_ && resumeProductivityQuery_) return;
+      resumeProductivityQuery_.reset();
+      return;
+    }
+
+    const bool hasProductivityResult =
+        std::any_of(flatItems_.begin(), flatItems_.end(),
+                    [](const DisplayItem& item) {
+                      return item.isCalculator || item.isConversion;
+                    });
+    // Closing can race the search worker. Re-evaluate the small pure
+    // calculator/converter inputs so a valid expression is still resumable
+    // even when its result has not been published yet.
+    const bool hasProductivityQuery =
+        feathercast::calculator::TryEvaluate(query_).has_value() ||
+        feathercast::converter::TryConvert(query_, currencyRates_.perUsd,
+                                            localeCurrency_)
+            .has_value();
+    const bool isCurrentDisplayedQuery = query_ == displayedQuery_;
+    const bool isResumedQuery = resumeProductivityQuery_ &&
+                                query_ == *resumeProductivityQuery_;
+    if ((isCurrentDisplayedQuery &&
+         (hasProductivityResult || hasProductivityQuery)) ||
+        hasProductivityQuery || isResumedQuery) {
+      resumeProductivityQuery_ = query_;
+    } else {
+      resumeProductivityQuery_.reset();
+    }
   }
 
   void RestoreNavigationState() {
@@ -6045,7 +6283,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
-    NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd_, OBJID_CLIENT, selected_ + 2);
+    NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd_, OBJID_CLIENT, selected_ + 3);
     ScheduleSelectedPreview();
   }
 
@@ -6072,6 +6310,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
     ApplyWindowSize();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT, 2);
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT,
+                   static_cast<LONG>(flatItems_.size()) + 3);
   }
 
   void TogglePreview() {
@@ -6089,6 +6330,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     previewBitmap_.Reset();
     ApplyWindowSize();
     ScheduleSelectedPreview();
+    NotifyWinEvent(EVENT_OBJECT_SHOW, hwnd_, OBJID_CLIENT,
+                   static_cast<LONG>(flatItems_.size()) + 3);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
   }
 
   void ScheduleSelectedPreview() {
@@ -6314,7 +6558,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void Paint() {
     PAINTSTRUCT ps{};
     BeginPaint(hwnd_, &ps);
-    if (EnsureRenderResources() && CreateGlassSurface(overlaySurface_, hwnd_)) {
+    const HRESULT resources = EnsureRenderResources() ? S_OK : E_FAIL;
+    if (FAILED(resources)) {
+      ScheduleRenderRecovery(L"overlay-resources", resources);
+      EndPaint(hwnd_, &ps);
+      return;
+    }
+    const HRESULT surface = CreateGlassSurface(overlaySurface_, hwnd_);
+    if (FAILED(surface)) {
+      ScheduleRenderRecovery(L"overlay-surface", surface);
+      EndPaint(hwnd_, &ps);
+      return;
+    }
+    {
       ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
       SetActiveTarget(dc);
       const HRESULT brushes = EnsureBrushResources();
@@ -6363,6 +6619,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const HRESULT present = overlaySurface_.swapChain->Present(1, 0);
         if (FAILED(present)) {
           ScheduleRenderRecovery(L"overlay-present", present);
+        } else {
+          RecordSuccessfulFrame();
         }
       }
     }
@@ -6372,8 +6630,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void PaintSettings() {
     PAINTSTRUCT ps{};
     BeginPaint(settingsHwnd_, &ps);
-    if (EnsureRenderResources() &&
-        CreateGlassSurface(settingsSurface_, settingsHwnd_)) {
+    const HRESULT resources = EnsureRenderResources() ? S_OK : E_FAIL;
+    if (FAILED(resources)) {
+      ScheduleRenderRecovery(L"settings-resources", resources);
+      EndPaint(settingsHwnd_, &ps);
+      return;
+    }
+    const HRESULT surface = CreateGlassSurface(settingsSurface_, settingsHwnd_);
+    if (FAILED(surface)) {
+      ScheduleRenderRecovery(L"settings-surface", surface);
+      EndPaint(settingsHwnd_, &ps);
+      return;
+    }
+    {
       ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
       SetActiveTarget(dc);
       const HRESULT brushes = EnsureBrushResources();
@@ -6410,6 +6679,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const HRESULT present = settingsSurface_.swapChain->Present(1, 0);
         if (FAILED(present)) {
           ScheduleRenderRecovery(L"settings-present", present);
+        } else {
+          RecordSuccessfulFrame();
         }
       }
     }
@@ -6419,8 +6690,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void PaintVolumeControl() {
     PAINTSTRUCT paint{};
     BeginPaint(volumeHwnd_, &paint);
-    if (EnsureRenderResources() &&
-        CreateGlassSurface(volumeSurface_, volumeHwnd_)) {
+    const HRESULT resources = EnsureRenderResources() ? S_OK : E_FAIL;
+    if (FAILED(resources)) {
+      ScheduleRenderRecovery(L"volume-resources", resources);
+      EndPaint(volumeHwnd_, &paint);
+      return;
+    }
+    const HRESULT surface = CreateGlassSurface(volumeSurface_, volumeHwnd_);
+    if (FAILED(surface)) {
+      ScheduleRenderRecovery(L"volume-surface", surface);
+      EndPaint(volumeHwnd_, &paint);
+      return;
+    }
+    {
       ID2D1DeviceContext* dc = volumeSurface_.dc.Get();
       SetActiveTarget(dc);
       const HRESULT brushes = EnsureBrushResources();
@@ -6496,6 +6778,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const HRESULT present = volumeSurface_.swapChain->Present(1, 0);
         if (FAILED(present)) {
           ScheduleRenderRecovery(L"volume-present", present);
+        } else {
+          RecordSuccessfulFrame();
         }
       }
     }
@@ -7304,7 +7588,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FillRound({selectionLeft, 17.0f, std::max(selectionLeft + 1.0f, selectionRight), 46.0f},
                 3.0f, Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.35f, 0.85f));
     }
-    DrawTextBlock(input, {52, 15, width - 94, 48}, inputFormat_.Get(), displayedQuery.empty() ? D2DColor(theme_.textMuted) : D2DColor(theme_.textPrimary));
+    const bool compactHintVisible = settings_.compactMode && width >= 620.0f;
+    const float hintLeft = width - 360.0f;
+    const float inputRight = compactHintVisible ? hintLeft - 12.0f : width - 94.0f;
+    DrawTextBlock(input, {52, 15, inputRight, 48}, inputFormat_.Get(),
+                  displayedQuery.empty() ? D2DColor(theme_.textMuted)
+                                         : D2DColor(theme_.textPrimary));
+    if (compactHintVisible) {
+      auto hintColor = D2DColor(theme_.textDim);
+      hintColor.a *= 0.82f;
+      DrawTextBlock(L"Tab actions · @ scopes · Ctrl+Space preview",
+                    {hintLeft, 18, width - 94, 45}, footerRightFormat_.Get(),
+                    hintColor);
+    }
 
     float caretX = 52.0f;
     if (!displayedQuery.empty()) {
@@ -7917,7 +8213,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   float SettingsStatusOffset() const {
-    return settingsStatus_ ? kSettStatus : 0.0f;
+    return kSettStatus;
   }
 
   void SetSettingsStatus(StatusSeverity severity, std::wstring text) {
@@ -7933,8 +8229,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     overlayStatus_ = StatusMessage{severity, std::move(text)};
     if (hwnd_) {
       InvalidateRect(hwnd_, nullptr, FALSE);
-      NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT,
-                     CHILDID_SELF);
+      NotifyWinEvent(EVENT_OBJECT_SHOW, hwnd_, OBJID_CLIENT, 2);
+      NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT, 2);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
     }
   }
 
@@ -8788,23 +9085,47 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     const auto png = IconCachePath(key);
     std::error_code ec;
-    if (!std::filesystem::exists(png, ec)) {
+    auto createCachedIcon = [&]() {
       UniqueBitmap bitmap(CreateShellBitmap(key));
-      if (!bitmap) return std::nullopt;
+      if (!bitmap) return false;
       auto temporary = png;
       temporary += L".tmp-" + std::to_wstring(GetCurrentThreadId());
       std::filesystem::remove(temporary, ec);
       if (!SaveHBitmapPng(workerWicFactory.Get(), bitmap.get(), temporary)) {
         std::filesystem::remove(temporary, ec);
-        return std::nullopt;
+        return false;
       }
       if (!MoveFileExW(temporary.c_str(), png.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         std::filesystem::remove(temporary, ec);
-        if (!std::filesystem::exists(png, ec)) return std::nullopt;
+        const bool existsAfterRace = std::filesystem::exists(png, ec);
+        if (ec || !existsAfterRace) return false;
       }
+      return true;
+    };
+
+    const bool cached = std::filesystem::exists(png, ec);
+    if (ec) return std::nullopt;
+    if (!cached && !createCachedIcon()) return std::nullopt;
+    if (auto decoded = DecodeIconFile(workerWicFactory.Get(), png, key)) {
+      return decoded;
     }
-    return DecodeIconFile(workerWicFactory.Get(), png, key);
+
+    // Remove the canonical cache entry with one atomic rename, then rebuild it
+    // exactly once. A second decode failure falls back to the iconless row.
+    auto corrupt = png;
+    corrupt += L".corrupt-" + std::to_wstring(GetCurrentThreadId());
+    std::filesystem::remove(corrupt, ec);
+    if (MoveFileExW(png.c_str(), corrupt.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      std::filesystem::remove(corrupt, ec);
+    } else {
+      std::filesystem::remove(png, ec);
+    }
+    if (!createCachedIcon()) return std::nullopt;
+    auto decoded = DecodeIconFile(workerWicFactory.Get(), png, key);
+    if (!decoded) std::filesystem::remove(png, ec);
+    return decoded;
   }
 
   HBITMAP CreateShellBitmap(const std::wstring& key) {
@@ -8936,6 +9257,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool control = ModifierPressed(VK_CONTROL);
     const bool shift = ModifierPressed(VK_SHIFT);
 
+    if (control && (vk == 'Z' || vk == 'Y')) {
+      const auto effects =
+          vk == 'Z'
+              ? feathercast::ui::OverlayController::UndoQueryEdit(overlayState_)
+              : feathercast::ui::OverlayController::RedoQueryEdit(overlayState_);
+      if (feathercast::ui::HasEffect(
+              effects, feathercast::ui::UiEffect::RequestSearch)) {
+        SyncSelectionAnimationToTarget();
+        ExecuteOverlayEffects(effects);
+      }
+      return;
+    }
+
     if (control && vk == VK_SPACE) {
       suppressNextChar_ = true;
       TogglePreview();
@@ -9039,6 +9373,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       : feathercast::text_edit::NextCodePoint(query_, caret_),
                   shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
+      } else if (SelectionRange()) {
+        // A resumed calculator/conversion query is selected on reopen. Right
+        // at the end clears that selection so the next text extends it.
+        MoveCaret(caret_, false);
       } else if (query_.empty() && browseView_ == BrowseView::None &&
                  ResultsActivationAllowed()) {
         OpenSelectedResultActions();
@@ -9053,7 +9391,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OpenSelectedResultActions();
       }
     } else if (vk == VK_LEFT) {
-      if (caret_ > 0) {
+      if (SelectionRange()) {
+        // Collapse a resumed select-all query to its beginning when moving
+        // left, matching normal edit-control behavior.
+        MoveCaret(0, false);
+      } else if (caret_ > 0) {
         MoveCaret(control
                       ? feathercast::text_edit::PreviousWord(query_, caret_)
                       : feathercast::text_edit::PreviousCodePoint(query_, caret_),
@@ -9069,7 +9411,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       ActivateResultAt(selected_, admin);
     } else if (vk == VK_BACK) {
       if (!query_.empty() && (caret_ > 0 || SelectionRange())) {
-        if (DeleteSelection()) {
+        const bool hadSelection = SelectionRange().has_value();
+        if (!hadSelection) {
+          feathercast::ui::OverlayController::RecordUserEdit(overlayState_);
+        }
+        if (hadSelection && DeleteSelection()) {
           // Selection deletion already updated the caret.
         } else if (control) {
           const size_t previous = feathercast::text_edit::PreviousWord(query_, caret_);
@@ -9085,7 +9431,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     } else if (vk == VK_DELETE) {
       if (!query_.empty() && (caret_ < query_.size() || SelectionRange())) {
-        if (DeleteSelection()) {
+        const bool hadSelection = SelectionRange().has_value();
+        if (!hadSelection) {
+          feathercast::ui::OverlayController::RecordUserEdit(overlayState_);
+        }
+        if (hadSelection && DeleteSelection()) {
           // Selection deletion already updated the caret.
         } else if (control) {
           query_.erase(caret_, feathercast::text_edit::NextWord(query_, caret_) - caret_);
@@ -9612,7 +9962,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return std::nullopt;
     }
     CoMemPtr<wchar_t> pathOwner(rawPath);
-    return std::wstring(rawPath);
+    const std::filesystem::path selected(rawPath);
+    if (!feathercast::files::IsFixedLocalIndexRoot(selected)) {
+      SetSettingsStatus(
+          StatusSeverity::Error,
+          L"Only folders on fixed local drives can be indexed. Network and UNC folders are not supported.");
+      return std::nullopt;
+    }
+    return selected.lexically_normal().wstring();
   }
 
   void HandleSettingsHit(HitType type) {
@@ -9754,6 +10111,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           std::lock_guard lock(dataMutex_);
           fileIndex_.clear();
           fileIndexLoaded_ = false;
+          fileIndexLoadPending_ = false;
+          ++fileIndexLoadGeneration_;
         }
         PersistSettings();
         if (settings_.fileIndexEnabled) {
@@ -10286,7 +10645,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (item.isWindow) {
       HideOverlay(OverlayCloseReason::Action);
-      FocusWindow(item.window.hwnd);
+      if (!FocusWindow(item.window.hwnd)) {
+        ShowTrayNotification(L"FeatherCast",
+                             L"The selected window could not be focused.");
+      }
       return;
     }
 
@@ -10578,7 +10940,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenThemeFile:
-        feathercast::theme::WriteDefaultTheme(ThemePath());
+        if (!feathercast::theme::WriteDefaultTheme(ThemePath())) {
+          SetOverlayStatus(
+              StatusSeverity::Error,
+              L"The default theme file could not be inspected or created.");
+          return;
+        }
         launchExecutor_.Submit([path = ThemePath()](std::stop_token) {
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -10693,7 +11060,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           return;
         case ActionKind::Switch:
           HideOverlay(OverlayCloseReason::Action);
-          FocusWindow(target);
+          if (!FocusWindow(target)) {
+            ShowTrayNotification(L"FeatherCast",
+                                 L"The selected window could not be focused.");
+          }
           return;
         case ActionKind::Minimize:
           ShowWindowAsync(target, SW_MINIMIZE);
@@ -10765,7 +11135,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           }
           if (ApplyWindowLayout(target, layout)) {
             HideOverlay(OverlayCloseReason::Action);
-            FocusWindow(target);
+            if (!FocusWindow(target)) {
+              ShowTrayNotification(L"FeatherCast",
+                                   L"The arranged window could not be focused.");
+            }
           } else {
             SetOverlayStatus(StatusSeverity::Error,
                              L"Could not arrange the selected window.");
@@ -11274,6 +11647,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool forceWarp_ = false;
   unsigned deviceLossCount_ = 0;
   bool renderRecoveryQueued_ = false;
+  unsigned renderRecoveryAttempts_ = 0;
   float visualSelectedY_ = -1.0f;
   bool animatingSelection_ = false;
   double selectionSettleSeconds_ = 0.090;
@@ -11297,6 +11671,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::vector<NavigationState>& navigationStack_ = overlayState_.navigationStack;
   std::optional<NavigationState>& pendingNavigationRestore_ =
       overlayState_.pendingNavigationRestore;
+  std::optional<std::wstring> resumeProductivityQuery_;
   feathercast::ui::SettingsState settingsState_;
   bool& recording_ = settingsState_.recordingShortcut;
   bool gearHovered_ = false;
@@ -11322,9 +11697,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::atomic<bool> appsReady_ = false;
   std::uint64_t discoveryGeneration_ = 0;
   std::uint64_t fileIndexGeneration_ = 0;
+  std::uint64_t fileIndexLoadGeneration_ = 0;
   bool fileIndexServiceStarted_ = false;
   bool fileIndexConfigured_ = false;
   bool fileIndexLoaded_ = false;
+  bool fileIndexLoadPending_ = false;
   std::uint64_t previewGeneration_ = 0;
   uint64_t snapshotScheduledRevision_ = 0;
   feathercast::interaction::SearchPresentationState searchPresentation_;
@@ -11643,20 +12020,27 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   }
 
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
-  if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-    for (int attempt = 0; attempt < 40; ++attempt) {
-      HWND existing = FindWindowW(kWindowClass, L"FeatherCast");
-      if (existing) {
-        DWORD_PTR acknowledged = 0;
-        if (SendMessageTimeoutW(existing, WM_SHOW_SEARCH, 0, 0,
-                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &acknowledged)) {
-          return 0;
-        }
-      }
-      Sleep(50);
+  const DWORD mutexError = GetLastError();
+  if (!mutex || mutexError == ERROR_ALREADY_EXISTS) {
+    const feathercast::window_activation::ExistingInstanceAdapter adapter{
+        [] { return FindWindowW(kWindowClass, L"FeatherCast"); },
+        [](HWND window) { return IsWindow(window) != FALSE; },
+        [](HWND window, unsigned timeout) {
+          DWORD_PTR acknowledged = 0;
+          return SendMessageTimeoutW(
+                     window, WM_SHOW_SEARCH, 0, 0,
+                     SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                     static_cast<UINT>(timeout), &acknowledged) != 0;
+        }};
+    const auto activation =
+        feathercast::window_activation::ActivateExisting(adapter, 1000);
+    if (activation == feathercast::window_activation::ExistingInstanceResult::Activated) {
+      return 0;
     }
-    MessageBoxW(nullptr, L"FeatherCast is already running but could not be activated.",
-                L"FeatherCast", MB_OK | MB_ICONWARNING);
+    const wchar_t* message = !mutex
+                                 ? L"FeatherCast could not establish single-instance protection and no responsive existing window was found."
+                                 : L"FeatherCast is already running but its window could not be activated within one second.";
+    MessageBoxW(nullptr, message, L"FeatherCast", MB_OK | MB_ICONWARNING);
     return 1;
   }
 

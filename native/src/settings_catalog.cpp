@@ -216,6 +216,42 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
   }
 }
 
+AccessibleRole Role(const SettingDescriptor& descriptor) {
+  if (descriptor.kind == ControlKind::Toggle) {
+    return AccessibleRole::CheckButton;
+  }
+  if (descriptor.kind == ControlKind::Slider) return AccessibleRole::Slider;
+  return AccessibleRole::PushButton;
+}
+
+std::wstring AccessibleValue(app::HitType hit,
+                             const app::Settings& settings) {
+  if (const auto* descriptor = Find(hit);
+      descriptor && descriptor->kind == ControlKind::Toggle) {
+    return Checked(hit, settings) ? L"On" : L"Off";
+  }
+  using app::HitType;
+  switch (hit) {
+    case HitType::AnimationLevel:
+      return std::wstring(
+          feathercast::settings::AnimationLevelLabel(settings.animationLevel));
+    case HitType::OverlayWidthDown:
+    case HitType::OverlayWidthUp:
+      return std::to_wstring(settings.overlayWidth) + L" DIP";
+    case HitType::MaxResultsDown:
+    case HitType::MaxResultsUp:
+      return std::to_wstring(settings.maxResults);
+    case HitType::ClipboardLimitDown:
+    case HitType::ClipboardLimitUp:
+      return std::to_wstring(settings.clipboardHistoryLimit) + L" entries";
+    case HitType::FileIndexLimitDown:
+    case HitType::FileIndexLimitUp:
+      return std::to_wstring(settings.fileIndexMaxEntries) + L" entries";
+    case HitType::AccentColor: return settings.customAccentColor;
+    default: return L"";
+  }
+}
+
 std::vector<app::HitType> FocusOrder(app::SettingsCategory category,
                                      const CatalogContext& context) {
   std::vector<app::HitType> order;

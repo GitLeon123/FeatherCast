@@ -33,6 +33,8 @@ and then with pointer input.
   acronym, name boundary, field prefix, typo, then general fuzzy/path matches.
   Pinning and usage reorder items only inside the same tier.
 - Rapid query edits never display results from an older query.
+- `Ctrl+Z` and `Ctrl+Y` restore query text, caret, and selection for the most
+  recent 32 user edits; a new edit after Undo clears Redo.
 - Results dim while a generation is pending; navigation pressed during that
   interval applies to the newly published generation, while Enter and pointer
   activation remain blocked.
@@ -46,6 +48,10 @@ and then with pointer input.
   their intended result type. Root search never displays content-only matches.
 - Empty `@files` is newest-first. Name/path results precede content matches and
   the same normalized Windows path never appears twice.
+- Empty root, disabled Clipboard/Files scopes, and an empty Files index expose
+  a keyboard-activatable next step instead of dead-end text.
+- The compact search bar keeps the actions/scopes/preview shortcut hint visible
+  without changing the overlay height.
 
 ## Pointer and Accessibility
 
@@ -54,10 +60,15 @@ and then with pointer input.
 - Moving off a pressed target before release does not activate it.
 - Narrator/UI Automation names, roles, focus, actions, and bounds match the
   visible controls.
+- Narrator exposes Search, the stable live Status node, Results, and Preview in
+  that order. Loading, empty, error, and preview changes are announced without
+  moving child IDs.
 
 ## Settings and Persistence
 
 - Every settings category has the same focus order and controls.
+- Saving, success, and error banners use the permanently reserved 52-DIP area;
+  content position, scroll, hit regions, and keyboard focus do not jump.
 - Shortcut recording, accent selection, quicklinks, folder selection, and all
   maintenance actions work.
 - Settings persist across restart without changing paths or unrelated fields.
@@ -71,6 +82,10 @@ and then with pointer input.
 - Deep trees, create/write/rename/delete bursts, unavailable roots, permission
   failures, watcher overflow reconciliation, Sleep/Resume, and shutdown converge
   to the correct index without following hidden/system/reparse entries.
+- Opening `@files` for the first time stays responsive while the persisted
+  index loads. Taking one configured root offline preserves its stored entries;
+  removing a root deliberately removes them. UNC/network folders are rejected
+  in the folder picker with an explanation.
 - Settings > Library lists snippets and quicklinks and opens the native manager
   on the requested tab. Add, edit, cancel, delete confirmation, reload, and
   Open File work with keyboard, pointer, IME, Narrator, and multiline text.
@@ -86,6 +101,8 @@ and then with pointer input.
 - App launch, run as administrator, window focus, URLs, folders, commands, and
   plugin activation retain their notifications and recent-item tracking.
 - Icons load lazily, survive device recreation, and can be cleared/rebuilt.
+- A truncated cached PNG is removed from the canonical cache path, regenerated
+  once from the Shell, and otherwise falls back without an icon.
 - Automatic/manual update checks, failure notices, SHA-256 verification,
   Authenticode verification, installer launch, and currency conversion retain
   their existing URLs, timeouts, and visible behavior.
@@ -106,8 +123,8 @@ and then with pointer input.
   bounds finish at the correct top-anchored or centered final rectangle.
 - Disabling app or Windows animations and enabling high contrast immediately
   snaps every active transition to its final state.
-- Minimize/restore, monitor changes, and graphics device loss recreate resources
-  without stale hit regions or crashes.
+- Monitor changes preserve healthy composition surfaces; DPI changes and
+  graphics device loss recreate resources without stale hit regions or crashes.
 
 ## File Preview
 
@@ -122,6 +139,17 @@ and then with pointer input.
   safely. Other formats expose metadata only.
 - Device loss recreates image resources, and High Contrast, Reduced Motion,
   Narrator, keyboard, and pointer paths remain usable.
+
+## QoL automated baseline (2026-07-22)
+
+- The suite contains 17 CTest targets with explicit 30-second unit-test and
+  120-second plugin/lifecycle/file-integration timeouts.
+- Coverage includes query Undo/Redo bounds, empty-state actions, instance and
+  verified-focus adapters, async file-index loading, offline-root merging,
+  invalid settings/theme paths, and corrupt PNG rejection.
+- Pull requests and the nightly schedule build ZIP and NSIS packages, run both
+  packaged executables with `--self-test`, and verify Start menu and uninstall
+  artifacts.
 
 ## Search & Files automated baseline (2026-07-18)
 

@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.7.3 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.8.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -388,6 +388,30 @@ add_test(NAME FeatherCastLibraryTests COMMAND FeatherCastLibraryTests)
 add_test(NAME FeatherCastSearchFilesTests COMMAND FeatherCastSearchFilesTests)
 add_test(NAME FeatherCastGameDiscoveryTests COMMAND FeatherCastGameDiscoveryTests)
 add_test(NAME FeatherCastSilentLifecycleTests COMMAND FeatherCast --self-test)
+
+set_tests_properties(
+  FeatherCastCoreTests
+  FeatherCastSettingsExecutorTests
+  FeatherCastStorageTrustTests
+  FeatherCastInteractionStateTests
+  FeatherCastUiEventQueueTests
+  FeatherCastPersistenceServiceTests
+  FeatherCastSearchCoordinatorTests
+  FeatherCastDiscoveryServiceTests
+  FeatherCastCatalogUiStateTests
+  FeatherCastBackgroundServicesTests
+  FeatherCastProductivityPackTests
+  FeatherCastLibraryTests
+  FeatherCastGameDiscoveryTests
+  PROPERTIES TIMEOUT 30
+)
+set_tests_properties(
+  FeatherCastPluginHostTests
+  FeatherCastRuntimeLifecycleTests
+  FeatherCastSearchFilesTests
+  FeatherCastSilentLifecycleTests
+  PROPERTIES TIMEOUT 120
+)
 
 install(TARGETS FeatherCast FeatherCastPluginHost RUNTIME DESTINATION bin)
 

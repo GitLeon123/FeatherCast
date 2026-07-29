@@ -49,6 +49,12 @@ struct NavigationState {
   std::wstring selectedKey;
 };
 
+struct QuerySnapshot {
+  std::wstring query;
+  std::size_t caret = 0;
+  std::optional<std::size_t> selectionAnchor;
+};
+
 struct OverlayState {
   app::View view = app::View::Search;
   std::wstring query;
@@ -66,6 +72,8 @@ struct OverlayState {
   int confirmationHover = -1;
   std::vector<NavigationState> navigationStack;
   std::optional<NavigationState> pendingNavigationRestore;
+  std::vector<QuerySnapshot> queryUndo;
+  std::vector<QuerySnapshot> queryRedo;
 };
 
 struct SettingsState {
@@ -79,12 +87,17 @@ struct SettingsState {
 
 class OverlayController {
  public:
-  static UiEffects ResetForShow(OverlayState& state, app::View view) {
+  static UiEffects ResetForShow(OverlayState& state, app::View view,
+                                std::wstring initialQuery = L"",
+                                bool selectInitialQuery = false) {
     state.view = view;
-    state.query.clear();
+    state.query = std::move(initialQuery);
     state.imeComposition.clear();
-    state.caret = 0;
-    state.selectionAnchor.reset();
+    state.caret = state.query.size();
+    state.selectionAnchor =
+        selectInitialQuery && !state.query.empty()
+            ? std::optional<std::size_t>(0)
+            : std::nullopt;
     state.selected = 0;
     state.scroll = 0;
     state.actionMode = false;
@@ -96,6 +109,8 @@ class OverlayController {
     state.confirmationHover = -1;
     state.navigationStack.clear();
     state.pendingNavigationRestore.reset();
+    state.queryUndo.clear();
+    state.queryRedo.clear();
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
 
@@ -168,16 +183,87 @@ class OverlayController {
   static bool DeleteSelection(OverlayState& state) {
     const auto range = SelectionRange(state);
     if (!range) return false;
-    state.query.erase(range->first, range->second - range->first);
-    state.caret = range->first;
-    state.selectionAnchor.reset();
+    RecordUserEdit(state);
+    DeleteSelectionWithoutHistory(state, *range);
     return true;
   }
+
+  static void RecordUserEdit(OverlayState& state) {
+    PushSnapshot(state.queryUndo, Snapshot(state));
+    state.queryRedo.clear();
+  }
+
+  static UiEffects UndoQueryEdit(OverlayState& state) {
+    if (state.queryUndo.empty()) return Effect(UiEffect::Invalidate);
+    PushSnapshot(state.queryRedo, Snapshot(state));
+    const QuerySnapshot snapshot = std::move(state.queryUndo.back());
+    state.queryUndo.pop_back();
+    RestoreSnapshot(state, snapshot);
+    return UiEffect::RequestSearch | UiEffect::Invalidate;
+  }
+
+  static UiEffects RedoQueryEdit(OverlayState& state) {
+    if (state.queryRedo.empty()) return Effect(UiEffect::Invalidate);
+    PushSnapshot(state.queryUndo, Snapshot(state));
+    const QuerySnapshot snapshot = std::move(state.queryRedo.back());
+    state.queryRedo.pop_back();
+    RestoreSnapshot(state, snapshot);
+    return UiEffect::RequestSearch | UiEffect::Invalidate;
+  }
+
+  static bool CanUndoQueryEdit(const OverlayState& state) {
+    return !state.queryUndo.empty();
+  }
+
+  static bool CanRedoQueryEdit(const OverlayState& state) {
+    return !state.queryRedo.empty();
+  }
+
+ private:
+  static constexpr std::size_t kQueryHistoryLimit = 32;
+
+  static QuerySnapshot Snapshot(const OverlayState& state) {
+    return {state.query, state.caret, state.selectionAnchor};
+  }
+
+  static void PushSnapshot(std::vector<QuerySnapshot>& history,
+                           QuerySnapshot snapshot) {
+    if (history.size() == kQueryHistoryLimit) history.erase(history.begin());
+    history.push_back(std::move(snapshot));
+  }
+
+  static void RestoreSnapshot(OverlayState& state,
+                              const QuerySnapshot& snapshot) {
+    state.query = snapshot.query;
+    state.caret = std::min(snapshot.caret, state.query.size());
+    state.selectionAnchor = snapshot.selectionAnchor;
+    if (state.selectionAnchor) {
+      *state.selectionAnchor =
+          std::min(*state.selectionAnchor, state.query.size());
+    }
+    state.imeComposition.clear();
+    state.selected = 0;
+    state.scroll = 0;
+    state.status.reset();
+  }
+
+  static void DeleteSelectionWithoutHistory(
+      OverlayState& state,
+      const std::pair<std::size_t, std::size_t>& range) {
+    state.query.erase(range.first, range.second - range.first);
+    state.caret = range.first;
+    state.selectionAnchor.reset();
+  }
+
+ public:
 
   static UiEffects InsertText(OverlayState& state, const std::wstring& text,
                               std::size_t maxCharacters = 4096) {
     ClampCaret(state);
-    DeleteSelection(state);
+    RecordUserEdit(state);
+    if (const auto range = SelectionRange(state)) {
+      DeleteSelectionWithoutHistory(state, *range);
+    }
     const std::size_t room = state.query.size() < maxCharacters
                                  ? maxCharacters - state.query.size()
                                  : 0;

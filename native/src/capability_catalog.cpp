@@ -160,6 +160,43 @@ app::DisplayItem Display(const CapabilityDescriptor& descriptor) {
   return item;
 }
 
+app::DisplayItem EmptyStateDisplay(EmptyStateAction action) {
+  app::DisplayItem item;
+  item.isCapability = true;
+  item.capability.category = L"NEXT STEP";
+  switch (action) {
+    case EmptyStateAction::Discover:
+      item.capability.stableId = L"empty:discover";
+      item.capability.title = L"Open Discover FeatherCast";
+      item.capability.summary =
+          L"Browse built-in features, examples, and search scopes.";
+      item.capability.action = Browse(app::BrowseView::Capabilities);
+      break;
+    case EmptyStateAction::ClipboardPrivacy:
+      item.capability.stableId = L"empty:clipboard-privacy";
+      item.capability.title = L"Enable clipboard history in Privacy";
+      item.capability.summary =
+          L"Open Privacy settings to opt in to local clipboard history.";
+      item.capability.action = Settings(app::SettingsCategory::Privacy);
+      break;
+    case EmptyStateAction::FilesPrivacy:
+      item.capability.stableId = L"empty:files-privacy";
+      item.capability.title = L"Enable file search in Privacy";
+      item.capability.summary =
+          L"Open Privacy settings to enable the local file index.";
+      item.capability.action = Settings(app::SettingsCategory::Privacy);
+      break;
+    case EmptyStateAction::ConfigureIndexedFolders:
+      item.capability.stableId = L"empty:configure-indexed-folders";
+      item.capability.title = L"Configure indexed folders";
+      item.capability.summary =
+          L"Choose fixed local folders from Privacy settings.";
+      item.capability.action = Settings(app::SettingsCategory::Privacy);
+      break;
+  }
+  return item;
+}
+
 bool ValidateCatalog(std::wstring* error) {
   std::set<std::wstring> ids;
   for (const auto& capability : Catalog()) {

@@ -30,9 +30,19 @@ struct IndexStatus {
   std::size_t indexedContentFiles = 0;
   long long indexedContentBytes = 0;
   std::size_t unavailableRoots = 0;
+  std::vector<std::wstring> configuredRoots;
+  std::vector<std::wstring> availableRoots;
   bool live = false;
   std::wstring message;
 };
+
+bool IsFixedLocalIndexRoot(const std::filesystem::path& path);
+
+std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
+    const std::vector<storage::FileIndexEntry>& previous,
+    std::vector<storage::FileIndexEntry> scanned,
+    const std::vector<std::wstring>& configuredRoots,
+    const std::vector<std::wstring>& availableRoots, std::size_t limit);
 
 class FileIndexService {
  public:

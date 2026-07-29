@@ -1,6 +1,7 @@
 #pragma once
 
 #include "settings.hpp"
+#include "filesystem_semantics.hpp"
 
 #include <windows.h>
 
@@ -77,15 +78,18 @@ inline std::filesystem::path InvalidBackupPath(
 inline LoadResult LoadSettingsFile(const std::filesystem::path& settingsPath) {
   LoadResult result;
   std::error_code ec;
-  if (!std::filesystem::exists(settingsPath, ec)) {
-    result.status = feathercast::settings::ParseStatus::Missing;
-    return result;
-  }
-  if (ec) {
+  const bool exists = std::filesystem::exists(settingsPath, ec);
+  const auto presence =
+      feathercast::filesystem_semantics::ClassifyPresence(exists, ec);
+  if (presence == feathercast::filesystem_semantics::Presence::Error) {
     result.status = feathercast::settings::ParseStatus::Invalid;
     result.persistenceAllowed = false;
     result.message = L"FeatherCast could not inspect settings.json. "
                      L"Automatic settings saves are disabled.";
+    return result;
+  }
+  if (presence == feathercast::filesystem_semantics::Presence::Missing) {
+    result.status = feathercast::settings::ParseStatus::Missing;
     return result;
   }
 

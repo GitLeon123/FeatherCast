@@ -1,5 +1,7 @@
 #include "persistence_service.hpp"
 
+#include "file_index_service.hpp"
+
 #include <exception>
 #include <future>
 #include <utility>
@@ -59,6 +61,18 @@ std::vector<storage::FileIndexEntry> PersistenceService::LoadFileIndex(
     return {};
   }
   return ready.get();
+}
+
+bool PersistenceService::LoadFileIndexAsync(std::size_t limit,
+                                            std::uint64_t generation) {
+  return executor_.Submit([this, limit, generation](std::stop_token token) {
+    if (token.stop_requested()) return;
+    std::vector<storage::FileIndexEntry> entries;
+    if (EnsureStorageOpen()) entries = storage_.LoadFileIndex(limit);
+    Emit(FileIndexLoaded{generation, std::move(entries),
+                         storage_.IsOpen() ? storage::StorageError{}
+                                           : storage_.LastError()});
+  });
 }
 
 void PersistenceService::Start() {
@@ -155,6 +169,44 @@ bool PersistenceService::UpdateFileIndex(
             EnsureStorageOpen() && storage_.UpdateFileIndex(entries);
         Emit(FileIndexWriteCompleted{
             succeeded,
+            succeeded ? storage::StorageError{} : storage_.LastError()});
+      });
+}
+
+bool PersistenceService::MergeFileIndex(
+    std::vector<storage::FileIndexEntry> entries,
+    std::vector<std::wstring> configuredRoots,
+    std::vector<std::wstring> availableRoots, std::size_t limit,
+    std::uint64_t generation) {
+  return executor_.Submit(
+      [this, entries = std::move(entries),
+       configuredRoots = std::move(configuredRoots),
+       availableRoots = std::move(availableRoots), limit,
+       generation](std::stop_token token) mutable {
+        if (token.stop_requested()) return;
+        if (!EnsureStorageOpen()) {
+          Emit(FileIndexMerged{generation, false, {}, storage_.LastError()});
+          return;
+        }
+        auto merged = files::MergeFileIndexEntries(
+            storage_.LoadFileIndex(limit), std::move(entries), configuredRoots,
+            availableRoots, limit);
+        std::vector<std::wstring> preserveRoots;
+        for (const auto& configured : configuredRoots) {
+          const bool available = std::any_of(
+              availableRoots.begin(), availableRoots.end(),
+              [&](const std::wstring& root) {
+                return _wcsicmp(root.c_str(), configured.c_str()) == 0;
+              });
+          if (!available) {
+            preserveRoots.push_back(
+                std::filesystem::path(configured).lexically_normal().wstring());
+          }
+        }
+        const bool succeeded = storage_.UpdateFileIndex(merged, preserveRoots);
+        Emit(FileIndexMerged{
+            generation, succeeded, succeeded ? std::move(merged)
+                                             : std::vector<storage::FileIndexEntry>{},
             succeeded ? storage::StorageError{} : storage_.LastError()});
       });
 }

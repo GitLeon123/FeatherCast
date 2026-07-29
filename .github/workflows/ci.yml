@@ -12,6 +12,8 @@ on:
     branches: ['**']
     tags: ['v*']
   pull_request:
+  schedule:
+    - cron: '17 2 * * *'
 
 jobs:
   build:
@@ -74,6 +76,16 @@ jobs:
           }
           Invoke-SelfTest 'build-native\Release\FeatherCast.exe' 'FeatherCast'
           Invoke-SelfTest 'build-native\Release\FeatherCastPluginHost.exe' 'Plugin host'
+
+      - name: Install NSIS for PR and nightly package smoke
+        if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+        shell: pwsh
+        run: choco install nsis --yes --no-progress --limit-output
+
+      - name: Smoke-test PR and nightly packages
+        if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+        shell: pwsh
+        run: scripts/package-smoke.ps1 -BuildDirectory build-native -Configuration Release
 
       - name: Validate tag version
         if: startsWith(github.ref, 'refs/tags/v')
