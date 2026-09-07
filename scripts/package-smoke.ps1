@@ -45,7 +45,7 @@ try {
     $InstallRoot = Join-Path $temporaryRoot (
       "feathercast-package-smoke-install-" + [Guid]::NewGuid().ToString("N"))
   }
-  $installArguments = @("/S", "/D=$InstallRoot")
+  $installArguments = @("/S", ('/D="' + $InstallRoot + '"'))
   $install = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
   if ($install.ExitCode -ne 0) { throw "NSIS install failed." }
   $uninstaller = Join-Path $InstallRoot "Uninstall.exe"
@@ -64,6 +64,28 @@ try {
     $process = Start-Process $binary -ArgumentList "--self-test" -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "$name installed self-test failed." }
   }
+
+  $repeatInstall = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
+  if ($repeatInstall.ExitCode -ne 0) { throw "Repeated NSIS install failed." }
+  $uninstallRoots = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+  )
+  $identities = @($uninstallRoots | ForEach-Object {
+    Get-ChildItem $_ -ErrorAction SilentlyContinue |
+      Where-Object PSChildName -eq "FeatherCast"
+  })
+  if ($identities.Count -ne 1) {
+    throw "Expected one FeatherCast uninstall identity after repeat install; found $($identities.Count)."
+  }
+  $identity = Get-ItemProperty $identities[0].PSPath
+  $uninstallString = [string]$identity.UninstallString
+  if (-not $uninstallString -or
+      $uninstallString.IndexOf($InstallRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+    throw "The uninstall entry does not point at the custom install root."
+  }
+
   & $uninstaller /S
   $uninstallExitCode = $LASTEXITCODE
   for ($attempt = 0; $attempt -lt 20 -and (Test-Path $InstallRoot); $attempt++) {

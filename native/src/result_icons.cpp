@@ -119,6 +119,7 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
 }  // namespace
 
 ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
+  if (item.isSectionExpander) return ResultIcon::Actions;
   if (item.timerRequest) return ResultIcon::Clock;
   if (!item.settingId.empty()) return ResultIcon::Gear;
   if (item.isCapability) return CapabilityIcon(item.capability.stableId);

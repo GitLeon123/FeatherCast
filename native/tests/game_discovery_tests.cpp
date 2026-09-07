@@ -305,7 +305,7 @@ int main() {
       [](const auto& section) { return section.title == L"Apps"; });
   assert(gamesSection != results.sections.end());
   assert(appsSection != results.sections.end());
-  assert(gamesSection < appsSection);
+  assert(appsSection < gamesSection);
 
   request.snapshot = std::make_shared<feathercast::app::SearchSnapshot>();
   request.browseView = feathercast::app::BrowseView::Games;

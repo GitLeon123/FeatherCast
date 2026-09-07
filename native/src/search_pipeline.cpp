@@ -22,12 +22,6 @@ namespace {
 
 using namespace app;
 
-std::wstring PrimaryAppId(const AppEntry& entry) {
-  if (!entry.id.empty()) return entry.id;
-  if (!entry.path.empty()) return entry.path;
-  return entry.launchTarget;
-}
-
 DisplayItem CalculatorDisplay(const calculator::Result& calculation) {
   DisplayItem item;
   item.isCalculator = true;
@@ -128,15 +122,25 @@ UtilityKind UtilityKindFor(const std::wstring& stableId) {
   return UtilityKind::LocalTime;
 }
 
+bool IsPlainApp(const DisplayItem& item) {
+  return !item.isWindow && !item.isCommand && !item.isAction &&
+         !item.isExtension && !item.isSnippet && !item.isClipboard &&
+         !item.isCalculator && !item.isConversion && !item.isWebSearch &&
+         !item.isRunCommand && !item.isSymbol && !item.isCapability &&
+         !item.utility;
+}
+
+bool IsLaunchableApp(const DisplayItem& item) {
+  return IsPlainApp(item) && item.app.source != L"file" &&
+         item.app.source != L"system-folder" &&
+         item.app.source != L"windows-settings";
+}
+
 bool MatchesScope(const DisplayItem& item, search_scope::Scope scope) {
-  const bool plainApp = !item.isWindow && !item.isCommand && !item.isSnippet &&
-                        !item.isClipboard && !item.isAction &&
-                        !item.isExtension && !item.utility;
+  const bool plainApp = IsPlainApp(item);
   switch (scope) {
     case search_scope::Scope::All: return true;
-    case search_scope::Scope::Apps:
-      return plainApp && item.app.source != L"file" &&
-             item.app.source != L"system-folder";
+    case search_scope::Scope::Apps: return IsLaunchableApp(item);
     case search_scope::Scope::Games:
       return plainApp && item.app.isGame;
     case search_scope::Scope::Windows: return item.isWindow;
@@ -181,6 +185,7 @@ DisplayItem ScopeSuggestion(const search_scope::Descriptor& descriptor) {
 
 app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
   using namespace app;
+  constexpr std::size_t kCollapsedSectionLimit = 5;
   ResultsCollection result;
   result.generation = request.generation;
 
@@ -299,8 +304,16 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
     addSection(ScopeTitle(request.scope, request.empty), take(hits));
   } else if (request.empty) {
-    addSection(L"Pinned", take(snapshot->pinned, 12));
-    addSection(L"Recently used", take(snapshot->recent, 8));
+    std::vector<DisplayItem> appSuggestions;
+    auto appendLaunchable = [&](const std::vector<DisplayItem>& items) {
+      for (const auto& item : items) {
+        if (IsLaunchableApp(item)) appSuggestions.push_back(item);
+      }
+    };
+    appendLaunchable(snapshot->pinned);
+    appendLaunchable(snapshot->recent);
+    appendLaunchable(snapshot->appItems);
+    addSection(L"Apps", take(appSuggestions, 20));
     addSection(L"Open windows", take(snapshot->windowItems));
     addSection(L"Snippets", take(snapshot->snippetItems, 8));
     addSection(L"Clipboard History", take(snapshot->clipboardItems, 5));
@@ -361,8 +374,6 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                                         UtilityKindFor(utility->stableId))},
                         1));
       }
-      addSection(L"Extensions", take(request.extensionItems, 20));
-
       if (const auto timer = timers::Parse(request.query)) {
         DisplayItem item;
         item.timerRequest = *timer;
@@ -392,10 +403,11 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
         settingMatches.push_back(std::move(item));
         if (settingMatches.size() == 6) break;
       }
-      addSection(L"FeatherCast Settings", take(settingMatches));
 
       core::SearchOptions options;
-      options.limit = static_cast<std::size_t>(request.limit);
+      // Search the whole corpus before bucketing so a lower-scoring app is
+      // still promoted ahead of a higher-scoring setting or command.
+      options.limit = request.limit > 0 ? snapshot->pool.size() : 0;
       options.now = request.now;
       options.generation = request.generation;
       options.latestGeneration = request.latestGeneration;
@@ -405,57 +417,54 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       std::vector<DisplayItem> hits;
       hits.reserve(order.size());
       for (const auto index : order) hits.push_back(snapshot->pool[index]);
-      if (!hits.empty()) addSection(L"Best match", take({hits.front()}, 1));
-
-      std::vector<DisplayItem> rest(
-          hits.size() > 1 ? hits.begin() + 1 : hits.end(), hits.end());
-      std::vector<DisplayItem> recent;
       std::vector<DisplayItem> games;
       std::vector<DisplayItem> apps;
       std::vector<DisplayItem> windows;
       std::vector<DisplayItem> system;
       std::vector<DisplayItem> commands;
-      std::vector<DisplayItem> quicklinks;
       std::vector<DisplayItem> snippets;
       std::vector<DisplayItem> clipboard;
       std::vector<DisplayItem> files;
       std::vector<DisplayItem> systemFolders;
       std::vector<DisplayItem> other;
-      for (const auto& item : rest) {
-        const bool plainApp = !item.isWindow && !item.isCommand &&
-                              !item.isSnippet && !item.isClipboard &&
-                              !item.utility;
-        if (item.isSnippet) snippets.push_back(item);
-        if (item.isClipboard) clipboard.push_back(item);
-        if (item.isCommand) commands.push_back(item);
-        if (plainApp && item.app.source == L"quicklink") quicklinks.push_back(item);
-        if (plainApp && item.app.source == L"file") files.push_back(item);
-        if (plainApp && item.app.source == L"system-folder") {
+      for (const auto& item : hits) {
+        if (item.isSnippet) {
+          snippets.push_back(item);
+        } else if (item.isClipboard) {
+          clipboard.push_back(item);
+        } else if (item.isCommand) {
+          commands.push_back(item);
+        } else if (item.isWindow) {
+          windows.push_back(item);
+        } else if (IsLaunchableApp(item)) {
+          if (item.app.isGame) {
+            games.push_back(item);
+          } else {
+            apps.push_back(item);
+          }
+        } else if (item.app.source == L"file") {
+          files.push_back(item);
+        } else if (item.app.source == L"system-folder") {
           systemFolders.push_back(item);
-        }
-        if (plainApp && item.app.isGame) games.push_back(item);
-        if (plainApp && item.app.source != L"file" &&
-            request.recentIds.contains(PrimaryAppId(item.app))) {
-          recent.push_back(item);
-        }
-        if (plainApp && !item.app.isGame && item.app.source == L"shortcut") {
-          apps.push_back(item);
-        }
-        if (item.isWindow) windows.push_back(item);
-        if (plainApp && !item.app.isGame && item.app.source != L"shortcut" &&
-            item.app.source != L"quicklink" && item.app.source != L"file" &&
-            item.app.source != L"system-folder") {
+        } else if (IsPlainApp(item)) {
           system.push_back(item);
+        } else {
+          other.push_back(item);
         }
-        other.push_back(item);
       }
+
+      const bool hasLaunchableApps = !apps.empty() || !games.empty();
+      if (hasLaunchableApps) {
+        addSection(L"Apps", take(apps, 80));
+        addSection(L"Games", take(games, 80));
+      } else if (!hits.empty()) {
+        addSection(L"Best match", take({hits.front()}, 1));
+      }
+      addSection(L"FeatherCast Settings", take(settingMatches));
+      addSection(L"Extensions", take(request.extensionItems, 20));
       addSection(L"Commands", take(commands, 20));
-      addSection(L"Quicklinks", take(quicklinks, 20));
       addSection(L"Snippets", take(snippets, 20));
       addSection(L"Clipboard History", take(clipboard, 20));
-      addSection(L"Recently used", take(recent, 8));
-      addSection(L"Games", take(games, 80));
-      addSection(L"Apps", take(apps, 80));
       addSection(L"Files & Folders", take(files, 40));
       addSection(L"System Folders", take(systemFolders, 30));
       addSection(L"Open windows", take(windows, 40));
@@ -464,7 +473,17 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
   }
 
-  for (const auto& section : sections) {
+  for (auto& section : sections) {
+    if (!request.expandedSections.contains(section.title) &&
+        section.items.size() > kCollapsedSectionLimit) {
+      const std::size_t hidden = section.items.size() - kCollapsedSectionLimit;
+      section.items.resize(kCollapsedSectionLimit);
+      DisplayItem expander;
+      expander.isSectionExpander = true;
+      expander.sectionTitle = section.title;
+      expander.hiddenResultCount = hidden;
+      section.items.push_back(std::move(expander));
+    }
     result.flatItems.insert(result.flatItems.end(), section.items.begin(),
                             section.items.end());
   }

@@ -93,6 +93,7 @@
 #include <fstream>
 #include <iterator>
 #include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -720,10 +721,147 @@ void AppendUpdateLog(const std::wstring& message) {
   file << UnixNow() << " " << WideToUtf8(message) << "\n";
 }
 
+std::filesystem::path ExePath() {
+  std::array<wchar_t, 32768> exePath{};
+  const DWORD length = GetModuleFileNameW(
+      nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+  if (length == 0 || length >= exePath.size()) return {};
+  return std::filesystem::path(exePath.data());
+}
+
 std::filesystem::path ExeDirectory() {
-  wchar_t exePath[MAX_PATH]{};
-  GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-  return std::filesystem::path(exePath).parent_path();
+  return ExePath().parent_path();
+}
+
+std::wstring NormalizedPathForComparison(const std::filesystem::path& path) {
+  std::error_code ec;
+  auto normalized = std::filesystem::weakly_canonical(path, ec);
+  if (ec) normalized = path.lexically_normal();
+  return Lower(normalized.wstring());
+}
+
+bool PathsEqualInsensitive(const std::filesystem::path& left,
+                           const std::filesystem::path& right) {
+  return !left.empty() && !right.empty() &&
+         NormalizedPathForComparison(left) ==
+             NormalizedPathForComparison(right);
+}
+
+void CleanupUpdateHelpers() {
+  const auto updates = UpdatesPath();
+  std::error_code ec;
+  if (!std::filesystem::is_directory(updates, ec)) return;
+
+  std::filesystem::directory_iterator entries(updates, ec);
+  const std::wstring prefix = L"feathercast-update-helper-";
+  for (const auto& entry : entries) {
+    if (ec) break;
+    ec.clear();
+    if (!entry.is_regular_file(ec)) continue;
+    const std::wstring name = Lower(entry.path().filename().wstring());
+    if (!name.starts_with(prefix) ||
+        Lower(entry.path().extension().wstring()) != L".exe") {
+      continue;
+    }
+    std::error_code removeEc;
+    std::filesystem::remove(entry.path(), removeEc);
+  }
+}
+
+bool IsVerifiedUpdateInstallerPath(const std::filesystem::path& installer) {
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(installer, ec) ||
+      Lower(installer.extension().wstring()) != L".exe") {
+    return false;
+  }
+  return PathsEqualInsensitive(installer.parent_path(), UpdatesPath());
+}
+
+int RunUpdateBootstrap(const std::filesystem::path& installer,
+                       const std::filesystem::path& installRoot,
+                       DWORD parentProcessId) {
+  if (parentProcessId == 0 || parentProcessId == GetCurrentProcessId() ||
+      !feathercast::updater::IsInstalledLayout(installRoot) ||
+      !IsVerifiedUpdateInstallerPath(installer)) {
+    AppendUpdateLog(L"Update bootstrap rejected its arguments");
+    return 1;
+  }
+
+  UniqueHandle parent(OpenProcess(SYNCHRONIZE, FALSE, parentProcessId));
+  if (parent) {
+    const DWORD wait = WaitForSingleObject(parent.get(), INFINITE);
+    if (wait != WAIT_OBJECT_0) {
+      AppendUpdateLog(L"Update bootstrap could not wait for FeatherCast to exit");
+      return 1;
+    }
+  } else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+    AppendUpdateLog(L"Update bootstrap could not open the FeatherCast process");
+    return 1;
+  }
+
+  auto relaunch = [&]() {
+    const auto executable = installRoot / L"bin" / L"FeatherCast.exe";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(executable, ec)) {
+      AppendUpdateLog(L"Update bootstrap could not find the installed executable");
+      return false;
+    }
+
+    std::wstring commandLine =
+        feathercast::updater::QuoteWindowsCommandLineArgument(
+            executable.wstring()) +
+        L" --show";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_SHOWNORMAL;
+    PROCESS_INFORMATION processInfo{};
+    if (!CreateProcessW(
+            executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+            CREATE_UNICODE_ENVIRONMENT, nullptr, installRoot.c_str(), &startup,
+            &processInfo)) {
+      AppendUpdateLog(L"Update bootstrap failed to relaunch FeatherCast");
+      return false;
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    return true;
+  };
+
+  std::wstring installerArguments =
+      feathercast::updater::NsisInstallDirectoryArgument(installRoot);
+  SHELLEXECUTEINFOW execute{};
+  execute.cbSize = sizeof(execute);
+  execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+  execute.lpVerb = L"runas";
+  execute.lpFile = installer.c_str();
+  execute.lpParameters = installerArguments.c_str();
+  execute.lpDirectory = installRoot.c_str();
+  execute.nShow = SW_SHOWNORMAL;
+
+  DWORD installerExitCode = 1;
+  bool installerStarted = false;
+  if (ShellExecuteExW(&execute)) {
+    if (execute.hProcess) {
+      installerStarted = true;
+      const DWORD wait = WaitForSingleObject(execute.hProcess, INFINITE);
+      if (wait == WAIT_OBJECT_0 &&
+          GetExitCodeProcess(execute.hProcess, &installerExitCode)) {
+        // Keep the installer result for logging and the bootstrap exit code.
+      } else {
+        AppendUpdateLog(L"Update bootstrap could not wait for the installer");
+      }
+      CloseHandle(execute.hProcess);
+    } else {
+      AppendUpdateLog(L"Update bootstrap received no installer process handle");
+    }
+  } else {
+    AppendUpdateLog(L"Update bootstrap could not launch the visible installer");
+  }
+
+  const bool relaunched = relaunch();
+  if (!relaunched) return 1;
+  return installerStarted && installerExitCode == 0 ? 0 : 1;
 }
 
 std::filesystem::path SettingsPath() {
@@ -900,6 +1038,15 @@ inline void ApplyDarkMode(HWND hwnd) {
   constexpr DWORD DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
   BOOL enabled = TRUE;
   DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
+}
+
+// FeatherCast drives its own reveal animation; DWM's automatic popup transition
+// would animate the backdrop on a separate timeline and make the blur trail it.
+inline void DisableDwmTransitions(HWND hwnd) {
+  constexpr DWORD DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+  BOOL disabled = TRUE;
+  DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disabled,
+                        sizeof(disabled));
 }
 
 // Lets DWM clip Acrylic to rounded Windows 11 corners. On older Windows versions
@@ -1261,6 +1408,20 @@ struct UpdateTaskResult {
   std::filesystem::path installerPath;
   std::wstring message;
 };
+
+template <typename Operation>
+auto RetryUpdateOperation(std::stop_token stopToken, Operation operation) {
+  using Result = std::invoke_result_t<Operation>;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (stopToken.stop_requested()) return Result{};
+    if (auto result = operation(); result) return result;
+    if (attempt < 2) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(attempt == 0 ? 500 : 1500));
+    }
+  }
+  return Result{};
+}
 
 using NetworkEvent = std::variant<CurrencyRates, UpdateTaskResult>;
 
@@ -3698,6 +3859,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // readable panel tint while DWM blurs the live desktop content behind it.
   void ApplyGlass(HWND hwnd) {
     ApplyDarkMode(hwnd);
+    DisableDwmTransitions(hwnd);
     MARGINS margins{0, 0, 0, 0};
     DwmExtendFrameIntoClientArea(hwnd, &margins);
     ApplyModernBackdrop(hwnd, DwmBackdropType::None);
@@ -4832,9 +4994,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       result.manual = manual;
       result.kind = UpdateTaskKind::Check;
 
-      const auto body = feathercast::network::HttpsGet(
-          L"api.github.com",
-          L"/repos/GenericLeon0/FeatherCast/releases/latest");
+      const auto body = RetryUpdateOperation(
+          stopToken, [] {
+            return feathercast::network::HttpsGet(
+                L"api.github.com",
+                L"/repos/GenericLeon0/FeatherCast/releases/latest");
+          });
       if (stopToken.stop_requested() || stopThreads_) {
         return std::nullopt;
       }
@@ -4917,8 +5082,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return result;
       }
 
-      const auto hashText = feathercast::network::HttpsGetUrl(
-          hash->browserDownloadUrl, 64 * 1024);
+      const auto hashText = RetryUpdateOperation(
+          stopToken, [&] {
+            return feathercast::network::HttpsGetUrl(
+                hash->browserDownloadUrl, 64 * 1024);
+          });
       if (stopToken.stop_requested() || stopThreads_) {
         return std::nullopt;
       }
@@ -4931,8 +5099,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       std::wstring fileName = std::filesystem::path(installer->name).filename().wstring();
       if (fileName.empty()) fileName = feathercast::updater::ExpectedInstallerAssetName(release.tagName);
       const auto installerPath = UpdatesPath() / fileName;
-      if (!feathercast::network::HttpsDownloadToFile(
-              installer->browserDownloadUrl, installerPath, stopToken)) {
+      if (!RetryUpdateOperation(stopToken, [&] {
+            return feathercast::network::HttpsDownloadToFile(
+                installer->browserDownloadUrl, installerPath, stopToken);
+          })) {
         if (stopToken.stop_requested() || stopThreads_) {
           return std::nullopt;
         }
@@ -4963,6 +5133,74 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       result.message = L"Verified update installer: " + installerPath.wstring();
       return result;
     });
+  }
+
+  bool StartUpdateBootstrap(const std::filesystem::path& installer,
+                            std::wstring& error) {
+    const auto currentExecutable = ExePath();
+    const auto installRoot =
+        feathercast::updater::InstalledRootFromExecutable(currentExecutable);
+    if (!installRoot ||
+        !feathercast::updater::IsInstalledLayout(*installRoot) ||
+        !PathsEqualInsensitive(
+            currentExecutable,
+            *installRoot / L"bin" / L"FeatherCast.exe")) {
+      error =
+          L"This copy of FeatherCast is not an installed NSIS copy. "
+          L"In-app updates are unavailable for portable builds; install the "
+          L"NSIS package or update the ZIP build manually.";
+      AppendUpdateLog(L"In-app update refused for a non-NSIS layout");
+      return false;
+    }
+    if (!IsVerifiedUpdateInstallerPath(installer)) {
+      error = L"The verified update installer is no longer available.";
+      AppendUpdateLog(L"In-app update installer path validation failed");
+      return false;
+    }
+
+    const auto helper =
+        UpdatesPath() /
+        (L"FeatherCast-update-helper-" +
+         std::to_wstring(GetCurrentProcessId()) + L".exe");
+    std::error_code ec;
+    if (std::filesystem::exists(helper, ec) &&
+        !std::filesystem::remove(helper, ec)) {
+      error = L"FeatherCast could not prepare its update helper.";
+      AppendUpdateLog(L"In-app update helper could not replace a stale copy");
+      return false;
+    }
+    if (!CopyFileW(currentExecutable.c_str(), helper.c_str(), FALSE)) {
+      error = L"FeatherCast could not prepare its update helper.";
+      AppendUpdateLog(L"In-app update helper copy failed");
+      return false;
+    }
+
+    std::wstring commandLine =
+        feathercast::updater::QuoteWindowsCommandLineArgument(
+            helper.wstring()) +
+        L" --apply-update " +
+        feathercast::updater::QuoteWindowsCommandLineArgument(
+            installer.wstring()) +
+        L" " +
+        feathercast::updater::QuoteWindowsCommandLineArgument(
+            installRoot->wstring()) +
+        L" " + std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION processInfo{};
+    if (!CreateProcessW(helper.c_str(), commandLine.data(), nullptr, nullptr,
+                        FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                        nullptr, installRoot->c_str(), &startup,
+                        &processInfo)) {
+      std::filesystem::remove(helper, ec);
+      error = L"FeatherCast could not start its update helper.";
+      AppendUpdateLog(L"In-app update helper launch failed");
+      return false;
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    AppendUpdateLog(L"In-app update helper started");
+    return true;
   }
 
   void OnUpdateReady(UpdateTaskResult result) {
@@ -5021,9 +5259,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1);
         if (choice != IDYES) return;
 
-        HINSTANCE launched = ShellExecuteW(nullptr, L"open", result.installerPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(launched) <= 32) {
-          MessageBoxW(hwnd_, L"FeatherCast could not start the verified installer.", L"FeatherCast Updates",
+        std::wstring error;
+        if (!StartUpdateBootstrap(result.installerPath, error)) {
+          MessageBoxW(hwnd_, error.c_str(), L"FeatherCast Updates",
                       MB_OK | MB_ICONWARNING);
           return;
         }
@@ -5345,9 +5583,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   // Entry point for every "results changed" trigger (formerly BuildSections).
-  // Cheap result sets (empty query, action mode) are computed synchronously so
-  // callers that immediately show/position the window see correct sizing with
-  // no flicker; the expensive full-pool search is offloaded to the worker.
+  // Result composition is offloaded to the coalescing search worker; only the
+  // compact clear and small action-mode paths stay synchronous.
   void MarkSearchDataChanged() {
     dataRevision_.fetch_add(1, std::memory_order_release);
   }
@@ -5436,7 +5673,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       return;
     }
-    if (req.compactClear || req.empty || req.actionMode) {
+    // Keep result composition off the UI thread, including the empty-state app
+    // suggestions. Compact mode still clears immediately, while action mode is
+    // a small target-specific list that is safe to render synchronously.
+    if (req.compactClear || req.actionMode) {
       ApplyResults(ComputeResults(req));
     } else {
       DispatchToWorker(std::move(req));
@@ -5469,6 +5709,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                        view_ == View::Search &&
                        !actionMode_ && browseView_ == BrowseView::None;
     req.recentIds = std::set<std::wstring>(settings_.recentApps.begin(), settings_.recentApps.end());
+    if (expandedSectionsQuery_ != query_) {
+      expandedSections_.clear();
+      expandedSectionsQuery_ = query_;
+    }
+    req.expandedSections = expandedSections_;
     req.limit = std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
     req.now = UnixNow();
     {
@@ -5553,6 +5798,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (ContainsAnyAppKey(snapshotSettings.hiddenApps, folder)) continue;
       appItems.push_back(AppDisplay(folder));
     }
+    snap->appItems = appItems;
     for (const auto& snippet : snippets) {
       snap->snippetItems.push_back(SnippetDisplay(snippet));
     }
@@ -5991,7 +6237,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         discoveryResumePending_ = true;
       }
       currencyService_.Cancel();
-      updateService_.Cancel();
       fileIndexService_.Pause();
       fileIndexConfigured_ = false;
       ++fileIndexGeneration_;
@@ -7717,10 +7962,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (HasActiveMotion()) {
-      // Wait until DWM has consumed this frame before queueing another one.
-      // This keeps the self-posted animation loop display-paced even when the
-      // process has just returned from reduced background priority.
-      DwmFlush();
       RequestAnimationFrame();
     } else {
       animationLoopRunning_ = false;
@@ -9321,6 +9562,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::wstring SourceLabel(const DisplayItem& item) const {
+    if (item.isSectionExpander) {
+      return std::to_wstring(item.hiddenResultCount) +
+             (item.hiddenResultCount == 1 ? L" more result" : L" more results");
+    }
     if (item.timerRequest || !item.settingId.empty()) return item.commandDetail;
     if (item.isCapability) {
       return item.capability.example.empty()
@@ -9359,6 +9604,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::wstring ActionHint(const DisplayItem& item) const {
+    if (item.isSectionExpander) return L"Enter Expand";
     if (!item.settingId.empty()) return L"Enter Settings";
     if (item.timerRequest) return item.timerRequest->action == feathercast::timers::Action::Invalid ? L"" : L"Enter Select";
     if (item.isCapability) {
@@ -9430,7 +9676,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   float SettingsStatusOffset() const {
-    return kSettStatus;
+    return settingsStatus_ ? kSettStatus : 0.0f;
   }
 
   void SetSettingsStatus(StatusSeverity severity, std::wstring text) {
@@ -10871,15 +11117,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       UpdateKeyboardHook();
     }
     if (changed) {
-      settingsPageProgress_.Snap(0.0);
-      settingsPageProgress_.Retarget(1.0, 0.120, FadeAnimationsAllowed());
-      settingsCategoryTop_.Retarget(
+      settingsPageProgress_.Snap(1.0);
+      settingsCategoryTop_.Snap(
           kSettTop + static_cast<double>(SettingsCategoryIndex(category)) *
-                         kSettCategoryRow,
-          0.090, SpatialAnimationsAllowed());
-      RetargetSettingsScroll();
-      ResizeSettingsWindow();
-      RequestAnimationFrame();
+                         kSettCategoryRow);
+      RetargetSettingsScroll(false);
+      ResizeSettingsWindow(false);
     }
     if (settingsHwnd_) {
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
@@ -11095,7 +11338,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     EnterActionMode(flatItems_[static_cast<size_t>(selected_)]);
   }
 
-  void ResizeSettingsWindow() {
+  void ResizeSettingsWindow(bool animate = true) {
     if (!settingsHwnd_ || !IsWindowVisible(settingsHwnd_)) return;
     RECT rc{};
     GetWindowRect(settingsHwnd_, &rc);
@@ -11114,7 +11357,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         mi.rcWork.bottom - static_cast<int>(20 * scale) - physicalHeight;
     const int top = std::clamp(centerY - physicalHeight / 2, minTop,
                                std::max(minTop, maxTop));
-    if (SpatialAnimationsAllowed()) {
+    if (animate && SpatialAnimationsAllowed()) {
       if (!settingsBounds_.Active()) SnapWindowBounds(settingsBounds_, rc);
       settingsBounds_.Retarget(rc.left, top, width, physicalHeight,
                                kSettingsResizeSeconds, true);
@@ -11868,6 +12111,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void Activate(DisplayItem item, bool asAdmin) {
+    if (item.isSectionExpander) {
+      expandedSections_.insert(item.sectionTitle);
+      expandedSectionsQuery_ = query_;
+      feathercast::ui::OverlayController::ResetResultPosition(overlayState_);
+      RequestSearch();
+      return;
+    }
     if (item.timerRequest) {
       ExecuteTimerItem(item);
       return;
@@ -13011,6 +13261,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::map<std::wstring, ResultElementMotion> resultRowMotion_;
   std::map<std::wstring, ResultElementMotion> resultHeaderMotion_;
   std::wstring displayedQuery_;
+  std::wstring expandedSectionsQuery_;
+  std::set<std::wstring> expandedSections_;
   bool overlayClosing_ = false;
   bool settingsClosing_ = false;
   bool volumeClosing_ = false;
@@ -13402,6 +13654,31 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   if (cmdLineStr.find(L"--self-test") != std::wstring::npos) {
     return RunFeatherCastSelfTest();
   }
+
+  int argumentCount = 0;
+  LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+  if (arguments && argumentCount > 1 &&
+      _wcsicmp(arguments[1], L"--apply-update") == 0) {
+    int result = 1;
+    if (argumentCount == 5) {
+      wchar_t* end = nullptr;
+      const unsigned long parsed = std::wcstoul(arguments[4], &end, 10);
+      if (end && *end == L'\0' && parsed > 0 &&
+          parsed <= static_cast<unsigned long>(
+                        std::numeric_limits<DWORD>::max())) {
+        result = RunUpdateBootstrap(
+            arguments[2], arguments[3], static_cast<DWORD>(parsed));
+      } else {
+        AppendUpdateLog(L"Update bootstrap received an invalid parent PID");
+      }
+    } else {
+      AppendUpdateLog(L"Update bootstrap received an invalid argument list");
+    }
+    LocalFree(arguments);
+    return result;
+  }
+  if (arguments) LocalFree(arguments);
+  CleanupUpdateHelpers();
 
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
   const DWORD mutexError = GetLastError();

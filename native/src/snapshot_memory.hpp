@@ -19,7 +19,8 @@ inline std::size_t SearchItemBytes(const core::SearchItem& item) {
 }
 inline std::size_t SnapshotBytes(const app::SearchSnapshot& snapshot) {
   std::size_t bytes = sizeof(snapshot);
-  for (const auto* items : {&snapshot.pool, &snapshot.pinned, &snapshot.recent,
+  for (const auto* items : {&snapshot.pool, &snapshot.appItems,
+       &snapshot.pinned, &snapshot.recent,
        &snapshot.windowItems, &snapshot.system, &snapshot.systemFolders,
        &snapshot.commandItems, &snapshot.snippetItems, &snapshot.clipboardItems, &snapshot.gameItems}) {
     bytes += items->capacity() * sizeof(app::DisplayItem);

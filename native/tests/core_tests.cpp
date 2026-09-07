@@ -304,6 +304,27 @@ int main() {
     const auto tempRoot = TestTempRoot(L"FeatherCastUpdaterCoreTests");
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
+    const auto installedRoot = tempRoot / L"Installed FeatherCast";
+    const auto installedExecutable =
+        installedRoot / L"bin" / L"FeatherCast.exe";
+    assert(feathercast::updater::InstalledRootFromExecutable(
+               installedExecutable) == installedRoot);
+    assert(!feathercast::updater::InstalledRootFromExecutable(
+        tempRoot / L"FeatherCast.exe"));
+    assert(!feathercast::updater::InstalledRootFromExecutable(
+        installedRoot / L"bin" / L"Other.exe"));
+    assert(!feathercast::updater::IsInstalledLayout(installedRoot));
+    WriteUtf8(installedExecutable, "binary");
+    WriteUtf8(installedRoot / L"Uninstall.exe", "uninstaller");
+    assert(feathercast::updater::IsInstalledLayout(installedRoot));
+    assert(feathercast::updater::QuoteWindowsCommandLineArgument(
+               L"C:\\Program Files\\FeatherCast") ==
+           L"\"C:\\Program Files\\FeatherCast\"");
+    assert(feathercast::updater::QuoteWindowsCommandLineArgument(
+               L"C:\\Program Files\\FeatherCast\\") ==
+           L"\"C:\\Program Files\\FeatherCast\\\\\"");
+    assert(feathercast::updater::NsisInstallDirectoryArgument(installedRoot) ==
+           L"/D=\"" + installedRoot.wstring() + L"\"");
     WriteUtf8(tempRoot / L"hash.txt", "abc");
     assert(VerifyFileSha256(tempRoot / L"hash.txt",
                             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));

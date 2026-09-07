@@ -261,6 +261,12 @@ jobs:
           $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
           if (-not $installer) { throw "NSIS installer was not generated." }
 
+          $installRoot = Join-Path $env:RUNNER_TEMP 'feathercast-upgrade-root'
+          if (Test-Path $installRoot) {
+            Remove-Item -LiteralPath $installRoot -Recurse -Force
+          }
+          $installArguments = @('/S', ('/D="' + $installRoot + '"'))
+
           # Exercise a real in-place upgrade when a published predecessor exists.
           $previousTag = $null
           $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
@@ -292,7 +298,7 @@ jobs:
             $previousInstaller = Get-ChildItem $previousDirectory -Filter 'FeatherCast-*-win64.exe' |
               Select-Object -First 1
             if ($downloaded -and $previousInstaller) {
-              $previousProcess = Start-Process $previousInstaller.FullName -ArgumentList '/S' -PassThru -Wait
+              $previousProcess = Start-Process $previousInstaller.FullName -ArgumentList $installArguments -PassThru -Wait
               if ($previousProcess.ExitCode -ne 0) {
                 throw "Previous installer failed with exit code $($previousProcess.ExitCode)."
               }
@@ -321,9 +327,8 @@ jobs:
             $preservedHashes[$preservedFile] = (Get-FileHash $preservedFile -Algorithm SHA256).Hash
           }
 
-          $process = Start-Process $installer.FullName -ArgumentList '/S' -PassThru -Wait
+          $process = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Installer failed with exit code $($process.ExitCode)." }
-          $installRoot = Join-Path $env:ProgramFiles 'FeatherCast'
           $app = Join-Path $installRoot 'bin\FeatherCast.exe'
           $uninstaller = Join-Path $installRoot 'Uninstall.exe'
           if (-not (Test-Path $app)) { throw "Installed FeatherCast.exe was not found." }
@@ -365,6 +370,12 @@ jobs:
           })
           if ($identities.Count -ne 1) {
             throw "Expected one FeatherCast uninstall identity after upgrade; found $($identities.Count)."
+          }
+          $identity = Get-ItemProperty $identities[0].PSPath
+          $installLocation = [string]$identity.InstallLocation
+          if (-not $installLocation -or
+              $installLocation.TrimEnd('\') -ne $installRoot.TrimEnd('\')) {
+            throw "The uninstall identity points at the wrong install root: $installLocation"
           }
 
           $uninstall = Start-Process $uninstaller -ArgumentList '/S' -PassThru -Wait

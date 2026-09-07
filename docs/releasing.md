@@ -78,6 +78,12 @@ The updater will not run an installer unless the `.sha256` asset exists and matc
 - If the user dismisses an automatic update prompt, FeatherCast will not prompt again for that same version.
 - Installers are downloaded to `%LOCALAPPDATA%\FeatherCast\updates`.
 - Update logs are written to `%LOCALAPPDATA%\FeatherCast\update-log.txt`.
+- A verified in-app update is a visible, in-place NSIS upgrade. It preserves the
+  existing `FeatherCast` install directory and uninstall identity, so updating
+  does not create a second Windows installation entry.
+- ZIP releases are portable builds. They intentionally do not use the in-app
+  updater; replace the portable files manually, keeping the user-data folders
+  under `%APPDATA%\FeatherCast` and `%LOCALAPPDATA%\FeatherCast`.
 
 ## Suggested Release Flow
 

@@ -125,6 +125,67 @@ inline std::wstring AssetVersionFromTag(std::wstring tagName) {
   return tagName;
 }
 
+inline std::optional<std::filesystem::path> InstalledRootFromExecutable(
+    const std::filesystem::path& executable) {
+  if (executable.empty()) return std::nullopt;
+  if (LowerWide(executable.filename().wstring()) != L"feathercast.exe") {
+    return std::nullopt;
+  }
+  const auto binDirectory = executable.parent_path();
+  if (LowerWide(binDirectory.filename().wstring()) != L"bin") {
+    return std::nullopt;
+  }
+  const auto root = binDirectory.parent_path();
+  return root.empty() ? std::nullopt
+                      : std::optional<std::filesystem::path>(root);
+}
+
+inline bool IsInstalledLayout(const std::filesystem::path& installRoot) {
+  if (installRoot.empty()) return false;
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(installRoot / L"Uninstall.exe", ec)) {
+    return false;
+  }
+  ec.clear();
+  return std::filesystem::is_regular_file(
+      installRoot / L"bin" / L"FeatherCast.exe", ec);
+}
+
+inline std::wstring QuoteWindowsCommandLineArgument(std::wstring_view value) {
+  if (value.empty()) return L"\"\"";
+
+  const bool needsQuotes = value.find_first_of(L" \t\n\v\"") !=
+                           std::wstring_view::npos;
+  if (!needsQuotes) return std::wstring(value);
+
+  std::wstring quoted;
+  quoted.reserve(value.size() + 2);
+  quoted.push_back(L'\"');
+  std::size_t backslashes = 0;
+  for (const wchar_t ch : value) {
+    if (ch == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (ch == L'\"') {
+      quoted.append(backslashes * 2 + 1, L'\\');
+      quoted.push_back(L'\"');
+    } else {
+      quoted.append(backslashes, L'\\');
+      quoted.push_back(ch);
+    }
+    backslashes = 0;
+  }
+  quoted.append(backslashes * 2, L'\\');
+  quoted.push_back(L'\"');
+  return quoted;
+}
+
+inline std::wstring NsisInstallDirectoryArgument(
+    const std::filesystem::path& installRoot) {
+  return L"/D=" + QuoteWindowsCommandLineArgument(installRoot.wstring());
+}
+
 inline std::optional<ReleaseInfo> ParseGitHubReleaseJson(const std::string& json) {
   auto tagName = feathercast::extensions::JsonString(json, "tag_name");
   if (!tagName || tagName->empty()) return std::nullopt;

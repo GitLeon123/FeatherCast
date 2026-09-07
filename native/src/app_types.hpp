@@ -13,6 +13,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -365,6 +366,7 @@ struct DisplayItem {
   bool isRunCommand = false;
   bool isSymbol = false;
   bool isCapability = false;
+  bool isSectionExpander = false;
   std::optional<UtilityResult> utility;
   AppEntry app;
   WindowEntry window;
@@ -384,8 +386,11 @@ struct DisplayItem {
   std::wstring calculationResult;
   std::wstring webSearchUrl;
   std::wstring webSearchLabel;
+  std::wstring sectionTitle;
+  std::size_t hiddenResultCount = 0;
 
   std::wstring Key() const {
+    if (isSectionExpander) return L"expand:" + sectionTitle;
     if (timerRequest) return L"timer:" + std::to_wstring(timerRequest->id) + L":" + std::to_wstring(static_cast<int>(timerRequest->action));
     if (!settingId.empty()) return L"setting:" + settingId;
     if (isCapability) return L"capability:" + capability.stableId;
@@ -427,6 +432,7 @@ struct DisplayItem {
   }
 
   std::wstring Name() const {
+    if (isSectionExpander) return L"Show all " + sectionTitle;
     if (timerRequest || !settingId.empty()) return commandName;
     if (isCapability) return capability.title;
     if (isCalculator || isConversion) return calculationResult;
@@ -442,6 +448,7 @@ struct DisplayItem {
   }
 
   std::wstring IconKey() const {
+    if (isSectionExpander) return L"";
     if (timerRequest || !settingId.empty()) return L"";
     if (isCapability) return L"";
     if (isCalculator || isConversion || isWebSearch || isRunCommand ||
@@ -479,6 +486,7 @@ struct SearchSnapshot {
   std::size_t retainedBytes = 0;
   std::vector<DisplayItem> pool;
   std::vector<feathercast::core::PreparedSearchItem> searchItems;
+  std::vector<DisplayItem> appItems;
   std::vector<DisplayItem> pinned;
   std::vector<DisplayItem> recent;
   std::vector<DisplayItem> windowItems;
@@ -528,6 +536,7 @@ struct QueryRequest {
   std::map<std::wstring, std::wstring> searchEngines;
   std::map<std::wstring, double> currencyRates;
   std::wstring defaultCurrency;
+  std::set<std::wstring> expandedSections;
   std::shared_ptr<const SearchSnapshot> snapshot;
   std::vector<DisplayItem> extensionItems;
   std::vector<DisplayItem> actions;

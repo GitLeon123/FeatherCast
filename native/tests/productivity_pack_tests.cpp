@@ -444,6 +444,51 @@ int main() {
   snapshot->searchItems.push_back(
       feathercast::core::PrepareSearchItem(searchItem));
 
+  feathercast::app::DisplayItem pinnedApp;
+  pinnedApp.app.id = L"app:pinned";
+  pinnedApp.app.name = L"Pinned Launcher";
+  pinnedApp.app.source = L"shortcut";
+  feathercast::app::DisplayItem recentApp;
+  recentApp.app.id = L"app:recent";
+  recentApp.app.name = L"Recent Launcher";
+  recentApp.app.source = L"shortcut";
+  feathercast::app::DisplayItem remainingApp;
+  remainingApp.app.id = L"app:remaining";
+  remainingApp.app.name = L"Remaining Launcher";
+  remainingApp.app.source = L"shortcut";
+  feathercast::app::DisplayItem indexedFile;
+  indexedFile.app.id = L"file:indexed";
+  indexedFile.app.name = L"Indexed file";
+  indexedFile.app.source = L"file";
+  feathercast::app::DisplayItem windowsSetting;
+  windowsSetting.app.id = L"windows-settings:test";
+  windowsSetting.app.name = L"Windows Settings";
+  windowsSetting.app.source = L"windows-settings";
+  snapshot->pinned = {pinnedApp};
+  snapshot->recent = {recentApp};
+  snapshot->appItems = {
+      pinnedApp, recentApp, remainingApp, indexedFile, windowsSetting};
+
+  feathercast::app::QueryRequest emptyRequest;
+  emptyRequest.empty = true;
+  emptyRequest.limit = 20;
+  emptyRequest.snapshot = snapshot;
+  const auto emptyResults =
+      feathercast::search_pipeline::ComputeResults(emptyRequest);
+  assert(!emptyResults.sections.empty());
+  assert(emptyResults.sections.front().title == L"Apps");
+  assert(emptyResults.sections.front().items.size() == 3);
+  assert(emptyResults.sections.front().items[0].app.id == L"app:pinned");
+  assert(emptyResults.sections.front().items[1].app.id == L"app:recent");
+  assert(emptyResults.sections.front().items[2].app.id == L"app:remaining");
+
+  const auto hasSection = [](const auto& results, const std::wstring& title) {
+    return std::any_of(results.sections.begin(), results.sections.end(),
+                       [&](const auto& section) { return section.title == title; });
+  };
+  assert(!hasSection(emptyResults, L"Pinned"));
+  assert(!hasSection(emptyResults, L"Recently used"));
+
   feathercast::app::DisplayItem volumeCommand;
   volumeCommand.isCommand = true;
   volumeCommand.command = feathercast::app::CommandKind::VolumeUp;
@@ -484,6 +529,169 @@ int main() {
   snapshot->pool.push_back(notepad);
   snapshot->searchItems.push_back(
       feathercast::core::PrepareSearchItem(searchItem));
+
+  auto typedSnapshot =
+      std::make_shared<feathercast::app::SearchSnapshot>();
+  const auto addSearchable =
+      [&](feathercast::app::DisplayItem item, const std::wstring& kind,
+          const std::wstring& source) {
+        feathercast::core::SearchItem searchable;
+        searchable.id = item.Key();
+        searchable.name = item.Name();
+        searchable.kind = kind;
+        searchable.source = source;
+        typedSnapshot->pool.push_back(std::move(item));
+        typedSnapshot->searchItems.push_back(
+            feathercast::core::PrepareSearchItem(searchable));
+      };
+  feathercast::app::DisplayItem updateApp;
+  updateApp.app.id = L"app:update-tool";
+  updateApp.app.name = L"Update Tool";
+  updateApp.app.source = L"shortcut";
+  addSearchable(updateApp, L"app", L"shortcut");
+  feathercast::app::DisplayItem storeApp;
+  storeApp.app.id = L"app:store-update-tool";
+  storeApp.app.name = L"Store Update Tool";
+  storeApp.app.source = L"appx";
+  storeApp.app.launchType = feathercast::app::LaunchType::AppsFolder;
+  addSearchable(storeApp, L"app", L"appx");
+  feathercast::app::DisplayItem updateGame;
+  updateGame.app.id = L"game:update";
+  updateGame.app.name = L"Update Game";
+  updateGame.app.source = L"game";
+  updateGame.app.isGame = true;
+  addSearchable(updateGame, L"game", L"game");
+  feathercast::app::DisplayItem updateSetting;
+  updateSetting.app.id = L"windows-settings:update";
+  updateSetting.app.name = L"Windows Update";
+  updateSetting.app.source = L"windows-settings";
+  addSearchable(updateSetting, L"app", L"windows-settings");
+  feathercast::app::DisplayItem updateCommand;
+  updateCommand.isCommand = true;
+  updateCommand.command = feathercast::app::CommandKind::VolumeUp;
+  updateCommand.commandName = L"Update Command";
+  addSearchable(updateCommand, L"command", L"command");
+
+  feathercast::app::QueryRequest typedRequest;
+  typedRequest.query = L"update";
+  typedRequest.limit = 20;
+  typedRequest.snapshot = typedSnapshot;
+  const auto typedResults =
+      feathercast::search_pipeline::ComputeResults(typedRequest);
+  assert(!typedResults.sections.empty());
+  assert(typedResults.sections.front().title == L"Apps");
+  const auto appsSection = std::find_if(
+      typedResults.sections.begin(), typedResults.sections.end(),
+      [](const auto& section) { return section.title == L"Apps"; });
+  const auto gamesSection = std::find_if(
+      typedResults.sections.begin(), typedResults.sections.end(),
+      [](const auto& section) { return section.title == L"Games"; });
+  const auto settingsSection = std::find_if(
+      typedResults.sections.begin(), typedResults.sections.end(),
+      [](const auto& section) {
+        return section.title == L"FeatherCast Settings";
+      });
+  assert(appsSection != typedResults.sections.end());
+  assert(gamesSection != typedResults.sections.end());
+  assert(settingsSection != typedResults.sections.end());
+  assert(appsSection < gamesSection && gamesSection < settingsSection);
+  assert(std::any_of(appsSection->items.begin(), appsSection->items.end(),
+                     [](const auto& item) {
+                       return item.app.id == L"app:store-update-tool";
+                     }));
+  assert(std::any_of(gamesSection->items.begin(), gamesSection->items.end(),
+                     [](const auto& item) { return item.app.isGame; }));
+
+  auto manyAppsSnapshot = std::make_shared<feathercast::app::SearchSnapshot>();
+  for (int index = 0; index < 7; ++index) {
+    feathercast::app::DisplayItem item;
+    item.app.id = L"app:launcher-" + std::to_wstring(index);
+    item.app.name = L"Launcher " + std::to_wstring(index);
+    item.app.source = L"shortcut";
+    feathercast::core::SearchItem searchable;
+    searchable.id = item.app.id;
+    searchable.name = item.app.name;
+    searchable.kind = L"app";
+    searchable.source = L"shortcut";
+    manyAppsSnapshot->pool.push_back(item);
+    manyAppsSnapshot->searchItems.push_back(
+        feathercast::core::PrepareSearchItem(searchable));
+  }
+  feathercast::app::QueryRequest collapsedRequest;
+  collapsedRequest.query = L"launcher";
+  collapsedRequest.limit = 20;
+  collapsedRequest.snapshot = manyAppsSnapshot;
+  const auto collapsedResults =
+      feathercast::search_pipeline::ComputeResults(collapsedRequest);
+  assert(!collapsedResults.sections.empty());
+  assert(collapsedResults.sections.front().title == L"Apps");
+  const auto collapsedAppsSection = std::find_if(
+      collapsedResults.sections.begin(), collapsedResults.sections.end(),
+      [](const auto& section) { return section.title == L"Apps"; });
+  assert(collapsedAppsSection != collapsedResults.sections.end());
+  assert(collapsedAppsSection->items.size() == 6);
+  assert(collapsedAppsSection->items.back().isSectionExpander);
+  assert(collapsedAppsSection->items.back().hiddenResultCount == 2);
+
+  collapsedRequest.expandedSections.insert(L"Apps");
+  const auto expandedResults =
+      feathercast::search_pipeline::ComputeResults(collapsedRequest);
+  const auto expandedAppsSection = std::find_if(
+      expandedResults.sections.begin(), expandedResults.sections.end(),
+      [](const auto& section) { return section.title == L"Apps"; });
+  assert(expandedAppsSection != expandedResults.sections.end());
+  assert(expandedAppsSection->items.size() == 7);
+  assert(!expandedAppsSection->items.back().isSectionExpander);
+
+  auto manyGamesSnapshot = std::make_shared<feathercast::app::SearchSnapshot>();
+  for (int index = 0; index < 7; ++index) {
+    feathercast::app::DisplayItem item;
+    item.app.id = L"game:launcher-" + std::to_wstring(index);
+    item.app.name = L"Launcher Game " + std::to_wstring(index);
+    item.app.source = L"game";
+    item.app.isGame = true;
+    manyGamesSnapshot->gameItems.push_back(item);
+  }
+  feathercast::app::QueryRequest gamesRequest;
+  gamesRequest.empty = true;
+  gamesRequest.snapshot = manyGamesSnapshot;
+  gamesRequest.browseView = feathercast::app::BrowseView::Games;
+  const auto browseGames =
+      feathercast::search_pipeline::ComputeResults(gamesRequest);
+  assert(browseGames.sections.size() == 1);
+  assert(browseGames.sections.front().items.size() == 6);
+  assert(browseGames.sections.front().items.back().isSectionExpander);
+  gamesRequest.expandedSections.insert(L"Games");
+  const auto expandedGames =
+      feathercast::search_pipeline::ComputeResults(gamesRequest);
+  assert(expandedGames.sections.front().items.size() == 7);
+  assert(!expandedGames.sections.front().items.back().isSectionExpander);
+
+  auto noAppSnapshot =
+      std::make_shared<feathercast::app::SearchSnapshot>();
+  feathercast::app::DisplayItem onlyCommand;
+  onlyCommand.isCommand = true;
+  onlyCommand.command = feathercast::app::CommandKind::VolumeDown;
+  onlyCommand.commandName = L"Settings Command";
+  feathercast::core::SearchItem onlyCommandSearch;
+  onlyCommandSearch.id = onlyCommand.Key();
+  onlyCommandSearch.name = onlyCommand.Name();
+  onlyCommandSearch.kind = L"command";
+  onlyCommandSearch.source = L"command";
+  noAppSnapshot->pool.push_back(onlyCommand);
+  noAppSnapshot->searchItems.push_back(
+      feathercast::core::PrepareSearchItem(onlyCommandSearch));
+  feathercast::app::QueryRequest noAppRequest;
+  noAppRequest.query = L"settings";
+  noAppRequest.limit = 20;
+  noAppRequest.snapshot = noAppSnapshot;
+  const auto noAppResults =
+      feathercast::search_pipeline::ComputeResults(noAppRequest);
+  assert(!noAppResults.sections.empty());
+  assert(noAppResults.sections.front().title == L"Best match");
+  assert(noAppResults.flatItems.front().isCommand);
+  assert(!hasSection(noAppResults, L"Apps"));
+  assert(!hasSection(noAppResults, L"Games"));
 
   feathercast::app::QueryRequest request;
   request.generation = 44;
