@@ -9,6 +9,7 @@
 #include "run_command.hpp"
 #include "search_scope.hpp"
 #include "symbols.hpp"
+#include "settings_catalog.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -208,6 +209,12 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
 
   if (request.compactClear) {
     // Compact mode deliberately renders no results.
+  } else if (request.browseView == BrowseView::Timers) {
+    std::vector<DisplayItem> items;
+    for (const auto& item : request.timerItems) {
+      if (request.empty || core::Lower(item.Name()).find(core::Lower(request.query)) != std::wstring::npos) items.push_back(item);
+    }
+    addSection(L"Timers & Stopwatch", take(items));
   } else if (request.browseView == BrowseView::Clipboard) {
     if (request.empty) {
       addSection(L"Clipboard History", take(snapshot->clipboardItems));
@@ -216,6 +223,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                                       snapshot->clipboardSearchItems);
       std::vector<DisplayItem> hits;
       for (const auto index : order) hits.push_back(snapshot->clipboardItems[index]);
+      std::stable_partition(hits.begin(), hits.end(), [](const auto& item) { return item.clipboard.pinned; });
       addSection(L"Clipboard History", take(hits));
     }
   } else if (request.browseView == BrowseView::Emoji) {
@@ -354,6 +362,37 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                         1));
       }
       addSection(L"Extensions", take(request.extensionItems, 20));
+
+      if (const auto timer = timers::Parse(request.query)) {
+        DisplayItem item;
+        item.timerRequest = *timer;
+        item.commandName = timer->action == timers::Action::Create ? L"Start timer: " + timer->name : L"Enter a timer duration";
+        item.commandDetail = timer->action == timers::Action::Create ? timers::Format(timer->duration) : L"Use positive h, m, s values. Example: timer 1h 30m Tea";
+        addSection(L"Timer", take({item}));
+      }
+
+      std::vector<DisplayItem> settingMatches;
+      static const auto settingSearch = [] {
+        std::vector<core::SearchItem> items;
+        for (const auto& descriptor : settings_catalog::Catalog()) {
+          core::SearchItem item;
+          item.id = descriptor.stableId;
+          item.name = descriptor.label;
+          item.keywords = {std::wstring(descriptor.description), std::wstring(descriptor.accessibleName), std::wstring(descriptor.stableId)};
+          items.push_back(std::move(item));
+        }
+        return items;
+      }();
+      for (const auto index : core::Search(request.query, settingSearch)) {
+        const auto& descriptor = settings_catalog::Catalog()[index];
+        DisplayItem item;
+        item.settingId = descriptor.stableId;
+        item.commandName = descriptor.label;
+        item.commandDetail = L"FeatherCast Settings - " + std::wstring(descriptor.description);
+        settingMatches.push_back(std::move(item));
+        if (settingMatches.size() == 6) break;
+      }
+      addSection(L"FeatherCast Settings", take(settingMatches));
 
       core::SearchOptions options;
       options.limit = static_cast<std::size_t>(request.limit);

@@ -77,12 +77,199 @@ struct OverlayState {
 };
 
 struct SettingsState {
+  std::optional<app::HitType> searchTarget;
   app::SettingsCategory category = app::SettingsCategory::General;
   int focusIndex = 0;
   float scroll = 0.0f;
   bool recordingShortcut = false;
+  int recordingCaptureShortcut = -1;
   std::wstring pendingShortcut;
   int hover = -1;
+};
+
+enum class CapturePhase {
+  Idle,
+  SelectingScreenshot,
+  SelectingRecording,
+  StartingScreenshot,
+  StartingRecording,
+  Recording,
+  Paused,
+  Stopping,
+};
+
+enum class CaptureShortcutTarget {
+  None,
+  ScreenshotFullscreen,
+  ScreenshotRegion,
+  RecordFullscreen,
+  RecordRegion,
+};
+
+struct PixelPoint {
+  int x = 0;
+  int y = 0;
+
+  constexpr bool operator==(const PixelPoint&) const = default;
+};
+
+struct PixelRect {
+  int left = 0;
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+
+  constexpr int Width() const { return right - left; }
+  constexpr int Height() const { return bottom - top; }
+  constexpr bool operator==(const PixelRect&) const = default;
+};
+
+struct CaptureUiState {
+  CapturePhase phase = CapturePhase::Idle;
+  CaptureShortcutTarget target = CaptureShortcutTarget::None;
+  std::optional<PixelPoint> selectionStart;
+  std::optional<PixelPoint> selectionEnd;
+  std::uint64_t elapsedMilliseconds = 0;
+  int controlFocus = 0;
+  int controlHover = -1;
+};
+
+class CaptureUiController {
+ public:
+  static bool Begin(CaptureUiState& state, CaptureShortcutTarget target) {
+    if (state.phase != CapturePhase::Idle ||
+        target == CaptureShortcutTarget::None) {
+      return false;
+    }
+    state.target = target;
+    state.selectionStart.reset();
+    state.selectionEnd.reset();
+    state.elapsedMilliseconds = 0;
+    state.controlFocus = 0;
+    state.controlHover = -1;
+    switch (target) {
+      case CaptureShortcutTarget::ScreenshotFullscreen:
+        state.phase = CapturePhase::StartingScreenshot;
+        break;
+      case CaptureShortcutTarget::ScreenshotRegion:
+        state.phase = CapturePhase::SelectingScreenshot;
+        break;
+      case CaptureShortcutTarget::RecordFullscreen:
+        state.phase = CapturePhase::StartingRecording;
+        break;
+      case CaptureShortcutTarget::RecordRegion:
+        state.phase = CapturePhase::SelectingRecording;
+        break;
+      case CaptureShortcutTarget::None: return false;
+    }
+    return true;
+  }
+
+  static bool BeginSelection(CaptureUiState& state, PixelPoint point) {
+    if (!IsSelecting(state)) return false;
+    state.selectionStart = point;
+    state.selectionEnd = point;
+    return true;
+  }
+
+  static bool UpdateSelection(CaptureUiState& state, PixelPoint point) {
+    if (!IsSelecting(state) || !state.selectionStart) return false;
+    state.selectionEnd = point;
+    return true;
+  }
+
+  static bool FinishSelection(CaptureUiState& state, PixelPoint point) {
+    if (!UpdateSelection(state, point)) return false;
+    state.phase = state.phase == CapturePhase::SelectingScreenshot
+                      ? CapturePhase::StartingScreenshot
+                      : CapturePhase::StartingRecording;
+    return true;
+  }
+
+  static std::optional<PixelRect> SelectionRect(const CaptureUiState& state) {
+    if (!state.selectionStart || !state.selectionEnd) return std::nullopt;
+    return PixelRect{std::min(state.selectionStart->x, state.selectionEnd->x),
+                     std::min(state.selectionStart->y, state.selectionEnd->y),
+                     std::max(state.selectionStart->x, state.selectionEnd->x),
+                     std::max(state.selectionStart->y, state.selectionEnd->y)};
+  }
+
+  static bool CancelSelection(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Idle) return true;
+    if (!IsSelecting(state)) return false;
+    Reset(state);
+    return true;
+  }
+
+  static bool RecordingStarted(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Recording) return true;
+    if (state.phase != CapturePhase::StartingRecording) return false;
+    state.phase = CapturePhase::Recording;
+    return true;
+  }
+
+  static bool Pause(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Paused) return true;
+    if (state.phase != CapturePhase::Recording) return false;
+    state.phase = CapturePhase::Paused;
+    return true;
+  }
+
+  static bool Resume(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Recording) return true;
+    if (state.phase != CapturePhase::Paused) return false;
+    state.phase = CapturePhase::Recording;
+    return true;
+  }
+
+  static bool Stop(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Stopping) return true;
+    if (state.phase != CapturePhase::StartingRecording &&
+        state.phase != CapturePhase::Recording &&
+        state.phase != CapturePhase::Paused) {
+      return false;
+    }
+    state.phase = CapturePhase::Stopping;
+    return true;
+  }
+
+  static bool Complete(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Idle) return true;
+    if (state.phase != CapturePhase::StartingScreenshot &&
+        state.phase != CapturePhase::Stopping) {
+      return false;
+    }
+    Reset(state);
+    return true;
+  }
+
+  static bool Fail(CaptureUiState& state) {
+    if (state.phase == CapturePhase::Idle) return true;
+    Reset(state);
+    return true;
+  }
+
+  static bool AddElapsed(CaptureUiState& state, std::uint64_t milliseconds) {
+    if (state.phase != CapturePhase::Recording) return false;
+    state.elapsedMilliseconds += milliseconds;
+    return true;
+  }
+
+  static void SetControlFocus(CaptureUiState& state, int focus) {
+    state.controlFocus = std::clamp(focus, 0, 1);
+  }
+
+  static void SetControlHover(CaptureUiState& state, int hover) {
+    state.controlHover = std::clamp(hover, -1, 1);
+  }
+
+ private:
+  static bool IsSelecting(const CaptureUiState& state) {
+    return state.phase == CapturePhase::SelectingScreenshot ||
+           state.phase == CapturePhase::SelectingRecording;
+  }
+
+  static void Reset(CaptureUiState& state) { state = {}; }
 };
 
 class OverlayController {
@@ -365,6 +552,7 @@ class SettingsController {
  public:
   static UiEffects Open(SettingsState& state, int categoryIndex) {
     state.recordingShortcut = false;
+    state.recordingCaptureShortcut = -1;
     state.pendingShortcut.clear();
     state.hover = -1;
     state.focusIndex = std::max(0, categoryIndex);
@@ -373,17 +561,21 @@ class SettingsController {
   }
 
   static UiEffects Close(SettingsState& state) {
+    state.searchTarget.reset();
     state.recordingShortcut = false;
+    state.recordingCaptureShortcut = -1;
     state.pendingShortcut.clear();
     return UiEffect::CloseView | UiEffect::Invalidate;
   }
 
   static UiEffects SelectCategory(SettingsState& state,
                                   app::SettingsCategory category) {
+    state.searchTarget.reset();
     state.category = category;
     state.focusIndex = 0;
     state.scroll = 0.0f;
     state.recordingShortcut = false;
+    state.recordingCaptureShortcut = -1;
     state.pendingShortcut.clear();
     return Effect(UiEffect::Invalidate);
   }
@@ -435,11 +627,13 @@ class SettingsController {
                                       std::wstring shortcut) {
     state.pendingShortcut = std::move(shortcut);
     state.recordingShortcut = false;
+    state.recordingCaptureShortcut = -1;
     return Effect(UiEffect::Invalidate);
   }
 
   static UiEffects CancelShortcutRecording(SettingsState& state) {
     state.recordingShortcut = false;
+    state.recordingCaptureShortcut = -1;
     state.pendingShortcut.clear();
     return Effect(UiEffect::Invalidate);
   }

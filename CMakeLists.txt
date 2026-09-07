@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.8.0 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.9.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +51,7 @@ target_compile_definitions(FeatherCastSQLite PRIVATE
 
 add_library(FeatherCastRuntime STATIC
   native/src/runtime.cpp
+  native/src/timer_service.cpp
   native/src/persistence_service.cpp
   native/src/search_coordinator.cpp
   native/src/search_pipeline.cpp
@@ -59,6 +60,7 @@ add_library(FeatherCastRuntime STATIC
   native/src/capability_catalog.cpp
   native/src/settings_catalog.cpp
   native/src/background_services.cpp
+  native/src/capture_service.cpp
   native/src/network_client.cpp
   native/src/file_content.cpp
   native/src/file_index_service.cpp
@@ -81,7 +83,15 @@ target_link_libraries(FeatherCastRuntime PUBLIC
   FeatherCastSQLite
   advapi32
   crypt32
+  d3d11
+  dxgi
+  gdi32
+  mfplat
+  mfreadwrite
+  mfuuid
   ole32
+  shell32
+  windowsapp
   windowscodecs
   winhttp
 )
@@ -366,6 +376,10 @@ feathercast_apply_project_warnings(FeatherCastGameDiscoveryTests)
 
 enable_testing()
 add_test(NAME FeatherCastCoreTests COMMAND FeatherCastCoreTests)
+add_executable(FeatherCastProductivityBehaviorTests native/tests/productivity_behavior_tests.cpp)
+target_link_libraries(FeatherCastProductivityBehaviorTests PRIVATE FeatherCastRuntime)
+feathercast_apply_project_warnings(FeatherCastProductivityBehaviorTests)
+add_test(NAME FeatherCastProductivityBehaviorTests COMMAND FeatherCastProductivityBehaviorTests)
 add_test(NAME FeatherCastPluginHostTests
   COMMAND FeatherCastPluginHostTests
     $<TARGET_FILE:FeatherCastPluginHost>

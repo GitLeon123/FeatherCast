@@ -101,15 +101,18 @@ std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
 struct FileIndexService::Watcher {
   std::wstring root;
   HANDLE directory = INVALID_HANDLE_VALUE;
+  HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   std::jthread thread;
 
   ~Watcher() {
     if (thread.joinable()) {
       thread.request_stop();
+      SetEvent(stopEvent);
       if (directory != INVALID_HANDLE_VALUE) CancelIoEx(directory, nullptr);
       thread.join();
     }
     if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
+    if (stopEvent) CloseHandle(stopEvent);
   }
 };
 
@@ -143,20 +146,31 @@ void FileIndexService::Stop() {
   retryDelay_ = std::chrono::seconds(2);
 }
 
+void FileIndexService::Pause() {
+  {
+    std::lock_guard lock(mutex_);
+    paused_ = true;
+    request_.reset();
+    rebuildPending_ = false;
+    restartWatchersPending_ = true;
+  }
+  cv_.notify_all();
+}
+
 bool FileIndexService::Reconfigure(IndexRequest request) {
   currentGeneration_.store(request.generation, std::memory_order_release);
-  const auto roots = request.roots;
   {
     std::lock_guard lock(mutex_);
     if (stopping_ || !worker_.joinable()) return false;
   }
   // Watch first so changes made while the initial crawl is running are
   // retained by the watcher and reconciled by the coalesced follow-up scan.
-  RestartWatchers(roots);
   {
     std::lock_guard lock(mutex_);
     if (stopping_ || !worker_.joinable()) return false;
     request_ = std::move(request);
+    paused_ = false;
+    restartWatchersPending_ = true;
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
   }
@@ -176,13 +190,13 @@ bool FileIndexService::Rebuild() {
 }
 
 bool FileIndexService::IsCurrent(std::uint64_t generation) const {
-  return currentGeneration_.load(std::memory_order_acquire) == generation;
+  return !paused_ && currentGeneration_.load(std::memory_order_acquire) == generation;
 }
 
 void FileIndexService::ScheduleWatchRefresh(bool restartWatchers) {
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !request_) return;
+    if (stopping_ || paused_ || !request_) return;
     rebuildPending_ = true;
     restartWatchersPending_ = restartWatchersPending_ || restartWatchers;
     rebuildAfter_ = std::chrono::steady_clock::now() +
@@ -200,6 +214,7 @@ void FileIndexService::RestartWatchers(
     if (!FixedLocalRoot(path)) continue;
     auto watcher = std::make_unique<Watcher>();
     watcher->root = root;
+    if (!watcher->stopEvent) continue;
     watcher->directory = CreateFileW(
         root.c_str(), FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -224,12 +239,11 @@ void FileIndexService::RestartWatchers(
           if (!token.stop_requested()) ScheduleWatchRefresh(true);
           return;
         }
-        while (!token.stop_requested()) {
-          const DWORD wait = WaitForSingleObject(overlapped.hEvent, 200);
-          if (wait == WAIT_OBJECT_0) break;
-          if (wait == WAIT_FAILED) break;
+        const HANDLE events[] = {overlapped.hEvent, raw->stopEvent};
+        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (wait != WAIT_OBJECT_0 || token.stop_requested()) {
+          CancelIoEx(raw->directory, &overlapped);
         }
-        if (token.stop_requested()) CancelIoEx(raw->directory, &overlapped);
         DWORD transferred = 0;
         const BOOL completed = GetOverlappedResult(
             raw->directory, &overlapped, &transferred, TRUE);
@@ -252,15 +266,22 @@ void FileIndexService::StopWatchers() {
 }
 
 void FileIndexService::WorkerLoop(std::stop_token token) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     IndexRequest request;
     bool restartWatchers = false;
     {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] {
-        return stopping_ || token.stop_requested() || rebuildPending_;
+        return stopping_ || token.stop_requested() || rebuildPending_ || restartWatchersPending_;
       });
       if (stopping_ || token.stop_requested()) return;
+      if (paused_) {
+        restartWatchersPending_ = false;
+        lock.unlock();
+        StopWatchers();
+        continue;
+      }
       while (rebuildPending_ && std::chrono::steady_clock::now() < rebuildAfter_) {
         cv_.wait_until(lock, rebuildAfter_);
         if (stopping_ || token.stop_requested()) return;
@@ -336,7 +357,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
                directory, std::filesystem::directory_options::skip_permission_denied,
                ec), end;
            !ec && it != end; it.increment(ec)) {
-        if (token.stop_requested()) return status;
+        if (token.stop_requested() || !IsCurrent(request.generation)) return status;
         const auto path = it->path();
         const DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES ||
@@ -394,7 +415,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   });
   if (request.contentEnabled) {
     for (auto& entry : discovered) {
-      if (token.stop_requested()) return status;
+      if (token.stop_requested() || !IsCurrent(request.generation)) return status;
       if (entry.isDirectory) continue;
       auto extraction = file_content::Extract(entry.path,
                                               file_content::kMaxIndexedBytes,

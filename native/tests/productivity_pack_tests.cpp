@@ -1,11 +1,13 @@
 #include "clock_utilities.hpp"
 #include "audio_volume.hpp"
+#include "capture_service.hpp"
 #include "command_catalog.hpp"
 #include "core.hpp"
 #include "network_client.hpp"
 #include "search_pipeline.hpp"
 #include "test_framework.hpp"
 #include "system_settings.hpp"
+#include "ui_state.hpp"
 #include "window_layout.hpp"
 #include "uuid_utilities.hpp"
 
@@ -35,10 +37,14 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
                        const std::wstring& expectedValue) {
   const auto actions = feathercast::commands::BuildActions(
       item, feathercast::app::Settings{});
-  assert(actions.size() == 2);
+  assert(actions.size() == (item.isClipboard ? 3 : 2));
   assert(actions[0].action == feathercast::app::ActionKind::CopyText);
   assert(actions[1].action == feathercast::app::ActionKind::PasteText);
   for (const auto& action : actions) {
+    if (action.action == feathercast::app::ActionKind::PinClipboard) {
+      assert(std::get<feathercast::app::ClipboardEntry>(action.actionTarget).text == expectedValue);
+      continue;
+    }
     const auto* payload =
         std::get_if<feathercast::app::TextActionPayload>(&action.actionTarget);
     assert(payload && payload->value == expectedValue);
@@ -48,6 +54,137 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
 }  // namespace
 
 int main() {
+  using feathercast::ui::CapturePhase;
+  using feathercast::ui::CaptureShortcutTarget;
+  using feathercast::ui::CaptureUiController;
+  using feathercast::ui::CaptureUiState;
+  using feathercast::ui::PixelPoint;
+  using feathercast::ui::PixelRect;
+
+  CaptureUiState capture;
+  assert(CaptureUiController::Begin(
+      capture, CaptureShortcutTarget::ScreenshotRegion));
+  assert(capture.phase == CapturePhase::SelectingScreenshot);
+  assert(!CaptureUiController::Begin(
+      capture, CaptureShortcutTarget::RecordFullscreen));
+  assert(CaptureUiController::BeginSelection(capture, PixelPoint{100, 80}));
+  assert(CaptureUiController::UpdateSelection(capture, PixelPoint{-50, -20}));
+  assert(CaptureUiController::SelectionRect(capture) ==
+         (PixelRect{-50, -20, 100, 80}));
+  assert(CaptureUiController::FinishSelection(capture, PixelPoint{-60, 90}));
+  assert(capture.phase == CapturePhase::StartingScreenshot);
+  assert(CaptureUiController::Complete(capture));
+  assert(CaptureUiController::Complete(capture));
+  assert(capture.phase == CapturePhase::Idle &&
+         capture.target == CaptureShortcutTarget::None);
+
+  assert(CaptureUiController::Begin(
+      capture, CaptureShortcutTarget::RecordRegion));
+  assert(CaptureUiController::CancelSelection(capture));
+  assert(CaptureUiController::CancelSelection(capture));
+  assert(capture.phase == CapturePhase::Idle);
+
+  assert(CaptureUiController::Begin(
+      capture, CaptureShortcutTarget::RecordFullscreen));
+  assert(capture.phase == CapturePhase::StartingRecording);
+  assert(!CaptureUiController::Pause(capture));
+  assert(CaptureUiController::RecordingStarted(capture));
+  assert(CaptureUiController::RecordingStarted(capture));
+  assert(CaptureUiController::AddElapsed(capture, 1000));
+  assert(CaptureUiController::Pause(capture));
+  assert(CaptureUiController::Pause(capture));
+  assert(!CaptureUiController::AddElapsed(capture, 500));
+  assert(CaptureUiController::Resume(capture));
+  assert(CaptureUiController::Resume(capture));
+  assert(CaptureUiController::AddElapsed(capture, 250));
+  assert(capture.elapsedMilliseconds == 1250);
+  CaptureUiController::SetControlFocus(capture, 9);
+  CaptureUiController::SetControlHover(capture, -9);
+  assert(capture.controlFocus == 1 && capture.controlHover == -1);
+  assert(CaptureUiController::Stop(capture));
+  assert(CaptureUiController::Stop(capture));
+  assert(capture.phase == CapturePhase::Stopping);
+  assert(!CaptureUiController::Resume(capture));
+  assert(CaptureUiController::Complete(capture));
+  assert(capture.phase == CapturePhase::Idle &&
+         capture.elapsedMilliseconds == 0);
+
+  assert(CaptureUiController::Begin(
+      capture, CaptureShortcutTarget::ScreenshotFullscreen));
+  assert(!CaptureUiController::RecordingStarted(capture));
+  assert(CaptureUiController::Fail(capture));
+  assert(CaptureUiController::Fail(capture));
+  assert(capture.phase == CapturePhase::Idle);
+
+  using feathercast::capture::CaptureOperation;
+  using CaptureRect = feathercast::capture::PixelRect;
+
+  const CaptureRect normalized =
+      feathercast::capture::NormalizeRect({100, 80, -50, -20});
+  assert(normalized.left == -50 && normalized.top == -20 &&
+         normalized.right == 100 && normalized.bottom == 80);
+
+  const auto leftSlice = feathercast::capture::IntersectRects(
+      {-2000, -100, 100, 1200}, {-1920, -200, 0, 1080});
+  const auto rightSlice = feathercast::capture::IntersectRects(
+      {-2000, -100, 100, 1200}, {0, 0, 1920, 1080});
+  assert(leftSlice && leftSlice->left == -1920 && leftSlice->top == -100 &&
+         leftSlice->right == 0 && leftSlice->bottom == 1080);
+  assert(rightSlice && rightSlice->left == 0 && rightSlice->top == 0 &&
+         rightSlice->right == 100 && rightSlice->bottom == 1080);
+  assert(!feathercast::capture::IntersectRects(
+      {1920, 0, 3000, 500}, {0, 0, 1920, 1080}));
+  assert(!feathercast::capture::IntersectRects(
+      {1920, 0, 3000, 500}, {1920, 500, 3000, 1580}));
+  assert(!feathercast::capture::IntersectRects(
+      {0, 0, 100, 100}, {100, 0, 200, 100}));
+
+  assert((feathercast::capture::EvenRecordingSize({0, 0, 100, 100}) ==
+          std::pair<std::uint32_t, std::uint32_t>{100, 100}));
+  assert((feathercast::capture::EvenRecordingSize({101, 99, 0, 0}) ==
+          std::pair<std::uint32_t, std::uint32_t>{102, 100}));
+  assert(feathercast::capture::RecordingTimestamp(0) ==
+         std::chrono::nanoseconds::zero());
+  assert(feathercast::capture::RecordingTimestamp(30) ==
+         std::chrono::seconds(1));
+  assert(feathercast::capture::RecordingTimestamp(31) >
+         feathercast::capture::RecordingTimestamp(30));
+  assert(feathercast::capture::RecordingTimestamp(60) ==
+         std::chrono::seconds(2));
+
+  SYSTEMTIME captureTime{};
+  captureTime.wYear = 2026;
+  captureTime.wMonth = 7;
+  captureTime.wDay = 29;
+  captureTime.wHour = 14;
+  captureTime.wMinute = 5;
+  captureTime.wSecond = 6;
+  const std::filesystem::path captureFolder = LR"(C:\Captures)";
+  assert(feathercast::capture::CaptureOutputPath(
+             captureFolder, CaptureOperation::Screenshot, captureTime)
+             .filename() ==
+         L"FeatherCast Screenshot 2026-07-29 14-05-06.png");
+  assert(feathercast::capture::CaptureOutputPath(
+             captureFolder, CaptureOperation::Screenshot, captureTime, 2)
+             .filename() ==
+         L"FeatherCast Screenshot 2026-07-29 14-05-06 (2).png");
+  assert(feathercast::capture::CaptureOutputPath(
+             captureFolder, CaptureOperation::Recording, captureTime)
+             .filename() ==
+         L"FeatherCast Recording 2026-07-29 14-05-06.mp4");
+  assert(feathercast::capture::CaptureOutputPath(
+             captureFolder, CaptureOperation::Recording, captureTime, 3, true)
+             .filename() ==
+         L"FeatherCast Recording 2026-07-29 14-05-06 (3).partial.mp4");
+
+  feathercast::capture::CaptureService invalidCapture;
+  assert(!invalidCapture.StartScreenshot({0, 0, 1, 100}));
+  assert(!invalidCapture.StartRecording({0, 0, 47, 100}));
+  assert(!invalidCapture.StartRecording({0, 0, 100, 47}));
+  assert(!invalidCapture.StartRecording({0, 0, 4097, 100}));
+  assert(!invalidCapture.StartRecording({0, 0, 100, 2305}));
+  assert(invalidCapture.State() == feathercast::capture::CaptureState::Idle);
+
   assert(feathercast::audio::ClampPercent(-1) == 0);
   assert(feathercast::audio::ClampPercent(42) == 42);
   assert(feathercast::audio::ClampPercent(101) == 100);

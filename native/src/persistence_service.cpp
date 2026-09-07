@@ -147,6 +147,32 @@ bool PersistenceService::PruneClipboard(std::size_t limit) {
   });
 }
 
+bool PersistenceService::PinClipboard(long long id, bool pinned, std::size_t limit) {
+  return executor_.Submit([this, id, pinned, limit](std::stop_token token) {
+    if (token.stop_requested()) return;
+    const bool succeeded = EnsureStorageOpen() && storage_.PinClipboard(id, pinned, limit);
+    Emit(ClipboardLoaded{succeeded ? storage_.LoadClipboardHistory(limit) : std::vector<storage::ClipboardEntry>{},
+                         succeeded ? storage::StorageError{} : storage_.LastError()});
+  });
+}
+
+bool PersistenceService::LoadTimers() {
+  return executor_.Submit([this](std::stop_token token) {
+    if (token.stop_requested()) return;
+    timers::State state;
+    if (EnsureStorageOpen()) state = storage_.LoadTimers();
+    Emit(TimersLoaded{std::move(state), storage_.LastError()});
+  });
+}
+
+bool PersistenceService::SaveTimers(timers::State state, std::vector<std::wstring> expiredNames) {
+  return executor_.Submit([this, state = std::move(state), names = std::move(expiredNames)](std::stop_token token) mutable {
+    if (token.stop_requested()) return;
+    const bool succeeded = EnsureStorageOpen() && storage_.SaveTimers(state);
+    Emit(TimersSaved{succeeded, std::move(names), succeeded ? storage::StorageError{} : storage_.LastError()});
+  });
+}
+
 bool PersistenceService::ReplaceFileIndex(
     std::vector<storage::FileIndexEntry> entries) {
   return executor_.Submit(

@@ -43,6 +43,18 @@ const std::vector<CapabilityDescriptor>& Catalog() {
   using app::CommandKind;
   using app::SettingsCategory;
   static const std::vector<CapabilityDescriptor> capabilities = {
+      {L"timers", L"PRODUCTIVITY", L"Timers and stopwatch",
+       L"Save named timers, pause or resume them, and measure elapsed time.",
+       {L"timer", L"countdown", L"stopwatch", L"alarm"},
+       L"timer 10m Tea", Browse(BrowseView::Timers)},
+      {L"setting-search", L"CUSTOMIZE", L"Find FeatherCast settings",
+       L"Search a setting and jump directly to its control.",
+       {L"preferences", L"settings", L"animations"},
+       L"animations", Seed(L"animations")},
+      {L"clipboard-favorites", L"PRODUCTIVITY", L"Clipboard favorites",
+       L"Use an entry's actions to keep it when older history is removed.",
+       {L"clipboard", L"pin", L"favorites"},
+       L"", Browse(BrowseView::Clipboard)},
       {L"apps", L"GET STARTED", L"Launch apps",
        L"Find installed desktop, Start Menu, Store, and system apps.",
        {L"applications", L"start menu", L"programs", L"launch"},

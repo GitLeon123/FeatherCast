@@ -51,6 +51,12 @@ class ExtensionManager {
     StartQueryWorker();
   }
 
+  void CancelQuery() {
+    std::lock_guard lock(queryMutex_);
+    pendingQuery_.reset();
+    ++latestRequestedGeneration_;
+  }
+
   void OnBackground() {
     {
       std::lock_guard cacheLock(cacheMutex_);

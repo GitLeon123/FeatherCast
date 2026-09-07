@@ -66,6 +66,7 @@ class SnapshotCoordinator {
   void Start(Builder builder);
   void Stop();
   bool UpdateCorpus(app::SnapshotBuildRequest request);
+  void Invalidate();
 
  private:
   void WorkerLoop(std::stop_token stopToken);

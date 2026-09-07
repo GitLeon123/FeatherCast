@@ -17,11 +17,17 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - Optional recursive live indexing for explicitly selected local folders
 - Separately enabled local full-text search for supported text and source files
 - On-demand text, image, and metadata preview pane
-- Optional local clipboard history
+- Optional encrypted local clipboard history with up to 100 pinned favorites
+- Saved named timers (`timer 10m Tea`) and a stopwatch with native notifications
+- Search FeatherCast settings (`animations`, `clipboard history`) and jump to their controls
 - Calculator, unit/currency conversion, emoji, symbols, snippets, quicklinks, and web-search prefixes
 - Native Library manager for creating, editing, and deleting snippets and quicklinks
 - Local time, date, ISO-week, Unix-time, and UUID utilities
 - Searchable Windows settings plus volume, media playback, and Show Desktop commands
+- Full-display and cross-monitor region screenshots saved as PNG and copied to
+  the clipboard
+- Silent full-display and cross-monitor region screen recording with an
+  excluded Pause/Resume/Stop control bar
 - Searchable “Discover FeatherCast” guide with feature examples and shortcuts
 - Native out-of-process plugin host with timeouts and crash isolation
 - Lazy shell icon loading with a native PNG icon cache
@@ -32,6 +38,20 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - Background tray menu: Open FeatherCast, Settings, Quit
 
 AI chat and AI provider settings were removed in the native remake.
+
+Hidden FeatherCast pauses indexing and cancels query, preview, and pending icon
+work. Ordinary shortcuts use `RegisterHotKey`; special shortcuts and recording
+use a keyboard hook only when needed. Discovery and network maintenance start
+on use, with no game/process polling. Active timers, clipboard capture, and
+screen recording continue in the background.
+
+Timer durations accept combined integer hours, minutes, and seconds, for example
+`timer 1h 30m Break`. Open **Timers & Stopwatch** to pause, resume, restart, or
+delete a timer, or control the stopwatch. Timers count time while Windows sleeps
+or FeatherCast is closed; overdue timers are reported together on return without
+opening the overlay. The stopwatch pauses and saves when FeatherCast exits normally.
+Clipboard favorites appear first and survive automatic history cleanup; **Clear
+Clipboard History** also deletes favorites.
 
 ## Usage
 
@@ -50,7 +70,8 @@ AI chat and AI provider settings were removed in the native remake.
 | Browse feature guide | Search for `help` or `Discover FeatherCast` |
 
 Useful searches include `time`, `date`, `week number`, `unix timestamp`,
-`generate uuid`, `display settings`, `volume up`, and `play or pause media`.
+`generate uuid`, `screenshot`, `record screen`, `display settings`, `volume
+up`, and `play or pause media`.
 Open the action panel on a window result to arrange it, or on a text result to
 copy or paste its value.
 
@@ -71,6 +92,12 @@ manifests, registry entries, package registrations, and icon caches; it does not
 sync owned libraries or store launcher credentials.
 
 The tray icon runs in the background. Left-click opens search; right-click opens the menu.
+
+Screenshots are saved under `Pictures\FeatherCast` and are copied to the
+clipboard. Silent H.264 MP4 recordings are saved under `Videos\FeatherCast`.
+Fullscreen capture uses the display under the pointer; region selection can
+span displays. The four optional direct capture shortcuts are unassigned until
+configured in Settings.
 
 ## Development
 

@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "sqlite3.h"
+#include "timers.hpp"
 
 #include <windows.h>
 #include <wincrypt.h>
@@ -37,6 +38,7 @@ struct ClipboardEntry {
   std::wstring text;
   std::wstring preview;
   long long capturedAt = 0;
+  bool pinned = false;
 };
 
 struct StorageError {
@@ -132,16 +134,16 @@ class Storage {
       return false;
     }
     const int schemaVersion = ReadSchemaVersion();
-    if (schemaVersion < 0 || schemaVersion > 3) {
-      if (schemaVersion > 3) {
+    if (schemaVersion < 0 || schemaVersion > 4) {
+      if (schemaVersion > 4) {
         SetError(SQLITE_ERROR, "database schema is newer than this FeatherCast build");
       }
       Close();
       return false;
     }
-    if (schemaVersion < 3 &&
+    if (schemaVersion < 4 &&
         (HasTable("clipboard_history") || HasTable("file_index")) &&
-        !BackupBeforeMigration(path, schemaVersion < 2 ? 2 : 3)) {
+        !BackupBeforeMigration(path, schemaVersion < 2 ? 2 : schemaVersion < 3 ? 3 : 4)) {
       Close();
       return false;
     }
@@ -170,7 +172,7 @@ class Storage {
         !Exec("CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5("
               "content, content='', contentless_delete=1, "
               "tokenize='unicode61 remove_diacritics 2');") ||
-        !Exec("PRAGMA user_version=3;") ||
+        !Exec("PRAGMA user_version=4;") ||
         !Exec("COMMIT;")) {
       Exec("ROLLBACK;");
       Close();
@@ -355,8 +357,10 @@ class Storage {
 
     Statement stmt;
     if (!stmt.Prepare(db_,
-                      "SELECT id, text, preview, captured_at, encrypted FROM clipboard_history "
-                      "ORDER BY captured_at DESC, id DESC LIMIT ?;")) {
+                      "SELECT id, text, preview, captured_at, encrypted, pinned FROM clipboard_history "
+                      "WHERE pinned=1 OR id IN (SELECT id FROM clipboard_history WHERE pinned=0 "
+                      "ORDER BY captured_at DESC, id DESC LIMIT ?) "
+                      "ORDER BY pinned DESC, captured_at DESC, id DESC;")) {
       return out;
     }
     sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(limit));
@@ -378,6 +382,7 @@ class Storage {
         entry.preview = storedPreview;
       }
       entry.capturedAt = sqlite3_column_int64(stmt.get(), 3);
+      entry.pinned = sqlite3_column_int(stmt.get(), 5) != 0;
       out.push_back(std::move(entry));
     }
     return out;
@@ -397,14 +402,22 @@ class Storage {
     }
     if (!Exec("BEGIN IMMEDIATE;")) return std::nullopt;
 
+    long long id = 0;
+    bool pinned = false;
     {
-      Statement remove;
-      if (!remove.Prepare(db_, "DELETE FROM clipboard_history WHERE content_hash = ?;")) {
+      Statement read;
+      if (!read.Prepare(db_, "SELECT id,pinned FROM clipboard_history WHERE content_hash=? LIMIT 1;")) {
+        CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
-      BindText(remove.get(), 1, *contentHash);
-      if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+      BindText(read.get(), 1, *contentHash);
+      const int result = sqlite3_step(read.get());
+      if (result == SQLITE_ROW) {
+        id = sqlite3_column_int64(read.get(), 0);
+        pinned = sqlite3_column_int(read.get(), 1) != 0;
+      } else if (result != SQLITE_DONE) {
+        CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
@@ -414,8 +427,9 @@ class Storage {
       Statement insert;
       if (!insert.Prepare(db_,
                           "INSERT INTO clipboard_history "
-                          "(text, preview, captured_at, content_hash, encrypted) "
-                          "VALUES (?, ?, ?, ?, 1);")) {
+                          "(text, preview, captured_at, content_hash, encrypted, id, pinned) "
+                          "VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                          "text=excluded.text,preview=excluded.preview,captured_at=excluded.captured_at;")) {
         Exec("ROLLBACK;");
         return std::nullopt;
       }
@@ -423,19 +437,22 @@ class Storage {
       BindText(insert.get(), 2, *protectedPreview);
       sqlite3_bind_int64(insert.get(), 3, capturedAt);
       BindText(insert.get(), 4, *contentHash);
+      if (id) sqlite3_bind_int64(insert.get(), 5, id);
+      else sqlite3_bind_null(insert.get(), 5);
+      sqlite3_bind_int(insert.get(), 6, pinned ? 1 : 0);
       if (sqlite3_step(insert.get()) != SQLITE_DONE) {
         Exec("ROLLBACK;");
         return std::nullopt;
       }
     }
 
-    const long long id = sqlite3_last_insert_rowid(db_);
+    if (!id) id = sqlite3_last_insert_rowid(db_);
 
     {
       Statement prune;
       if (!prune.Prepare(db_,
-                         "DELETE FROM clipboard_history WHERE id NOT IN ("
-                         "SELECT id FROM clipboard_history ORDER BY captured_at DESC, id DESC LIMIT ?"
+                         "DELETE FROM clipboard_history WHERE pinned=0 AND id NOT IN ("
+                         "SELECT id FROM clipboard_history WHERE pinned=0 ORDER BY captured_at DESC, id DESC LIMIT ?"
                          ");")) {
         Exec("ROLLBACK;");
         return std::nullopt;
@@ -452,7 +469,81 @@ class Storage {
       return std::nullopt;
     }
 
-    return ClipboardEntry{id, text, preview, capturedAt};
+    return ClipboardEntry{id, text, preview, capturedAt, pinned};
+  }
+
+  bool PinClipboard(long long id, bool pinned, std::size_t limit) {
+    if (!db_ || !Exec("BEGIN IMMEDIATE;")) return false;
+    Statement update;
+    if (!update.Prepare(db_, "UPDATE clipboard_history SET pinned=? WHERE id=? AND "
+        "(?=0 OR pinned=1 OR (SELECT COUNT(*) FROM clipboard_history WHERE pinned=1)<100);")) {
+      CaptureError(); Exec("ROLLBACK;"); return false;
+    }
+    sqlite3_bind_int(update.get(), 1, pinned ? 1 : 0);
+    sqlite3_bind_int64(update.get(), 2, id);
+    sqlite3_bind_int(update.get(), 3, pinned ? 1 : 0);
+    if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
+      SetError(SQLITE_CONSTRAINT, "The entry is unavailable or the limit of 100 favorites has been reached.");
+      Exec("ROLLBACK;"); return false;
+    }
+    if (!PruneClipboardHistory(limit) || !Exec("COMMIT;")) { Exec("ROLLBACK;"); return false; }
+    return true;
+  }
+
+  timers::State LoadTimers() {
+    timers::State state;
+    if (!db_) return state;
+    Statement read;
+    if (!read.Prepare(db_, "SELECT id,name,duration,deadline,remaining,phase FROM timers ORDER BY id;")) { CaptureError(); return state; }
+    int result;
+    while ((result = sqlite3_step(read.get())) == SQLITE_ROW) {
+      timers::Timer timer;
+      timer.id = sqlite3_column_int64(read.get(), 0);
+      timer.name = ColumnText(read.get(), 1);
+      timer.duration = sqlite3_column_int64(read.get(), 2);
+      timer.deadline = sqlite3_column_int64(read.get(), 3);
+      timer.remaining = sqlite3_column_int64(read.get(), 4);
+      const int phase = sqlite3_column_int(read.get(), 5);
+      if (timer.id <= 0 || timer.duration <= 0 || timer.remaining < 0 ||
+          timer.remaining > timer.duration || phase < 0 || phase > 2 ||
+          timer.deadline < 0 || timer.deadline > 900000000000000LL ||
+          timer.duration > 900000000000000LL) {
+        SetError(SQLITE_ERROR, "Invalid saved timer state."); return {};
+      }
+      timer.phase = static_cast<timers::Phase>(phase);
+      state.timers.push_back(std::move(timer));
+    }
+    if (result != SQLITE_DONE) { CaptureError(); return {}; }
+    Statement watch;
+    if (!watch.Prepare(db_, "SELECT elapsed FROM stopwatch WHERE id=1;")) { CaptureError(); return {}; }
+    result = sqlite3_step(watch.get());
+    if (result == SQLITE_ROW) state.stopwatch.elapsed = std::max(0LL, sqlite3_column_int64(watch.get(), 0));
+    else if (result != SQLITE_DONE) { CaptureError(); return {}; }
+    lastError_ = {};
+    return state;
+  }
+
+  bool SaveTimers(const timers::State& state) {
+    if (!db_ || !Exec("BEGIN IMMEDIATE;")) return false;
+    if (!Exec("DELETE FROM timers;")) { Exec("ROLLBACK;"); return false; }
+    Statement insert;
+    if (!insert.Prepare(db_, "INSERT INTO timers VALUES (?,?,?,?,?,?);")) { CaptureError(); Exec("ROLLBACK;"); return false; }
+    for (const auto& timer : state.timers) {
+      sqlite3_reset(insert.get());
+      sqlite3_bind_int64(insert.get(), 1, timer.id);
+      BindText(insert.get(), 2, timer.name);
+      sqlite3_bind_int64(insert.get(), 3, timer.duration);
+      sqlite3_bind_int64(insert.get(), 4, timer.deadline);
+      sqlite3_bind_int64(insert.get(), 5, timer.remaining);
+      sqlite3_bind_int(insert.get(), 6, static_cast<int>(timer.phase));
+      if (sqlite3_step(insert.get()) != SQLITE_DONE) { CaptureError(); Exec("ROLLBACK;"); return false; }
+    }
+    Statement watch;
+    if (!watch.Prepare(db_, "INSERT INTO stopwatch VALUES (1,?) ON CONFLICT(id) DO UPDATE SET elapsed=excluded.elapsed;")) { CaptureError(); Exec("ROLLBACK;"); return false; }
+    sqlite3_bind_int64(watch.get(), 1, state.stopwatch.elapsed);
+    if (sqlite3_step(watch.get()) != SQLITE_DONE) { CaptureError(); Exec("ROLLBACK;"); return false; }
+    if (!Exec("COMMIT;")) { Exec("ROLLBACK;"); return false; }
+    return true;
   }
 
   bool ClearClipboardHistory() {
@@ -463,8 +554,8 @@ class Storage {
     Statement prune;
     if (!db_ ||
         !prune.Prepare(db_,
-                       "DELETE FROM clipboard_history WHERE id NOT IN ("
-                       "SELECT id FROM clipboard_history "
+                       "DELETE FROM clipboard_history WHERE pinned=0 AND id NOT IN ("
+                       "SELECT id FROM clipboard_history WHERE pinned=0 "
                        "ORDER BY captured_at DESC, id DESC LIMIT ?"
                        ");")) {
       return false;
@@ -625,6 +716,11 @@ class Storage {
           !Exec("DROP TABLE file_index_v2;")) {
         return false;
       }
+    }
+    if (version < 4) {
+      if (!Exec("ALTER TABLE clipboard_history ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;") ||
+          !Exec("CREATE TABLE timers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, duration INTEGER NOT NULL, deadline INTEGER NOT NULL, remaining INTEGER NOT NULL, phase INTEGER NOT NULL);") ||
+          !Exec("CREATE TABLE stopwatch (id INTEGER PRIMARY KEY CHECK(id=1), elapsed INTEGER NOT NULL);")) return false;
     }
     return true;
   }

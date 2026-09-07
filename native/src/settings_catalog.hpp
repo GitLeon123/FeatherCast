@@ -15,6 +15,10 @@ enum class Requirement {
   Always,
   PendingShortcut,
   ExistingShortcut,
+  ExistingScreenshotFullscreenShortcut,
+  ExistingScreenshotRegionShortcut,
+  ExistingRecordFullscreenShortcut,
+  ExistingRecordRegionShortcut,
   ClipboardEnabled,
   FileIndexEnabled,
   StorageIdle,
@@ -43,6 +47,10 @@ struct CategoryDescriptor {
 struct CatalogContext {
   bool hasPendingShortcut = false;
   bool hasExistingShortcut = false;
+  bool hasScreenshotFullscreenShortcut = false;
+  bool hasScreenshotRegionShortcut = false;
+  bool hasRecordFullscreenShortcut = false;
+  bool hasRecordRegionShortcut = false;
   bool clipboardEnabled = false;
   bool fileIndexEnabled = false;
   bool storageIdle = true;

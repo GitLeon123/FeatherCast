@@ -89,6 +89,11 @@ class SingleOperationService {
     });
   }
 
+  void Cancel() {
+    std::lock_guard lock(mutex_);
+    if (worker_.joinable()) worker_.request_stop();
+  }
+
   void Stop() {
     std::jthread worker;
     {
@@ -164,6 +169,7 @@ class IconResolver {
   std::set<std::wstring> pending_;
   std::deque<std::wstring> jobs_;
   std::vector<std::jthread> workers_;
+  std::stop_source operationStop_;
   bool stopping_ = false;
 };
 

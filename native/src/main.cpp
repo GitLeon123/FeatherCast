@@ -2,10 +2,14 @@
 #include "accessibility.hpp"
 #include "accessibility_projection.hpp"
 #include "app_types.hpp"
+#include "timer_service.hpp"
+#include "timer_items.hpp"
+#include "snapshot_memory.hpp"
 #include "audio_volume.hpp"
 #include "background_executor.hpp"
 #include "background_services.hpp"
 #include "capability_catalog.hpp"
+#include "capture_service.hpp"
 #include "command_catalog.hpp"
 #include "converter.hpp"
 #include "core.hpp"
@@ -123,6 +127,10 @@ constexpr int IDI_APP_ICON = 101;
 constexpr wchar_t kWindowClass[] = L"FeatherCastNativeWindow";
 constexpr wchar_t kSettingsWindowClass[] = L"FeatherCastSettingsWindow";
 constexpr wchar_t kVolumeWindowClass[] = L"FeatherCastVolumeWindow";
+constexpr wchar_t kCaptureSelectorWindowClass[] =
+    L"FeatherCastCaptureSelectorWindow";
+constexpr wchar_t kRecordingControlWindowClass[] =
+    L"FeatherCastRecordingControlWindow";
 constexpr wchar_t kMutexName[] = L"FeatherCastNativeSingleInstance";
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_SHOW_SEARCH = WM_APP + 2;
@@ -136,15 +144,21 @@ constexpr UINT WM_BACKGROUND_TASK_ERROR = WM_APP + 17;
 constexpr UINT WM_APP_EVENTS = WM_APP + 18;
 constexpr UINT WM_RENDER_RECOVER = WM_APP + 19;
 constexpr UINT WM_OVERLAY_RETRY_ACTIVATION = WM_APP + 20;
+constexpr UINT WM_CAPTURE_SHORTCUT = WM_APP + 21;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
-constexpr UINT TIMER_MEM_TRIM = 3;
+constexpr int HOTKEY_SCREENSHOT_FULLSCREEN = 0x4C45;
+constexpr int HOTKEY_SCREENSHOT_REGION = 0x4C46;
+constexpr int HOTKEY_RECORD_FULLSCREEN = 0x4C47;
+constexpr int HOTKEY_RECORD_REGION = 0x4C48;
+constexpr UINT TIMER_CLOCK_DISPLAY = 3;
 constexpr UINT TIMER_VOLUME_REFRESH = 5;
 constexpr UINT TIMER_OVERLAY_ACTIVATE = 6;
 constexpr UINT TIMER_PREVIEW_LOAD = 7;
 constexpr UINT TIMER_FILE_SNAPSHOT = 8;
 constexpr UINT TIMER_SHORTCUT_TOGGLE = 9;
 constexpr UINT TIMER_RENDER_RECOVER = 10;
+constexpr UINT TIMER_RECORDING_ELAPSED = 11;
 constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
 constexpr UINT RENDER_RECOVERY_MAX_DELAY_MS = 1000;
 
@@ -1266,7 +1280,15 @@ FeatherCastApp* g_app = nullptr;
 class FeatherCastApp : public feathercast::accessibility::Model {
  public:
   explicit FeatherCastApp(HINSTANCE instance, std::wstring cmdLine)
-      : persistenceEvents_([this] {
+      : captureEvents_([this] {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
+          }
+        }),
+        captureService_([this](feathercast::capture::CaptureEvent event) {
+          captureEvents_.Push(std::move(event));
+        }),
+        persistenceEvents_([this] {
           if (hwnd_ && !stopThreads_) {
             PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
           }
@@ -1366,6 +1388,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         updateService_([this](UpdateTaskResult result) {
           networkEvents_.Push(std::move(result));
         }),
+        timerEvents_([this] {
+          if (hwnd_ && !stopThreads_) PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
+        }),
+        timerService_([this](feathercast::timers::Due due) { timerEvents_.Push(due); }),
         instance_(instance),
         cmdLine_(std::move(cmdLine)) {
     QueryPerformanceFrequency(&qpcFrequency_);
@@ -1388,6 +1414,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     g_diagnosticsEnabled = settings_.diagnosticsEnabled;
     hadLegacyOperationalData_ = MigrateLegacyOperationalData();
     shortcut_ = ParseShortcut(settings_.shortcut);
+    screenshotFullscreenShortcut_ =
+        ParseShortcut(settings_.screenshotFullscreenShortcut);
+    screenshotRegionShortcut_ =
+        ParseShortcut(settings_.screenshotRegionShortcut);
+    recordFullscreenShortcut_ =
+        ParseShortcut(settings_.recordFullscreenShortcut);
+    recordRegionShortcut_ = ParseShortcut(settings_.recordRegionShortcut);
     theme_ = feathercast::theme::LoadTheme(ThemePath());
     RefreshSystemPreferences();
     const auto loadedSnippets = feathercast::snippets_io::Load(SnippetsPath());
@@ -1407,14 +1440,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   ~FeatherCastApp() {
     ShutdownBackgroundWorkers();
     if (clipboardListenerRegistered_ && hwnd_) RemoveClipboardFormatListener(hwnd_);
-    UnregisterShortcutHotKey();
+    UnregisterAllHotKeys();
     if (hook_) UnhookWindowsHookEx(hook_);
     RemoveTray();
   }
 
   void ShutdownBackgroundWorkers() {
     if (shutdownStarted_.exchange(true)) return;
+    if (timersLoaded_ && timerState_.stopwatch.running) {
+      timerState_.stopwatch.Pause(GetTickCount64());
+      persistence_.SaveTimers(timerState_);
+    }
     stopThreads_ = true;
+    timerService_.Stop();
+    timerEvents_.Close();
+    captureService_.Shutdown();
+    captureEvents_.Close();
     launchExecutor_.Stop();
     extensions_.Shutdown();
     fileIndexService_.Stop();
@@ -1448,7 +1489,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return 1;
     }
     if (!InitializeFactories() || !RegisterWindowClass() || !CreateMainWindow() ||
-        !CreateSettingsWindow() || !CreateVolumeWindow()) {
+        !CreateSettingsWindow() || !CreateVolumeWindow() ||
+        !CreateCaptureWindows()) {
       MessageBoxW(nullptr, L"FeatherCast could not initialize its native windows or graphics factories.",
                   L"FeatherCast Startup", MB_OK | MB_ICONERROR);
       ReleaseComResources();
@@ -1461,6 +1503,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     previewService_.Start();
     PromptForPrivacyConsentIfNeeded();
     LoadPersistentState();
+    if (!timerService_.Start() || !persistence_.LoadTimers()) {
+      SetSettingsStatus(StatusSeverity::Error, L"Timers could not be initialized.");
+    }
     UpdateClipboardListenerRegistration();
     if (!CreateTray()) {
       MessageBoxW(hwnd_, L"FeatherCast could not create its tray icon.",
@@ -1478,8 +1523,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               : L"Invalid settings were preserved and defaults are active.");
     }
     extensions_.Initialize(UserDataPath(), ExeDirectory(), hwnd_, WM_REBUILD_RESULTS);
-    const bool hookReady = InstallHook();
-    const bool hotKeyReady = RegisterShortcutHotKey();
+    const bool hotKeyReady = RegisterAllHotKeys();
+    const bool hookReady = hook_ != nullptr;
     if (!hotKeyReady && !hookReady) {
       MessageBoxW(hwnd_, L"FeatherCast could not register the global shortcut or keyboard hook.",
                   L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
@@ -1498,9 +1543,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         [this](const DiscoveryRequest& request, std::stop_token token) {
           return PerformDiscovery(request, token);
         });
-    StartAppDiscovery();
-    StartCurrencyFetch();
-    StartAutomaticUpdateCheck();
+    // Discovery and network maintenance are deferred until first use.
 
     if (cmdLine_.find(L"--show") != std::wstring::npos) {
       ShowOverlay(View::Search);
@@ -1523,7 +1566,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool IsFeatherCastWindow(HWND window) const {
     return window &&
-           (window == hwnd_ || window == settingsHwnd_ || window == volumeHwnd_);
+           (window == hwnd_ || window == settingsHwnd_ || window == volumeHwnd_ ||
+            window == captureSelectorHwnd_ ||
+            window == recordingControlHwnd_);
   }
 
   std::optional<ForegroundSnapshot> CaptureForegroundSnapshot(
@@ -1610,14 +1655,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return HandleRecordingKey(vk, down, up);
     }
 
-    if (ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_)) {
-      PressedModifiers modifiers = hookModifiers_;
-      if (down && IsModifier(vk)) {
-        SetHookModifier(vk, true);
-        modifiers = hookModifiers_;
-      }
-      const auto result = shortcutRuntime_.Handle(shortcut_, vk, down, up, modifiers);
+    if (down && IsModifier(vk)) SetHookModifier(vk, true);
+    const PressedModifiers modifiers = hookModifiers_;
+    const auto finishModifier = [&] {
       if (up && IsModifier(vk)) SetHookModifier(vk, false);
+    };
+
+    if (ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_)) {
+      const auto result = shortcutRuntime_.Handle(shortcut_, vk, down, up, modifiers);
       if (result.suppressWinStart) {
         SendVirtualKeyTap(0xE8);
       }
@@ -1626,14 +1671,43 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             CaptureForegroundSnapshot(GetForegroundWindow(), kb->time),
             result.deferToggleUntilWinRelease);
       }
-      if (result.consume) return 1;
+      if (result.consume) {
+        finishModifier();
+        return 1;
+      }
     }
+    const auto captureSpecs = CaptureShortcutSpecs();
+    const auto captureTargets = CaptureHotKeyTargets();
+    for (std::size_t index = 0; index < captureSpecs.size(); ++index) {
+      if (!ShouldHandleInLowLevelHook(
+              *captureSpecs[index], captureHotKeyRegistered_[index])) {
+        continue;
+      }
+      const auto result = captureShortcutRuntimes_[index].Handle(
+          *captureSpecs[index], vk, down, up, modifiers);
+      if (result.suppressWinStart) SendVirtualKeyTap(0xE8);
+      if (result.toggle && hwnd_) {
+        PostMessageW(hwnd_, WM_CAPTURE_SHORTCUT,
+                     static_cast<WPARAM>(captureTargets[index]), 0);
+      }
+      if (result.consume) {
+        finishModifier();
+        return 1;
+      }
+    }
+    finishModifier();
     return CallNextHookEx(hook_, nCode, wParam, lParam);
   }
 
   std::wstring AccessibleWindowName(HWND hwnd) const override {
     if (hwnd == settingsHwnd_) return L"FeatherCast Settings";
     if (hwnd == volumeHwnd_) return L"FeatherCast Volume Control";
+    if (hwnd == recordingControlHwnd_) {
+      return L"FeatherCast Recording Controls";
+    }
+    if (hwnd == captureSelectorHwnd_) {
+      return L"FeatherCast Region Selection";
+    }
     return L"FeatherCast Launcher";
   }
 
@@ -1653,6 +1727,61 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         origin.y + static_cast<LONG>(rect.bottom * scale),
       };
     };
+
+    if (hwnd == captureSelectorHwnd_) {
+      Item selector;
+      selector.name = L"Screen region selector";
+      selector.description =
+          L"Drag to select a region. Press Escape or right-click to cancel.";
+      if (const auto selection =
+              feathercast::ui::CaptureUiController::SelectionRect(
+                  captureUiState_)) {
+        selector.value = std::to_wstring(selection->Width()) + L" by " +
+                         std::to_wstring(selection->Height()) + L" pixels";
+      }
+      selector.role = ROLE_SYSTEM_STATICTEXT;
+      selector.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE |
+                       STATE_SYSTEM_FOCUSED;
+      selector.screenRect = {origin.x, origin.y, origin.x + client.right,
+                             origin.y + client.bottom};
+      items.push_back(std::move(selector));
+      return items;
+    }
+
+    if (hwnd == recordingControlHwnd_) {
+      const bool enabled =
+          captureUiState_.phase == feathercast::ui::CapturePhase::Recording ||
+          captureUiState_.phase == feathercast::ui::CapturePhase::Paused;
+      Item pause;
+      pause.name =
+          captureUiState_.phase == feathercast::ui::CapturePhase::Paused
+              ? L"Resume recording"
+              : L"Pause recording";
+      pause.value = RecordingElapsedText(
+          captureUiState_.elapsedMilliseconds);
+      pause.defaultAction = pause.name;
+      pause.role = ROLE_SYSTEM_PUSHBUTTON;
+      pause.state = STATE_SYSTEM_FOCUSABLE;
+      if (!enabled) pause.state |= STATE_SYSTEM_UNAVAILABLE;
+      if (captureUiState_.controlFocus == 0) {
+        pause.state |= STATE_SYSTEM_FOCUSED;
+      }
+      pause.screenRect = screenRect(RecordingPauseRect());
+      items.push_back(std::move(pause));
+
+      Item stop;
+      stop.name = L"Stop recording";
+      stop.defaultAction = stop.name;
+      stop.role = ROLE_SYSTEM_PUSHBUTTON;
+      stop.state = STATE_SYSTEM_FOCUSABLE;
+      if (!enabled) stop.state |= STATE_SYSTEM_UNAVAILABLE;
+      if (captureUiState_.controlFocus == 1) {
+        stop.state |= STATE_SYSTEM_FOCUSED;
+      }
+      stop.screenRect = screenRect(RecordingStopRect());
+      items.push_back(std::move(stop));
+      return items;
+    }
 
     if (hwnd == volumeHwnd_) {
       const float width = static_cast<float>(client.right) / scale;
@@ -1921,6 +2050,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   int AccessibleFocusedChild(HWND hwnd) const override {
+    if (hwnd == captureSelectorHwnd_) return 1;
+    if (hwnd == recordingControlHwnd_) {
+      return captureUiState_.controlFocus + 1;
+    }
     if (hwnd == volumeHwnd_) return 1;
     if (hwnd == hwnd_) {
       if (confirmation_) return confirmationFocus_ + 1;
@@ -1930,6 +2063,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void AccessibleFocusChild(HWND hwnd, int child) override {
+    if (hwnd == captureSelectorHwnd_) {
+      if (child == 1) SetFocus(captureSelectorHwnd_);
+      return;
+    }
+    if (hwnd == recordingControlHwnd_) {
+      feathercast::ui::CaptureUiController::SetControlFocus(
+          captureUiState_, child - 1);
+      SetFocus(recordingControlHwnd_);
+      InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+      return;
+    }
     if (hwnd == volumeHwnd_) {
       if (child == 1) SetFocus(volumeHwnd_);
       return;
@@ -1959,6 +2103,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void AccessibleInvokeChild(HWND hwnd, int child) override {
+    if (hwnd == captureSelectorHwnd_) return;
+    if (hwnd == recordingControlHwnd_) {
+      feathercast::ui::CaptureUiController::SetControlFocus(
+          captureUiState_, child - 1);
+      if (captureUiState_.controlFocus == 0) ToggleRecordingPause();
+      else StopRecording();
+      return;
+    }
     if (hwnd == volumeHwnd_) {
       if (child == 1) SetFocus(volumeHwnd_);
       return;
@@ -2002,14 +2154,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (hwnd == settingsHwnd_) return SettingsWndProc(hwnd, msg, wParam, lParam);
     if (hwnd == volumeHwnd_) return VolumeWndProc(hwnd, msg, wParam, lParam);
+    if (hwnd == captureSelectorHwnd_) {
+      return CaptureSelectorWndProc(hwnd, msg, wParam, lParam);
+    }
+    if (hwnd == recordingControlHwnd_) {
+      return RecordingControlWndProc(hwnd, msg, wParam, lParam);
+    }
     if (taskbarCreatedMessage_ && msg == taskbarCreatedMessage_) {
       RemoveTray();
       CreateTray();
       return 0;
     }
     switch (msg) {
+      case WM_TIMECHANGE:
+        ExpireTimers();
+        return 0;
       case WM_TIMER:
-        if (wParam == 1) {
+        if (wParam == TIMER_CLOCK_DISPLAY) {
+          if (visible_ && (browseView_ == BrowseView::Timers || (actionMode_ && actionTarget_.timerRequest))) RequestSearch();
+          else KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+        } else if (wParam == 1) {
           if (visible_) {
             if (!suppressHide_ && !overlayClosing_ &&
                 !overlayFocusSession_.GuardActive(GetTickCount64())) {
@@ -2027,9 +2191,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               InvalidateRect(hwnd_, nullptr, FALSE);
             }
           }
-        } else if (wParam == TIMER_MEM_TRIM) {
-          KillTimer(hwnd_, TIMER_MEM_TRIM);
-          SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         } else if (wParam == TIMER_OVERLAY_ACTIVATE) {
           RetryOverlayActivation();
         } else if (wParam == TIMER_PREVIEW_LOAD) {
@@ -2077,11 +2238,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OnClipboardUpdate();
         return 0;
       case WM_HOTKEY:
+        if (recording_) return 0;
         if (static_cast<int>(wParam) == HOTKEY_OPEN_SEARCH) {
-          if (!recording_) {
-            TriggerShortcutToggle(CaptureForegroundSnapshot(
-                GetForegroundWindow(), static_cast<DWORD>(GetMessageTime())));
-          }
+          TriggerShortcutToggle(CaptureForegroundSnapshot(
+              GetForegroundWindow(), static_cast<DWORD>(GetMessageTime())));
+          return 0;
+        }
+        if (const auto target =
+                CaptureTargetForHotKey(static_cast<int>(wParam))) {
+          BeginCapture(*target);
           return 0;
         }
         break;
@@ -2101,8 +2266,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_OVERLAY_RETRY_ACTIVATION:
         RetryOverlayActivation();
         return 0;
+      case WM_CAPTURE_SHORTCUT:
+        if (!recording_) {
+          BeginCapture(
+              static_cast<feathercast::ui::CaptureShortcutTarget>(wParam));
+        }
+        return 0;
       case WM_DESTROY:
-        UnregisterShortcutHotKey();
+        UnregisterAllHotKeys();
+        captureService_.Shutdown();
+        if (captureSelectorHwnd_) {
+          HWND selector = captureSelectorHwnd_;
+          captureSelectorHwnd_ = nullptr;
+          DestroyWindow(selector);
+        }
+        if (recordingControlHwnd_) {
+          HWND controls = recordingControlHwnd_;
+          recordingControlHwnd_ = nullptr;
+          DestroyWindow(controls);
+        }
         if (settingsHwnd_) {
           HWND settings = settingsHwnd_;
           settingsHwnd_ = nullptr;
@@ -2220,8 +2402,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
       case WM_POWERBROADCAST:
-        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
-          fileIndexService_.Rebuild();
+        if (wParam == PBT_APMSUSPEND &&
+            captureUiState_.phase !=
+                feathercast::ui::CapturePhase::Idle) {
+          StopRecording();
+        } else if (wParam == PBT_APMRESUMEAUTOMATIC ||
+                   wParam == PBT_APMRESUMESUSPEND) {
+          ExpireTimers();
+          if (fileIndexConfigured_) fileIndexService_.Rebuild();
         }
         return TRUE;
       case WM_TRAYICON:
@@ -2279,6 +2467,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           InvalidateRect(settingsHwnd_, nullptr, FALSE);
         }
         if (volumeVisible_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
+        if (captureSelectorHwnd_ &&
+            IsWindowVisible(captureSelectorHwnd_)) {
+          InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+        }
+        if (recordingControlHwnd_ &&
+            IsWindowVisible(recordingControlHwnd_)) {
+          InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+        }
         return 0;
       case WM_EXTENSION_RELOAD_READY:
         extensionReloadPending_ = false;
@@ -2299,7 +2495,80 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnRuntimeEvents() {
+    for (auto& event : captureEvents_.Drain()) {
+      using feathercast::capture::CaptureEventKind;
+      switch (event.kind) {
+        case CaptureEventKind::Started:
+          if (event.operation ==
+              feathercast::capture::CaptureOperation::Recording) {
+            feathercast::ui::CaptureUiController::RecordingStarted(
+                captureUiState_);
+            InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+            NotifyWinEvent(EVENT_OBJECT_SHOW, recordingControlHwnd_,
+                           OBJID_CLIENT, CHILDID_SELF);
+          }
+          break;
+        case CaptureEventKind::Paused:
+          feathercast::ui::CaptureUiController::Pause(captureUiState_);
+          InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+          NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, recordingControlHwnd_,
+                         OBJID_CLIENT, 1);
+          break;
+        case CaptureEventKind::Resumed:
+          feathercast::ui::CaptureUiController::Resume(captureUiState_);
+          InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+          NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, recordingControlHwnd_,
+                         OBJID_CLIENT, 1);
+          break;
+        case CaptureEventKind::Stopping:
+          feathercast::ui::CaptureUiController::Stop(captureUiState_);
+          InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+          break;
+        case CaptureEventKind::Completed: {
+          const bool recording =
+              event.operation ==
+              feathercast::capture::CaptureOperation::Recording;
+          if (recording) HideRecordingControls();
+          feathercast::ui::CaptureUiController::Complete(captureUiState_);
+          UpdateBackgroundState();
+          if (event.path.empty()) {
+            ShowTrayNotification(
+                recording ? L"FeatherCast Recording"
+                          : L"FeatherCast Screenshot",
+                event.message.empty() ? L"Capture canceled." : event.message);
+            break;
+          }
+          const std::wstring path = event.path.wstring();
+          ShowTrayNotification(
+              recording ? L"FeatherCast Recording"
+                        : L"FeatherCast Screenshot",
+              recording
+                  ? L"Recording saved to " + path
+                  : (event.clipboardSucceeded
+                         ? L"Screenshot saved and copied to the clipboard: " +
+                               path
+                         : L"Screenshot saved, but could not be copied: " +
+                               path));
+          break;
+        }
+        case CaptureEventKind::Failed:
+          HideRecordingControls();
+          ShowWindow(captureSelectorHwnd_, SW_HIDE);
+          feathercast::ui::CaptureUiController::Fail(captureUiState_);
+          UpdateBackgroundState();
+          ShowTrayNotification(
+              event.operation ==
+                      feathercast::capture::CaptureOperation::Recording
+                  ? L"FeatherCast Recording"
+                  : L"FeatherCast Screenshot",
+              event.message.empty() ? L"Capture failed." : event.message);
+          break;
+      }
+    }
     OnPersistenceEvents();
+    for (const auto& due : timerEvents_.Drain()) {
+      if (due.generation == timerGeneration_) ExpireTimers();
+    }
     for (auto& queued : searchEvents_.Drain()) {
       std::visit(
           [this](auto&& event) {
@@ -2372,12 +2641,83 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  void SaveTimerState(std::vector<std::wstring> expired = {}) {
+    auto saved = timerState_;
+    saved.stopwatch.Pause(GetTickCount64());
+    if (!persistence_.SaveTimers(std::move(saved), std::move(expired))) {
+      SetOverlayStatus(StatusSeverity::Error, L"Timers could not be saved.");
+    }
+  }
+
+  void ExpireTimers() {
+    if (!timersLoaded_) return;
+    auto names = feathercast::timers::Expire(timerState_, feathercast::timers::Now());
+    if (!names.empty()) SaveTimerState(std::move(names));
+    if (!timerService_.Schedule(feathercast::timers::NextDeadline(timerState_), ++timerGeneration_)) {
+      SetSettingsStatus(StatusSeverity::Error, L"Timer notifications could not be scheduled.");
+    }
+    if (visible_ && browseView_ == BrowseView::Timers) RequestSearch();
+  }
+
+  void ExecuteTimerItem(const DisplayItem& item) {
+    using feathercast::timers::Action;
+    const auto& request = *item.timerRequest;
+    if (!timersLoaded_) {
+      SetOverlayStatus(StatusSeverity::Error, L"Timers are not available yet. Open Settings for storage errors.");
+      return;
+    }
+    if (request.action == Action::Invalid || (request.action == Action::Open && request.id == -1)) {
+      if (request.action == Action::Invalid) {
+        SetOverlayStatus(StatusSeverity::Info, L"Try: timer 10m Tea or timer 1h 30m Break");
+      } else {
+        actionMode_ = false;
+        browseView_ = BrowseView::None;
+        SetQueryText(L"timer ");
+      }
+      return;
+    }
+    if (request.action == Action::Open) { EnterActionMode(item); return; }
+    ExpireTimers();
+    if (!feathercast::timers::Apply(timerState_, request, feathercast::timers::Now(), GetTickCount64())) {
+      RequestSearch();
+      SetOverlayStatus(StatusSeverity::Error, L"This timer changed or the duration is invalid. Select it again.");
+      return;
+    }
+    SaveTimerState();
+    ExpireTimers();
+    if (actionMode_) ExitActionMode();
+    if (browseView_ != BrowseView::Timers) EnterBrowseView(BrowseView::Timers);
+    else RequestSearch();
+  }
+
   void OnPersistenceEvents() {
     for (auto& queued : persistenceEvents_.Drain()) {
       std::visit(
           [this](auto&& event) {
             using Event = std::decay_t<decltype(event)>;
-            if constexpr (std::is_same_v<
+            if constexpr (std::is_same_v<Event, feathercast::persistence::TimersLoaded>) {
+              if (!event.error.message.empty()) {
+                ReportPersistenceFailure(Utf8ToWide(event.error.message));
+                return;
+              }
+              timerState_ = std::move(event.state);
+              timersLoaded_ = true;
+              ExpireTimers();
+              if (visible_) RequestSearch();
+            } else if constexpr (std::is_same_v<Event, feathercast::persistence::TimersSaved>) {
+              if (!event.succeeded) {
+                ReportPersistenceFailure(L"Timers could not be saved. " + Utf8ToWide(event.error.message));
+                SetOverlayStatus(StatusSeverity::Error, L"Timers could not be saved. Open Settings for details.");
+              } else if (!event.expiredNames.empty()) {
+                std::wstring names;
+                for (const auto& name : event.expiredNames) {
+                  if (!names.empty()) names += L", ";
+                  names += name;
+                }
+                ShowTrayNotification(L"Timer finished", names);
+                MessageBeep(MB_ICONINFORMATION);
+              }
+            } else if constexpr (std::is_same_v<
                               Event,
                               feathercast::persistence::
                                   SettingsSaveCompleted>) {
@@ -2456,10 +2796,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                      feathercast::persistence::
                                          ClipboardStored>) {
               if (!event.entry) {
-                ReportPersistenceFailure(
-                    event.error.message.empty()
-                        ? L"Clipboard history could not be saved."
-                        : Utf8ToWide(event.error.message));
+                ReportPersistenceFailure(event.error.message.empty() ? L"Clipboard history could not be saved." : Utf8ToWide(event.error.message));
+              } else if (settings_.clipboardHistoryEnabled) {
+                persistence_.LoadClipboard(ClipboardHistoryLimit());
               }
             } else if constexpr (std::is_same_v<
                                      Event,
@@ -2476,6 +2815,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                   item.text = stored.text;
                   item.preview = stored.preview;
                   item.capturedAt = stored.capturedAt;
+                  item.pinned = stored.pinned;
                   loaded.push_back(std::move(item));
                   serial = std::max<unsigned long long>(
                       serial, static_cast<unsigned long long>(stored.id));
@@ -2520,6 +2860,579 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  static feathercast::capture::PixelRect CaptureRect(
+      const feathercast::ui::PixelRect& rect) {
+    return {rect.left, rect.top, rect.right, rect.bottom};
+  }
+
+  static feathercast::capture::CaptureScope CaptureScopeFor(
+      feathercast::ui::CaptureShortcutTarget target) {
+    using Target = feathercast::ui::CaptureShortcutTarget;
+    return target == Target::ScreenshotFullscreen ||
+                   target == Target::RecordFullscreen
+               ? feathercast::capture::CaptureScope::Fullscreen
+               : feathercast::capture::CaptureScope::Region;
+  }
+
+  static bool IsRecordingTarget(
+      feathercast::ui::CaptureShortcutTarget target) {
+    using Target = feathercast::ui::CaptureShortcutTarget;
+    return target == Target::RecordFullscreen ||
+           target == Target::RecordRegion;
+  }
+
+  feathercast::capture::PixelRect MonitorUnderPointerBounds() const {
+    POINT point{};
+    GetCursorPos(&point);
+    const HMONITOR monitor =
+        MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info)) return {};
+    return {info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right,
+            info.rcMonitor.bottom};
+  }
+
+  void HideFeatherCastForCapture() {
+    if (visible_) HideOverlay(OverlayCloseReason::Action);
+    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) HideSettings(false);
+    if (volumeVisible_) HideVolumeControl(false);
+  }
+
+  void CancelCaptureSelection() {
+    using feathercast::ui::CaptureUiController;
+    if (!CaptureUiController::CancelSelection(captureUiState_)) return;
+    captureUiState_.selectionStart.reset();
+    captureUiState_.selectionEnd.reset();
+    if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
+    ShowWindow(captureSelectorHwnd_, SW_HIDE);
+    UpdateBackgroundState();
+  }
+
+  void ShowCaptureSelector() {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (width <= 0 || height <= 0) {
+      feathercast::ui::CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      ShowTrayNotification(L"FeatherCast Capture",
+                           L"Windows did not report a capturable desktop.");
+      return;
+    }
+    captureVirtualBounds_ = {left, top, left + width, top + height};
+    SetWindowPos(captureSelectorHwnd_, HWND_TOPMOST, left, top, width, height,
+                 SWP_SHOWWINDOW);
+    RedrawWindow(captureSelectorHwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    SetForegroundWindow(captureSelectorHwnd_);
+    SetFocus(captureSelectorHwnd_);
+    NotifyWinEvent(EVENT_OBJECT_SHOW, captureSelectorHwnd_, OBJID_CLIENT,
+                   CHILDID_SELF);
+    UpdateBackgroundState();
+  }
+
+  bool ApplyCaptureWindowExclusion() {
+    return feathercast::capture::ExcludeWindowFromCapture(
+               recordingControlHwnd_) &&
+           feathercast::capture::ExcludeWindowFromCapture(hwnd_) &&
+           feathercast::capture::ExcludeWindowFromCapture(settingsHwnd_) &&
+           feathercast::capture::ExcludeWindowFromCapture(volumeHwnd_);
+  }
+
+  void PositionRecordingControls(
+      feathercast::capture::PixelRect bounds) {
+    auto slices = feathercast::capture::GetMonitorSlices(bounds);
+    HMONITOR monitor = nullptr;
+    long long largestArea = -1;
+    for (const auto& slice : slices) {
+      const long long area =
+          static_cast<long long>(slice.intersection.Width()) *
+          slice.intersection.Height();
+      if (area > largestArea) {
+        largestArea = area;
+        monitor = slice.monitor;
+      }
+    }
+    if (!monitor) {
+      POINT point{bounds.left, bounds.top};
+      monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+    }
+    MONITORINFO info{sizeof(info)};
+    GetMonitorInfoW(monitor, &info);
+    const float scale = GetMonitorScale(monitor);
+    const int width = static_cast<int>(360.0f * scale);
+    const int height = static_cast<int>(64.0f * scale);
+    const int x =
+        info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
+    const int y = info.rcMonitor.top + static_cast<int>(12.0f * scale);
+    SetWindowPos(recordingControlHwnd_, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE);
+  }
+
+  void ShowRecordingControls() {
+    PositionRecordingControls(activeCaptureBounds_);
+    ApplyGlass(recordingControlHwnd_);
+    RedrawWindow(recordingControlHwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    ShowWindow(recordingControlHwnd_, SW_SHOWNOACTIVATE);
+    SetWindowPos(recordingControlHwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetTimer(recordingControlHwnd_, TIMER_RECORDING_ELAPSED, 250, nullptr);
+    UpdateBackgroundState();
+  }
+
+  void HideRecordingControls() {
+    KillTimer(recordingControlHwnd_, TIMER_RECORDING_ELAPSED);
+    ShowWindow(recordingControlHwnd_, SW_HIDE);
+    UpdateBackgroundState();
+  }
+
+  void StartCaptureOperation(feathercast::capture::PixelRect bounds) {
+    using Target = feathercast::ui::CaptureShortcutTarget;
+    if (bounds.Empty()) {
+      feathercast::ui::CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      return;
+    }
+    activeCaptureBounds_ = bounds;
+    HideFeatherCastForCapture();
+    DwmFlush();
+
+    const auto target = captureUiState_.target;
+    const auto scope = CaptureScopeFor(target);
+    if (!IsRecordingTarget(target)) {
+      if (!captureService_.StartScreenshot(bounds, scope)) {
+        feathercast::ui::CaptureUiController::Fail(captureUiState_);
+        UpdateBackgroundState();
+        ShowTrayNotification(L"FeatherCast Capture",
+                             L"Another capture is already in progress.");
+      }
+      return;
+    }
+
+    if (!ApplyCaptureWindowExclusion()) {
+      feathercast::ui::CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      ShowTrayNotification(
+          L"FeatherCast Recording",
+          L"Windows could not exclude the recording controls from capture.");
+      return;
+    }
+    if (!captureService_.StartRecording(bounds, scope)) {
+      feathercast::ui::CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      ShowTrayNotification(L"FeatherCast Recording",
+                           L"Another capture is already in progress.");
+      return;
+    }
+    ShowRecordingControls();
+  }
+
+  void BeginCapture(feathercast::ui::CaptureShortcutTarget target) {
+    if (!feathercast::ui::CaptureUiController::Begin(captureUiState_, target)) {
+      ShowTrayNotification(L"FeatherCast Capture",
+                           L"A capture is already in progress.");
+      return;
+    }
+    const auto fullscreenBounds =
+        CaptureScopeFor(target) ==
+                feathercast::capture::CaptureScope::Fullscreen
+            ? MonitorUnderPointerBounds()
+            : feathercast::capture::PixelRect{};
+    HideFeatherCastForCapture();
+    if (CaptureScopeFor(target) ==
+        feathercast::capture::CaptureScope::Region) {
+      ShowCaptureSelector();
+      return;
+    }
+    StartCaptureOperation(fullscreenBounds);
+  }
+
+  void FinishCaptureSelection(POINT screenPoint) {
+    using feathercast::ui::CaptureUiController;
+    if (!CaptureUiController::FinishSelection(
+            captureUiState_, {screenPoint.x, screenPoint.y})) {
+      return;
+    }
+    const auto selection = CaptureUiController::SelectionRect(captureUiState_);
+    if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
+    ShowWindow(captureSelectorHwnd_, SW_HIDE);
+    DwmFlush();
+    if (!selection) {
+      CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      return;
+    }
+    const int width = selection->Width();
+    const int height = selection->Height();
+    const bool recording = IsRecordingTarget(captureUiState_.target);
+    const bool valid =
+        recording ? width >= 48 && height >= 48 && width <= 4096 &&
+                        height <= 2304
+                  : width >= 2 && height >= 2;
+    if (!valid) {
+      CaptureUiController::Fail(captureUiState_);
+      ShowTrayNotification(
+          L"FeatherCast Capture",
+          recording
+              ? L"Recording regions must be between 48x48 and 4096x2304 pixels."
+              : L"Drag a larger screenshot region.");
+      UpdateBackgroundState();
+      return;
+    }
+    StartCaptureOperation(CaptureRect(*selection));
+  }
+
+  static std::wstring RecordingElapsedText(std::uint64_t milliseconds) {
+    const auto totalSeconds = milliseconds / 1000;
+    const auto hours = totalSeconds / 3600;
+    const auto minutes = (totalSeconds / 60) % 60;
+    const auto seconds = totalSeconds % 60;
+    wchar_t text[32]{};
+    swprintf_s(text, L"%02llu:%02llu:%02llu", hours, minutes, seconds);
+    return text;
+  }
+
+  static RectF RecordingPauseRect() {
+    return {184.0f, 12.0f, 264.0f, 52.0f};
+  }
+
+  static RectF RecordingStopRect() {
+    return {272.0f, 12.0f, 348.0f, 52.0f};
+  }
+
+  void PaintCaptureSelector() {
+    PAINTSTRUCT paint{};
+    BeginPaint(captureSelectorHwnd_, &paint);
+    if (!EnsureRenderResources() ||
+        FAILED(CreateGlassSurface(captureSelectorSurface_,
+                                  captureSelectorHwnd_))) {
+      EndPaint(captureSelectorHwnd_, &paint);
+      return;
+    }
+    ID2D1DeviceContext* dc = captureSelectorSurface_.dc.Get();
+    SetActiveTarget(dc);
+    if (FAILED(EnsureBrushResources())) {
+      activeRT_ = nullptr;
+      activeDC_.Reset();
+      EndPaint(captureSelectorHwnd_, &paint);
+      return;
+    }
+    const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+      RECT client{};
+      GetClientRect(captureSelectorHwnd_, &client);
+      const float scale = GetWindowScale(captureSelectorHwnd_);
+      const float width = static_cast<float>(client.right) / scale;
+      const float height = static_cast<float>(client.bottom) / scale;
+      dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, highContrast_ ? 0.72f : 0.46f));
+
+      const auto selection =
+          feathercast::ui::CaptureUiController::SelectionRect(captureUiState_);
+      if (selection) {
+        RectF rect{
+            static_cast<float>(selection->left - captureVirtualBounds_.left) /
+                scale,
+            static_cast<float>(selection->top - captureVirtualBounds_.top) /
+                scale,
+            static_cast<float>(selection->right - captureVirtualBounds_.left) /
+                scale,
+            static_cast<float>(selection->bottom - captureVirtualBounds_.top) /
+                scale};
+        dc->PushAxisAlignedClip(
+            D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom),
+            D2D1_ANTIALIAS_MODE_ALIASED);
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->PopAxisAlignedClip();
+        auto accent = Brush(D2DColor(ActiveAccent()));
+        dc->DrawRectangle(
+            D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom),
+            accent.Get(), 2.0f);
+        DrawTextBlock(
+            std::to_wstring(selection->Width()) + L" x " +
+                std::to_wstring(selection->Height()),
+            {rect.left + 8.0f, rect.top + 8.0f, rect.right - 8.0f,
+             rect.top + 32.0f},
+            bodyFormat_.Get(), D2D1::ColorF(1, 1, 1));
+      }
+
+      if (captureUiState_.selectionEnd) {
+        const float x =
+            static_cast<float>(captureUiState_.selectionEnd->x -
+                               captureVirtualBounds_.left) /
+            scale;
+        const float y =
+            static_cast<float>(captureUiState_.selectionEnd->y -
+                               captureVirtualBounds_.top) /
+            scale;
+        auto crosshair = Brush(D2D1::ColorF(1, 1, 1, 0.75f));
+        dc->DrawLine(D2D1::Point2F(0, y), D2D1::Point2F(width, y),
+                     crosshair.Get(), 1.0f);
+        dc->DrawLine(D2D1::Point2F(x, 0), D2D1::Point2F(x, height),
+                     crosshair.Get(), 1.0f);
+      }
+      DrawTextBlock(L"Drag to select  \u00b7  Esc to cancel",
+                    {0, 24.0f, width, 56.0f}, centerFormat_.Get(),
+                    D2D1::ColorF(1, 1, 1));
+    });
+    activeRT_ = nullptr;
+    activeDC_.Reset();
+    if (SUCCEEDED(frame.result)) {
+      captureSelectorSurface_.swapChain->Present(1, 0);
+    }
+    EndPaint(captureSelectorHwnd_, &paint);
+  }
+
+  void PaintRecordingControls() {
+    PAINTSTRUCT paint{};
+    BeginPaint(recordingControlHwnd_, &paint);
+    if (!EnsureRenderResources() ||
+        FAILED(CreateGlassSurface(recordingControlSurface_,
+                                  recordingControlHwnd_))) {
+      EndPaint(recordingControlHwnd_, &paint);
+      return;
+    }
+    ID2D1DeviceContext* dc = recordingControlSurface_.dc.Get();
+    SetActiveTarget(dc);
+    if (FAILED(EnsureBrushResources())) {
+      activeRT_ = nullptr;
+      activeDC_.Reset();
+      EndPaint(recordingControlHwnd_, &paint);
+      return;
+    }
+    const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+      RECT client{};
+      GetClientRect(recordingControlHwnd_, &client);
+      const float scale = GetWindowScale(recordingControlHwnd_);
+      const float width = static_cast<float>(client.right) / scale;
+      const float height = static_cast<float>(client.bottom) / scale;
+      DrawObsidianBackground(width, height, theme_.overlayRadius,
+                             ObsidianBackgroundKind::Volume);
+
+      auto red = Brush(D2D1::ColorF(0.95f, 0.18f, 0.20f));
+      dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(24.0f, 32.0f), 6.0f, 6.0f),
+                      red.Get());
+      std::wstring elapsed =
+          RecordingElapsedText(captureUiState_.elapsedMilliseconds);
+      if (captureUiState_.phase ==
+          feathercast::ui::CapturePhase::StartingRecording) {
+        elapsed = L"Starting...";
+      } else if (captureUiState_.phase ==
+                 feathercast::ui::CapturePhase::Stopping) {
+        elapsed = L"Saving...";
+      }
+      DrawTextBlock(elapsed, {40.0f, 17.0f, 174.0f, 49.0f},
+                    titleFormat_.Get(), D2DColor(theme_.textPrimary));
+
+      const bool enabled =
+          captureUiState_.phase == feathercast::ui::CapturePhase::Recording ||
+          captureUiState_.phase == feathercast::ui::CapturePhase::Paused;
+      const RectF pause = RecordingPauseRect();
+      const RectF stop = RecordingStopRect();
+      FillRound(pause, theme_.controlRadius,
+                D2DColor(captureUiState_.controlHover == 0
+                             ? theme_.surfaceHover
+                             : theme_.surface));
+      FillRound(stop, theme_.controlRadius,
+                D2DColor(captureUiState_.controlHover == 1
+                             ? theme_.surfaceHover
+                             : theme_.surface));
+      if (captureUiState_.controlFocus == 0) {
+        StrokeRound(pause, theme_.controlRadius, D2DColor(ActiveAccent()), 2.0f);
+      } else {
+        StrokeRound(stop, theme_.controlRadius, D2DColor(ActiveAccent()), 2.0f);
+      }
+      DrawTextBlock(captureUiState_.phase ==
+                                feathercast::ui::CapturePhase::Paused
+                            ? L"Resume"
+                            : L"Pause",
+                    pause, centerFormat_.Get(),
+                    enabled ? D2DColor(theme_.textPrimary)
+                            : D2DColor(theme_.textMuted));
+      DrawTextBlock(L"Stop", stop, centerFormat_.Get(),
+                    enabled ? D2DColor(theme_.danger)
+                            : D2DColor(theme_.textMuted));
+    });
+    activeRT_ = nullptr;
+    activeDC_.Reset();
+    if (SUCCEEDED(frame.result)) {
+      recordingControlSurface_.swapChain->Present(1, 0);
+    }
+    EndPaint(recordingControlHwnd_, &paint);
+  }
+
+  void ToggleRecordingPause() {
+    if (captureUiState_.phase == feathercast::ui::CapturePhase::Recording) {
+      captureService_.Pause();
+    } else if (captureUiState_.phase ==
+               feathercast::ui::CapturePhase::Paused) {
+      captureService_.Resume();
+    }
+  }
+
+  void StopRecording() {
+    if (captureUiState_.phase ==
+        feathercast::ui::CapturePhase::StartingScreenshot) {
+      captureService_.Stop();
+      feathercast::ui::CaptureUiController::Fail(captureUiState_);
+      UpdateBackgroundState();
+      return;
+    }
+    if (feathercast::ui::CaptureUiController::Stop(captureUiState_)) {
+      captureService_.Stop();
+      InvalidateRect(recordingControlHwnd_, nullptr, FALSE);
+    }
+  }
+
+  LRESULT CaptureSelectorWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                 LPARAM lParam) {
+    auto screenPoint = [&](LPARAM value) {
+      POINT point{GET_X_LPARAM(value), GET_Y_LPARAM(value)};
+      ClientToScreen(hwnd, &point);
+      return point;
+    };
+    switch (msg) {
+      case WM_ERASEBKGND: return 1;
+      case WM_PAINT:
+        PaintCaptureSelector();
+        return 0;
+      case WM_SIZE:
+        ResizeGlassSurface(captureSelectorSurface_, hwnd, LOWORD(lParam),
+                           HIWORD(lParam));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+        return TRUE;
+      case WM_LBUTTONDOWN: {
+        const POINT point = screenPoint(lParam);
+        feathercast::ui::CaptureUiController::BeginSelection(
+            captureUiState_, {point.x, point.y});
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      case WM_MOUSEMOVE:
+        if (captureUiState_.selectionStart) {
+          const POINT point = screenPoint(lParam);
+          feathercast::ui::CaptureUiController::UpdateSelection(
+              captureUiState_, {point.x, point.y});
+          InvalidateRect(hwnd, nullptr, FALSE);
+          NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
+        }
+        return 0;
+      case WM_LBUTTONUP:
+        if (captureUiState_.selectionStart) {
+          FinishCaptureSelection(screenPoint(lParam));
+        }
+        return 0;
+      case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) CancelCaptureSelection();
+        return 0;
+      case WM_RBUTTONUP:
+      case WM_CANCELMODE:
+        CancelCaptureSelection();
+        return 0;
+      case WM_CAPTURECHANGED:
+        if (captureUiState_.phase ==
+                feathercast::ui::CapturePhase::SelectingScreenshot ||
+            captureUiState_.phase ==
+                feathercast::ui::CapturePhase::SelectingRecording) {
+          CancelCaptureSelection();
+        }
+        return 0;
+      case WM_DISPLAYCHANGE:
+        CancelCaptureSelection();
+        return 0;
+      case WM_CLOSE:
+        CancelCaptureSelection();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+  }
+
+  LRESULT RecordingControlWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                  LPARAM lParam) {
+    const float scale = GetWindowScale(hwnd);
+    const float x = static_cast<float>(GET_X_LPARAM(lParam)) / scale;
+    const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / scale;
+    switch (msg) {
+      case WM_ERASEBKGND: return 1;
+      case WM_GETOBJECT:
+        if (static_cast<LONG>(lParam) == OBJID_CLIENT) {
+          return feathercast::accessibility::HandleGetObject(this, hwnd, wParam,
+                                                              lParam);
+        }
+        break;
+      case WM_PAINT:
+        PaintRecordingControls();
+        return 0;
+      case WM_SIZE:
+        ResizeGlassSurface(recordingControlSurface_, hwnd, LOWORD(lParam),
+                           HIWORD(lParam));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_TIMER:
+        if (wParam == TIMER_RECORDING_ELAPSED) {
+          feathercast::ui::CaptureUiController::AddElapsed(captureUiState_, 250);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tracking);
+        const int hover = PointInRect(RecordingPauseRect(), x, y)
+                              ? 0
+                              : (PointInRect(RecordingStopRect(), x, y) ? 1
+                                                                        : -1);
+        if (hover != captureUiState_.controlHover) {
+          feathercast::ui::CaptureUiController::SetControlHover(
+              captureUiState_, hover);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      }
+      case WM_MOUSELEAVE:
+        feathercast::ui::CaptureUiController::SetControlHover(
+            captureUiState_, -1);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        return 0;
+      case WM_LBUTTONUP:
+        if (PointInRect(RecordingPauseRect(), x, y)) {
+          feathercast::ui::CaptureUiController::SetControlFocus(
+              captureUiState_, 0);
+          ToggleRecordingPause();
+        } else if (PointInRect(RecordingStopRect(), x, y)) {
+          feathercast::ui::CaptureUiController::SetControlFocus(
+              captureUiState_, 1);
+          StopRecording();
+        }
+        return 0;
+      case WM_KEYDOWN:
+        if (wParam == VK_TAB) {
+          const int next =
+              captureUiState_.controlFocus == 0 ? 1 : 0;
+          feathercast::ui::CaptureUiController::SetControlFocus(
+              captureUiState_, next);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wParam == VK_RETURN || wParam == VK_SPACE) {
+          if (captureUiState_.controlFocus == 0) ToggleRecordingPause();
+          else StopRecording();
+        }
+        return 0;
+      case WM_DISPLAYCHANGE:
+        StopRecording();
+        return 0;
+      case WM_CLOSE:
+        StopRecording();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+  }
+
   LRESULT VolumeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
       case WM_ERASEBKGND:
@@ -2533,9 +3446,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_DWMCOMPOSITIONCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
+        RefreshSystemPreferences();
+        ApplyGlass(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
       case WM_DISPLAYCHANGE:
         RefreshSystemPreferences();
         ApplyGlass(hwnd);
+        if (captureUiState_.phase ==
+                feathercast::ui::CapturePhase::SelectingScreenshot ||
+            captureUiState_.phase ==
+                feathercast::ui::CapturePhase::SelectingRecording) {
+          CancelCaptureSelection();
+        } else if (captureUiState_.phase !=
+                   feathercast::ui::CapturePhase::Idle) {
+          StopRecording();
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case WM_PAINT:
@@ -2750,6 +3676,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     wc.lpszClassName = kVolumeWindowClass;
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return false;
+    }
+
+    wc.lpszClassName = kCaptureSelectorWindowClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_CROSS);
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return false;
+    }
+
+    wc.lpszClassName = kRecordingControlWindowClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     return RegisterClassExW(&wc) != 0 ||
            GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
   }
@@ -2791,7 +3731,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool CreateMainWindow() {
     const int width = OverlayWidth();
     hwnd_ = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
       kWindowClass,
       L"FeatherCast",
       WS_POPUP,
@@ -2813,7 +3753,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool CreateSettingsWindow() {
     settingsHwnd_ = CreateWindowExW(
-      WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+      WS_EX_APPWINDOW,
       kSettingsWindowClass,
       L"FeatherCast Settings",
       WS_POPUP,
@@ -2834,11 +3774,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool CreateVolumeWindow() {
     volumeHwnd_ = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         kVolumeWindowClass, L"FeatherCast Volume Control", WS_POPUP, -32000,
         -32000, VOLUME_WIDTH, VOLUME_HEIGHT, nullptr, nullptr, instance_, this);
     if (!volumeHwnd_) return false;
     ApplyGlass(volumeHwnd_);
+    return true;
+  }
+
+  bool CreateCaptureWindows() {
+    captureSelectorHwnd_ = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+        kCaptureSelectorWindowClass, L"FeatherCast Region Selection", WS_POPUP,
+        -32000, -32000, 1, 1, nullptr, nullptr, instance_, this);
+    if (!captureSelectorHwnd_) return false;
+
+    recordingControlHwnd_ = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        kRecordingControlWindowClass, L"FeatherCast Recording Controls",
+        WS_POPUP, -32000, -32000, 360, 64, nullptr, nullptr, instance_, this);
+    if (!recordingControlHwnd_) return false;
+    ApplyGlass(recordingControlHwnd_);
     return true;
   }
 
@@ -2920,6 +3876,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     overlaySurface_.Reset();
     settingsSurface_.Reset();
     volumeSurface_.Reset();
+    captureSelectorSurface_.Reset();
+    recordingControlSurface_.Reset();
     dcompDevice_.Reset();
     dxgiFactory_.Reset();
     d2dDevice_.Reset();
@@ -3197,6 +4155,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, subFormat_);
+    for (auto* format : {rowFormat_.Get(), subFormat_.Get()}) {
+      if (!format) continue;
+      ComPtr<IDWriteInlineObject> ellipsis;
+      if (SUCCEEDED(dwriteFactory_->CreateEllipsisTrimmingSign(format, &ellipsis))) {
+        const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        format->SetTrimming(&trimming, ellipsis.Get());
+      }
+    }
     // 10px Semi-Bold: section labels in all-caps feel (was 11px).
     CreateTextFormat(10.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, sectionFormat_);
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, footerFormat_);
@@ -3281,8 +4247,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool InstallHook() {
+    if (hook_) return true;
     hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, StaticKeyboardProc, GetModuleHandleW(nullptr), 0);
     return hook_ != nullptr;
+  }
+
+  void UpdateKeyboardHook() {
+    bool needed = recording_ || ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_);
+    const auto specs = CaptureShortcutSpecs();
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+      needed = needed || ShouldHandleInLowLevelHook(*specs[i], captureHotKeyRegistered_[i]);
+    }
+    if (needed) {
+      if (!InstallHook()) SetSettingsStatus(StatusSeverity::Error, L"Could not activate the keyboard shortcut hook.");
+    } else if (hook_) {
+      UnhookWindowsHookEx(hook_);
+      hook_ = nullptr;
+      hookModifiers_ = {};
+      shortcutRuntime_ = ShortcutRuntime{};
+      for (auto& runtime : captureShortcutRuntimes_) runtime = ShortcutRuntime{};
+    }
   }
 
   void SetHookModifier(UINT vk, bool pressed) {
@@ -3299,12 +4283,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // A bare Windows-key shortcut is handled on key-up by the low-level
       // hook. Reserving VK_LWIN/VK_RWIN with RegisterHotKey interferes with
       // native Windows chords such as Win+Arrow.
-      return hook_ != nullptr;
+      return InstallHook();
     }
+    if (!shortcut_.valid) { UpdateKeyboardHook(); return true; }
     const auto hotKey = ToHotKeySpec(shortcut_);
-    if (!hwnd_ || !hotKey.supported) return false;
+    if (!hwnd_ || !hotKey.supported) { UpdateKeyboardHook(); return hook_ != nullptr; }
     hotKeyRegistered_ = RegisterHotKey(hwnd_, HOTKEY_OPEN_SEARCH, hotKey.modifiers, hotKey.vk) != FALSE;
-    return hotKeyRegistered_;
+    UpdateKeyboardHook();
+    return hotKeyRegistered_ || hook_ != nullptr;
   }
 
   bool EnsureRenderResources() {
@@ -3338,6 +4324,164 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     hotKeyRegistered_ = false;
   }
 
+  std::array<ShortcutSpec*, 4> CaptureShortcutSpecs() {
+    return {&screenshotFullscreenShortcut_, &screenshotRegionShortcut_,
+            &recordFullscreenShortcut_, &recordRegionShortcut_};
+  }
+
+  std::array<const ShortcutSpec*, 4> CaptureShortcutSpecs() const {
+    return {&screenshotFullscreenShortcut_, &screenshotRegionShortcut_,
+            &recordFullscreenShortcut_, &recordRegionShortcut_};
+  }
+
+  static constexpr std::array<int, 4> CaptureHotKeyIds() {
+    return {HOTKEY_SCREENSHOT_FULLSCREEN, HOTKEY_SCREENSHOT_REGION,
+            HOTKEY_RECORD_FULLSCREEN, HOTKEY_RECORD_REGION};
+  }
+
+  static constexpr std::array<feathercast::ui::CaptureShortcutTarget, 4>
+  CaptureHotKeyTargets() {
+    using Target = feathercast::ui::CaptureShortcutTarget;
+    return {Target::ScreenshotFullscreen, Target::ScreenshotRegion,
+            Target::RecordFullscreen, Target::RecordRegion};
+  }
+
+  bool RegisterCaptureHotKeys() {
+    UnregisterCaptureHotKeys();
+    bool ready = true;
+    const auto specs = CaptureShortcutSpecs();
+    const auto ids = CaptureHotKeyIds();
+    for (std::size_t index = 0; index < specs.size(); ++index) {
+      const auto& spec = *specs[index];
+      if (spec.display.empty() || spec.display == L"none") continue;
+      if (IsExclusiveWinShortcut(spec)) {
+        ready = InstallHook() && ready;
+        continue;
+      }
+      const auto hotKey = ToHotKeySpec(spec);
+      if (!hotKey.supported) {
+        ready = InstallHook() && ready;
+        continue;
+      }
+      captureHotKeyRegistered_[index] =
+          hwnd_ && RegisterHotKey(hwnd_, ids[index], hotKey.modifiers,
+                                  hotKey.vk) != FALSE;
+      ready = ready && captureHotKeyRegistered_[index];
+    }
+    UpdateKeyboardHook();
+    return ready || hook_ != nullptr;
+  }
+
+  void UnregisterCaptureHotKeys() {
+    const auto ids = CaptureHotKeyIds();
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+      if (captureHotKeyRegistered_[index] && hwnd_) {
+        UnregisterHotKey(hwnd_, ids[index]);
+      }
+      captureHotKeyRegistered_[index] = false;
+      captureShortcutRuntimes_[index] = ShortcutRuntime{};
+    }
+  }
+
+  bool RegisterAllHotKeys() {
+    const bool launcherReady = RegisterShortcutHotKey();
+    const bool captureReady = RegisterCaptureHotKeys();
+    return launcherReady && captureReady;
+  }
+
+  void UnregisterAllHotKeys() {
+    UnregisterShortcutHotKey();
+    UnregisterCaptureHotKeys();
+  }
+
+  std::optional<feathercast::ui::CaptureShortcutTarget>
+  CaptureTargetForHotKey(int id) const {
+    const auto ids = CaptureHotKeyIds();
+    const auto targets = CaptureHotKeyTargets();
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+      if (ids[index] == id) return targets[index];
+    }
+    return std::nullopt;
+  }
+
+  bool CaptureShortcutDuplicate(const std::wstring& candidate,
+                                int ignoredIndex = -1) const {
+    if (candidate.empty() || candidate == L"none") return false;
+    if (settings_.shortcut == candidate) return true;
+    const std::array values = {
+        settings_.screenshotFullscreenShortcut,
+        settings_.screenshotRegionShortcut,
+        settings_.recordFullscreenShortcut,
+        settings_.recordRegionShortcut};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      if (static_cast<int>(index) != ignoredIndex &&
+          values[index] == candidate) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::wstring& CaptureShortcutSetting(std::size_t index) {
+    switch (index) {
+      case 0: return settings_.screenshotFullscreenShortcut;
+      case 1: return settings_.screenshotRegionShortcut;
+      case 2: return settings_.recordFullscreenShortcut;
+      default: return settings_.recordRegionShortcut;
+    }
+  }
+
+  ShortcutSpec& CaptureShortcutSpec(std::size_t index) {
+    return *CaptureShortcutSpecs()[index];
+  }
+
+  bool AssignCaptureShortcut(std::size_t index,
+                             const std::wstring& shortcutText) {
+    if (index >= CaptureShortcutSpecs().size()) return false;
+    const ShortcutSpec candidate = ParseShortcut(shortcutText);
+    if (CaptureShortcutDuplicate(candidate.display,
+                                 static_cast<int>(index))) {
+      MessageBoxW(settingsHwnd_,
+                  L"That shortcut is already assigned to another FeatherCast action.",
+                  L"FeatherCast Shortcut", MB_OK | MB_ICONWARNING);
+      return false;
+    }
+
+    const std::wstring previousText = CaptureShortcutSetting(index);
+    const ShortcutSpec previousSpec = CaptureShortcutSpec(index);
+    UnregisterCaptureHotKeys();
+    if (!CanActivateShortcut(candidate)) {
+      RegisterCaptureHotKeys();
+      MessageBoxW(
+          settingsHwnd_,
+          L"That shortcut is already reserved by Windows or another application.",
+          L"FeatherCast Shortcut", MB_OK | MB_ICONWARNING);
+      return false;
+    }
+
+    CaptureShortcutSetting(index) = candidate.display;
+    CaptureShortcutSpec(index) = candidate;
+    if (!RegisterCaptureHotKeys()) {
+      CaptureShortcutSetting(index) = previousText;
+      CaptureShortcutSpec(index) = previousSpec;
+      RegisterCaptureHotKeys();
+      MessageBoxW(settingsHwnd_,
+                  L"FeatherCast could not activate that shortcut. The previous shortcut was restored.",
+                  L"FeatherCast Shortcut", MB_OK | MB_ICONWARNING);
+      return false;
+    }
+    PersistSettings();
+    return true;
+  }
+
+  void ClearCaptureShortcut(std::size_t index) {
+    if (index >= CaptureShortcutSpecs().size()) return;
+    CaptureShortcutSetting(index) = L"none";
+    CaptureShortcutSpec(index) = ParseShortcut(L"none");
+    RegisterCaptureHotKeys();
+    PersistSettings();
+  }
+
   LRESULT HandleRecordingKey(UINT vk, bool down, bool up) {
     const auto result = shortcutRecorder_.Handle(vk, down, up);
     if (result.canceled) {
@@ -3345,10 +4489,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           settingsState_);
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
     } else if (result.done) {
-      feathercast::ui::SettingsController::SetPendingShortcut(
-          settingsState_, result.shortcut);
+      if (recordingCaptureShortcut_ >= 0) {
+        const int target = recordingCaptureShortcut_;
+        feathercast::ui::SettingsController::CancelShortcutRecording(
+            settingsState_);
+        AssignCaptureShortcut(static_cast<std::size_t>(target),
+                              result.shortcut);
+      } else {
+        feathercast::ui::SettingsController::SetPendingShortcut(
+            settingsState_, result.shortcut);
+      }
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
     }
+    UpdateKeyboardHook();
     return result.consume ? 1 : 0;
   }
 
@@ -3362,7 +4515,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const size_t limit = ClipboardHistoryLimit();
     {
       std::lock_guard lock(dataMutex_);
-      if (clipboardHistory_.size() > limit) clipboardHistory_.resize(limit);
+      std::size_t unpinned = 0;
+      std::erase_if(clipboardHistory_, [&](const auto& item) { return !item.pinned && ++unpinned > limit; });
     }
     if (!persistence_.PruneClipboard(limit)) {
       ReportPersistenceFailure(L"The persistence worker is unavailable.");
@@ -3441,6 +4595,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         item.text = entry.text;
         item.preview = entry.preview;
         item.capturedAt = entry.capturedAt;
+        item.pinned = entry.pinned;
         clipboardHistory_.push_back(std::move(item));
         clipboardSerial_ = std::max<unsigned long long>(
             clipboardSerial_, static_cast<unsigned long long>(entry.id));
@@ -3588,6 +4743,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   std::optional<DiscoveryResult> PerformDiscovery(
       const DiscoveryRequest& request, std::stop_token stopToken) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ScopeExit uninitialize([] { CoUninitialize(); });
     auto apps = DiscoverApps(stopToken, request.generation);
@@ -4183,6 +5339,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::vector<DisplayItem> ActionsFor(const DisplayItem& target) const {
+    if (target.timerRequest) return feathercast::timers::Actions(timerState_, target.timerRequest->id);
+    if (!target.settingId.empty()) return {};
     return feathercast::commands::BuildActions(target, settings_);
   }
 
@@ -4236,6 +5394,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void RequestSearch() {
+    if (!visible_) return;
+    if (browseView_ == BrowseView::Timers || (actionMode_ && actionTarget_.timerRequest)) {
+      if (!timerDisplayArmed_) {
+        SetTimer(hwnd_, TIMER_CLOCK_DISPLAY, 1000, nullptr);
+        timerDisplayArmed_ = true;
+      }
+    } else {
+      KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+      timerDisplayArmed_ = false;
+    }
     overlayStatus_.reset();
     const auto requestedScope = feathercast::search_scope::Parse(query_).scope;
     if (settings_.fileIndexEnabled &&
@@ -4296,6 +5464,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     req.empty = empty;
     req.actionMode = actionMode_;
     req.browseView = browseView_;
+    if (browseView_ == BrowseView::Timers) req.timerItems = feathercast::timers::Items(timerState_, feathercast::timers::Now(), GetTickCount64());
     req.compactClear = settings_.compactMode && Trim(query_).empty() &&
                        view_ == View::Search &&
                        !actionMode_ && browseView_ == BrowseView::None;
@@ -4454,11 +5623,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     snap->searchItems = std::move(searchItems);
     snap->pool = std::move(pool);
+    snap->retainedBytes = feathercast::search::SnapshotBytes(*snap);
 
     return snap;
   }
 
   void ScheduleSnapshotBuild(uint64_t revision) {
+    if (!visible_) return;
     if (snapshotRevision_ == revision || snapshotScheduledRevision_ == revision) return;
     SnapshotBuildRequest request;
     request.revision = revision;
@@ -4471,7 +5642,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnSnapshotReady(SnapshotBuildResult result) {
-    if (!result.snapshot) return;
+    if (!result.snapshot || !visible_) return;
 
     const uint64_t currentRevision = dataRevision_.load(std::memory_order_acquire);
     if (result.revision != currentRevision) {
@@ -4562,6 +5733,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   // UI thread: commit a freshly computed result set to the rendered state.
   void ApplyResults(ResultsCollection result) {
+    if (!visible_) return;
     if (!searchPresentation_.Publish(result.generation)) return;
     const bool compactAtRest = settings_.compactMode && Trim(query_).empty() &&
                                browseView_ == BrowseView::None;
@@ -4664,7 +5836,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::core::SearchItem ToSearchItem(const DisplayItem& item,
                                              const Settings& searchSettings) const {
     feathercast::core::SearchItem out;
-    if (item.isCalculator) {
+    if (item.timerRequest || !item.settingId.empty()) {
+      out.id = item.Key();
+      out.name = item.commandName;
+      out.keywords = item.commandKeywords;
+    } else if (item.isCalculator) {
       out.id = item.Key();
       out.kind = L"calculator";
       out.source = L"calculator";
@@ -4793,27 +5969,54 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void UpdateBackgroundState() {
     const bool isForeground =
         visible_ || volumeVisible_ ||
-        (settingsHwnd_ && IsWindowVisible(settingsHwnd_));
+        (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) ||
+        (captureSelectorHwnd_ && IsWindowVisible(captureSelectorHwnd_)) ||
+        captureUiState_.phase != feathercast::ui::CapturePhase::Idle;
     if (isForeground) {
       EnterInteractiveScheduling();
+      if (!maintenanceStarted_ || discoveryResumePending_) {
+        maintenanceStarted_ = true;
+        discoveryResumePending_ = false;
+        StartAppDiscovery();
+      }
+      if (!backgroundInteractive_) {
+        StartCurrencyFetch();
+        StartAutomaticUpdateCheck();
+      }
+      backgroundInteractive_ = true;
     } else {
-      // File watchers and the indexing worker are only needed while the
-      // launcher is actively being used. Stop them with the overlay so a
-      // hidden launcher does not keep crawling user folders.
-      StopFileIndexService();
-      // Drop query-independent snapshots and decoded icon buffers while idle.
-      // They are rebuilt lazily on the next invocation and can otherwise keep
-      // hundreds of megabytes resident after a large discovery/index pass.
-      snapshot_.reset();
-      snapshotRevision_ = 0;
+      backgroundInteractive_ = false;
+      if (maintenanceStarted_ && !appsReady_.load(std::memory_order_acquire)) {
+        discoveryGeneration_ = discoveryService_.Cancel();
+        discoveryResumePending_ = true;
+      }
+      currencyService_.Cancel();
+      updateService_.Cancel();
+      fileIndexService_.Pause();
+      fileIndexConfigured_ = false;
+      ++fileIndexGeneration_;
+      ++fileIndexLoadGeneration_;
+      fileIndexLoadPending_ = false;
+      KillTimer(hwnd_, TIMER_FILE_SNAPSHOT);
+      snapshotCoordinator_.Invalidate();
+      extensions_.CancelQuery();
       snapshotScheduledRevision_ = 0;
-      ClearIconBitmaps();
+      if (snapshot_ && snapshot_->retainedBytes > 16u * 1024u * 1024u) {
+        snapshot_.reset();
+        snapshotRevision_ = 0;
+      }
       iconResolver_.ClearPending();
-      StopIconThreads();
-
+      pendingDecodedIcons_.clear();
+      pendingDecodedIconOrder_.clear();
+      pendingDecodedIconBytes_ = 0;
       {
         std::lock_guard lock(dataMutex_);
-        fileIndex_.clear();
+        if (!fileIndex_.empty()) {
+          std::vector<AppEntry>{}.swap(fileIndex_);
+          ++dataRevision_;
+          snapshot_.reset();
+          snapshotRevision_ = 0;
+        }
       }
       fileSearchService_.UpdateFiles({});
       fileIndexLoaded_ = false;
@@ -4830,12 +6033,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // Background work remains unobtrusive without forcing page faults,
       // re-decoding icons, or restarting plugin hosts on every reopen.
       EnterBackgroundScheduling();
-      SetTimer(hwnd_, TIMER_MEM_TRIM, 1000, nullptr);
+
     }
   }
 
   void EnterInteractiveScheduling() {
-    KillTimer(hwnd_, TIMER_MEM_TRIM);
+
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     MEMORY_PRIORITY_INFORMATION memPriority{};
@@ -4888,6 +6091,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void ExecuteSettingsEffects(feathercast::ui::UiEffects effects) {
+    UpdateKeyboardHook();
     using feathercast::ui::HasEffect;
     using feathercast::ui::UiEffect;
     if (HasEffect(effects, UiEffect::PersistSettings)) PersistSettings();
@@ -5169,6 +6373,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     animationFrameQueued_ = false;
     visualSelectedY_ = -1.0f;
     StopSelectionAnimationTimer();
+    KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+    timerDisplayArmed_ = false;
     KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
     previewOpen_ = false;
     ++previewGeneration_;
@@ -5415,7 +6621,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ToggleOverlay(
       std::optional<ForegroundSnapshot> foregroundSnapshot = std::nullopt) {
-    if (volumeVisible_) HideVolumeControl(true);
+    if (captureUiState_.phase ==
+            feathercast::ui::CapturePhase::SelectingScreenshot ||
+        captureUiState_.phase ==
+            feathercast::ui::CapturePhase::SelectingRecording) {
+      CancelCaptureSelection();
+      ShowOverlay(View::Search, std::move(foregroundSnapshot));
+    } else if (volumeVisible_) HideVolumeControl(true);
     else if (visible_ && overlayClosing_) {
       ShowOverlay(View::Search, std::move(foregroundSnapshot));
     } else if (visible_) {
@@ -5718,7 +6930,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void EnterActionMode(const DisplayItem& target) {
-    if (target.isCommand ||
+    if (!target.settingId.empty() || target.isCommand ||
         (target.isAction && target.action != ActionKind::ArrangeWindow) ||
         target.isExtension ||
         target.isRunCommand || target.isWebSearch || target.isCapability) {
@@ -5795,6 +7007,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   // Placeholder shown in the search box when the query is empty.
   std::wstring SearchPlaceholder() const {
+    if (browseView_ == BrowseView::Timers) return L"Search timers and stopwatch...";
     if (browseView_ == BrowseView::Clipboard) return L"Search clipboard history...";
     if (browseView_ == BrowseView::Emoji) return L"Search emoji...";
     if (browseView_ == BrowseView::Games) return L"Search installed games...";
@@ -8098,15 +9311,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
-    // Unified text start at +52px (was +50 for icon path) to eliminate horizontal jitter.
-    DrawTextBlock(item.Name(), {rowRect.left + 52, rowRect.top + 8, rowRect.right - 180, rowRect.top + 28}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
-    DrawTextBlock(SourceLabel(item), {rowRect.left + 52, rowRect.top + 29, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
-    if (selected && rowRect.right - rowRect.left > 520.0f) {
-      DrawTextBlock(ActionHint(item), {rowRect.right - 330, rowRect.top + 16, rowRect.right - 10, rowRect.bottom}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+    const bool showHint = selected && rowRect.right - rowRect.left > 520.0f;
+    const float titleRight = rowRect.right - (showHint ? 200.0f : 14.0f);
+    DrawTextBlock(item.Name(), {rowRect.left + 52, rowRect.top + 8, titleRight, rowRect.top + 28}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
+    DrawTextBlock(SourceLabel(item), {rowRect.left + 52, rowRect.top + 29, rowRect.right - 14, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
+    if (showHint) {
+      DrawTextBlock(ActionHint(item), {titleRight + 8, rowRect.top + 10, rowRect.right - 14, rowRect.top + 28}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
     }
   }
 
   std::wstring SourceLabel(const DisplayItem& item) const {
+    if (item.timerRequest || !item.settingId.empty()) return item.commandDetail;
     if (item.isCapability) {
       return item.capability.example.empty()
                  ? item.capability.summary
@@ -8117,7 +9332,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isWebSearch) return item.commandDetail;
     if (item.isExtension) return item.commandDetail;
     if (item.isSnippet) return L"Snippet - " + item.snippet.keyword;
-    if (item.isClipboard) return L"Clipboard History";
+    if (item.isClipboard) return item.clipboard.pinned ? L"Favorite - Clipboard History" : L"Clipboard History";
     if (item.isRunCommand) return item.commandDetail;
     if (item.isSymbol) return L"Symbol - paste";
     if (item.utility) return L"Local utility - " + item.utility->value;
@@ -8144,6 +9359,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::wstring ActionHint(const DisplayItem& item) const {
+    if (!item.settingId.empty()) return L"Enter Settings";
+    if (item.timerRequest) return item.timerRequest->action == feathercast::timers::Action::Invalid ? L"" : L"Enter Select";
     if (item.isCapability) {
       switch (item.capability.action.kind) {
         case CapabilityActionKind::SeedQuery: return L"Enter Try";
@@ -8162,7 +9379,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isCommand) return L"Enter Run";
     if (item.isAction) return L"Enter Apply";
     if (item.isWindow) return L"Enter Switch";
-    return L"Enter Open | Ctrl+Shift Admin | Ctrl+K Actions";
+    return L"Enter Open · Ctrl+K Actions";
   }
 
   static constexpr float kSettTop = 72.0f;
@@ -8171,7 +9388,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   static constexpr float kSettCategoryRow = 44.0f;
   static constexpr float kSettSection = 34.0f;
   static constexpr float kSettRow = 60.0f;
-  static constexpr float kSettShortcut = 98.0f;
+  static constexpr float kSettShortcut = 410.0f;
   static constexpr float kSettMaint = 58.0f;
   static constexpr float kSettBottom = 22.0f;
   static constexpr float kSettStatus = 52.0f;
@@ -8247,6 +9464,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     context.hasPendingShortcut = !pendingShortcut_.empty();
     context.hasExistingShortcut =
         !settings_.shortcut.empty() && settings_.shortcut != L"none";
+    context.hasScreenshotFullscreenShortcut =
+        !settings_.screenshotFullscreenShortcut.empty() &&
+        settings_.screenshotFullscreenShortcut != L"none";
+    context.hasScreenshotRegionShortcut =
+        !settings_.screenshotRegionShortcut.empty() &&
+        settings_.screenshotRegionShortcut != L"none";
+    context.hasRecordFullscreenShortcut =
+        !settings_.recordFullscreenShortcut.empty() &&
+        settings_.recordFullscreenShortcut != L"none";
+    context.hasRecordRegionShortcut =
+        !settings_.recordRegionShortcut.empty() &&
+        settings_.recordRegionShortcut != L"none";
     context.clipboardEnabled = settings_.clipboardHistoryEnabled;
     context.fileIndexEnabled = settings_.fileIndexEnabled;
     context.storageIdle = !pendingStorageOperation_.has_value();
@@ -8308,6 +9537,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     auto controls = feathercast::settings_catalog::FocusOrder(
         settingsCategory_, SettingsCatalogContext());
     order.insert(order.end(), controls.begin(), controls.end());
+    if (settingsState_.searchTarget && std::find(order.begin(), order.end(), *settingsState_.searchTarget) == order.end()) {
+      order.push_back(*settingsState_.searchTarget);
+    }
     order.push_back(HitType::CloseSettings);
     return order;
   }
@@ -8642,6 +9874,57 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           hits_.push_back({clearBtn, HitType::ClearShortcut});
           DrawTextBlock(L"Clear", clearBtn, centerFormat_.Get(),
                         D2DColor(theme_.danger));
+        }
+        y += 108.0f;
+        y = DrawSettingsSection(y, L"CAPTURE SHORTCUTS", contentLeft,
+                                contentRight);
+        struct CaptureShortcutRow {
+          const wchar_t* label;
+          const std::wstring* value;
+          HitType record;
+          HitType clear;
+        };
+        const std::array<CaptureShortcutRow, 4> captureRows{{
+            {L"Fullscreen screenshot", &settings_.screenshotFullscreenShortcut,
+             HitType::RecordScreenshotFullscreenShortcut,
+             HitType::ClearScreenshotFullscreenShortcut},
+            {L"Region screenshot", &settings_.screenshotRegionShortcut,
+             HitType::RecordScreenshotRegionShortcut,
+             HitType::ClearScreenshotRegionShortcut},
+            {L"Fullscreen recording", &settings_.recordFullscreenShortcut,
+             HitType::RecordFullscreenShortcut,
+             HitType::ClearFullscreenShortcut},
+            {L"Region recording", &settings_.recordRegionShortcut,
+             HitType::RecordRegionShortcut, HitType::ClearRegionShortcut},
+        }};
+        for (std::size_t index = 0; index < captureRows.size(); ++index) {
+          const auto& row = captureRows[index];
+          const bool assigned =
+              !row.value->empty() && *row.value != L"none";
+          DrawTextBlock(row.label,
+                        {contentLeft, y + 6.0f, contentRight - 204.0f,
+                         y + 27.0f},
+                        labelFormat_.Get(), SettWhite());
+          DrawTextBlock(assigned ? *row.value : L"None",
+                        {contentLeft, y + 29.0f, contentRight - 204.0f,
+                         y + 49.0f},
+                        bodyFormat_.Get(), SettGray());
+          const RectF recordButton{contentRight - 196.0f, y + 8.0f,
+                                   contentRight - 76.0f, y + 46.0f};
+          const RectF clearButton{contentRight - 68.0f, y + 8.0f,
+                                  contentRight, y + 46.0f};
+          const bool isRecording =
+              recording_ &&
+              recordingCaptureShortcut_ == static_cast<int>(index);
+          DrawSettingsButton(recordButton,
+                             isRecording
+                                 ? L"Press a key..."
+                                 : (assigned ? L"Change" : L"Record"),
+                             row.record);
+          if (assigned) {
+            DrawSettingsButton(clearButton, L"Clear", row.clear);
+          }
+          y += 66.0f;
         }
         break;
       }
@@ -9047,8 +10330,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void StartIconWorkers() {
-    const unsigned hw = std::thread::hardware_concurrency();
-    const size_t workers = std::min<size_t>(3, std::max<unsigned>(2, hw / 2));
+    const size_t workers = 1;
     iconResolver_.Start(workers, [this](const std::wstring& key,
                                        std::stop_token stopToken) {
       if (stopThreads_ || stopToken.stop_requested()) {
@@ -9583,10 +10865,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     settingsFocusIndex_ = SettingsCategoryIndex(category);
     if (category == SettingsCategory::Privacy && settings_.fileIndexEnabled) {
       EnsureFileIndexLoaded();
-      if (!fileIndexConfigured_) ConfigureFileIndex();
     }
     if (wasRecording) {
       shortcutRecorder_.Reset();
+      UpdateKeyboardHook();
     }
     if (changed) {
       settingsPageProgress_.Snap(0.0);
@@ -9994,9 +11276,40 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OpenLibraryManager(feathercast::library::ItemKind::Quicklink);
         break;
       case HitType::RecordShortcut:
+        recordingCaptureShortcut_ = -1;
         shortcutRecorder_.Reset();
         feathercast::ui::SettingsController::BeginShortcutRecording(
             settingsState_);
+        break;
+      case HitType::RecordScreenshotFullscreenShortcut:
+      case HitType::RecordScreenshotRegionShortcut:
+      case HitType::RecordFullscreenShortcut:
+      case HitType::RecordRegionShortcut: {
+        if (type == HitType::RecordScreenshotFullscreenShortcut) {
+          recordingCaptureShortcut_ = 0;
+        } else if (type == HitType::RecordScreenshotRegionShortcut) {
+          recordingCaptureShortcut_ = 1;
+        } else if (type == HitType::RecordFullscreenShortcut) {
+          recordingCaptureShortcut_ = 2;
+        } else {
+          recordingCaptureShortcut_ = 3;
+        }
+        shortcutRecorder_.Reset();
+        feathercast::ui::SettingsController::BeginShortcutRecording(
+            settingsState_);
+        break;
+      }
+      case HitType::ClearScreenshotFullscreenShortcut:
+        ClearCaptureShortcut(0);
+        break;
+      case HitType::ClearScreenshotRegionShortcut:
+        ClearCaptureShortcut(1);
+        break;
+      case HitType::ClearFullscreenShortcut:
+        ClearCaptureShortcut(2);
+        break;
+      case HitType::ClearRegionShortcut:
+        ClearCaptureShortcut(3);
         break;
       case HitType::SaveShortcut:
         if (!pendingShortcut_.empty()) {
@@ -10005,6 +11318,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             break;
           }
           const ShortcutSpec candidate = ParseShortcut(pendingShortcut_);
+          if (CaptureShortcutDuplicate(candidate.display)) {
+            MessageBoxW(
+                settingsHwnd_,
+                L"That shortcut is already assigned to a FeatherCast capture action.",
+                L"FeatherCast Shortcut", MB_OK | MB_ICONWARNING);
+            break;
+          }
           if (!CanActivateShortcut(candidate)) {
             MessageBoxW(
                 settingsHwnd_,
@@ -10316,6 +11636,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       default:
         break;
     }
+    UpdateKeyboardHook();
     InvalidateRect(settingsHwnd_, nullptr, FALSE);
   }
 
@@ -10547,6 +11868,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void Activate(DisplayItem item, bool asAdmin) {
+    if (item.timerRequest) {
+      ExecuteTimerItem(item);
+      return;
+    }
+    if (!item.settingId.empty()) {
+      for (const auto& descriptor : feathercast::settings_catalog::Catalog()) {
+        if (descriptor.stableId != item.settingId) continue;
+        SelectSettingsCategory(descriptor.category);
+        OpenSettings();
+        settingsState_.searchTarget = descriptor.hit;
+        const auto order = SettingsFocusOrder();
+        const auto found = std::find(order.begin(), order.end(), descriptor.hit);
+        if (found != order.end()) settingsFocusIndex_ = static_cast<int>(found - order.begin());
+        if (!SettingsControlEnabled(descriptor.hit)) SetSettingsStatus(StatusSeverity::Info, std::wstring(descriptor.label) + L" is currently unavailable. Enable the related feature first.");
+        RedrawWindow(settingsHwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        EnsureSettingsFocusVisible();
+        InvalidateRect(settingsHwnd_, nullptr, FALSE);
+        NotifyWinEvent(EVENT_OBJECT_FOCUS, settingsHwnd_, OBJID_CLIENT, settingsFocusIndex_ + 1);
+        break;
+      }
+      return;
+    }
     DebugLaunchLog(L"Activate: isSnippet=" + std::to_wstring(item.isSnippet) +
                    L" isClipboard=" + std::to_wstring(item.isClipboard) +
                    L" isSymbol=" + std::to_wstring(item.isSymbol) +
@@ -10746,7 +12089,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void ClearClipboardHistoryData() {
     const int choice = MessageBoxW(
         settingsHwnd_ ? settingsHwnd_ : hwnd_,
-        L"Delete all currently stored clipboard history?\n\n"
+        L"Delete all currently stored clipboard history, including favorites?\n\n"
         L"Clipboard History will remain enabled and may collect new entries.",
         L"FeatherCast Privacy",
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
@@ -10850,6 +12193,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     switch (command) {
+      case CommandKind::Timers:
+        EnterBrowseView(BrowseView::Timers);
+        return;
       case CommandKind::ClipboardHistory:
         if (!settings_.clipboardHistoryEnabled) {
           OpenSettings();
@@ -11029,6 +12375,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                            L"Could not show the desktop.");
         }
         return;
+      case CommandKind::ScreenshotFullscreen:
+        BeginCapture(
+            feathercast::ui::CaptureShortcutTarget::ScreenshotFullscreen);
+        return;
+      case CommandKind::ScreenshotRegion:
+        BeginCapture(
+            feathercast::ui::CaptureShortcutTarget::ScreenshotRegion);
+        return;
+      case CommandKind::RecordFullscreen:
+        BeginCapture(
+            feathercast::ui::CaptureShortcutTarget::RecordFullscreen);
+        return;
+      case CommandKind::RecordRegion:
+        BeginCapture(feathercast::ui::CaptureShortcutTarget::RecordRegion);
+        return;
       case CommandKind::GenerateUuid:
         if (const auto uuid = GenerateUuidText();
             uuid && CopyTextToClipboard(*uuid)) {
@@ -11169,6 +12530,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
+    if (const auto* clipboard = std::get_if<ClipboardEntry>(&item.actionTarget)) {
+      if (item.action == ActionKind::PinClipboard || item.action == ActionKind::UnpinClipboard) {
+        const long long id = _wtoi64(clipboard->id.c_str());
+        if (!persistence_.PinClipboard(id, item.action == ActionKind::PinClipboard, ClipboardHistoryLimit())) {
+          SetOverlayStatus(StatusSeverity::Error, L"The clipboard favorite could not be saved.");
+        }
+        ExitActionMode();
+      }
+      return;
+    }
     const auto* appTarget = std::get_if<AppEntry>(&item.actionTarget);
     if (!appTarget) return;
     const AppEntry& app = *appTarget;
@@ -11286,20 +12657,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     const long long capturedAt = UnixNow();
     const std::wstring preview = SingleLinePreview(*text);
-    ClipboardEntry entry;
-    entry.id = std::to_wstring(++clipboardSerial_);
-    entry.text = *text;
-    entry.preview = preview;
-    entry.capturedAt = capturedAt;
-    {
-      std::lock_guard lock(dataMutex_);
-      clipboardHistory_.erase(
-          std::remove_if(clipboardHistory_.begin(), clipboardHistory_.end(),
-                         [&](const ClipboardEntry& existing) { return existing.text == entry.text; }),
-          clipboardHistory_.end());
-      clipboardHistory_.insert(clipboardHistory_.begin(), std::move(entry));
-      if (clipboardHistory_.size() > ClipboardHistoryLimit()) clipboardHistory_.resize(ClipboardHistoryLimit());
-    }
     const std::wstring storedText = *text;
     const size_t retention = ClipboardHistoryLimit();
     if (!persistence_.StoreClipboard(storedText, preview, capturedAt,
@@ -11553,6 +12910,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  feathercast::runtime::UiEventQueue<feathercast::capture::CaptureEvent>
+      captureEvents_;
+  feathercast::capture::CaptureService captureService_;
   feathercast::runtime::UiEventQueue<feathercast::persistence::Event>
       persistenceEvents_;
   feathercast::persistence::PersistenceService persistence_;
@@ -11576,11 +12936,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::runtime::UiEventQueue<NetworkEvent> networkEvents_;
   feathercast::runtime::CurrencyService<CurrencyRates> currencyService_;
   feathercast::runtime::UpdateService<UpdateTaskResult> updateService_;
+  feathercast::runtime::UiEventQueue<feathercast::timers::Due> timerEvents_;
+  feathercast::timers::TimerService timerService_;
+  feathercast::timers::State timerState_;
+  bool timersLoaded_ = false;
+  bool timerDisplayArmed_ = false;
+  std::uint64_t timerGeneration_ = 0;
   HINSTANCE instance_ = nullptr;
   std::wstring cmdLine_;
   HWND hwnd_ = nullptr;
   HWND settingsHwnd_ = nullptr;
   HWND volumeHwnd_ = nullptr;
+  HWND captureSelectorHwnd_ = nullptr;
+  HWND recordingControlHwnd_ = nullptr;
   NOTIFYICONDATAW tray_{};
   HHOOK hook_ = nullptr;
   bool hotKeyRegistered_ = false;
@@ -11599,6 +12967,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::wstring startupSettingsNotice_;
   std::optional<StatusMessage> settingsStatus_;
   ShortcutSpec shortcut_;
+  ShortcutSpec screenshotFullscreenShortcut_;
+  ShortcutSpec screenshotRegionShortcut_;
+  ShortcutSpec recordFullscreenShortcut_;
+  ShortcutSpec recordRegionShortcut_;
+  std::array<ShortcutRuntime, 4> captureShortcutRuntimes_;
+  std::array<bool, 4> captureHotKeyRegistered_{};
   std::optional<RestoreCandidate> overlayRestoreCandidate_;
   HWND volumeRestoreWindow_ = nullptr;
   bool visible_ = false;
@@ -11651,6 +13025,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   float visualSelectedY_ = -1.0f;
   bool animatingSelection_ = false;
   double selectionSettleSeconds_ = 0.090;
+  feathercast::ui::CaptureUiState captureUiState_;
+  feathercast::capture::PixelRect captureVirtualBounds_;
+  feathercast::capture::PixelRect activeCaptureBounds_;
   feathercast::ui::OverlayState overlayState_;
   View& view_ = overlayState_.view;
   HMONITOR overlayMonitor_ = nullptr;
@@ -11674,6 +13051,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::optional<std::wstring> resumeProductivityQuery_;
   feathercast::ui::SettingsState settingsState_;
   bool& recording_ = settingsState_.recordingShortcut;
+  int& recordingCaptureShortcut_ =
+      settingsState_.recordingCaptureShortcut;
   bool gearHovered_ = false;
   bool mouseTracking_ = false;
   bool ignoreMouseUntilMove_ = false;
@@ -11700,6 +13079,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::uint64_t fileIndexLoadGeneration_ = 0;
   bool fileIndexServiceStarted_ = false;
   bool fileIndexConfigured_ = false;
+  bool maintenanceStarted_ = false;
+  bool discoveryResumePending_ = false;
+  bool backgroundInteractive_ = false;
   bool fileIndexLoaded_ = false;
   bool fileIndexLoadPending_ = false;
   std::uint64_t previewGeneration_ = 0;
@@ -11767,6 +13149,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   GlassSurface overlaySurface_;
   GlassSurface settingsSurface_;
   GlassSurface volumeSurface_;
+  GlassSurface captureSelectorSurface_;
+  GlassSurface recordingControlSurface_;
   bool overlayBlurApplied_ = false;
   bool settingsBlurApplied_ = false;
   bool volumeBlurApplied_ = false;

@@ -72,6 +72,7 @@ void IconResolver::Start(std::size_t workers, Resolve resolve) {
   std::lock_guard lock(mutex_);
   if (!workers_.empty()) return;
   stopping_ = false;
+  operationStop_ = std::stop_source{};
   resolve_ = std::move(resolve);
   workers = std::max<std::size_t>(1, workers);
   workers_.reserve(workers);
@@ -86,6 +87,7 @@ void IconResolver::Stop() {
     std::lock_guard lock(mutex_);
     if (workers_.empty()) return;
     stopping_ = true;
+    operationStop_.request_stop();
     jobs_.clear();
     pending_.clear();
     for (auto& worker : workers_) worker.request_stop();
@@ -114,11 +116,14 @@ bool IconResolver::Queue(std::wstring key) {
 
 void IconResolver::ClearPending() {
   std::lock_guard lock(mutex_);
+  operationStop_.request_stop();
+  operationStop_ = std::stop_source{};
   jobs_.clear();
   pending_.clear();
 }
 
 void IconResolver::WorkerLoop(std::stop_token stopToken) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(coResult)) {
     if (failed_) {
@@ -133,6 +138,7 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
     std::wstring key;
     Resolve resolve;
     std::optional<DecodedIcon> decoded;
+    std::stop_token operationToken;
     {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] {
@@ -142,9 +148,10 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
       key = std::move(jobs_.front());
       jobs_.pop_front();
       resolve = resolve_;
+      operationToken = operationStop_.get_token();
     }
     try {
-      if (!stopToken.stop_requested()) decoded = resolve(key, stopToken);
+      if (!operationToken.stop_requested()) decoded = resolve(key, operationToken);
     } catch (...) {
       if (failed_) {
         try { failed_(std::current_exception()); } catch (...) {}
@@ -152,9 +159,9 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
     }
     {
       std::lock_guard lock(mutex_);
-      pending_.erase(key);
+      if (!operationToken.stop_requested()) pending_.erase(key);
     }
-    if (!stopToken.stop_requested() && decoded && completed_) {
+    if (!stopToken.stop_requested() && !operationToken.stop_requested() && decoded && completed_) {
       try { completed_(std::move(*decoded)); } catch (...) {
         if (failed_) {
           try { failed_(std::current_exception()); } catch (...) {}

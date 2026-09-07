@@ -4,6 +4,9 @@ namespace feathercast::ui {
 namespace {
 
 ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
+  if (id == L"timers") return ResultIcon::Clock;
+  if (id == L"setting-search") return ResultIcon::Gear;
+  if (id == L"clipboard-favorites") return ResultIcon::Clipboard;
   if (id == L"apps") return ResultIcon::AppGrid;
   if (id == L"games") return ResultIcon::Gamepad;
   if (id == L"windows") return ResultIcon::Windows;
@@ -30,6 +33,7 @@ ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
 ResultIcon CommandIcon(app::CommandKind kind) noexcept {
   using app::CommandKind;
   switch (kind) {
+    case CommandKind::Timers: return ResultIcon::Clock;
     case CommandKind::Settings: return ResultIcon::Gear;
     case CommandKind::Quit: return ResultIcon::Exit;
     case CommandKind::Restart:
@@ -63,6 +67,10 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
     case CommandKind::MediaPrevious: return ResultIcon::PreviousTrack;
     case CommandKind::ShowDesktop: return ResultIcon::Monitor;
     case CommandKind::GenerateUuid: return ResultIcon::Code;
+    case CommandKind::ScreenshotFullscreen:
+    case CommandKind::ScreenshotRegion: return ResultIcon::Copy;
+    case CommandKind::RecordFullscreen:
+    case CommandKind::RecordRegion: return ResultIcon::Monitor;
   }
   return ResultIcon::App;
 }
@@ -70,6 +78,8 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
 ResultIcon ActionIcon(app::ActionKind kind) noexcept {
   using app::ActionKind;
   switch (kind) {
+    case ActionKind::PinClipboard: return ResultIcon::Pin;
+    case ActionKind::UnpinClipboard: return ResultIcon::PinOff;
     case ActionKind::Open: return ResultIcon::ExternalLink;
     case ActionKind::Preview: return ResultIcon::Eye;
     case ActionKind::RunAsAdmin: return ResultIcon::Shield;
@@ -109,6 +119,8 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
 }  // namespace
 
 ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
+  if (item.timerRequest) return ResultIcon::Clock;
+  if (!item.settingId.empty()) return ResultIcon::Gear;
   if (item.isCapability) return CapabilityIcon(item.capability.stableId);
   if (item.isCommand) return CommandIcon(item.command);
   if (item.isAction) return ActionIcon(item.action);

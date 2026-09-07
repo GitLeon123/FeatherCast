@@ -8,6 +8,7 @@
 #include "search_scope.hpp"
 #include "snippets.hpp"
 #include "symbols.hpp"
+#include "timers.hpp"
 
 #include <windows.h>
 
@@ -64,6 +65,14 @@ enum class HitType {
   RecordShortcut,
   SaveShortcut,
   ClearShortcut,
+  RecordScreenshotFullscreenShortcut,
+  ClearScreenshotFullscreenShortcut,
+  RecordScreenshotRegionShortcut,
+  ClearScreenshotRegionShortcut,
+  RecordFullscreenShortcut,
+  ClearFullscreenShortcut,
+  RecordRegionShortcut,
+  ClearRegionShortcut,
   CompactToggle,
   AnimationLevel,
   AccentToggle,
@@ -134,6 +143,11 @@ enum class CommandKind {
   MediaPrevious,
   ShowDesktop,
   GenerateUuid,
+  ScreenshotFullscreen,
+  ScreenshotRegion,
+  RecordFullscreen,
+  RecordRegion,
+  Timers,
 };
 
 struct ConfirmationDialog {
@@ -172,6 +186,7 @@ enum class BrowseView {
   Emoji,
   Games,
   Capabilities,
+  Timers,
 };
 
 enum class CapabilityActionKind {
@@ -231,6 +246,8 @@ enum class ActionKind {
   Preview,
   CopyText,
   PasteText,
+  PinClipboard,
+  UnpinClipboard,
 };
 
 struct RectF {
@@ -303,6 +320,7 @@ struct ClipboardEntry {
   std::wstring text;
   std::wstring preview;
   long long capturedAt = 0;
+  bool pinned = false;
 };
 
 struct CurrencyRates {
@@ -330,9 +348,11 @@ struct TextActionPayload {
 };
 
 using ActionTarget =
-    std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload>;
+    std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload, ClipboardEntry>;
 
 struct DisplayItem {
+  std::optional<feathercast::timers::Request> timerRequest;
+  std::wstring settingId;
   bool isWindow = false;
   bool isCommand = false;
   bool isAction = false;
@@ -366,6 +386,8 @@ struct DisplayItem {
   std::wstring webSearchLabel;
 
   std::wstring Key() const {
+    if (timerRequest) return L"timer:" + std::to_wstring(timerRequest->id) + L":" + std::to_wstring(static_cast<int>(timerRequest->action));
+    if (!settingId.empty()) return L"setting:" + settingId;
     if (isCapability) return L"capability:" + capability.stableId;
     if (isCalculator) return L"calc:" + calculationExpression;
     if (isConversion) return L"conv:" + calculationExpression;
@@ -384,6 +406,7 @@ struct DisplayItem {
     }
     if (isAction) {
       std::wstring target;
+      if (const auto* clipboardTarget = std::get_if<ClipboardEntry>(&actionTarget)) target = clipboardTarget->id;
       if (const auto* windowTarget = std::get_if<WindowEntry>(&actionTarget)) {
         target = std::to_wstring(
             reinterpret_cast<std::uintptr_t>(windowTarget->hwnd));
@@ -404,6 +427,7 @@ struct DisplayItem {
   }
 
   std::wstring Name() const {
+    if (timerRequest || !settingId.empty()) return commandName;
     if (isCapability) return capability.title;
     if (isCalculator || isConversion) return calculationResult;
     if (isWebSearch) return webSearchLabel;
@@ -418,6 +442,7 @@ struct DisplayItem {
   }
 
   std::wstring IconKey() const {
+    if (timerRequest || !settingId.empty()) return L"";
     if (isCapability) return L"";
     if (isCalculator || isConversion || isWebSearch || isRunCommand ||
         isSymbol || utility) {
@@ -451,6 +476,7 @@ struct Section {
 };
 
 struct SearchSnapshot {
+  std::size_t retainedBytes = 0;
   std::vector<DisplayItem> pool;
   std::vector<feathercast::core::PreparedSearchItem> searchItems;
   std::vector<DisplayItem> pinned;
@@ -505,6 +531,7 @@ struct QueryRequest {
   std::shared_ptr<const SearchSnapshot> snapshot;
   std::vector<DisplayItem> extensionItems;
   std::vector<DisplayItem> actions;
+  std::vector<DisplayItem> timerItems;
   std::vector<feathercast::core::SearchItem> actionSearchItems;
 };
 

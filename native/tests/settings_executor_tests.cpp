@@ -22,6 +22,10 @@ int main() {
     const auto missing = settings::ParseSettingsDocument("");
     assert(missing.status == settings::ParseStatus::Missing);
     assert(missing.value.shortcut == L"Alt+Space");
+    assert(missing.value.screenshotFullscreenShortcut == L"none");
+    assert(missing.value.screenshotRegionShortcut == L"none");
+    assert(missing.value.recordFullscreenShortcut == L"none");
+    assert(missing.value.recordRegionShortcut == L"none");
 
     const auto valid =
         settings::ParseSettingsDocument(R"({"shortcut":"Ctrl+Space","maxResults":42})");
@@ -40,6 +44,23 @@ int main() {
         R"({"schemaVersion":2,"fileContentIndexEnabled":true})");
     assert(current.status == settings::ParseStatus::Valid);
     assert(current.value.fileContentIndexEnabled);
+    assert(current.value.screenshotFullscreenShortcut == L"none");
+
+    const auto captureShortcuts = settings::ParseSettingsDocument(
+        R"({"schemaVersion":2,"screenshotFullscreenShortcut":"Ctrl+Shift+1","screenshotRegionShortcut":"Ctrl+Shift+2","recordFullscreenShortcut":"Ctrl+Shift+3","recordRegionShortcut":"Ctrl+Shift+4"})");
+    assert(captureShortcuts.status == settings::ParseStatus::Valid);
+    assert(captureShortcuts.value.screenshotFullscreenShortcut ==
+           L"Ctrl+Shift+1");
+    assert(captureShortcuts.value.screenshotRegionShortcut == L"Ctrl+Shift+2");
+    assert(captureShortcuts.value.recordFullscreenShortcut == L"Ctrl+Shift+3");
+    assert(captureShortcuts.value.recordRegionShortcut == L"Ctrl+Shift+4");
+    const auto captureRoundTrip = settings::ParseSettingsDocument(
+        settings::SerializeSettings(captureShortcuts.value));
+    assert(captureRoundTrip.value.screenshotFullscreenShortcut ==
+           L"Ctrl+Shift+1");
+    assert(captureRoundTrip.value.screenshotRegionShortcut == L"Ctrl+Shift+2");
+    assert(captureRoundTrip.value.recordFullscreenShortcut == L"Ctrl+Shift+3");
+    assert(captureRoundTrip.value.recordRegionShortcut == L"Ctrl+Shift+4");
 
     const auto future = settings::ParseSettingsDocument(
         R"({"schemaVersion":3,"shortcut":"DoNotLoad"})");
@@ -66,6 +87,14 @@ int main() {
     assert(settings::ParseSettings(R"({"shortcut":)").shortcut == L"Alt+Space");
     const auto serialized = settings::SerializeSettings(settings::Settings{});
     assert(serialized.find("\"schemaVersion\": 2") != std::string::npos);
+    assert(serialized.find("\"screenshotFullscreenShortcut\": \"none\"") !=
+           std::string::npos);
+    assert(serialized.find("\"screenshotRegionShortcut\": \"none\"") !=
+           std::string::npos);
+    assert(serialized.find("\"recordFullscreenShortcut\": \"none\"") !=
+           std::string::npos);
+    assert(serialized.find("\"recordRegionShortcut\": \"none\"") !=
+           std::string::npos);
   }
 
   {

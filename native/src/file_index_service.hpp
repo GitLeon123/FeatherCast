@@ -56,6 +56,7 @@ class FileIndexService {
 
   void Start();
   void Stop();
+  void Pause();
   bool Reconfigure(IndexRequest request);
   bool Rebuild();
   bool IsCurrent(std::uint64_t generation) const;
@@ -78,6 +79,7 @@ class FileIndexService {
   std::mutex watchersMutex_;
   std::atomic<std::uint64_t> currentGeneration_ = 0;
   bool stopping_ = false;
+  std::atomic<bool> paused_ = false;
   bool rebuildPending_ = false;
   bool restartWatchersPending_ = false;
   std::chrono::steady_clock::time_point rebuildAfter_{};

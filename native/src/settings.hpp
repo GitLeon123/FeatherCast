@@ -105,6 +105,10 @@ struct PrivacySettings {
 
 struct Settings {
   std::wstring shortcut = L"Alt+Space";
+  std::wstring screenshotFullscreenShortcut = L"none";
+  std::wstring screenshotRegionShortcut = L"none";
+  std::wstring recordFullscreenShortcut = L"none";
+  std::wstring recordRegionShortcut = L"none";
   std::vector<std::wstring> recentApps;
   std::vector<std::wstring> pinnedApps;
   std::vector<std::wstring> hiddenApps;
@@ -309,6 +313,13 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   if (!root || root->type != Value::Type::Object) return settings;
 
   ReadString(*root, "shortcut", settings.shortcut);
+  ReadString(*root, "screenshotFullscreenShortcut",
+             settings.screenshotFullscreenShortcut);
+  ReadString(*root, "screenshotRegionShortcut",
+             settings.screenshotRegionShortcut);
+  ReadString(*root, "recordFullscreenShortcut",
+             settings.recordFullscreenShortcut);
+  ReadString(*root, "recordRegionShortcut", settings.recordRegionShortcut);
   settings.recentApps = ReadStringArray(*root, "recentApps");
   settings.pinnedApps = ReadStringArray(*root, "pinnedApps");
   settings.hiddenApps = ReadStringArray(*root, "hiddenApps");
@@ -437,6 +448,14 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "{\n";
   out << "  \"schemaVersion\": " << kCurrentSettingsSchemaVersion << ",\n";
   out << "  \"shortcut\": \"" << JsonEscape(settings.shortcut) << "\",\n";
+  out << "  \"screenshotFullscreenShortcut\": \""
+      << JsonEscape(settings.screenshotFullscreenShortcut) << "\",\n";
+  out << "  \"screenshotRegionShortcut\": \""
+      << JsonEscape(settings.screenshotRegionShortcut) << "\",\n";
+  out << "  \"recordFullscreenShortcut\": \""
+      << JsonEscape(settings.recordFullscreenShortcut) << "\",\n";
+  out << "  \"recordRegionShortcut\": \""
+      << JsonEscape(settings.recordRegionShortcut) << "\",\n";
   out << "  \"recentApps\": ";
   detail::WriteStringArray(out, settings.recentApps);
   out << ",\n";

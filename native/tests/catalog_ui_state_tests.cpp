@@ -42,6 +42,18 @@ int main() {
     assert(std::find(discover->keywords.begin(), discover->keywords.end(),
                      keyword) != discover->keywords.end());
   }
+  for (const auto& [kind, stableId] : {
+           std::pair{feathercast::app::CommandKind::ScreenshotFullscreen,
+                     std::wstring_view{L"screenshot-fullscreen"}},
+           std::pair{feathercast::app::CommandKind::ScreenshotRegion,
+                     std::wstring_view{L"screenshot-region"}},
+           std::pair{feathercast::app::CommandKind::RecordFullscreen,
+                     std::wstring_view{L"record-fullscreen"}},
+           std::pair{feathercast::app::CommandKind::RecordRegion,
+                     std::wstring_view{L"record-region"}}}) {
+    const auto* descriptor = feathercast::commands::Find(kind);
+    assert(descriptor && descriptor->stableId == stableId);
+  }
 
   const auto capabilityMatches =
       feathercast::capabilities::Search(L"math expression");
@@ -64,6 +76,9 @@ int main() {
          ResultIcon::Gamepad);
 
   const std::array capabilityIcons{
+      std::pair{L"timers", ResultIcon::Clock},
+      std::pair{L"setting-search", ResultIcon::Gear},
+      std::pair{L"clipboard-favorites", ResultIcon::Clipboard},
       std::pair{L"apps", ResultIcon::AppGrid},
       std::pair{L"games", ResultIcon::Gamepad},
       std::pair{L"windows", ResultIcon::Windows},
@@ -132,6 +147,11 @@ int main() {
       std::pair{CommandKind::MediaPrevious, ResultIcon::PreviousTrack},
       std::pair{CommandKind::ShowDesktop, ResultIcon::Monitor},
       std::pair{CommandKind::GenerateUuid, ResultIcon::Code},
+      std::pair{CommandKind::ScreenshotFullscreen, ResultIcon::Copy},
+      std::pair{CommandKind::ScreenshotRegion, ResultIcon::Copy},
+      std::pair{CommandKind::RecordFullscreen, ResultIcon::Monitor},
+      std::pair{CommandKind::RecordRegion, ResultIcon::Monitor},
+      std::pair{CommandKind::Timers, ResultIcon::Clock},
   };
   assert(commandIcons.size() == feathercast::commands::Catalog().size());
   for (const auto& [kind, expected] : commandIcons) {
@@ -216,6 +236,36 @@ int main() {
   assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::App);
 
   feathercast::settings_catalog::CatalogContext context;
+  for (const auto& [hit, requirement] : {
+           std::pair{
+               feathercast::app::HitType::ClearScreenshotFullscreenShortcut,
+               feathercast::settings_catalog::Requirement::
+                   ExistingScreenshotFullscreenShortcut},
+           std::pair{
+               feathercast::app::HitType::ClearScreenshotRegionShortcut,
+               feathercast::settings_catalog::Requirement::
+                   ExistingScreenshotRegionShortcut},
+           std::pair{
+               feathercast::app::HitType::ClearFullscreenShortcut,
+               feathercast::settings_catalog::Requirement::
+                   ExistingRecordFullscreenShortcut},
+           std::pair{
+               feathercast::app::HitType::ClearRegionShortcut,
+               feathercast::settings_catalog::Requirement::
+                   ExistingRecordRegionShortcut}}) {
+    const auto* descriptor = feathercast::settings_catalog::Find(hit);
+    assert(descriptor && descriptor->requirement == requirement);
+    assert(!feathercast::settings_catalog::Enabled(*descriptor, context));
+  }
+  context.hasScreenshotFullscreenShortcut = true;
+  assert(feathercast::settings_catalog::Enabled(
+      *feathercast::settings_catalog::Find(
+          feathercast::app::HitType::ClearScreenshotFullscreenShortcut),
+      context));
+  assert(!feathercast::settings_catalog::Enabled(
+      *feathercast::settings_catalog::Find(
+          feathercast::app::HitType::ClearScreenshotRegionShortcut),
+      context));
   context.clipboardEnabled = false;
   auto privacy = feathercast::settings_catalog::FocusOrder(
       feathercast::app::SettingsCategory::Privacy, context);

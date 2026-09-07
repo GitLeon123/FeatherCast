@@ -125,6 +125,12 @@ void SnapshotCoordinator::Stop() {
   stopping_ = false;
 }
 
+void SnapshotCoordinator::Invalidate() {
+  std::lock_guard lock(mutex_);
+  ++latestRevision_;
+  pending_.reset();
+}
+
 bool SnapshotCoordinator::UpdateCorpus(app::SnapshotBuildRequest request) {
   latestRevision_.store(request.revision, std::memory_order_release);
   {

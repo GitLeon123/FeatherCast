@@ -1,5 +1,15 @@
 # Manual Regression Checklist
 
+For the 0.9.0 candidate's measured results and remaining publication checks, see
+[release-0.9.0.md](release-0.9.0.md).
+
+- Verify `timer 2s Tea` and multiple simultaneous timers notify without taking focus.
+- Pause, resume, restart, and delete timers; restart FeatherCast and suspend/resume Windows.
+- Run and pause the stopwatch; confirm a normal exit preserves its elapsed time.
+- Pin clipboard entries, copy them again, exceed the unpinned limit, and unpin them.
+- Search `animations` and `clipboard history`; Enter must focus without changing the setting.
+- Repeatedly type, press Enter, and close/reopen while discovery and indexing are active.
+
 Run the checklist at 100%, 150%, and 200% display scaling, first keyboard-only
 and then with pointer input.
 
@@ -67,6 +77,9 @@ and then with pointer input.
 ## Settings and Persistence
 
 - Every settings category has the same focus order and controls.
+- The four capture shortcuts start unassigned, record/change and clear with
+  keyboard or pointer input, reject duplicates (including the launcher
+  shortcut), and persist across restart without changing the launcher shortcut.
 - Saving, success, and error banners use the permanently reserved 52-DIP area;
   content position, scroll, hit regions, and keyboard focus do not jump.
 - Shortcut recording, accent selection, quicklinks, folder selection, and all
@@ -93,6 +106,36 @@ and then with pointer input.
   Invalid or externally changed snippets.json is never overwritten.
 - Extensions lists each plugin's version and Available, Degraded, or
   Unavailable state, including the latest failure reason when present.
+
+## Screen Capture
+
+- Full-screen capture targets the monitor under the pointer. Full-screen and
+  region screenshots save valid PNGs at 100%, 150%, and 200% scaling, including
+  negative-origin and mixed-DPI displays.
+- Region selection works in every drag direction and across monitors. The
+  saved image has the selected physical-pixel dimensions, with uncovered gaps
+  in irregular monitor layouts rendered black.
+- Screenshots save under `Pictures\FeatherCast`, copy successfully into
+  another app, and use collision suffixes without replacing an existing file.
+  A clipboard failure retains the saved PNG and reports the warning.
+- Full-screen and cross-monitor region recordings play in Windows Media Player
+  as silent H.264 MP4 files with the pointer visible. Odd capture dimensions
+  retain every selected pixel through even-size edge padding.
+- Multiple Pause/Resume cycles remove paused duration and preserve monotonic,
+  gap-free playback. Stop enters a disabled Saving state and produces the final
+  file once.
+- The top recording bar supports pointer, Tab, Shift+Tab, Enter, and Space,
+  exposes correct accessibility names and focus in Narrator and High Contrast,
+  and remains visible live while absent from every recorded frame without
+  leaving a black rectangle.
+- Starting another capture while selecting, recording, paused, or stopping is
+  rejected without disturbing the active operation. Escape and cancellation
+  paths never discard a recording.
+- Display disconnect or rotation, graphics-device loss, suspend, app quit,
+  unsupported Windows capture, encoder failure, and disk/finalization failure
+  stop or finalize exactly once, report the result, and return capture state to
+  idle. A failed finalization preserves and reports its partial file; restart
+  does not leave stale capture windows or workers.
 
 ## Discovery, Launch, and Updates
 

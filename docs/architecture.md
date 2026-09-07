@@ -24,6 +24,9 @@ may mutate live window state.
 - `PreviewService` reads bounded metadata/text/image payloads on demand and
   suppresses stale generations. WIC decoding produces CPU pixels; Direct2D
   bitmap creation remains on the UI thread.
+- `CaptureService` owns the native screenshot/recording worker: GDI/WIC writes
+  PNG screenshots, while Windows Graphics Capture and Media Foundation produce
+  silent H.264 MP4 recordings. It reports typed lifecycle events to the UI.
 - `SearchCoordinator` coalesces queries; `SnapshotCoordinator` prepares
   immutable corpus snapshots by revision. `search_pipeline::ComputeResults`
   is the pure query-to-sections engine shared by the app and headless tests.
@@ -45,6 +48,9 @@ may mutate live window state.
 `FeatherCastUi` owns UI-thread-only overlay/settings state and controllers. UI
 state transitions and descriptor projections are pure and unit tested. Direct2D
 resources are render-target-bound and must never be touched by runtime workers.
+The region selector and capture-excluded recording controls remain UI-thread
+windows; only physical-pixel bounds and typed capture requests cross to the
+worker.
 `FeatherCastApp` retains reference aliases for legacy rendering and routing code,
 but the referenced values live exclusively in `OverlayState` and
 `SettingsState`; new interaction state must be added to those production models.
@@ -92,7 +98,8 @@ window.
 - Settings JSON writes `"schemaVersion": 2`. A missing version is version 0.
   Files newer than the supported version are preserved and automatic saving is
   blocked.
-- SQLite schema v3 gives indexed files stable IDs and uses an FTS5
+- SQLite schema v4 adds clipboard pins and saved timer/stopwatch state, with a
+  transactional migration and a `.pre-v4.bak` backup. Schema v3 gives indexed files stable IDs and uses an FTS5
   `contentless_delete` table whose row IDs match file IDs. Migration creates a
   database backup because clipboard data shares the file. SQLite uses WAL,
   busy timeouts, integrity checks, and corrupt database quarantine. Clipboard

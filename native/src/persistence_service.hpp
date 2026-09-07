@@ -62,6 +62,16 @@ struct ClipboardPruned {
   storage::StorageError error;
 };
 
+struct TimersLoaded {
+  timers::State state;
+  storage::StorageError error;
+};
+struct TimersSaved {
+  bool succeeded = false;
+  std::vector<std::wstring> expiredNames;
+  storage::StorageError error;
+};
+
 struct StorageClearCompleted {
   app::StorageOperationKind kind =
       app::StorageOperationKind::ClearClipboard;
@@ -77,7 +87,7 @@ using Event =
     std::variant<SettingsSaveCompleted, FileIndexWriteCompleted,
                  FileIndexLoaded, FileIndexMerged,
                  ClipboardStored, ClipboardLoaded, ClipboardPruned,
-                 StorageClearCompleted, WorkerFailed>;
+                 StorageClearCompleted, WorkerFailed, TimersLoaded, TimersSaved>;
 
 class PersistenceService {
  public:
@@ -110,6 +120,9 @@ class PersistenceService {
   bool SaveSettingsAndWait(settings::Settings settings,
                            std::wstring* error = nullptr);
   bool PruneClipboard(std::size_t limit);
+  bool PinClipboard(long long id, bool pinned, std::size_t limit);
+  bool LoadTimers();
+  bool SaveTimers(timers::State state, std::vector<std::wstring> expiredNames = {});
   bool ReplaceFileIndex(std::vector<storage::FileIndexEntry> entries);
   bool UpdateFileIndex(std::vector<storage::FileIndexEntry> entries);
   bool MergeFileIndex(std::vector<storage::FileIndexEntry> entries,

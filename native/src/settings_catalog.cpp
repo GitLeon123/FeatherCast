@@ -41,6 +41,49 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"shortcut.clear", SettingsCategory::Shortcut, HitType::ClearShortcut,
        ControlKind::Action, L"Clear shortcut", L"Disable the global shortcut.",
        L"Clear global shortcut", Requirement::ExistingShortcut},
+      {L"shortcut.screenshot-fullscreen.record", SettingsCategory::Shortcut,
+       HitType::RecordScreenshotFullscreenShortcut, ControlKind::Action,
+       L"Record or change full screen screenshot shortcut",
+       L"Capture a shortcut for full screen screenshots.",
+       L"Record or change full screen screenshot shortcut"},
+      {L"shortcut.screenshot-fullscreen.clear", SettingsCategory::Shortcut,
+       HitType::ClearScreenshotFullscreenShortcut, ControlKind::Action,
+       L"Clear full screen screenshot shortcut",
+       L"Disable the full screen screenshot shortcut.",
+       L"Clear full screen screenshot shortcut",
+       Requirement::ExistingScreenshotFullscreenShortcut},
+      {L"shortcut.screenshot-region.record", SettingsCategory::Shortcut,
+       HitType::RecordScreenshotRegionShortcut, ControlKind::Action,
+       L"Record or change region screenshot shortcut",
+       L"Capture a shortcut for region screenshots.",
+       L"Record or change region screenshot shortcut"},
+      {L"shortcut.screenshot-region.clear", SettingsCategory::Shortcut,
+       HitType::ClearScreenshotRegionShortcut, ControlKind::Action,
+       L"Clear region screenshot shortcut",
+       L"Disable the region screenshot shortcut.",
+       L"Clear region screenshot shortcut",
+       Requirement::ExistingScreenshotRegionShortcut},
+      {L"shortcut.record-fullscreen.record", SettingsCategory::Shortcut,
+       HitType::RecordFullscreenShortcut, ControlKind::Action,
+       L"Record or change full screen recording shortcut",
+       L"Capture a shortcut for full screen recording.",
+       L"Record or change full screen recording shortcut"},
+      {L"shortcut.record-fullscreen.clear", SettingsCategory::Shortcut,
+       HitType::ClearFullscreenShortcut, ControlKind::Action,
+       L"Clear full screen recording shortcut",
+       L"Disable the full screen recording shortcut.",
+       L"Clear full screen recording shortcut",
+       Requirement::ExistingRecordFullscreenShortcut},
+      {L"shortcut.record-region.record", SettingsCategory::Shortcut,
+       HitType::RecordRegionShortcut, ControlKind::Action,
+       L"Record or change region recording shortcut",
+       L"Capture a shortcut for region recording.",
+       L"Record or change region recording shortcut"},
+      {L"shortcut.record-region.clear", SettingsCategory::Shortcut,
+       HitType::ClearRegionShortcut, ControlKind::Action,
+       L"Clear region recording shortcut",
+       L"Disable the region recording shortcut.",
+       L"Clear region recording shortcut", Requirement::ExistingRecordRegionShortcut},
       {L"general.startup", SettingsCategory::General, HitType::StartupToggle,
        ControlKind::Toggle, L"Start on Startup",
        L"Launch FeatherCast when you log into Windows.", L"Start on startup"},
@@ -187,6 +230,14 @@ bool Enabled(const SettingDescriptor& descriptor,
     case Requirement::PendingShortcut: return context.hasPendingShortcut;
     case Requirement::ExistingShortcut:
       return !context.hasPendingShortcut && context.hasExistingShortcut;
+    case Requirement::ExistingScreenshotFullscreenShortcut:
+      return context.hasScreenshotFullscreenShortcut;
+    case Requirement::ExistingScreenshotRegionShortcut:
+      return context.hasScreenshotRegionShortcut;
+    case Requirement::ExistingRecordFullscreenShortcut:
+      return context.hasRecordFullscreenShortcut;
+    case Requirement::ExistingRecordRegionShortcut:
+      return context.hasRecordRegionShortcut;
     case Requirement::ClipboardEnabled:
       return context.clipboardEnabled && context.storageIdle;
     case Requirement::FileIndexEnabled:

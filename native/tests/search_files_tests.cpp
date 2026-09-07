@@ -448,13 +448,13 @@ int main() {
 
     const auto futurePath = root / L"future.db";
     assert(sqlite3_open16(futurePath.c_str(), &database) == SQLITE_OK);
-    assert(sqlite3_exec(database, "PRAGMA user_version=4;", nullptr, nullptr,
+    assert(sqlite3_exec(database, "PRAGMA user_version=5;", nullptr, nullptr,
                         nullptr) == SQLITE_OK);
     sqlite3_close(database);
     feathercast::storage::Storage future;
     assert(!future.Open(futurePath));
     assert(sqlite3_open16(futurePath.c_str(), &database) == SQLITE_OK);
-    assert(Scalar(database, "PRAGMA user_version;") == 4);
+    assert(Scalar(database, "PRAGMA user_version;") == 5);
     sqlite3_close(database);
   }
 
@@ -471,7 +471,7 @@ int main() {
 
     sqlite3* database = nullptr;
     assert(sqlite3_open16(databasePath.c_str(), &database) == SQLITE_OK);
-    assert(Scalar(database, "PRAGMA user_version;") == 3);
+    assert(Scalar(database, "PRAGMA user_version;") == 4);
     const auto createSql = ScalarText(
         database,
         "SELECT sql FROM sqlite_master WHERE name='file_content_fts';");

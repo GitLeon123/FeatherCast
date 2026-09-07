@@ -63,6 +63,9 @@ bool HasAppKey(const std::vector<std::wstring>& values,
 
 const std::vector<CommandDescriptor>& Catalog() {
   static const std::vector<CommandDescriptor> commands = {
+      {L"timers", app::CommandKind::Timers, L"Timers & Stopwatch",
+       L"Manage saved timers and a stopwatch. Try: timer 10m Tea",
+       {L"timer", L"timers", L"countdown", L"stopwatch", L"alarm"}},
       {L"clipboard-history", app::CommandKind::ClipboardHistory,
        L"Clipboard History", L"Browse and paste copied items",
        {L"clipboard", L"history", L"paste", L"copy"}},
@@ -163,6 +166,18 @@ const std::vector<CommandDescriptor>& Catalog() {
       {L"generate-uuid", app::CommandKind::GenerateUuid, L"Generate UUID",
        L"Create and copy a new UUID v4",
        {L"uuid", L"guid", L"developer", L"random identifier"}},
+      {L"screenshot-fullscreen", app::CommandKind::ScreenshotFullscreen,
+       L"Take Fullscreen Screenshot", L"Capture the display under the cursor",
+       {L"screenshot", L"screen capture", L"monitor", L"fullscreen"}},
+      {L"screenshot-region", app::CommandKind::ScreenshotRegion,
+       L"Take Region Screenshot", L"Select and capture part of the screen",
+       {L"screenshot", L"screen capture", L"selection", L"region"}},
+      {L"record-fullscreen", app::CommandKind::RecordFullscreen,
+       L"Record Full Screen", L"Record the display under the cursor",
+       {L"record", L"screen recording", L"video", L"monitor", L"fullscreen"}},
+      {L"record-region", app::CommandKind::RecordRegion,
+       L"Record Screen Region", L"Select and record part of the screen",
+       {L"record", L"screen recording", L"video", L"selection", L"region"}},
   };
   return commands;
 }
@@ -261,6 +276,13 @@ std::vector<app::DisplayItem> BuildActions(
                                      L"Copy this value to the clipboard", value));
     actions.push_back(TextActionItem(app::ActionKind::PasteText, L"Paste",
                                      L"Paste this value into the previous app", value));
+    if (target.isClipboard) {
+      auto pin = TextActionItem(target.clipboard.pinned ? app::ActionKind::UnpinClipboard : app::ActionKind::PinClipboard,
+                                target.clipboard.pinned ? L"Remove from Favorites" : L"Add to Favorites",
+                                L"Keep this entry when older history is removed", L"");
+      pin.actionTarget = target.clipboard;
+      actions.push_back(std::move(pin));
+    }
     return actions;
   }
   if (target.app.source == L"file") {
