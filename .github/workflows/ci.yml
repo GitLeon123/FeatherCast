@@ -205,7 +205,26 @@ jobs:
 
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
-        run: cpack --config build-native/CPackConfig.cmake -C Release
+        shell: pwsh
+        run: |
+          cpack --config build-native/CPackConfig.cmake -C Release -G ZIP
+          if ($LASTEXITCODE -ne 0) { throw "ZIP packaging failed." }
+          cpack --config build-native/CPackConfig.cmake -C Release -G NSIS
+          if ($LASTEXITCODE -ne 0) { throw "NSIS packaging failed." }
+          $root = (Get-Location).Path
+          $generatedPackages = @(Get-ChildItem -Path $root -Recurse -File |
+            Where-Object { $_.Name -like 'FeatherCast-*-win64.exe' -or
+                           $_.Name -like 'FeatherCast-*-win64.zip' })
+          foreach ($package in $generatedPackages) {
+            if ($package.DirectoryName -ne $root) {
+              Copy-Item -LiteralPath $package.FullName -Destination (Join-Path $root $package.Name) -Force
+            }
+          }
+          $packages = @(Get-ChildItem -Path $root -File |
+            Where-Object { $_.Name -like 'FeatherCast-*-win64.exe' -or
+                           $_.Name -like 'FeatherCast-*-win64.zip' })
+          if (-not ($packages | Where-Object Extension -eq '.exe')) { throw "NSIS installer was not generated." }
+          if (-not ($packages | Where-Object Extension -eq '.zip')) { throw "ZIP package was not generated." }
 
       - name: Sign installer
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
