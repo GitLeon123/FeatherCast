@@ -272,8 +272,8 @@ jobs:
           $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
             --limit 20 --json tagName 2>&1
           if ($LASTEXITCODE -eq 0) {
-            $previousTag = $releaseJson |
-              ConvertFrom-Json |
+            $previousTag = ConvertFrom-Json -InputObject (
+              $releaseJson -join [Environment]::NewLine) |
               Where-Object tagName -ne '${{ github.ref_name }}' |
               Select-Object -ExpandProperty tagName -First 1
           } else {
