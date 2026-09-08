@@ -269,15 +269,19 @@ jobs:
 
           # Exercise a real in-place upgrade when a published predecessor exists.
           $previousTag = $null
-          $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
-            --limit 20 --json tagName 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            $previousTag = ConvertFrom-Json -InputObject (
-              $releaseJson -join [Environment]::NewLine) |
-              Where-Object tagName -ne '${{ github.ref_name }}' |
+          try {
+            $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
+              --limit 20 --json tagName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "gh release list exited with code $LASTEXITCODE. $releaseJson"
+            }
+            $releaseRecords = ConvertFrom-Json -InputObject (
+              $releaseJson -join [Environment]::NewLine)
+            $previousTag = $releaseRecords |
+              Where-Object { $_.tagName -and $_.tagName -ne '${{ github.ref_name }}' } |
               Select-Object -ExpandProperty tagName -First 1
-          } else {
-            Write-Warning "Unable to list previous releases; running a clean-install smoke test. $releaseJson"
+          } catch {
+            Write-Warning "Unable to list previous releases; running a clean-install smoke test. $($_.Exception.Message)"
           }
           if ($previousTag) {
             $previousDirectory = Join-Path $env:RUNNER_TEMP 'previous-release'
