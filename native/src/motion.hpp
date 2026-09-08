@@ -18,6 +18,29 @@ inline double EaseOutCubic(double progress) {
   return 1.0 - remaining * remaining * remaining;
 }
 
+inline double NormalizedProgress(double elapsedSeconds, double durationSeconds) {
+  if (durationSeconds <= 0.0) return 1.0;
+  return std::clamp(elapsedSeconds / durationSeconds, 0.0, 1.0);
+}
+
+// Keeps the animation message queue coalesced. A queued frame represents the
+// latest state, so older intermediate frames must never accumulate behind it.
+class FrameRequestGate {
+ public:
+  bool TryQueue() {
+    if (queued_) return false;
+    queued_ = true;
+    return true;
+  }
+
+  void Complete() { queued_ = false; }
+  void Reset() { queued_ = false; }
+  bool Queued() const { return queued_; }
+
+ private:
+  bool queued_ = false;
+};
+
 class ScalarAnimation {
  public:
   double Value() const { return value_; }

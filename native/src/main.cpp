@@ -146,6 +146,7 @@ constexpr UINT WM_APP_EVENTS = WM_APP + 18;
 constexpr UINT WM_RENDER_RECOVER = WM_APP + 19;
 constexpr UINT WM_OVERLAY_RETRY_ACTIVATION = WM_APP + 20;
 constexpr UINT WM_CAPTURE_SHORTCUT = WM_APP + 21;
+constexpr UINT WM_PREWARM_SURFACES = WM_APP + 22;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
 constexpr int HOTKEY_SCREENSHOT_FULLSCREEN = 0x4C45;
@@ -160,6 +161,7 @@ constexpr UINT TIMER_FILE_SNAPSHOT = 8;
 constexpr UINT TIMER_SHORTCUT_TOGGLE = 9;
 constexpr UINT TIMER_RENDER_RECOVER = 10;
 constexpr UINT TIMER_RECORDING_ELAPSED = 11;
+constexpr UINT TIMER_RENDER_RETRY = 12;
 constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
 constexpr UINT RENDER_RECOVERY_MAX_DELAY_MS = 1000;
 
@@ -1556,9 +1558,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         instance_(instance),
         cmdLine_(std::move(cmdLine)) {
     QueryPerformanceFrequency(&qpcFrequency_);
+    startupShowRequested_ = cmdLine_.find(L"--show") != std::wstring::npos;
     overlayOpacity_.Snap(1.0);
     settingsOpacity_.Snap(1.0);
     volumeOpacity_.Snap(1.0);
+    overlaySurfaceScale_.Snap(1.0);
+    settingsSurfaceScale_.Snap(1.0);
+    volumeSurfaceScale_.Snap(1.0);
     confirmationProgress_.Snap(0.0);
     overlayVisualScroll_.Snap(0.0);
     settingsVisualScroll_.Snap(0.0);
@@ -1658,6 +1664,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       CoUninitialize();
       g_app = nullptr;
       return 1;
+    }
+    // Move the cold D2D/DWrite/DirectComposition setup out of the first
+    // shortcut reveal. The normal startup path lets the message loop process
+    // input between each later operation; --show prewarms before revealing.
+    if (cmdLine_.find(L"--show") != std::wstring::npos) {
+      PrewarmInteractiveSurfaces();
+    } else {
+      PostMessageW(hwnd_, WM_PREWARM_SURFACES, 0, 0);
     }
     persistence_.Start();
     fileSearchService_.Start();
@@ -2336,7 +2350,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           else KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
         } else if (wParam == 1) {
           if (visible_) {
-            if (!suppressHide_ && !overlayClosing_ &&
+            if (!suppressHide_ && !startupShowRequested_ && !overlayClosing_ &&
                 !overlayFocusSession_.GuardActive(GetTickCount64())) {
               HWND foreground = GetForegroundWindow();
               if (foreground && foreground != hwnd_) {
@@ -2376,6 +2390,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) == FALSE) {
             renderRecoveryQueued_ = false;
           }
+        } else if (wParam == TIMER_RENDER_RETRY) {
+          KillTimer(hwnd_, TIMER_RENDER_RETRY);
+          InvalidateRect(hwnd_, nullptr, FALSE);
         }
         return 0;
       case WM_CREATE:
@@ -2433,6 +2450,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               static_cast<feathercast::ui::CaptureShortcutTarget>(wParam));
         }
         return 0;
+      case WM_PREWARM_SURFACES:
+        PrewarmInteractiveSurfaces();
+        return 0;
       case WM_DESTROY:
         UnregisterAllHotKeys();
         captureService_.Shutdown();
@@ -2475,7 +2495,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       }
       case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) {
+        if (LOWORD(wParam) != WA_INACTIVE) {
+          startupShowRequested_ = false;
+        } else {
           CancelPointerPress(hwnd);
           HandleOverlayFocusLoss(reinterpret_cast<HWND>(lParam));
         }
@@ -2577,6 +2599,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OnTray(lParam);
         return 0;
       case WM_SHOW_SEARCH:
+        // A second process launched with --show uses this message to wake the
+        // resident instance. Keep the explicit launch visible even when
+        // Windows temporarily refuses the foreground request.
+        startupShowRequested_ = true;
         ShowOverlay(View::Search);
         return 0;
       case WM_REBUILD_RESULTS:
@@ -2730,15 +2756,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (const auto& due : timerEvents_.Drain()) {
       if (due.generation == timerGeneration_) ExpireTimers();
     }
+    std::optional<ResultsCollection> latestResults;
     for (auto& queued : searchEvents_.Drain()) {
       std::visit(
-          [this](auto&& event) {
+          [this, &latestResults](auto&& event) {
             using Event = std::decay_t<decltype(event)>;
             if constexpr (std::is_same_v<Event, ResultsCollection>) {
               searchPresentation_.MarkCompleted(event.generation);
               if (event.generation == searchPresentation_.Requested()) {
-                ApplyResults(std::move(event));
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                latestResults = std::move(event);
               }
             } else if constexpr (std::is_same_v<Event,
                                                 SnapshotBuildResult>) {
@@ -2756,9 +2782,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (auto& result : fileSearchEvents_.Drain()) {
       searchPresentation_.MarkCompleted(result.generation);
       if (result.generation == searchPresentation_.Requested()) {
-        ApplyResults(std::move(result));
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        latestResults = std::move(result);
       }
+    }
+    if (latestResults) {
+      ApplyResults(std::move(*latestResults));
+      InvalidateRect(hwnd_, nullptr, FALSE);
     }
     for (auto& result : previewEvents_.Drain()) {
       if (result.generation != previewGeneration_ || !previewOpen_) continue;
@@ -2781,7 +2810,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     }
     if (visible_ && !decodedIcons.empty()) {
-      InvalidateRect(hwnd_, nullptr, FALSE);
+      if (animating_) {
+        // Keep the fallback icon stable during the reveal and promote all
+        // decoded icons together at its presentation boundary.
+        iconPresentationDeferred_ = true;
+      } else {
+        PromotePendingVisibleIcons();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
     }
     for (auto& queued : networkEvents_.Drain()) {
       std::visit(
@@ -3339,7 +3375,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     activeRT_ = nullptr;
     activeDC_.Reset();
     if (SUCCEEDED(frame.result)) {
-      captureSelectorSurface_.swapChain->Present(1, 0);
+      PresentSurface(captureSelectorSurface_, captureSelectorHwnd_,
+                     L"capture-selector-present");
     }
     EndPaint(captureSelectorHwnd_, &paint);
   }
@@ -3417,7 +3454,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     activeRT_ = nullptr;
     activeDC_.Reset();
     if (SUCCEEDED(frame.result)) {
-      recordingControlSurface_.swapChain->Present(1, 0);
+      PresentSurface(recordingControlSurface_, recordingControlHwnd_,
+                     L"recording-controls-present");
     }
     EndPaint(recordingControlHwnd_, &paint);
   }
@@ -3461,6 +3499,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         ResizeGlassSurface(captureSelectorSurface_, hwnd, LOWORD(lParam),
                            HIWORD(lParam));
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_TIMER:
+        if (wParam == TIMER_RENDER_RETRY) {
+          KillTimer(hwnd, TIMER_RENDER_RETRY);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
       case WM_SETCURSOR:
         SetCursor(LoadCursorW(nullptr, IDC_CROSS));
@@ -3536,6 +3580,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_TIMER:
         if (wParam == TIMER_RECORDING_ELAPSED) {
           feathercast::ui::CaptureUiController::AddElapsed(captureUiState_, 250);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wParam == TIMER_RENDER_RETRY) {
+          KillTimer(hwnd, TIMER_RENDER_RETRY);
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -3644,7 +3691,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       }
       case WM_TIMER:
-        if (wParam == TIMER_VOLUME_REFRESH) RefreshVolumeFromSystem();
+        if (wParam == TIMER_VOLUME_REFRESH) {
+          RefreshVolumeFromSystem();
+        } else if (wParam == TIMER_RENDER_RETRY) {
+          KillTimer(hwnd, TIMER_RENDER_RETRY);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
       case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE && volumeVisible_) {
@@ -3659,7 +3711,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         HandleVolumeKeyDown(static_cast<UINT>(wParam));
         return 0;
       case WM_LBUTTONDOWN: {
-        if (volumeClosing_) return 0;
+        if (!PointerInputAllowed(hwnd)) return 0;
         const float scale = GetWindowScale(hwnd);
         const float x = static_cast<float>(GET_X_LPARAM(lParam)) / scale;
         const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / scale;
@@ -3674,7 +3726,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       }
       case WM_MOUSEMOVE:
-        if (volumeClosing_) return 0;
+        if (!PointerInputAllowed(hwnd)) return 0;
         if (volumeDragging_ && GetCapture() == hwnd) {
           const float scale = GetWindowScale(hwnd);
           RECT client{};
@@ -3732,6 +3784,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_SIZE:
         ResizeGlassSurface(settingsSurface_, settingsHwnd_, LOWORD(lParam), HIWORD(lParam));
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_TIMER:
+        if (wParam == TIMER_RENDER_RETRY) {
+          KillTimer(hwnd, TIMER_RENDER_RETRY);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
@@ -3974,15 +4032,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual> visual;
+    ComPtr<IDCompositionVisual3> visual3;
     ComPtr<ID2D1DeviceContext> dc;
     ComPtr<ID2D1Bitmap1> bitmap;
+    bool blurClipActive = false;
+    RECT blurClip{};
+    int blurClipCorner = 0;
     void Reset() {
       if (dc) dc->SetTarget(nullptr);
       bitmap.Reset();
+      visual3.Reset();
       visual.Reset();
       target.Reset();
       swapChain.Reset();
       dc.Reset();
+      blurClipActive = false;
+      blurClip = {};
+      blurClipCorner = 0;
     }
   };
 
@@ -4035,6 +4101,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   // Tears down the whole device stack (used on device-lost). It is rebuilt lazily.
   void DiscardGlassDevice() {
+    if (hwnd_ && overlaySurface_.blurClipActive) {
+      SetWindowRgn(hwnd_, nullptr, TRUE);
+    }
+    if (settingsHwnd_ && settingsSurface_.blurClipActive) {
+      SetWindowRgn(settingsHwnd_, nullptr, TRUE);
+    }
+    if (volumeHwnd_ && volumeSurface_.blurClipActive) {
+      SetWindowRgn(volumeHwnd_, nullptr, TRUE);
+    }
     overlaySurface_.Reset();
     settingsSurface_.Reset();
     volumeSurface_.Reset();
@@ -4161,6 +4236,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       surface.Reset();
       return result;
     }
+    // IDCompositionVisual3 owns the scalar opacity property. Keep the base
+    // visual for the common transform/content APIs and use the newer
+    // interface when the active Windows compositor exposes it.
+    surface.visual.As(&surface.visual3);
     result = surface.visual->SetContent(surface.swapChain.Get());
     if (FAILED(result)) {
       surface.Reset();
@@ -4204,7 +4283,229 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return surface.dc != nullptr;
   }
 
-  // Resizes a surface's swap chain to match the window's new physical client size.
+  void ScheduleRenderRetry(HWND hwnd) {
+    if (!hwnd) return;
+    SetTimer(hwnd, TIMER_RENDER_RETRY, 1, nullptr);
+  }
+
+  enum class PresentResult { Presented, BackPressured, Failed };
+
+  PresentResult PresentSurface(GlassSurface& surface, HWND hwnd,
+                               const wchar_t* phase) {
+    if (!surface.swapChain) return PresentResult::Failed;
+    const HRESULT result = surface.swapChain->Present(
+        0, DXGI_PRESENT_DO_NOT_WAIT);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING) {
+      // The compositor still owns the available back buffer. Keep the latest
+      // logical state and retry shortly instead of blocking the UI thread or
+      // presenting a backlog of obsolete animation frames.
+      ScheduleRenderRetry(hwnd);
+      return PresentResult::BackPressured;
+    }
+    if (FAILED(result)) {
+      ScheduleRenderRecovery(phase, result);
+      return PresentResult::Failed;
+    }
+    RecordSuccessfulFrame();
+    return PresentResult::Presented;
+  }
+
+  static D2D1_MATRIX_3X2_F SurfaceBoundsTransform(
+      const feathercast::motion::AnimatedBounds* bounds) {
+    if (!bounds) return D2D1::Matrix3x2F::Identity();
+    const double targetWidth = bounds->width.Target();
+    const double targetHeight = bounds->height.Target();
+    if (targetWidth <= 0.0 || targetHeight <= 0.0) {
+      return D2D1::Matrix3x2F::Identity();
+    }
+    const float scaleX = static_cast<float>(
+        std::clamp(bounds->width.Value() / targetWidth, 0.01, 1.0));
+    const float scaleY = static_cast<float>(
+        std::clamp(bounds->height.Value() / targetHeight, 0.01, 1.0));
+    const float translateX = static_cast<float>(
+        bounds->left.Value() - bounds->left.Target());
+    const float translateY = static_cast<float>(
+        bounds->top.Value() - bounds->top.Target());
+    return D2D1::Matrix3x2F::Translation(translateX, translateY) *
+           D2D1::Matrix3x2F::Scale(scaleX, scaleY);
+  }
+
+  bool BlurAppliedForWindow(HWND hwnd) const {
+    if (hwnd == hwnd_) return overlayBlurApplied_;
+    if (hwnd == settingsHwnd_) return settingsBlurApplied_;
+    if (hwnd == volumeHwnd_) return volumeBlurApplied_;
+    return false;
+  }
+
+  void ClearSurfaceBlurClip(GlassSurface& surface, HWND hwnd) {
+    if (!hwnd || !surface.blurClipActive) return;
+    SetWindowRgn(hwnd, nullptr, TRUE);
+    surface.blurClipActive = false;
+    surface.blurClip = {};
+    surface.blurClipCorner = 0;
+  }
+
+  // DWM blur belongs to the HWND, while the panel content belongs to the
+  // DirectComposition visual. During a visual scale/resize those two bounds
+  // would otherwise diverge and expose a strip of blurred desktop around the
+  // panel. Clip the transient blur to the same transformed bounds and remove
+  // the temporary region once the visual is at rest.
+  void UpdateSurfaceBlurClip(
+      GlassSurface& surface, HWND hwnd, const D2D1_MATRIX_3X2_F& transform,
+      double scale, double opacity,
+      const feathercast::motion::AnimatedBounds* bounds, float radius) {
+    if (!hwnd || !BlurAppliedForWindow(hwnd)) {
+      ClearSurfaceBlurClip(surface, hwnd);
+      return;
+    }
+
+    const bool transient =
+        std::abs(scale - 1.0) > 0.001 || std::abs(opacity - 1.0) > 0.001 ||
+        (bounds && bounds->Active());
+    if (!transient) {
+      ClearSurfaceBlurClip(surface, hwnd);
+      return;
+    }
+
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const float width = static_cast<float>(std::max<LONG>(1, client.right));
+    const float height = static_cast<float>(std::max<LONG>(1, client.bottom));
+    const auto transformPoint = [&](float x, float y) {
+      return D2D1::Point2F(
+          x * transform._11 + y * transform._21 + transform._31,
+          x * transform._12 + y * transform._22 + transform._32);
+    };
+    const std::array<D2D1_POINT_2F, 4> corners = {
+        transformPoint(0.0f, 0.0f), transformPoint(width, 0.0f),
+        transformPoint(0.0f, height), transformPoint(width, height)};
+    float left = corners[0].x;
+    float top = corners[0].y;
+    float right = corners[0].x;
+    float bottom = corners[0].y;
+    for (const auto& corner : corners) {
+      left = std::min(left, corner.x);
+      top = std::min(top, corner.y);
+      right = std::max(right, corner.x);
+      bottom = std::max(bottom, corner.y);
+    }
+
+    // Match the DComp opacity with a gently shrinking blur footprint. This
+    // keeps a zero-opacity panel from leaving a full-size blur behind it.
+    const float blurScale = static_cast<float>(std::sqrt(
+        std::clamp(opacity, 0.0, 1.0)));
+    const float centerX = (left + right) * 0.5f;
+    const float centerY = (top + bottom) * 0.5f;
+    const float halfWidth = (right - left) * 0.5f * blurScale;
+    const float halfHeight = (bottom - top) * 0.5f * blurScale;
+    left = centerX - halfWidth;
+    right = centerX + halfWidth;
+    top = centerY - halfHeight;
+    bottom = centerY + halfHeight;
+
+    RECT clip{
+        std::clamp(static_cast<LONG>(std::floor(left)), 0L,
+                   static_cast<LONG>(width)),
+        std::clamp(static_cast<LONG>(std::floor(top)), 0L,
+                   static_cast<LONG>(height)),
+        std::clamp(static_cast<LONG>(std::ceil(right)), 0L,
+                   static_cast<LONG>(width)),
+        std::clamp(static_cast<LONG>(std::ceil(bottom)), 0L,
+                   static_cast<LONG>(height)),
+    };
+    if (clip.right <= clip.left) {
+      clip.right = std::min<LONG>(static_cast<LONG>(width), clip.left + 1);
+    }
+    if (clip.bottom <= clip.top) {
+      clip.bottom = std::min<LONG>(static_cast<LONG>(height), clip.top + 1);
+    }
+
+    const float transformScale = std::min(
+        std::hypot(transform._11, transform._12),
+        std::hypot(transform._21, transform._22));
+    const int corner = std::max(
+        2, static_cast<int>(std::lround(radius * GetWindowScale(hwnd) *
+                                         std::max(0.01f, transformScale) *
+                                         std::max(0.02f, blurScale) * 2.0f)));
+    if (surface.blurClipActive && surface.blurClip.left == clip.left &&
+        surface.blurClip.top == clip.top &&
+        surface.blurClip.right == clip.right &&
+        surface.blurClip.bottom == clip.bottom &&
+        surface.blurClipCorner == corner) {
+      return;
+    }
+
+    HRGN region = CreateRoundRectRgn(clip.left, clip.top, clip.right + 1,
+                                     clip.bottom + 1, corner, corner);
+    if (!region) return;
+    if (!SetWindowRgn(hwnd, region, TRUE)) {
+      DeleteObject(region);
+      return;
+    }
+    surface.blurClipActive = true;
+    surface.blurClip = clip;
+    surface.blurClipCorner = corner;
+  }
+
+  HRESULT SetSurfaceVisualState(
+      GlassSurface& surface, HWND hwnd, double scale, bool topAnchored,
+      double opacity, const feathercast::motion::AnimatedBounds* bounds) {
+    if (!surface.visual || !hwnd) return S_OK;
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const float width = static_cast<float>(std::max(1L, client.right));
+    const float height = static_cast<float>(std::max(1L, client.bottom));
+    const float anchorY = topAnchored ? 0.0f : height * 0.5f;
+    const auto scaleTransform = D2D1::Matrix3x2F::Scale(
+        static_cast<float>(std::clamp(scale, 0.01, 1.0)),
+        static_cast<float>(std::clamp(scale, 0.01, 1.0)),
+        D2D1::Point2F(width * 0.5f, anchorY));
+    const auto boundsTransform = SurfaceBoundsTransform(bounds);
+    const auto transform = scaleTransform * boundsTransform;
+    const D2D_MATRIX_3X2_F compositionTransform{
+        transform._11, transform._12, transform._21,
+        transform._22, transform._31, transform._32};
+    HRESULT result = surface.visual->SetTransform(compositionTransform);
+    if (FAILED(result)) return result;
+    const float radius = hwnd == settingsHwnd_ ? theme_.settingsRadius
+                                                : theme_.overlayRadius;
+    UpdateSurfaceBlurClip(surface, hwnd, transform, scale, opacity, bounds,
+                          radius);
+    if (surface.visual3) {
+      result = surface.visual3->SetOpacity(
+          static_cast<float>(std::clamp(opacity, 0.0, 1.0)));
+      if (FAILED(result)) return result;
+    }
+    return S_OK;
+  }
+
+  HRESULT ApplySurfaceVisualStates() {
+    HRESULT result = SetSurfaceVisualState(
+        overlaySurface_, hwnd_, overlaySurfaceScale_.Value(), true,
+        overlayOpacity_.Value(), &overlayBounds_);
+    if (FAILED(result)) return result;
+    result = SetSurfaceVisualState(
+        settingsSurface_, settingsHwnd_, settingsSurfaceScale_.Value(), false,
+        settingsOpacity_.Value(), &settingsBounds_);
+    if (FAILED(result)) return result;
+    result = SetSurfaceVisualState(
+        volumeSurface_, volumeHwnd_, volumeSurfaceScale_.Value(), false,
+        volumeOpacity_.Value(), &volumeBounds_);
+    if (FAILED(result)) return result;
+    return dcompDevice_ ? dcompDevice_->Commit() : S_OK;
+  }
+
+  void PrewarmInteractiveSurfaces() {
+    if (!EnsureRenderResources()) return;
+    PrewarmGlassSurface(hwnd_, overlaySurface_);
+    PrewarmGlassSurface(settingsHwnd_, settingsSurface_);
+    PrewarmGlassSurface(volumeHwnd_, volumeSurface_);
+    ApplySurfaceVisualStates();
+  }
+
+  // Resizes a surface's swap chain to match a committed native window size.
+  // Animated intermediate geometry is handled by DirectComposition and never
+  // reaches this function once per frame.
   void ResizeGlassSurface(GlassSurface& surface, HWND hwnd, UINT width, UINT height) {
     if (!surface.swapChain || !surface.dc) return;
     width = std::max<UINT>(1, width);
@@ -5624,6 +5925,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return searchPresentation_.CanActivate();
   }
 
+  bool PointerInputAllowed(HWND owner) const {
+    if (owner == hwnd_) {
+      return !animating_ && !overlaySurfaceScale_.Active() &&
+             !overlayClosing_;
+    }
+    if (owner == settingsHwnd_) {
+      return !settingsSurfaceScale_.Active() && !settingsClosing_;
+    }
+    if (owner == volumeHwnd_) {
+      return !volumeSurfaceScale_.Active() && !volumeClosing_;
+    }
+    return true;
+  }
+
   void CancelResultPointerPress() {
     if (pointerPress_ && pointerPress_->type == HitType::Result) {
       CancelPointerPress(pointerPress_->owner);
@@ -5940,7 +6255,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void StartResultTransitions(const ResultPositions& oldPositions) {
     resultRowMotion_.clear();
     resultHeaderMotion_.clear();
-    if (!FadeAnimationsAllowed() || !visible_) return;
+    // The opening reveal owns the row timing. A result batch arriving during
+    // that reveal must not start a second, staggered-looking transition.
+    if (!FadeAnimationsAllowed() || !visible_ || animating_) return;
 
     float y = kResultsTop;
     for (const auto& section : sections_) {
@@ -6016,6 +6333,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             : std::wstring{};
     sections_ = std::move(result.sections);
     flatItems_ = std::move(result.flatItems);
+    renderedQuery_ = query_;
+    renderedView_ = view_;
+    renderedBrowseView_ = browseView_;
+    renderedActionMode_ = actionMode_;
+    renderedDataRevision_ = dataRevision_.load(std::memory_order_acquire);
+    hasRenderedResults_ = true;
     if (pendingNavigationRestore_) {
       const auto& restore = *pendingNavigationRestore_;
       const auto match = std::find_if(
@@ -6064,6 +6387,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EnsureSelectedVisible();
     }
     ApplyWindowSize();
+    QueueVisibleResultIcons();
     StartResultTransitions(oldPositions);
     SyncSelectionAnimationToTarget();
     ScheduleSelectedPreview();
@@ -6254,6 +6578,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       pendingDecodedIcons_.clear();
       pendingDecodedIconOrder_.clear();
       pendingDecodedIconBytes_ = 0;
+      visibleIconKeys_.clear();
+      iconPresentationDeferred_ = false;
       {
         std::lock_guard lock(dataMutex_);
         if (!fileIndex_.empty()) {
@@ -6266,13 +6592,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       fileSearchService_.UpdateFiles({});
       fileIndexLoaded_ = false;
 
-      // Only query-specific results are discarded here; the source data stays
-      // available for the next search without another discovery pass.
+      // Keep the last rendered result model as a warm reopen snapshot. It is
+      // reused only when ShowOverlay verifies the query, view and data
+      // revision, so stale results can never be presented for a new search.
       searchPresentation_.Invalidate();
       searchCoordinator_.Invalidate(searchPresentation_.Requested());
       fileSearchService_.Invalidate(searchPresentation_.Requested());
-      sections_.clear();
-      flatItems_.clear();
       hits_.clear();
 
       // Background work remains unobtrusive without forcing page faults,
@@ -6411,6 +6736,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         std::to_wstring(overlayFocusSession_.Generation()) + L" requested=" +
         std::to_wstring(requested != FALSE) + L" verified=" +
         std::to_wstring(activated));
+    if (activated) startupShowRequested_ = false;
     return activated;
   }
 
@@ -6433,6 +6759,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       overlayFocusSession_.Expire(now);
       HWND foreground = GetForegroundWindow();
       if (foreground != hwnd_) {
+        if (startupShowRequested_) {
+          // Explicit command-line/tray activation should remain visible even
+          // if the caller is not currently allowed to take foreground focus.
+          // A later click or successful activation clears this one-shot guard.
+          overlayFocusSession_.End();
+          return;
+        }
         HideOverlay(OverlayCloseReason::PassiveFocusLoss);
       }
       return;
@@ -6458,14 +6791,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const bool activated = TryActivateOverlay();
       overlayFocusSession_.RecordActivationAttempt(activated);
       overlayFocusSession_.End();
-      if (!activated) HideOverlay(OverlayCloseReason::PassiveFocusLoss);
+      if (!activated && !startupShowRequested_) {
+        HideOverlay(OverlayCloseReason::PassiveFocusLoss);
+      }
       return;
     }
     RetryOverlayActivation();
   }
 
   void HandleOverlayFocusLoss(HWND nextWindow) {
-    if (!visible_ || suppressHide_ || overlayClosing_ ||
+    if (!visible_ || suppressHide_ || startupShowRequested_ || overlayClosing_ ||
         overlayFocusSession_.Phase() ==
             feathercast::interaction::OverlayFocusPhase::Closing) {
       return;
@@ -6493,6 +6828,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       foregroundSnapshot = CaptureForegroundSnapshot(GetForegroundWindow());
     }
     const bool wasVisible = visible_;
+    const bool wasClosing = overlayClosing_;
+    const bool revealWasInProgress =
+        wasVisible && animating_ && overlayRevealTimeline_.Active();
     const auto previousCandidate = overlayRestoreCandidate_;
     overlayClosing_ = false;
     overlayReactivationQueued_ = false;
@@ -6525,27 +6863,51 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     UpdateBackgroundState();
     SyncSelectionAnimationToTarget();
     ExecuteOverlayEffects(effects);
+    const bool canReuseRenderedResults =
+        hasRenderedResults_ && renderedQuery_ == query_ &&
+        renderedView_ == view_ && renderedBrowseView_ == browseView_ &&
+        renderedActionMode_ == actionMode_ &&
+        renderedDataRevision_ == dataRevision_.load(std::memory_order_acquire);
+    if (!canReuseRenderedResults) {
+      sections_.clear();
+      flatItems_.clear();
+      hits_.clear();
+    } else {
+      QueueVisibleResultIcons();
+    }
     PositionWindow();
     // Reassert the transparent window treatment each reveal.
     ApplyGlass(hwnd_);
     const bool surfaceReady = overlaySurface_.dc != nullptr ||
                               PrewarmGlassSurface(hwnd_, overlaySurface_);
-    animating_ = FadeAnimationsAllowed() && surfaceReady;
-    // The actual reveal clock begins only after the hidden initial frame has
-    // been rendered and foreground activation has completed.
-    overlayRevealTimeline_.Reset();
     if (!wasVisible) {
+      animating_ = FadeAnimationsAllowed() && surfaceReady;
+      // The actual reveal clock begins only after the hidden initial frame has
+      // been rendered and foreground activation has completed.
+      overlayRevealTimeline_.Reset();
       if (surfaceReady) {
-        StartSurfaceOpen(hwnd_, overlayBounds_, overlayOpacity_, true);
+        StartSurfaceOpen(hwnd_, overlaySurface_, overlayBounds_,
+                         overlayOpacity_, overlaySurfaceScale_, true);
       } else {
         RECT windowBounds{};
         GetWindowRect(hwnd_, &windowBounds);
         SnapWindowBounds(overlayBounds_, windowBounds);
+        overlaySurfaceScale_.Snap(1.0);
         overlayOpacity_.Snap(1.0);
       }
     } else {
+      // A view switch while the panel is already visible must not replay the
+      // opening reveal. If a close/reopen interrupts an active reveal, retain
+      // its current timeline and only retarget the surface back to visible.
+      if (!revealWasInProgress) {
+        animating_ = false;
+        overlayRevealTimeline_.Reset();
+      }
       overlayOpacity_.Retarget(1.0, kSurfaceOpenSeconds,
-                               animating_);
+                               FadeAnimationsAllowed() &&
+                                   (wasClosing || revealWasInProgress));
+      overlaySurfaceScale_.Retarget(1.0, kSurfaceOpenSeconds,
+                                    SpatialAnimationsAllowed());
     }
 
     // Prepare the reveal's zero-progress frame while the HWND is still hidden.
@@ -6568,7 +6930,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ignoreMouseUntilMove_ = true;
 
     SetTimer(hwnd_, 1, 200, nullptr);
-    if (animating_) {
+    if (animating_ && !revealWasInProgress) {
       overlayRevealTimeline_.Start(AnimFinishMs() / 1000.0);
     }
     RestartAnimationClock();
@@ -6615,7 +6977,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     animating_ = false;
     overlayRevealTimeline_.Reset();
     animatingSelection_ = false;
-    animationFrameQueued_ = false;
+    animationFrameGate_.Reset();
     visualSelectedY_ = -1.0f;
     StopSelectionAnimationTimer();
     KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
@@ -6665,6 +7027,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       CancelPointerPress(hwnd_);
       KillTimer(hwnd_, 1);
       overlayOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      // Keep the DWM blur and the DirectComposition panel on the same close
+      // timeline.  Fading only the visual leaves the HWND-sized blur behind
+      // until the window is finally hidden.
+      overlaySurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+                                     SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
     }
@@ -6810,11 +7177,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool surfaceReady =
         PrewarmGlassSurface(volumeHwnd_, volumeSurface_);
     if (surfaceReady) {
-      StartSurfaceOpen(volumeHwnd_, volumeBounds_, volumeOpacity_, false);
+      StartSurfaceOpen(volumeHwnd_, volumeSurface_, volumeBounds_,
+                       volumeOpacity_, volumeSurfaceScale_, false);
     } else {
       RECT windowBounds{};
       GetWindowRect(volumeHwnd_, &windowBounds);
       SnapWindowBounds(volumeBounds_, windowBounds);
+      volumeSurfaceScale_.Snap(1.0);
       volumeOpacity_.Snap(1.0);
     }
     RedrawWindow(volumeHwnd_, nullptr, nullptr,
@@ -6858,6 +7227,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       pendingVolumeRestore_ = restoreTarget;
       volumeClosing_ = true;
       volumeOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      volumeSurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+                                   SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
     }
@@ -7132,11 +7503,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool surfaceReady =
         PrewarmGlassSurface(settingsHwnd_, settingsSurface_);
     if (surfaceReady) {
-      StartSurfaceOpen(settingsHwnd_, settingsBounds_, settingsOpacity_, false);
+      StartSurfaceOpen(settingsHwnd_, settingsSurface_, settingsBounds_,
+                       settingsOpacity_, settingsSurfaceScale_, false);
     } else {
       RECT windowBounds{};
       GetWindowRect(settingsHwnd_, &windowBounds);
       SnapWindowBounds(settingsBounds_, windowBounds);
+      settingsSurfaceScale_.Snap(1.0);
       settingsOpacity_.Snap(1.0);
     }
     RedrawWindow(settingsHwnd_, nullptr, nullptr,
@@ -7168,6 +7541,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       settingsClosing_ = true;
       CancelPointerPress(settingsHwnd_);
       settingsOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      settingsSurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+                                      SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
     }
@@ -7436,6 +7811,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   static constexpr float kResultRowHeight = 50.0f;
   static constexpr float kResultRowGap = 2.0f;
   static constexpr float kResultRowStride = kResultRowHeight + kResultRowGap;
+  struct RowAnim {
+    float opacity;
+    float dy;
+  };
 
   int ResultsContentHeight() const {
     int height = 0;
@@ -7466,9 +7845,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const int currentHeight = rc.bottom - rc.top;
     if (currentWidth != width || currentHeight != height) {
       if (IsWindowVisible(hwnd_) && SpatialAnimationsAllowed()) {
-        if (!overlayBounds_.Active()) SnapWindowBounds(overlayBounds_, rc);
-        overlayBounds_.Retarget(rc.left, rc.top, width, height,
-                                kOverlayResizeSeconds, true);
+        RECT target{rc.left, rc.top, rc.left + width, rc.top + height};
+        StartBoundsTransition(hwnd_, overlayBounds_, target,
+                              kOverlayResizeSeconds);
         RequestAnimationFrame();
       } else {
         SetWindowPos(hwnd_, HWND_TOPMOST, rc.left, rc.top, width, height,
@@ -7523,13 +7902,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void ApplyAnimatedBounds(HWND hwnd,
                            feathercast::motion::AnimatedBounds& bounds) {
     if (!hwnd) return;
-    SetWindowPos(
-        hwnd, nullptr,
-        static_cast<int>(std::lround(bounds.left.Value())),
-        static_cast<int>(std::lround(bounds.top.Value())),
-        std::max(1, static_cast<int>(std::lround(bounds.width.Value()))),
-        std::max(1, static_cast<int>(std::lround(bounds.height.Value()))),
-        SWP_NOZORDER | SWP_NOACTIVATE);
     if (surfaceResizeFailed_) {
       surfaceResizeFailed_ = false;
       bounds.Snap(bounds.left.Target(), bounds.top.Target(),
@@ -7544,36 +7916,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  void StartBoundsTransition(
+      HWND hwnd, feathercast::motion::AnimatedBounds& bounds,
+      const RECT& target, double durationSeconds) {
+    if (!hwnd) return;
+    RECT current{};
+    GetWindowRect(hwnd, &current);
+    if (!bounds.Active()) SnapWindowBounds(bounds, current);
+    bounds.Retarget(target.left, target.top,
+                    target.right - target.left, target.bottom - target.top,
+                    durationSeconds, true);
+
+    // Resize the native window and swap chain once. The intermediate geometry
+    // is now represented by the DirectComposition visual, so WM_SIZE and
+    // ResizeBuffers never run once per animation frame.
+    SetWindowPos(hwnd, nullptr, target.left, target.top,
+                 target.right - target.left, target.bottom - target.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    ApplySurfaceVisualStates();
+  }
+
   void StartSurfaceOpen(HWND hwnd,
+                        GlassSurface& surface,
                         feathercast::motion::AnimatedBounds& bounds,
                         feathercast::motion::ScalarAnimation& opacity,
+                        feathercast::motion::ScalarAnimation& scale,
                         bool topAnchored) {
     if (!hwnd) return;
     RECT target{};
     GetWindowRect(hwnd, &target);
+    SnapWindowBounds(bounds, target);
     if (!FadeAnimationsAllowed() && !SpatialAnimationsAllowed()) {
-      SnapWindowBounds(bounds, target);
+      scale.Snap(1.0);
       opacity.Snap(1.0);
+      SetSurfaceVisualState(surface, hwnd, scale.Value(), topAnchored,
+                            opacity.Value(), &bounds);
+      if (dcompDevice_) dcompDevice_->Commit();
       return;
     }
 
-    const double targetWidth = target.right - target.left;
-    const double targetHeight = target.bottom - target.top;
     if (SpatialAnimationsAllowed()) {
-      const auto initial = feathercast::motion::OpeningBounds(
-          {static_cast<double>(target.left), static_cast<double>(target.top),
-           targetWidth, targetHeight},
-          0.98, topAnchored);
-      bounds.Snap(initial.left, initial.top, initial.width, initial.height);
-      SetWindowPos(hwnd, nullptr, static_cast<int>(std::lround(initial.left)),
-                   static_cast<int>(std::lround(initial.top)),
-                   static_cast<int>(std::lround(initial.width)),
-                   static_cast<int>(std::lround(initial.height)),
-                   SWP_NOZORDER | SWP_NOACTIVATE);
-      bounds.Retarget(target.left, target.top, targetWidth, targetHeight,
-                      kSurfaceOpenSeconds, true);
+      scale.Snap(0.98);
+      scale.Retarget(1.0, kSurfaceOpenSeconds, true);
     } else {
-      SnapWindowBounds(bounds, target);
+      scale.Snap(1.0);
     }
     if (FadeAnimationsAllowed()) {
       opacity.Snap(0.0);
@@ -7581,6 +7967,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     } else {
       opacity.Snap(1.0);
     }
+    SetSurfaceVisualState(surface, hwnd, scale.Value(), topAnchored,
+                          opacity.Value(), &bounds);
+    if (dcompDevice_) dcompDevice_->Commit();
     RequestAnimationFrame();
   }
 
@@ -7606,6 +7995,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snap(settingsVisualScroll_);
     snap(settingsCategoryTop_);
     snap(volumeVisualPercent_);
+    snap(overlaySurfaceScale_);
+    snap(settingsSurfaceScale_);
+    snap(volumeSurfaceScale_);
     for (auto& [_, element] : resultRowMotion_) {
       snap(element.offsetY);
     }
@@ -7639,6 +8031,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     applySnapped(hwnd_, overlayBounds_);
     applySnapped(settingsHwnd_, settingsBounds_);
     applySnapped(volumeHwnd_, volumeBounds_);
+    ApplySurfaceVisualStates();
     if (animatingSelection_) SyncSelectionAnimationToTarget();
   }
 
@@ -7657,6 +8050,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (auto& [_, element] : resultHeaderMotion_) snap(element.opacity);
     animating_ = false;
     overlayRevealTimeline_.Reset();
+    ApplySurfaceVisualStates();
     if (confirmationClosing_) FinishCancelConfirmation();
     if (overlayClosing_ && pendingOverlayClose_) {
       FinishHideOverlay(*pendingOverlayClose_);
@@ -7860,7 +8254,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     [](const auto& entry) { return entry.second.Active(); });
     return HasRevealAnimation() || animatingSelection_ ||
            overlayOpacity_.Active() || settingsOpacity_.Active() ||
-           volumeOpacity_.Active() || confirmationProgress_.Active() ||
+           volumeOpacity_.Active() || overlaySurfaceScale_.Active() ||
+           settingsSurfaceScale_.Active() || volumeSurfaceScale_.Active() ||
+           confirmationProgress_.Active() ||
            overlayVisualScroll_.Active() || settingsVisualScroll_.Active() ||
            settingsPageProgress_.Active() ||
            settingsCategoryTop_.Active() || volumeVisualPercent_.Active() ||
@@ -7870,12 +8266,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void RequestAnimationFrame() {
-    if (!hwnd_ || animationFrameQueued_ || !HasActiveMotion()) return;
+    if (!hwnd_ || !HasActiveMotion() || !animationFrameGate_.TryQueue()) {
+      return;
+    }
     if (!animationLoopRunning_) {
       lastAnimationFrameQpc_ = NowQpc();
       animationLoopRunning_ = true;
     }
-    animationFrameQueued_ = PostMessageW(hwnd_, WM_ANIMATION_FRAME, 0, 0) != FALSE;
+    if (PostMessageW(hwnd_, WM_ANIMATION_FRAME, 0, 0) == FALSE) {
+      animationFrameGate_.Reset();
+      animationLoopRunning_ = false;
+    }
   }
 
   void RestartAnimationClock() {
@@ -7886,12 +8287,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnAnimationFrame() {
-    animationFrameQueued_ = false;
+    animationFrameGate_.Complete();
     if (!HasActiveMotion()) {
       animationLoopRunning_ = false;
       return;
     }
 
+    const bool overlayContentMotion =
+        animating_ || animatingSelection_ || overlayVisualScroll_.Active() ||
+        confirmationProgress_.Active() || HasElementMotion(resultRowMotion_) ||
+        HasElementMotion(resultHeaderMotion_) ||
+        std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
+                    [](const auto& entry) { return entry.second.Active(); });
+    const bool settingsContentMotion =
+        settingsVisualScroll_.Active() || settingsPageProgress_.Active() ||
+        settingsCategoryTop_.Active();
+    const bool volumeContentMotion = volumeVisualPercent_.Active();
     const double deltaTime = ConsumeAnimationDeltaSeconds();
     if (animatingSelection_) UpdateSelectionAnimation(deltaTime);
     if (animating_) {
@@ -7901,6 +8312,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     overlayOpacity_.Update(deltaTime);
     settingsOpacity_.Update(deltaTime);
     volumeOpacity_.Update(deltaTime);
+    overlaySurfaceScale_.Update(deltaTime);
+    settingsSurfaceScale_.Update(deltaTime);
+    volumeSurfaceScale_.Update(deltaTime);
     confirmationProgress_.Update(deltaTime);
     overlayVisualScroll_.Update(deltaTime);
     settingsVisualScroll_.Update(deltaTime);
@@ -7931,6 +8345,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (volumeBoundsChanged) ApplyAnimatedBounds(volumeHwnd_, volumeBounds_);
 
+    if (const HRESULT visualResult = ApplySurfaceVisualStates();
+        FAILED(visualResult)) {
+      ScheduleRenderRecovery(L"animation-visual", visualResult);
+    }
+
+    if (animating_ == false && iconPresentationDeferred_) {
+      PromotePendingVisibleIcons();
+      iconPresentationDeferred_ = false;
+    }
+
     if (confirmationClosing_ && !confirmationProgress_.Active() &&
         confirmationProgress_.Value() <= 0.001) {
       FinishCancelConfirmation();
@@ -7948,15 +8372,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FinishHideVolumeControl(pendingVolumeRestore_);
     }
 
-    if (visible_) {
+    if (visible_ && overlayContentMotion) {
       RedrawWindow(hwnd_, nullptr, nullptr,
                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     }
-    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_) &&
+        settingsContentMotion) {
       RedrawWindow(settingsHwnd_, nullptr, nullptr,
                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     }
-    if (volumeVisible_) {
+    if (volumeVisible_ && volumeContentMotion) {
       RedrawWindow(volumeHwnd_, nullptr, nullptr,
                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     }
@@ -7993,10 +8418,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return std::max(base, std::min(base + 420, available));
   }
 
-  // Visible corners are drawn by Direct2D. This only ensures no stale Win32 region is
-  // left on the window, because a region would fight DirectComposition alpha.
+  // Visible corners are drawn by Direct2D. Clear only the temporary blur clip
+  // used during a visual transition; a persistent region would fight the
+  // DirectComposition alpha surface at rest.
   void ApplyRoundedRegion(int /*width*/, int /*height*/) {
-    SetWindowRgn(hwnd_, nullptr, TRUE);
+    ClearSurfaceBlurClip(overlaySurface_, hwnd_);
   }
 
   COLORREF ActiveAccent() const {
@@ -8024,6 +8450,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(hwnd_, &ps);
       return;
     }
+    const HRESULT visuals = ApplySurfaceVisualStates();
+    if (FAILED(visuals)) {
+      ScheduleRenderRecovery(L"overlay-visual", visuals);
+      EndPaint(hwnd_, &ps);
+      return;
+    }
     {
       ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
       SetActiveTarget(dc);
@@ -8036,16 +8468,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
-        const float surfaceOpacity = static_cast<float>(
-            std::clamp(overlayOpacity_.Value(), 0.0, 1.0));
-        const bool opacityLayer = surfaceOpacity < 0.999f;
-        if (opacityLayer) {
-          dc->PushLayer(
-              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                    D2D1::IdentityMatrix(), surfaceOpacity),
-              nullptr);
-        }
         hits_.clear();
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -8061,7 +8483,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           DrawConfirmationDialog();
         }
         DrawPressedState(hwnd_);
-        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
@@ -8070,12 +8491,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       } else if (FAILED(frame.result)) {
         ScheduleRenderRecovery(L"overlay-end-draw", frame.result);
       } else {
-        const HRESULT present = overlaySurface_.swapChain->Present(1, 0);
-        if (FAILED(present)) {
-          ScheduleRenderRecovery(L"overlay-present", present);
-        } else {
-          RecordSuccessfulFrame();
-        }
+        PresentSurface(overlaySurface_, hwnd_, L"overlay-present");
       }
     }
     EndPaint(hwnd_, &ps);
@@ -8096,6 +8512,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(settingsHwnd_, &ps);
       return;
     }
+    const HRESULT visuals = ApplySurfaceVisualStates();
+    if (FAILED(visuals)) {
+      ScheduleRenderRecovery(L"settings-visual", visuals);
+      EndPaint(settingsHwnd_, &ps);
+      return;
+    }
     {
       ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
       SetActiveTarget(dc);
@@ -8108,20 +8530,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
-        const float surfaceOpacity = static_cast<float>(
-            std::clamp(settingsOpacity_.Value(), 0.0, 1.0));
-        const bool opacityLayer = surfaceOpacity < 0.999f;
-        if (opacityLayer) {
-          dc->PushLayer(
-              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                    D2D1::IdentityMatrix(), surfaceOpacity),
-              nullptr);
-        }
         hits_.clear();
         DrawSettings();
         DrawPressedState(settingsHwnd_);
-        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
@@ -8130,12 +8541,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       } else if (FAILED(frame.result)) {
         ScheduleRenderRecovery(L"settings-end-draw", frame.result);
       } else {
-        const HRESULT present = settingsSurface_.swapChain->Present(1, 0);
-        if (FAILED(present)) {
-          ScheduleRenderRecovery(L"settings-present", present);
-        } else {
-          RecordSuccessfulFrame();
-        }
+        PresentSurface(settingsSurface_, settingsHwnd_, L"settings-present");
       }
     }
     EndPaint(settingsHwnd_, &ps);
@@ -8156,6 +8562,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(volumeHwnd_, &paint);
       return;
     }
+    const HRESULT visuals = ApplySurfaceVisualStates();
+    if (FAILED(visuals)) {
+      ScheduleRenderRecovery(L"volume-visual", visuals);
+      EndPaint(volumeHwnd_, &paint);
+      return;
+    }
     {
       ID2D1DeviceContext* dc = volumeSurface_.dc.Get();
       SetActiveTarget(dc);
@@ -8168,16 +8580,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
-        const float surfaceOpacity = static_cast<float>(
-            std::clamp(volumeOpacity_.Value(), 0.0, 1.0));
-        const bool opacityLayer = surfaceOpacity < 0.999f;
-        if (opacityLayer) {
-          dc->PushLayer(
-              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                    D2D1::IdentityMatrix(), surfaceOpacity),
-              nullptr);
-        }
         RECT client{};
         GetClientRect(volumeHwnd_, &client);
         const float scale = GetWindowScale(volumeHwnd_);
@@ -8220,7 +8622,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       bodyFormat_.Get(),
                        error ? D2DColor(theme_.danger)
                              : D2DColor(theme_.textMuted));
-        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
@@ -8229,12 +8630,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       } else if (FAILED(frame.result)) {
         ScheduleRenderRecovery(L"volume-end-draw", frame.result);
       } else {
-        const HRESULT present = volumeSurface_.swapChain->Present(1, 0);
-        if (FAILED(present)) {
-          ScheduleRenderRecovery(L"volume-present", present);
-        } else {
-          RecordSuccessfulFrame();
-        }
+        PresentSurface(volumeSurface_, volumeHwnd_, L"volume-present");
       }
     }
     EndPaint(volumeHwnd_, &paint);
@@ -9138,6 +9534,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         headerY += static_cast<float>(motion->second.offsetY.Value());
         headerOpacity = static_cast<float>(motion->second.opacity.Value());
       }
+      if (animating_) {
+        const RowAnim reveal = ComputeRowAnim(rowIndex);
+        headerY += reveal.dy;
+        headerOpacity = reveal.opacity;
+      }
       if (headerY + kSectionHeaderHeight >= resultsTop &&
           headerY <= resultsBottom) {
         const bool headerLayer = headerOpacity < 0.999f;
@@ -9347,27 +9748,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     activeRT_->SetTransform(dialogBase);
   }
 
-  // Keep the glass surface and search controls stationary while app rows fade
-  // and rise gently into place one after another. Only rows move, so the overlay
-  // itself cannot produce the doubled-panel effect of the previous reveal.
-  static constexpr double kRowAnimDurationMs = 140.0;
-  static constexpr double kRowAnimStaggerMs = 14.0;
-  static constexpr int kRowAnimMaxStaggerRows = 5;
+  // Keep the glass surface and search controls stationary while all app rows
+  // fade and rise from one shared reveal clock. The total reveal duration is
+  // intentionally unchanged; rows no longer appear one after another.
+  static constexpr double kRowAnimTotalMs = 210.0;
   static constexpr float kRowAnimSlidePx = 6.0f;
 
-  struct RowAnim { float opacity; float dy; };
-
   RowAnim ComputeRowAnim(int rowIndex) const {
+    (void)rowIndex;
     if (!animating_) return {1.0f, 0.0f};
-    const double delay =
-        std::min(rowIndex, kRowAnimMaxStaggerRows) * kRowAnimStaggerMs;
     const double revealElapsedMs =
         overlayRevealTimeline_.ElapsedSeconds() * 1000.0;
-    double t = (revealElapsedMs - delay) / kRowAnimDurationMs;
-    t = std::clamp(t, 0.0, 1.0);
-    const double eased = 1.0 - std::pow(1.0 - t, 3.0);
+    const double t = feathercast::motion::NormalizedProgress(
+        revealElapsedMs / 1000.0, kRowAnimTotalMs / 1000.0);
+    const double eased = feathercast::motion::EaseOutCubic(t);
+    // The surface opacity and the content reveal share one visible opacity.
+    // Compensate for the surface fade here so rows do not fade twice and then
+    // appear to pop in near the end of the opening animation.
+    const double surfaceOpacity =
+        std::max(0.001, std::clamp(overlayOpacity_.Value(), 0.0, 1.0));
+    const double contentOpacity =
+        std::clamp(eased / surfaceOpacity, 0.0, 1.0);
     return {
-        static_cast<float>(eased),
+        static_cast<float>(contentOpacity),
         SpatialAnimationsAllowed()
             ? static_cast<float>((eased - 1.0) * kRowAnimSlidePx)
             : 0.0f,
@@ -9375,7 +9778,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   double AnimFinishMs() const {
-    return kRowAnimMaxStaggerRows * kRowAnimStaggerMs + kRowAnimDurationMs;
+    return kRowAnimTotalMs;
   }
 
   void DrawSelectionPill(float width) {
@@ -10534,23 +10937,74 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  ComPtr<ID2D1Bitmap> CreateIconBitmap(
+      const feathercast::runtime::DecodedIcon& icon) {
+    if (!overlaySurface_.dc || icon.width == 0 || icon.height == 0 ||
+        icon.stride == 0 || icon.pixels.empty()) {
+      return nullptr;
+    }
+    ComPtr<ID2D1Bitmap> bitmap;
+    if (FAILED(overlaySurface_.dc->CreateBitmap(
+            D2D1::SizeU(icon.width, icon.height), icon.pixels.data(),
+            icon.stride,
+            D2D1::BitmapProperties(D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_PREMULTIPLIED)),
+            bitmap.GetAddressOf()))) {
+      return nullptr;
+    }
+    return bitmap;
+  }
+
+  void QueueVisibleResultIcons() {
+    visibleIconKeys_.clear();
+    constexpr size_t kVisibleIconPrefetchCap = 24;
+    for (const auto& item : flatItems_) {
+      if (item.isSymbol) continue;
+      const std::wstring key = item.IconKey();
+      if (!key.empty()) visibleIconKeys_.insert(key);
+      if (visibleIconKeys_.size() >= kVisibleIconPrefetchCap) break;
+    }
+    for (const auto& key : visibleIconKeys_) {
+      if (iconBitmaps_.find(key) != iconBitmaps_.end() ||
+          pendingDecodedIcons_.find(key) != pendingDecodedIcons_.end()) {
+        continue;
+      }
+      QueueIcon(key);
+    }
+  }
+
+  void PromotePendingVisibleIcons() {
+    if (!overlaySurface_.dc) return;
+    for (const auto& key : visibleIconKeys_) {
+      if (iconBitmaps_.find(key) != iconBitmaps_.end()) continue;
+      const auto decoded = pendingDecodedIcons_.find(key);
+      if (decoded == pendingDecodedIcons_.end()) continue;
+      const size_t bytes = decoded->second.pixels.size();
+      if (auto bitmap = CreateIconBitmap(decoded->second)) {
+        pendingDecodedIconBytes_ -=
+            std::min(pendingDecodedIconBytes_, bytes);
+        pendingDecodedIcons_.erase(decoded);
+        StoreIconBitmap(key, bitmap);
+      } else {
+        pendingDecodedIconBytes_ -=
+            std::min(pendingDecodedIconBytes_, bytes);
+        pendingDecodedIcons_.erase(decoded);
+      }
+    }
+  }
+
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
     if (key.empty() || !overlaySurface_.dc) return nullptr;
     if (auto cached = CachedIconBitmap(key)) return cached;
 
     if (auto decoded = pendingDecodedIcons_.find(key);
         decoded != pendingDecodedIcons_.end()) {
-      const auto& icon = decoded->second;
-      ComPtr<ID2D1Bitmap> bitmap;
-      if (icon.width != 0 && icon.height != 0 && icon.stride != 0 &&
-          !icon.pixels.empty() &&
-          SUCCEEDED(overlaySurface_.dc->CreateBitmap(
-              D2D1::SizeU(icon.width, icon.height), icon.pixels.data(),
-              icon.stride,
-              D2D1::BitmapProperties(D2D1::PixelFormat(
-                  DXGI_FORMAT_B8G8R8A8_UNORM,
-                  D2D1_ALPHA_MODE_PREMULTIPLIED)),
-              bitmap.GetAddressOf()))) {
+      // Keep the fallback icon stable for the complete opening reveal. The
+      // pending decoded batch is promoted once, after the shared reveal
+      // boundary, instead of allowing rows to change one by one.
+      if (animating_ || iconPresentationDeferred_) return nullptr;
+      if (auto bitmap = CreateIconBitmap(decoded->second)) {
         pendingDecodedIconBytes_ -=
             std::min(pendingDecodedIconBytes_, decoded->second.pixels.size());
         pendingDecodedIcons_.erase(decoded);
@@ -10576,7 +11030,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void StartIconWorkers() {
-    const size_t workers = 1;
+    const size_t workers = 2;
     iconResolver_.Start(workers, [this](const std::wstring& key,
                                        std::stop_token stopToken) {
       if (stopThreads_ || stopToken.stop_requested()) {
@@ -11026,6 +11480,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnMouseMove(float x, float y) {
+    if (!PointerInputAllowed(hwnd_)) return;
     UpdatePointerPress(hwnd_, x, y);
     if (!mouseTracking_) {
       TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
@@ -11080,6 +11535,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnSettingsMouseMove(float x, float y) {
+    if (!PointerInputAllowed(settingsHwnd_)) return;
     if (pointerPress_ && pointerPress_->owner == settingsHwnd_ &&
         pointerPress_->type == HitType::AnimationLevel &&
         GetCapture() == settingsHwnd_) {
@@ -11214,6 +11670,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnPointerDown(HWND owner, float x, float y) {
+    if (!PointerInputAllowed(owner)) return;
     CancelPointerPress();
 
     if (owner == hwnd_ && !confirmation_ && view_ == View::Search) {
@@ -11271,6 +11728,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnPointerUp(HWND owner, float x, float y) {
+    if (!PointerInputAllowed(owner)) {
+      CancelPointerPress(owner);
+      return;
+    }
     if (!pointerPress_ || pointerPress_->owner != owner) return;
     PointerPress press = std::move(*pointerPress_);
     const bool animationSliderDrag =
@@ -11315,7 +11776,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnRightClick(float x, float y) {
-    if (!ResultsActivationAllowed() || actionMode_ ||
+    if (!PointerInputAllowed(hwnd_) || !ResultsActivationAllowed() || actionMode_ ||
         browseView_ != BrowseView::None) {
       return;
     }
@@ -11358,9 +11819,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const int top = std::clamp(centerY - physicalHeight / 2, minTop,
                                std::max(minTop, maxTop));
     if (animate && SpatialAnimationsAllowed()) {
-      if (!settingsBounds_.Active()) SnapWindowBounds(settingsBounds_, rc);
-      settingsBounds_.Retarget(rc.left, top, width, physicalHeight,
-                               kSettingsResizeSeconds, true);
+      RECT target{rc.left, top, rc.left + width, top + physicalHeight};
+      StartBoundsTransition(settingsHwnd_, settingsBounds_, target,
+                            kSettingsResizeSeconds);
       RequestAnimationFrame();
     } else {
       SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, rc.left, top, width,
@@ -11368,8 +11829,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       RECT applied{};
       GetWindowRect(settingsHwnd_, &applied);
       SnapWindowBounds(settingsBounds_, applied);
+      ClearSurfaceBlurClip(settingsSurface_, settingsHwnd_);
     }
-    // Visible corners are drawn by Direct2D; no window region, so DirectComposition alpha stays intact.
+    // Visible corners are drawn by Direct2D; no persistent window region is
+    // kept after a transition.
   }
 
   void EnsureSettingsFocusVisible() {
@@ -13234,15 +13697,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool highContrast_ = false;
   bool systemAnimationsEnabled_ = true;
   bool suppressHide_ = false;
+  bool startupShowRequested_ = false;
   LARGE_INTEGER qpcFrequency_{};
   LONGLONG lastAnimationFrameQpc_ = 0;
   bool animating_ = false;
-  bool animationFrameQueued_ = false;
+  feathercast::motion::FrameRequestGate animationFrameGate_;
   bool animationLoopRunning_ = false;
   feathercast::motion::AnimationTimeline overlayRevealTimeline_;
   feathercast::motion::ScalarAnimation overlayOpacity_;
   feathercast::motion::ScalarAnimation settingsOpacity_;
   feathercast::motion::ScalarAnimation volumeOpacity_;
+  feathercast::motion::ScalarAnimation overlaySurfaceScale_;
+  feathercast::motion::ScalarAnimation settingsSurfaceScale_;
+  feathercast::motion::ScalarAnimation volumeSurfaceScale_;
   feathercast::motion::ScalarAnimation confirmationProgress_;
   feathercast::motion::ScalarAnimation overlayVisualScroll_;
   feathercast::motion::ScalarAnimation settingsVisualScroll_;
@@ -13261,6 +13728,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::map<std::wstring, ResultElementMotion> resultRowMotion_;
   std::map<std::wstring, ResultElementMotion> resultHeaderMotion_;
   std::wstring displayedQuery_;
+  std::wstring renderedQuery_;
+  View renderedView_ = View::Search;
+  BrowseView renderedBrowseView_ = BrowseView::None;
+  bool renderedActionMode_ = false;
+  std::uint64_t renderedDataRevision_ = 0;
+  bool hasRenderedResults_ = false;
   std::wstring expandedSectionsQuery_;
   std::set<std::wstring> expandedSections_;
   bool overlayClosing_ = false;
@@ -13383,6 +13856,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::unordered_map<std::wstring, IconCacheEntry> iconBitmaps_;
   std::unordered_map<std::wstring, feathercast::runtime::DecodedIcon>
       pendingDecodedIcons_;
+  std::set<std::wstring> visibleIconKeys_;
+  bool iconPresentationDeferred_ = false;
   static constexpr size_t kIconCacheCap = 256;
   static constexpr size_t kPendingDecodedIconCap = 256;
   static constexpr size_t kPendingDecodedIconBudget = 16 * 1024 * 1024;

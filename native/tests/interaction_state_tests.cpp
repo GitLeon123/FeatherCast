@@ -152,6 +152,32 @@ int main() {
   }
 
   {
+    const double duration = 0.21;
+    const double sharedProgress =
+        feathercast::motion::NormalizedProgress(0.105, duration);
+    // Every visible row uses this one reveal clock. There is deliberately no
+    // row-index delay, so rows become available in the same frame.
+    assert(std::abs(sharedProgress -
+                    feathercast::motion::NormalizedProgress(0.105, duration)) <
+           0.001);
+    assert(std::abs(feathercast::motion::NormalizedProgress(0.35, duration) -
+                    1.0) < 0.001);
+    assert(std::abs(duration - 0.21) < 0.001);
+  }
+
+  {
+    feathercast::motion::FrameRequestGate gate;
+    assert(gate.TryQueue());
+    assert(gate.Queued());
+    assert(!gate.TryQueue());
+    gate.Complete();
+    assert(!gate.Queued());
+    assert(gate.TryQueue());
+    gate.Reset();
+    assert(!gate.Queued());
+  }
+
+  {
     feathercast::motion::AnimatedBounds bounds;
     bounds.Snap(100.0, 200.0, 400.0, 300.0);
     bounds.Retarget(90.0, 190.0, 420.0, 320.0, 0.16, true);
