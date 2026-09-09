@@ -10,11 +10,12 @@ namespace feathercast::accessibility_projection {
 
 constexpr int SearchChild() { return 1; }
 constexpr int StatusChild() { return 2; }
+constexpr int SettingsChild() { return 3; }
 constexpr int ResultChild(std::size_t index) {
-  return static_cast<int>(index) + 3;
+  return static_cast<int>(index) + 4;
 }
 constexpr int PreviewChild(std::size_t resultCount) {
-  return static_cast<int>(resultCount) + 3;
+  return static_cast<int>(resultCount) + 4;
 }
 
 enum class LiveStatusKind { Hidden, Loading, Empty, Error, Preview };

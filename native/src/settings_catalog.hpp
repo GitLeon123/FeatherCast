@@ -60,6 +60,7 @@ struct CatalogContext {
 
 const std::vector<SettingDescriptor>& Catalog();
 const std::vector<CategoryDescriptor>& Categories();
+std::vector<const SettingDescriptor*> Search(const std::wstring& query);
 const SettingDescriptor* Find(app::HitType hit);
 const CategoryDescriptor* FindCategory(app::SettingsCategory category);
 const CategoryDescriptor* FindCategory(app::HitType hit);

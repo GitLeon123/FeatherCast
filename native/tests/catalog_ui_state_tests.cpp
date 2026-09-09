@@ -314,6 +314,16 @@ int main() {
       feathercast::app::SettingsCategory::General, context);
   assert(std::count(generalControls.begin(), generalControls.end(),
                     feathercast::app::HitType::AnimationLevel) == 1);
+  const auto startupMatches =
+      feathercast::settings_catalog::Search(L"sign in");
+  assert(!startupMatches.empty() &&
+         startupMatches.front()->hit ==
+             feathercast::app::HitType::StartupToggle);
+  const auto privacyMatches =
+      feathercast::settings_catalog::Search(L"privacy file index");
+  assert(!privacyMatches.empty() &&
+         privacyMatches.front()->category ==
+             feathercast::app::SettingsCategory::Privacy);
   const auto libraryControls = feathercast::settings_catalog::FocusOrder(
       feathercast::app::SettingsCategory::Library, context);
   assert(libraryControls.size() == 3);
@@ -383,6 +393,19 @@ int main() {
   assert(overlay.actionMode && overlay.actionTarget.app.id == L"terminal");
   feathercast::ui::OverlayController::RestoreNavigation(overlay);
   assert(!overlay.actionMode && overlay.selected == 2 && overlay.scroll == 50);
+
+  feathercast::app::DisplayItem commandTarget;
+  commandTarget.isCommand = true;
+  commandTarget.command = feathercast::app::CommandKind::VolumeUp;
+  commandTarget.commandStableId = L"volume-up";
+  commandTarget.commandName = L"Volume up";
+  feathercast::ui::OverlayController::EnterAction(
+      overlay, commandTarget, L"command:volume-up");
+  assert(overlay.actionMode && overlay.actionTarget.isCommand &&
+         overlay.actionTarget.InvocationKey() == L"command:volume-up");
+  feathercast::ui::OverlayController::RestoreNavigation(overlay);
+  assert(!overlay.actionMode && overlay.selected == 2 && overlay.scroll == 50);
+
   feathercast::ui::OverlayController::EnterBrowse(
       overlay, feathercast::app::BrowseView::Capabilities, L"cmd:guide");
   assert(overlay.browseView == feathercast::app::BrowseView::Capabilities);
@@ -460,6 +483,14 @@ int main() {
              feathercast::app::CapabilityActionKind::OpenSettings &&
          privacyEmpty.capability.action.settingsCategory ==
              feathercast::app::SettingsCategory::Privacy);
+  const auto moreToolsEmpty = feathercast::capabilities::EmptyStateDisplay(
+      feathercast::capabilities::EmptyStateAction::MoreTools);
+  assert(moreToolsEmpty.isCapability &&
+         moreToolsEmpty.capability.stableId == L"empty:more-tools" &&
+         moreToolsEmpty.capability.action.kind ==
+             feathercast::app::CapabilityActionKind::OpenBrowse &&
+         moreToolsEmpty.capability.action.browseView ==
+             feathercast::app::BrowseView::Capabilities);
 
   using feathercast::window_activation::ExistingInstanceResult;
   HWND fakeWindow = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1));
@@ -504,7 +535,8 @@ int main() {
 
   using namespace feathercast::accessibility_projection;
   static_assert(SearchChild() == 1 && StatusChild() == 2);
-  static_assert(ResultChild(0) == 3 && PreviewChild(4) == 7);
+  static_assert(SettingsChild() == 3);
+  static_assert(ResultChild(0) == 4 && PreviewChild(4) == 8);
   const auto loadingStatus =
       ProjectLiveStatus(false, true, L"", false, false, std::nullopt);
   assert(loadingStatus.visible && loadingStatus.kind == LiveStatusKind::Loading &&

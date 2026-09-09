@@ -561,6 +561,11 @@ int main() {
   assert(emptyResults.sections[2].title == L"Apps");
   assert(emptyResults.sections[2].items.size() == 1);
   assert(emptyResults.sections[2].items[0].app.id == L"app:remaining");
+  assert(emptyResults.sections[3].title == L"More tools");
+  assert(emptyResults.sections[3].items.size() == 1);
+  assert(emptyResults.sections[3].items[0].isCapability);
+  assert(emptyResults.sections[3].items[0].capability.stableId ==
+         L"empty:more-tools");
 
   const auto hasSection = [](const auto& results, const std::wstring& title) {
     return std::any_of(results.sections.begin(), results.sections.end(),
@@ -568,6 +573,9 @@ int main() {
   };
   assert(hasSection(emptyResults, L"Favorites"));
   assert(hasSection(emptyResults, L"Recent"));
+  assert(hasSection(emptyResults, L"More tools"));
+  assert(!hasSection(emptyResults, L"Snippets"));
+  assert(!hasSection(emptyResults, L"Commands"));
 
   feathercast::app::DisplayItem volumeCommand = *aliasedVolume;
   snapshot->pool.push_back(volumeCommand);

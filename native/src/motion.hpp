@@ -91,6 +91,72 @@ class ScalarAnimation {
   bool active_ = false;
 };
 
+// Velocity-carrying spring. Unlike ScalarAnimation, retargeting mid-flight keeps
+// the current velocity, so an interrupted or reversed move continues smoothly
+// instead of restarting from a standstill. Parameters follow Apple's
+// designer-facing pair: response (seconds to reach the target) and damping ratio
+// (1.0 = critically damped / no overshoot, <1.0 = bounce).
+class Spring {
+ public:
+  double Value() const { return value_; }
+  double Velocity() const { return velocity_; }
+  double Target() const { return target_; }
+  bool Active() const { return active_; }
+
+  void Configure(double responseSeconds, double dampingRatio) {
+    responseSeconds_ = std::max(responseSeconds, 0.001);
+    dampingRatio_ = std::clamp(dampingRatio, 0.1, 2.0);
+  }
+
+  void Snap(double value) {
+    value_ = value;
+    target_ = value;
+    velocity_ = 0.0;
+    active_ = false;
+  }
+
+  void Retarget(double target, bool animate = true) {
+    if (!animate) {
+      Snap(target);
+      return;
+    }
+    target_ = target;
+    active_ = std::abs(target_ - value_) > kEpsilon ||
+              std::abs(velocity_) > kEpsilon;
+  }
+
+  bool Update(double deltaSeconds) {
+    if (!active_) return false;
+    double remaining = ClampFrameDeltaSeconds(deltaSeconds);
+    // Fixed sub-steps keep the integration stable when a frame runs long.
+    constexpr double kStep = 1.0 / 240.0;
+    const double omega = 6.283185307179586 / responseSeconds_;
+    while (remaining > 0.0) {
+      const double dt = std::min(kStep, remaining);
+      remaining -= dt;
+      const double acceleration = -2.0 * dampingRatio_ * omega * velocity_ -
+                                  omega * omega * (value_ - target_);
+      velocity_ += acceleration * dt;
+      value_ += velocity_ * dt;
+    }
+    if (std::abs(target_ - value_) <= kEpsilon &&
+        std::abs(velocity_) <= kEpsilon * 20.0) {
+      Snap(target_);
+    }
+    return active_;
+  }
+
+ private:
+  static constexpr double kEpsilon = 0.15;
+
+  double value_ = 0.0;
+  double target_ = 0.0;
+  double velocity_ = 0.0;
+  double responseSeconds_ = 0.3;
+  double dampingRatio_ = 1.0;
+  bool active_ = false;
+};
+
 class AnimationTimeline {
  public:
   double ElapsedSeconds() const { return elapsedSeconds_; }

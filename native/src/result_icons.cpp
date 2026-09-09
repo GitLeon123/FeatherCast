@@ -27,6 +27,7 @@ ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
   if (id == L"windows-settings") return ResultIcon::Gear;
   if (id == L"plugins") return ResultIcon::Puzzle;
   if (id == L"shortcut") return ResultIcon::Keyboard;
+  if (id == L"empty:more-tools") return ResultIcon::Compass;
   return ResultIcon::App;
 }
 

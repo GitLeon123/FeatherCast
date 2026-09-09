@@ -308,28 +308,18 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     // snapshot builder resolves stable invocation keys and supplies them in
     // deterministic settings order; take() removes overlap between favorites,
     // recents, and the type-specific sections that follow.
-    addSection(L"Favorites", take(snapshot->pinned, 12));
-    addSection(L"Recent", take(snapshot->recent, 12));
+    addSection(L"Favorites", take(snapshot->pinned, 5));
+    addSection(L"Recent", take(snapshot->recent, 5));
     std::vector<DisplayItem> appSuggestions;
     for (const auto& item : snapshot->appItems) {
       if (IsLaunchableApp(item)) appSuggestions.push_back(item);
     }
-    addSection(L"Apps", take(appSuggestions, 20));
-    addSection(L"Open windows", take(snapshot->windowItems));
-    addSection(L"Snippets", take(snapshot->snippetItems, 8));
-    addSection(L"Clipboard History", take(snapshot->clipboardItems, 5));
-    addSection(L"System Folders", take(snapshot->systemFolders, 12));
-    addSection(L"System essentials", take(snapshot->system, 8));
-    addSection(L"Commands", take(snapshot->commandItems, 8));
-    const auto discover = std::find_if(
-        snapshot->commandItems.begin(), snapshot->commandItems.end(),
-        [](const DisplayItem& item) {
-          return item.isCommand &&
-                 item.command == CommandKind::DiscoverFeatherCast;
-        });
-    if (discover != snapshot->commandItems.end()) {
-      addSection(L"Explore", take({*discover}, 1));
-    }
+    addSection(L"Apps", take(appSuggestions, 5));
+    addSection(L"Open windows", take(snapshot->windowItems, 5));
+    addSection(L"More tools",
+               take({capabilities::EmptyStateDisplay(
+                         capabilities::EmptyStateAction::MoreTools)},
+                    1));
   } else {
     const std::wstring trimmed = core::Trim(request.query);
     if (trimmed.starts_with(L">")) {

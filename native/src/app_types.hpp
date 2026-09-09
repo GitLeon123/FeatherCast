@@ -55,6 +55,7 @@ enum class HitType {
   ConfirmAction,
   Back,
   CloseSettings,
+  SettingsFilter,
   SettingsShortcutCategory,
   SettingsGeneralCategory,
   SettingsResultsCategory,

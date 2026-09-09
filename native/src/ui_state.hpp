@@ -78,6 +78,10 @@ struct OverlayState {
 
 struct SettingsState {
   std::optional<app::HitType> searchTarget;
+  std::wstring filter;
+  std::wstring filterImeComposition;
+  std::size_t filterCaret = 0;
+  std::optional<std::size_t> filterSelectionAnchor;
   app::SettingsCategory category = app::SettingsCategory::General;
   int focusIndex = 0;
   float scroll = 0.0f;

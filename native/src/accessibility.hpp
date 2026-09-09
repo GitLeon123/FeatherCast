@@ -28,6 +28,9 @@ class Model {
   virtual int AccessibleFocusedChild(HWND hwnd) const = 0;  // one-based; 0 = root
   virtual void AccessibleFocusChild(HWND hwnd, int child) = 0;
   virtual void AccessibleInvokeChild(HWND hwnd, int child) = 0;
+  virtual HRESULT AccessibleSetValue(HWND, int, const std::wstring&) {
+    return E_NOTIMPL;
+  }
 };
 
 class Window final : public IAccessible {
@@ -220,7 +223,11 @@ class Window final : public IAccessible {
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
-  HRESULT STDMETHODCALLTYPE put_accValue(VARIANT, BSTR) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE put_accValue(VARIANT child, BSTR value) override {
+    const auto id = ChildId(child);
+    if (!id) return E_INVALIDARG;
+    return model_->AccessibleSetValue(hwnd_, *id, value ? value : L"");
+  }
 
  private:
   static bool IsSelf(const VARIANT& child) {

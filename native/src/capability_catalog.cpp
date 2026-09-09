@@ -184,6 +184,13 @@ app::DisplayItem EmptyStateDisplay(EmptyStateAction action) {
           L"Browse built-in features, examples, and search scopes.";
       item.capability.action = Browse(app::BrowseView::Capabilities);
       break;
+    case EmptyStateAction::MoreTools:
+      item.capability.stableId = L"empty:more-tools";
+      item.capability.title = L"More tools";
+      item.capability.summary =
+          L"Browse clipboard, snippets, capture tools, settings, and more.";
+      item.capability.action = Browse(app::BrowseView::Capabilities);
+      break;
     case EmptyStateAction::ClipboardPrivacy:
       item.capability.stableId = L"empty:clipboard-privacy";
       item.capability.title = L"Enable clipboard history in Privacy";

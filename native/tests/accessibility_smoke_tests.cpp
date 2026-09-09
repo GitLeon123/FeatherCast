@@ -59,10 +59,17 @@ class TestModel final : public feathercast::accessibility::Model {
     invokeRequests.push_back(child);
   }
 
+  HRESULT AccessibleSetValue(HWND, int child,
+                             const std::wstring& value) override {
+    valueRequests.emplace_back(child, value);
+    return S_OK;
+  }
+
   std::vector<Item> items;
   int focusedChild = feathercast::accessibility_projection::SearchChild();
   std::vector<int> focusRequests;
   std::vector<int> invokeRequests;
+  std::vector<std::pair<int, std::wstring>> valueRequests;
 };
 
 void VerifyLiveStatusProjection() {
@@ -70,10 +77,11 @@ void VerifyLiveStatusProjection() {
 
   static_assert(SearchChild() == 1);
   static_assert(StatusChild() == 2);
-  static_assert(ResultChild(0) == 3);
-  static_assert(ResultChild(4) == 7);
-  static_assert(PreviewChild(0) == 3);
-  static_assert(PreviewChild(4) == 7);
+  static_assert(SettingsChild() == 3);
+  static_assert(ResultChild(0) == 4);
+  static_assert(ResultChild(4) == 8);
+  static_assert(PreviewChild(0) == 4);
+  static_assert(PreviewChild(4) == 8);
 
   const auto hidden =
       ProjectLiveStatus(false, false, L"", false, false, std::nullopt);
@@ -149,6 +157,7 @@ void VerifyAccessibleModelTransport() {
   search.name = L"Search";
   search.value = L"note";
   search.description = L"Type to search FeatherCast";
+  search.defaultAction = L"Edit search";
   search.role = ROLE_SYSTEM_TEXT;
   search.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_FOCUSED;
   search.screenRect = RECT{10, 10, 310, 45};
@@ -163,8 +172,17 @@ void VerifyAccessibleModelTransport() {
                  STATE_SYSTEM_SELECTED;
   result.screenRect = RECT{10, 80, 310, 125};
 
+  Item settings;
+  settings.name = L"Open settings";
+  settings.description = L"Open FeatherCast settings. Keyboard shortcut Ctrl+,";
+  settings.defaultAction = L"Open settings";
+  settings.role = ROLE_SYSTEM_PUSHBUTTON;
+  settings.state = STATE_SYSTEM_FOCUSABLE;
+  settings.screenRect = RECT{320, 10, 355, 45};
+
   TestModel model;
-  model.items = {std::move(search), StatusItem(searching), std::move(result)};
+  model.items = {std::move(search), StatusItem(searching), std::move(settings),
+                 std::move(result)};
 
   auto* accessible =
       new feathercast::accessibility::Window(&model, nullptr);
@@ -179,7 +197,7 @@ void VerifyAccessibleModelTransport() {
 
   LONG childCount = 0;
   assert(accessible->get_accChildCount(&childCount) == S_OK);
-  assert(childCount == 3);
+  assert(childCount == 4);
 
   BSTR text = nullptr;
   assert(accessible->get_accName(Child(CHILDID_SELF), &text) == S_OK);
@@ -195,6 +213,15 @@ void VerifyAccessibleModelTransport() {
   assert(TakeString(text) == L"note");
   assert(accessible->get_accRole(Child(SearchChild()), &role) == S_OK);
   assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_TEXT);
+  assert(accessible->get_accDefaultAction(Child(SearchChild()), &text) == S_OK);
+  assert(TakeString(text) == L"Edit search");
+
+  BSTR replacement = SysAllocString(L"calendar");
+  assert(accessible->put_accValue(Child(SearchChild()), replacement) == S_OK);
+  SysFreeString(replacement);
+  assert(model.valueRequests.size() == 1);
+  assert(model.valueRequests.front().first == SearchChild());
+  assert(model.valueRequests.front().second == L"calendar");
 
   VARIANT state;
   assert(accessible->get_accState(Child(SearchChild()), &state) == S_OK);
@@ -212,6 +239,16 @@ void VerifyAccessibleModelTransport() {
   assert(accessible->get_accRole(Child(StatusChild()), &role) == S_OK);
   assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_STATICTEXT);
 
+  assert(accessible->get_accName(Child(SettingsChild()), &text) == S_OK);
+  assert(TakeString(text) == L"Open settings");
+  assert(accessible->get_accDescription(Child(SettingsChild()), &text) == S_OK);
+  assert(TakeString(text) ==
+         L"Open FeatherCast settings. Keyboard shortcut Ctrl+,");
+  assert(accessible->get_accRole(Child(SettingsChild()), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_PUSHBUTTON);
+  assert(accessible->get_accDefaultAction(Child(SettingsChild()), &text) == S_OK);
+  assert(TakeString(text) == L"Open settings");
+
   const int resultChild = ResultChild(0);
   assert(accessible->get_accName(Child(resultChild), &text) == S_OK);
   assert(TakeString(text) == L"Notepad");
@@ -223,9 +260,9 @@ void VerifyAccessibleModelTransport() {
   assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_LISTITEM);
   assert(accessible->get_accDefaultAction(Child(resultChild), &text) == S_OK);
   assert(TakeString(text) == L"Open");
-  assert(accessible->get_accDefaultAction(Child(SearchChild()), &text) ==
-         S_FALSE);
-  assert(text == nullptr);
+  assert(accessible->accDoDefaultAction(Child(SettingsChild())) == S_OK);
+  assert(model.invokeRequests.size() == 1);
+  assert(model.invokeRequests.front() == SettingsChild());
 
   VARIANT focus;
   assert(accessible->get_accFocus(&focus) == S_OK);
@@ -241,14 +278,18 @@ void VerifyAccessibleModelTransport() {
   assert(focus.lVal == resultChild);
 
   assert(accessible->accDoDefaultAction(Child(resultChild)) == S_OK);
-  assert(model.invokeRequests.size() == 1);
-  assert(model.invokeRequests.front() == resultChild);
+  assert(model.invokeRequests.size() == 2);
+  assert(model.invokeRequests.front() == SettingsChild());
+  assert(model.invokeRequests.back() == resultChild);
 
   VARIANT destination;
   assert(accessible->accNavigate(NAVDIR_FIRSTCHILD, Child(CHILDID_SELF),
                                  &destination) == S_OK);
   assert(destination.vt == VT_I4 && destination.lVal == SearchChild());
   assert(accessible->accNavigate(NAVDIR_NEXT, Child(StatusChild()),
+                                 &destination) == S_OK);
+  assert(destination.lVal == SettingsChild());
+  assert(accessible->accNavigate(NAVDIR_NEXT, Child(SettingsChild()),
                                  &destination) == S_OK);
   assert(destination.lVal == resultChild);
   assert(accessible->accNavigate(NAVDIR_LASTCHILD, Child(CHILDID_SELF),

@@ -1,5 +1,7 @@
 #include "settings_catalog.hpp"
 
+#include "core.hpp"
+
 #include <set>
 
 namespace feathercast::settings_catalog {
@@ -85,7 +87,7 @@ const std::vector<SettingDescriptor>& Catalog() {
        L"Disable the region recording shortcut.",
        L"Clear region recording shortcut", Requirement::ExistingRecordRegionShortcut},
       {L"general.startup", SettingsCategory::General, HitType::StartupToggle,
-       ControlKind::Toggle, L"Start on Startup",
+       ControlKind::Toggle, L"Launch at sign-in",
        L"Launch FeatherCast when you log into Windows.", L"Start on startup"},
       {L"general.updates", SettingsCategory::General, HitType::UpdateChecksToggle,
        ControlKind::Toggle, L"Automatic Update Checks",
@@ -100,7 +102,7 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Toggle, L"Open Window Results",
        L"Include currently open windows in search results.", L"Open window results"},
       {L"results.store-apps", SettingsCategory::Results, HitType::ShowStoreAppsToggle,
-       ControlKind::Toggle, L"Store/System Apps",
+       ControlKind::Toggle, L"Store and system apps",
        L"Include AppsFolder, Store, and system alias entries.", L"Store and system apps"},
       {L"results.width.down", SettingsCategory::Results, HitType::OverlayWidthDown,
        ControlKind::Decrement, L"Overlay Width", L"Width of the search overlay window.",
@@ -228,6 +230,33 @@ const std::vector<SettingDescriptor>& Catalog() {
        L"Check for updates"},
   };
   return controls;
+}
+
+std::vector<const SettingDescriptor*> Search(const std::wstring& query) {
+  const auto trimmed = core::Trim(query);
+  if (trimmed.empty()) return {};
+
+  std::vector<core::SearchItem> items;
+  items.reserve(Catalog().size());
+  for (const auto& descriptor : Catalog()) {
+    core::SearchItem item;
+    item.id = std::wstring(descriptor.stableId);
+    item.name = std::wstring(descriptor.label);
+    item.keywords = {std::wstring(descriptor.description),
+                     std::wstring(descriptor.accessibleName),
+                     std::wstring(descriptor.stableId)};
+    if (const auto* category = FindCategory(descriptor.category)) {
+      item.keywords.push_back(std::wstring(category->label));
+      item.keywords.push_back(std::wstring(category->accessibleName));
+    }
+    items.push_back(std::move(item));
+  }
+
+  const auto matches = core::Search(trimmed, items);
+  std::vector<const SettingDescriptor*> results;
+  results.reserve(matches.size());
+  for (const auto index : matches) results.push_back(&Catalog()[index]);
+  return results;
 }
 
 const SettingDescriptor* Find(app::HitType hit) {

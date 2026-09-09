@@ -19,6 +19,7 @@ struct CapabilityDescriptor {
 
 enum class EmptyStateAction {
   Discover,
+  MoreTools,
   ClipboardPrivacy,
   FilesPrivacy,
   ConfigureIndexedFolders,
