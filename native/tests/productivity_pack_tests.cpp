@@ -37,12 +37,19 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
                        const std::wstring& expectedValue) {
   const auto actions = feathercast::commands::BuildActions(
       item, feathercast::app::Settings{});
-  assert(actions.size() == (item.isClipboard ? 3 : 2));
+  assert(actions.size() == (item.isClipboard ? 3 : (item.isSnippet ? 4 : 2)));
   assert(actions[0].action == feathercast::app::ActionKind::CopyText);
   assert(actions[1].action == feathercast::app::ActionKind::PasteText);
   for (const auto& action : actions) {
     if (action.action == feathercast::app::ActionKind::PinClipboard) {
       assert(std::get<feathercast::app::ClipboardEntry>(action.actionTarget).text == expectedValue);
+      continue;
+    }
+    if (action.action == feathercast::app::ActionKind::EditAlias ||
+        action.action == feathercast::app::ActionKind::PinInvocation) {
+      const auto* target =
+          std::get_if<feathercast::app::AliasTarget>(&action.actionTarget);
+      assert(target && target->invocationKey == item.InvocationKey());
       continue;
     }
     const auto* payload =
@@ -304,6 +311,55 @@ int main() {
     assert(std::find(descriptor->keywords.begin(), descriptor->keywords.end(),
                      keyword) != descriptor->keywords.end());
   }
+  assert(feathercast::commands::Find(L"volume-up") ==
+         feathercast::commands::Find(feathercast::app::CommandKind::VolumeUp));
+
+  const std::map<std::wstring, std::wstring> commandAliases = {
+      {L"volume-up", L"Louder Now"},
+  };
+  const auto aliasedCommands =
+      feathercast::commands::BuildCommandItems(commandAliases);
+  const auto aliasedVolume = std::find_if(
+      aliasedCommands.begin(), aliasedCommands.end(), [](const auto& item) {
+        return item.command == feathercast::app::CommandKind::VolumeUp;
+      });
+  assert(aliasedVolume != aliasedCommands.end());
+  assert(aliasedVolume->commandStableId == L"volume-up");
+  assert(aliasedVolume->InvocationKey() == L"command:volume-up");
+  assert(std::find(aliasedVolume->commandKeywords.begin(),
+                   aliasedVolume->commandKeywords.end(), L"Louder Now") !=
+         aliasedVolume->commandKeywords.end());
+  const auto aliasedVolumeSearch =
+      feathercast::commands::BuildSearchItem(*aliasedVolume, commandAliases);
+  assert(aliasedVolumeSearch.id == L"command:volume-up");
+  assert(aliasedVolumeSearch.aliases ==
+         std::vector<std::wstring>{L"Louder Now"});
+  const auto preparedAliasedVolume =
+      feathercast::core::PrepareSearchItem(aliasedVolumeSearch);
+  assert(feathercast::core::ScorePreparedItem(
+             L"louder now", feathercast::core::Tokens(L"louder now"),
+             preparedAliasedVolume, {}) > 0.0);
+
+  feathercast::app::Settings invocationSettings;
+  invocationSettings.commandAliases = commandAliases;
+  invocationSettings.pinnedItems = {L"command:volume-up"};
+  const auto commandActions = feathercast::commands::BuildActions(
+      *aliasedVolume, invocationSettings);
+  assert(HasAction(commandActions, feathercast::app::ActionKind::EditAlias));
+  assert(HasAction(commandActions,
+                   feathercast::app::ActionKind::UnpinInvocation));
+  const auto editAlias = std::find_if(
+      commandActions.begin(), commandActions.end(), [](const auto& item) {
+        return item.action == feathercast::app::ActionKind::EditAlias;
+      });
+  assert(editAlias != commandActions.end());
+  const auto* aliasTarget = std::get_if<feathercast::app::AliasTarget>(
+      &editAlias->actionTarget);
+  assert(aliasTarget && aliasTarget->stableId == L"volume-up" &&
+         aliasTarget->invocationKey == L"command:volume-up" &&
+         aliasTarget->currentAlias == L"Louder Now");
+  assert(feathercast::commands::IsPersonalizableInvocation(*aliasedVolume));
+  assert(feathercast::commands::RecordsRecentActivation(*aliasedVolume));
 
   const auto settingsTargets = feathercast::system_settings::Catalog();
   assert(settingsTargets.size() == 5);
@@ -414,8 +470,24 @@ int main() {
 
   feathercast::app::DisplayItem snippet;
   snippet.isSnippet = true;
+  snippet.snippet.keyword = L"reuse";
+  snippet.snippet.name = L"Reusable text";
   snippet.snippet.text = L"Reusable text";
   AssertTextActions(snippet, snippet.snippet.text);
+  assert(snippet.InvocationKey() == L"snippet:reuse");
+  assert(feathercast::commands::RecordsRecentActivation(snippet));
+  feathercast::app::DisplayItem quicklink;
+  quicklink.app.id = L"quicklink:docs";
+  quicklink.app.name = L"Documentation";
+  quicklink.app.source = L"quicklink";
+  const auto quicklinkActions = feathercast::commands::BuildActions(
+      quicklink, feathercast::app::Settings{});
+  assert(HasAction(quicklinkActions,
+                   feathercast::app::ActionKind::EditAlias));
+  assert(HasAction(quicklinkActions,
+                   feathercast::app::ActionKind::PinInvocation));
+  assert(quicklink.InvocationKey() == L"quicklink:docs");
+  assert(feathercast::commands::RecordsRecentActivation(quicklink));
   feathercast::app::DisplayItem clipboard;
   clipboard.isClipboard = true;
   clipboard.clipboard.text = L"Clipboard text";
@@ -464,10 +536,11 @@ int main() {
   windowsSetting.app.id = L"windows-settings:test";
   windowsSetting.app.name = L"Windows Settings";
   windowsSetting.app.source = L"windows-settings";
-  snapshot->pinned = {pinnedApp};
-  snapshot->recent = {recentApp};
+  snapshot->pinned = {*aliasedVolume, pinnedApp};
+  snapshot->recent = {snippet, recentApp, *aliasedVolume, quicklink};
   snapshot->appItems = {
-      pinnedApp, recentApp, remainingApp, indexedFile, windowsSetting};
+      pinnedApp, recentApp, remainingApp, indexedFile, windowsSetting,
+      quicklink};
 
   feathercast::app::QueryRequest emptyRequest;
   emptyRequest.empty = true;
@@ -476,30 +549,30 @@ int main() {
   const auto emptyResults =
       feathercast::search_pipeline::ComputeResults(emptyRequest);
   assert(!emptyResults.sections.empty());
-  assert(emptyResults.sections.front().title == L"Apps");
-  assert(emptyResults.sections.front().items.size() == 3);
-  assert(emptyResults.sections.front().items[0].app.id == L"app:pinned");
-  assert(emptyResults.sections.front().items[1].app.id == L"app:recent");
-  assert(emptyResults.sections.front().items[2].app.id == L"app:remaining");
+  assert(emptyResults.sections[0].title == L"Favorites");
+  assert(emptyResults.sections[0].items.size() == 2);
+  assert(emptyResults.sections[0].items[0].commandStableId == L"volume-up");
+  assert(emptyResults.sections[0].items[1].app.id == L"app:pinned");
+  assert(emptyResults.sections[1].title == L"Recent");
+  assert(emptyResults.sections[1].items.size() == 3);
+  assert(emptyResults.sections[1].items[0].snippet.keyword == L"reuse");
+  assert(emptyResults.sections[1].items[1].app.id == L"app:recent");
+  assert(emptyResults.sections[1].items[2].app.id == L"quicklink:docs");
+  assert(emptyResults.sections[2].title == L"Apps");
+  assert(emptyResults.sections[2].items.size() == 1);
+  assert(emptyResults.sections[2].items[0].app.id == L"app:remaining");
 
   const auto hasSection = [](const auto& results, const std::wstring& title) {
     return std::any_of(results.sections.begin(), results.sections.end(),
                        [&](const auto& section) { return section.title == title; });
   };
-  assert(!hasSection(emptyResults, L"Pinned"));
-  assert(!hasSection(emptyResults, L"Recently used"));
+  assert(hasSection(emptyResults, L"Favorites"));
+  assert(hasSection(emptyResults, L"Recent"));
 
-  feathercast::app::DisplayItem volumeCommand;
-  volumeCommand.isCommand = true;
-  volumeCommand.command = feathercast::app::CommandKind::VolumeUp;
-  volumeCommand.commandName = L"Volume Up";
+  feathercast::app::DisplayItem volumeCommand = *aliasedVolume;
   snapshot->pool.push_back(volumeCommand);
-  feathercast::core::SearchItem commandSearchItem;
-  commandSearchItem.id = L"cmd:volume-up";
-  commandSearchItem.name = volumeCommand.commandName;
-  commandSearchItem.keywords = {L"volume", L"audio", L"louder"};
-  commandSearchItem.source = L"command";
-  commandSearchItem.kind = L"command";
+  const auto commandSearchItem = feathercast::commands::BuildSearchItem(
+      volumeCommand, commandAliases);
   snapshot->searchItems.push_back(
       feathercast::core::PrepareSearchItem(commandSearchItem));
 
@@ -752,6 +825,18 @@ int main() {
   assert(volumeControlResults.flatItems.front().isCommand);
   assert(volumeControlResults.flatItems.front().command ==
          feathercast::app::CommandKind::VolumeControl);
+
+  request.query = L"louder now";
+  const auto rootAliasResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  assert(!rootAliasResults.flatItems.empty());
+  assert(rootAliasResults.flatItems.front().commandStableId == L"volume-up");
+  request.scope = feathercast::search_scope::Scope::Commands;
+  const auto scopedAliasResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  assert(!scopedAliasResults.flatItems.empty());
+  assert(scopedAliasResults.flatItems.front().commandStableId == L"volume-up");
+  request.scope = feathercast::search_scope::Scope::All;
 
   request.searchEngines = {
       {L"docs", L"https://example.com/search?q=%s"},

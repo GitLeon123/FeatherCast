@@ -29,7 +29,8 @@ bool PersistenceService::SaveSettingsForStartup(
 }
 
 StorageStartupState PersistenceService::LoadStorageForStartup(
-    std::size_t fileLimit, std::size_t clipboardLimit, bool loadFiles) {
+    std::size_t fileLimit, std::size_t clipboardLimit, bool loadFiles,
+    std::size_t clipboardRetentionDays) {
   StorageStartupState state;
   state.opened = EnsureStorageOpen();
   if (!state.opened) {
@@ -40,6 +41,12 @@ StorageStartupState PersistenceService::LoadStorageForStartup(
   state.recoveredFromCorruption = storage_.RecoveredFromCorruption();
   state.quarantinedPath = storage_.QuarantinedPath();
   if (loadFiles) state.files = storage_.LoadFileIndex(fileLimit);
+  if (!storage_.PruneClipboardHistory(clipboardLimit,
+                                      clipboardRetentionDays)) {
+    state.opened = false;
+    state.error = storage_.LastError();
+    return state;
+  }
   state.clipboard = storage_.LoadClipboardHistory(clipboardLimit);
   return state;
 }
@@ -137,20 +144,27 @@ bool PersistenceService::SaveSettingsAndWait(settings::Settings settings,
   return succeeded;
 }
 
-bool PersistenceService::PruneClipboard(std::size_t limit) {
-  return executor_.Submit([this, limit](std::stop_token token) {
+bool PersistenceService::PruneClipboard(std::size_t limit,
+                                        std::size_t retentionDays) {
+  return executor_.Submit([this, limit, retentionDays](std::stop_token token) {
     if (token.stop_requested()) return;
     const bool succeeded =
-        EnsureStorageOpen() && storage_.PruneClipboardHistory(limit);
+        EnsureStorageOpen() &&
+        storage_.PruneClipboardHistory(limit, retentionDays);
     Emit(ClipboardPruned{
         succeeded, succeeded ? storage::StorageError{} : storage_.LastError()});
   });
 }
 
-bool PersistenceService::PinClipboard(long long id, bool pinned, std::size_t limit) {
-  return executor_.Submit([this, id, pinned, limit](std::stop_token token) {
+bool PersistenceService::PinClipboard(long long id, bool pinned,
+                                      std::size_t limit,
+                                      std::size_t retentionDays) {
+  return executor_.Submit(
+      [this, id, pinned, limit, retentionDays](std::stop_token token) {
     if (token.stop_requested()) return;
-    const bool succeeded = EnsureStorageOpen() && storage_.PinClipboard(id, pinned, limit);
+    const bool succeeded = EnsureStorageOpen() &&
+                           storage_.PinClipboard(id, pinned, limit,
+                                                 retentionDays);
     Emit(ClipboardLoaded{succeeded ? storage_.LoadClipboardHistory(limit) : std::vector<storage::ClipboardEntry>{},
                          succeeded ? storage::StorageError{} : storage_.LastError()});
   });
@@ -203,12 +217,15 @@ bool PersistenceService::MergeFileIndex(
     std::vector<storage::FileIndexEntry> entries,
     std::vector<std::wstring> configuredRoots,
     std::vector<std::wstring> availableRoots, std::size_t limit,
-    std::uint64_t generation) {
+    std::uint64_t generation,
+    std::vector<std::wstring> exclusionPatterns) {
   return executor_.Submit(
       [this, entries = std::move(entries),
        configuredRoots = std::move(configuredRoots),
        availableRoots = std::move(availableRoots), limit,
-       generation](std::stop_token token) mutable {
+       generation,
+       exclusionPatterns = std::move(exclusionPatterns)](
+          std::stop_token token) mutable {
         if (token.stop_requested()) return;
         if (!EnsureStorageOpen()) {
           Emit(FileIndexMerged{generation, false, {}, storage_.LastError()});
@@ -216,7 +233,7 @@ bool PersistenceService::MergeFileIndex(
         }
         auto merged = files::MergeFileIndexEntries(
             storage_.LoadFileIndex(limit), std::move(entries), configuredRoots,
-            availableRoots, limit);
+            availableRoots, limit, exclusionPatterns);
         std::vector<std::wstring> preserveRoots;
         for (const auto& configured : configuredRoots) {
           const bool available = std::any_of(
@@ -240,14 +257,16 @@ bool PersistenceService::MergeFileIndex(
 bool PersistenceService::StoreClipboard(std::wstring text,
                                         std::wstring preview,
                                         long long capturedAt,
-                                        std::size_t limit) {
+                                        std::size_t limit,
+                                        std::size_t retentionDays) {
   return executor_.Submit(
       [this, text = std::move(text), preview = std::move(preview),
-       capturedAt, limit](std::stop_token token) {
+       capturedAt, limit, retentionDays](std::stop_token token) {
         if (token.stop_requested()) return;
         std::optional<storage::ClipboardEntry> entry;
         if (EnsureStorageOpen()) {
-          entry = storage_.AddClipboardEntry(text, preview, capturedAt, limit);
+          entry = storage_.AddClipboardEntry(text, preview, capturedAt, limit,
+                                             retentionDays);
         }
         Emit(ClipboardStored{
             std::move(entry),
@@ -255,16 +274,20 @@ bool PersistenceService::StoreClipboard(std::wstring text,
       });
 }
 
-bool PersistenceService::LoadClipboard(std::size_t limit) {
-  return executor_.Submit([this, limit](std::stop_token token) {
+bool PersistenceService::LoadClipboard(std::size_t limit,
+                                       std::size_t retentionDays) {
+  return executor_.Submit([this, limit, retentionDays](std::stop_token token) {
     if (token.stop_requested()) return;
     std::vector<storage::ClipboardEntry> entries;
-    if (EnsureStorageOpen()) {
+    const bool succeeded = EnsureStorageOpen() &&
+                           storage_.PruneClipboardHistory(limit,
+                                                          retentionDays);
+    if (succeeded) {
       entries = storage_.LoadClipboardHistory(limit);
     }
     Emit(ClipboardLoaded{
         std::move(entries),
-        storage_.IsOpen() ? storage::StorageError{} : storage_.LastError()});
+        succeeded ? storage::StorageError{} : storage_.LastError()});
   });
 }
 

@@ -206,6 +206,18 @@ int main() {
   }
 
   {
+    using feathercast::files::MatchesRelativePathExclusion;
+    assert(MatchesRelativePathExclusion(
+        L"Private\\Secret.TXT", {L"private/**"}));
+    assert(MatchesRelativePathExclusion(L"draft.TMP", {L"**/*.tmp"}));
+    assert(MatchesRelativePathExclusion(
+        L"src\\generated/cache.txt", {L"src/*/cache.txt"}));
+    assert(!MatchesRelativePathExclusion(
+        L"src/generated/nested/cache.txt", {L"src/*/cache.txt"}));
+    assert(MatchesRelativePathExclusion(L"cache", {L"cache/**"}));
+    assert(!MatchesRelativePathExclusion(
+        L"public/secret.txt", {L"private/**"}));
+
     feathercast::storage::FileIndexEntry oldOnline;
     oldOnline.path = L"C:\\Online\\old.txt";
     oldOnline.name = L"old.txt";
@@ -222,6 +234,11 @@ int main() {
     removed.name = L"drop.txt";
     removed.root = L"C:\\Removed";
     removed.lastWriteTime = 3;
+    feathercast::storage::FileIndexEntry excludedOffline;
+    excludedOffline.path = L"C:\\Offline\\private\\drop.txt";
+    excludedOffline.name = L"drop.txt";
+    excludedOffline.root = L"C:\\Offline";
+    excludedOffline.lastWriteTime = 5;
     feathercast::storage::FileIndexEntry newOnline;
     newOnline.path = L"C:\\Online\\new.txt";
     newOnline.name = L"new.txt";
@@ -229,8 +246,9 @@ int main() {
     newOnline.lastWriteTime = 4;
     newOnline.indexedAt = 100;
     const auto merged = feathercast::files::MergeFileIndexEntries(
-        {oldOnline, oldOffline, removed}, {newOnline},
-        {L"C:\\Online", L"C:\\Offline"}, {L"C:\\Online"}, 100);
+        {oldOnline, oldOffline, removed, excludedOffline}, {newOnline},
+        {L"C:\\Online", L"C:\\Offline"}, {L"C:\\Online"}, 100,
+        {L"private/**"});
     assert(merged.size() == 2);
     assert(std::any_of(merged.begin(), merged.end(), [](const auto& entry) {
       return entry.path == L"C:\\Online\\new.txt";
@@ -243,6 +261,21 @@ int main() {
       return entry.path.find(L"old.txt") != std::wstring::npos ||
              entry.path.find(L"drop.txt") != std::wstring::npos;
     }));
+
+    const auto cleanupDatabase = root / L"exclusion-cleanup.db";
+    feathercast::storage::Storage cleanupStorage;
+    assert(cleanupStorage.Open(cleanupDatabase));
+    assert(cleanupStorage.UpdateFileIndex(
+        {oldOnline, oldOffline, excludedOffline}));
+    assert(cleanupStorage.UpdateFileIndex(merged, {L"C:\\Offline"}));
+    const auto persisted = cleanupStorage.LoadFileIndex(100);
+    assert(std::none_of(persisted.begin(), persisted.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Offline\\private\\drop.txt";
+    }));
+    assert(std::any_of(persisted.begin(), persisted.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Offline\\keep.txt";
+    }));
+    cleanupStorage.Close();
     assert(!feathercast::files::IsFixedLocalIndexRoot(
         std::filesystem::path(L"\\\\server\\share")));
   }
@@ -261,6 +294,12 @@ int main() {
     std::filesystem::create_directories(generated.parent_path(), error);
     assert(!error);
     WriteBytes(generated, {'g', 'e', 'n'});
+    const auto privateFile = indexedRoot / L"private" / L"secret.txt";
+    std::filesystem::create_directories(privateFile.parent_path(), error);
+    assert(!error);
+    WriteBytes(privateFile, {'s', 'e', 'c', 'r', 'e', 't'});
+    const auto temporaryFile = indexedRoot / L"level-0" / L"draft.tmp";
+    WriteBytes(temporaryFile, {'t', 'm', 'p'});
 
     std::mutex mutex;
     std::condition_variable ready;
@@ -280,13 +319,26 @@ int main() {
                          });
     };
     index.Start();
-    assert(index.Reconfigure({11, {indexedRoot.wstring()}, 100, false}));
+    assert(index.Reconfigure({11, {indexedRoot.wstring()}, 100, false,
+                              {L"private/**", L"**/*.tmp"}}));
     {
       std::unique_lock lock(mutex);
       assert(ready.wait_for(lock, std::chrono::seconds(5),
                             [&] { return contains(deepFile); }));
     }
     assert(!contains(generated));
+    assert(!contains(privateFile));
+    assert(!contains(temporaryFile));
+
+    assert(index.Reconfigure({12, {indexedRoot.wstring()}, 100, false,
+                              {L"private/**", L"**/*.tmp",
+                               L"**/deep.txt"}}));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return latest.generation == 12; }));
+    }
+    assert(!contains(deepFile));
 
     const auto watched = deep / L"watched.txt";
     WriteBytes(watched, {'n', 'e', 'w'});

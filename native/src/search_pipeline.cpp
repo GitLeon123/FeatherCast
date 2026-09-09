@@ -304,15 +304,16 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
     addSection(ScopeTitle(request.scope, request.empty), take(hits));
   } else if (request.empty) {
+    // pinned/recent are intentionally generic DisplayItem buckets. The
+    // snapshot builder resolves stable invocation keys and supplies them in
+    // deterministic settings order; take() removes overlap between favorites,
+    // recents, and the type-specific sections that follow.
+    addSection(L"Favorites", take(snapshot->pinned, 12));
+    addSection(L"Recent", take(snapshot->recent, 12));
     std::vector<DisplayItem> appSuggestions;
-    auto appendLaunchable = [&](const std::vector<DisplayItem>& items) {
-      for (const auto& item : items) {
-        if (IsLaunchableApp(item)) appSuggestions.push_back(item);
-      }
-    };
-    appendLaunchable(snapshot->pinned);
-    appendLaunchable(snapshot->recent);
-    appendLaunchable(snapshot->appItems);
+    for (const auto& item : snapshot->appItems) {
+      if (IsLaunchableApp(item)) appSuggestions.push_back(item);
+    }
     addSection(L"Apps", take(appSuggestions, 20));
     addSection(L"Open windows", take(snapshot->windowItems));
     addSection(L"Snippets", take(snapshot->snippetItems, 8));

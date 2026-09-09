@@ -1,5 +1,7 @@
 #include "library_ui.hpp"
 
+#include "command_catalog.hpp"
+
 #include <commctrl.h>
 #include <initguid.h>
 #include <oleacc.h>
@@ -76,6 +78,7 @@ class EditorWindow {
                const std::vector<snippets::Snippet>& snippets,
                const std::vector<settings::Quicklink>& quicklinks,
                const std::vector<library::AppAlias>& aliases,
+               const std::vector<library::CommandAlias>& commandAliases,
                const std::vector<library::AppChoice>& availableApps,
                const std::vector<library::WebSearch>& searches,
                std::optional<std::size_t> editingIndex,
@@ -85,6 +88,7 @@ class EditorWindow {
         snippets_(snippets),
         quicklinks_(quicklinks),
         aliases_(aliases),
+        commandAliases_(commandAliases),
         availableApps_(availableApps),
         searches_(searches),
         editingIndex_(editingIndex),
@@ -96,9 +100,14 @@ class EditorWindow {
         quicklink_ = quicklinks_.at(*editingIndex_);
       } else if (kind_ == library::ItemKind::AppAlias) {
         alias_ = aliases_.at(*editingIndex_);
+      } else if (kind_ == library::ItemKind::CommandAlias) {
+        commandAlias_ = commandAliases_.at(*editingIndex_);
       } else {
         webSearch_ = searches_.at(*editingIndex_);
       }
+    }
+    for (const auto& descriptor : commands::Catalog()) {
+      availableCommands_.push_back({descriptor.stableId, descriptor.label});
     }
   }
 
@@ -111,6 +120,8 @@ class EditorWindow {
       title = editingIndex_ ? L"Edit Quicklink" : L"Add Quicklink";
     } else if (kind_ == library::ItemKind::AppAlias) {
       title = editingIndex_ ? L"Edit App Alias" : L"Add App Alias";
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      title = editingIndex_ ? L"Edit Command Alias" : L"Add Command Alias";
     } else {
       title = editingIndex_ ? L"Edit Web Search" : L"Add Web Search";
     }
@@ -149,6 +160,7 @@ class EditorWindow {
   const snippets::Snippet& Snippet() const { return snippet_; }
   const settings::Quicklink& Quicklink() const { return quicklink_; }
   const library::AppAlias& Alias() const { return alias_; }
+  const library::CommandAlias& CommandAlias() const { return commandAlias_; }
   const library::WebSearch& WebSearch() const { return webSearch_; }
 
  private:
@@ -193,13 +205,17 @@ class EditorWindow {
   }
 
   void CreateControls() {
-    const bool alias = kind_ == library::ItemKind::AppAlias;
+    const bool appAlias = kind_ == library::ItemKind::AppAlias;
+    const bool commandAlias = kind_ == library::ItemKind::CommandAlias;
+    const bool alias = appAlias || commandAlias;
     const bool webSearch = kind_ == library::ItemKind::WebSearch;
-    nameLabel_ = AddControl(
-        WC_STATICW,
-        alias ? L"App" :
-        (kind_ == library::ItemKind::Snippet ? L"Name" : L"Name (optional)"),
-        SS_LEFT, 0);
+    const wchar_t* nameLabel = appAlias
+        ? L"App"
+        : (commandAlias
+               ? L"Command"
+               : (kind_ == library::ItemKind::Snippet ? L"Name"
+                                                       : L"Name (optional)"));
+    nameLabel_ = AddControl(WC_STATICW, nameLabel, SS_LEFT, 0);
     name_ = AddControl(alias ? WC_COMBOBOXW : WC_EDITW, L"",
                        WS_TABSTOP | (alias ? CBS_DROPDOWNLIST | WS_VSCROLL
                                            : ES_AUTOHSCROLL),
@@ -223,10 +239,17 @@ class EditorWindow {
     save_ = AddControl(WC_BUTTONW, L"Save",
                        WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
     cancel_ = AddControl(WC_BUTTONW, L"Cancel", WS_TABSTOP, IDCANCEL);
-    SetAccessibleName(name_, alias ? L"App" :
-        (kind_ == library::ItemKind::Snippet ? L"Snippet name"
-                                             : L"Quicklink name (optional)"));
-    SetAccessibleName(keyword_, alias ? L"App alias" : L"Keyword");
+    const wchar_t* accessibleName = appAlias
+        ? L"App"
+        : (commandAlias
+               ? L"Command"
+               : (kind_ == library::ItemKind::Snippet
+                      ? L"Snippet name"
+                      : L"Quicklink name (optional)"));
+    SetAccessibleName(name_, accessibleName);
+    SetAccessibleName(keyword_, appAlias ? L"App alias" :
+                                  (commandAlias ? L"Command alias"
+                                                : L"Keyword"));
     SetAccessibleName(value_, webSearch ? L"Web search URL template" :
         (kind_ == library::ItemKind::Snippet ? L"Snippet text"
                                              : L"Quicklink target"));
@@ -239,7 +262,7 @@ class EditorWindow {
       SetWindowTextW(name_, quicklink_.name.c_str());
       SetWindowTextW(keyword_, quicklink_.keyword.c_str());
       SetWindowTextW(value_, quicklink_.target.c_str());
-    } else if (alias) {
+    } else if (appAlias) {
       std::wstring selectedId = alias_.appId.empty() ? preferredAppId_
                                                      : alias_.appId;
       int selected = -1;
@@ -266,6 +289,33 @@ class EditorWindow {
       SetWindowTextW(keyword_, alias_.alias.c_str());
       ShowWindow(valueLabel_, SW_HIDE);
       ShowWindow(value_, SW_HIDE);
+    } else if (commandAlias) {
+      std::wstring selectedId = commandAlias_.stableId.empty()
+          ? preferredAppId_
+          : commandAlias_.stableId;
+      int selected = -1;
+      for (std::size_t index = 0; index < availableCommands_.size(); ++index) {
+        const auto& command = availableCommands_[index];
+        const int item = static_cast<int>(SendMessageW(
+            name_, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(command.name.c_str())));
+        SendMessageW(name_, CB_SETITEMDATA, item, static_cast<LPARAM>(index));
+        if (command.stableId == selectedId) selected = item;
+      }
+      if (selected < 0 && !selectedId.empty()) {
+        availableCommands_.push_back(
+            {selectedId, L"Missing command - " + selectedId});
+        selected = static_cast<int>(SendMessageW(
+            name_, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(availableCommands_.back().name.c_str())));
+        SendMessageW(name_, CB_SETITEMDATA, selected,
+                     static_cast<LPARAM>(availableCommands_.size() - 1));
+      }
+      if (selected < 0 && !availableCommands_.empty()) selected = 0;
+      SendMessageW(name_, CB_SETCURSEL, selected, 0);
+      SetWindowTextW(keyword_, commandAlias_.alias.c_str());
+      ShowWindow(valueLabel_, SW_HIDE);
+      ShowWindow(value_, SW_HIDE);
     } else {
       ShowWindow(nameLabel_, SW_HIDE);
       ShowWindow(name_, SW_HIDE);
@@ -285,14 +335,19 @@ class EditorWindow {
       MoveWindow(nameLabel_, margin, y, width - 2 * margin, labelHeight, TRUE);
       y += labelHeight;
       MoveWindow(name_, margin, y, width - 2 * margin,
-                 kind_ == library::ItemKind::AppAlias ? 240 : editHeight, TRUE);
+                 (kind_ == library::ItemKind::AppAlias ||
+                  kind_ == library::ItemKind::CommandAlias)
+                     ? 240
+                     : editHeight,
+                 TRUE);
       y += editHeight + gap;
     }
     MoveWindow(keywordLabel_, margin, y, width - 2 * margin, labelHeight, TRUE);
     y += labelHeight;
     MoveWindow(keyword_, margin, y, width - 2 * margin, editHeight, TRUE);
     y += editHeight + gap;
-    if (kind_ == library::ItemKind::AppAlias) {
+    if (kind_ == library::ItemKind::AppAlias ||
+        kind_ == library::ItemKind::CommandAlias) {
       MoveWindow(cancel_, width - margin - 90, height - margin - 30, 90, 30,
                  TRUE);
       MoveWindow(save_, width - margin - 90 - gap - 90,
@@ -347,6 +402,25 @@ class EditorWindow {
                     MB_OK | MB_ICONWARNING);
         return;
       }
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      const int selected =
+          static_cast<int>(SendMessageW(name_, CB_GETCURSEL, 0, 0));
+      if (selected >= 0) {
+        const auto index = static_cast<std::size_t>(
+            SendMessageW(name_, CB_GETITEMDATA, selected, 0));
+        if (index < availableCommands_.size()) {
+          commandAlias_.stableId = availableCommands_[index].stableId;
+          commandAlias_.commandName = availableCommands_[index].name;
+        }
+      }
+      commandAlias_.alias = snippets::Trim(ControlText(keyword_));
+      if (const auto error = library::ValidateCommandAlias(
+              commandAlias_, commandAliases_, aliases_, snippets_,
+              quicklinks_, editingIndex_)) {
+        MessageBoxW(hwnd_, error->c_str(), L"Invalid Command Alias",
+                    MB_OK | MB_ICONWARNING);
+        return;
+      }
     } else {
       webSearch_.keyword = library::NormalizeKeyword(ControlText(keyword_));
       webSearch_.urlTemplate = snippets::Trim(ControlText(value_));
@@ -392,12 +466,15 @@ class EditorWindow {
   std::vector<snippets::Snippet> snippets_;
   std::vector<settings::Quicklink> quicklinks_;
   std::vector<library::AppAlias> aliases_;
+  std::vector<library::CommandAlias> commandAliases_;
   std::vector<library::AppChoice> availableApps_;
+  std::vector<library::CommandChoice> availableCommands_;
   std::vector<library::WebSearch> searches_;
   std::optional<std::size_t> editingIndex_;
   snippets::Snippet snippet_;
   settings::Quicklink quicklink_;
   library::AppAlias alias_;
+  library::CommandAlias commandAlias_;
   library::WebSearch webSearch_;
   std::wstring preferredAppId_;
   bool accepted_ = false;
@@ -502,8 +579,10 @@ class ManagerWindow {
     TabCtrl_InsertItem(tabs_, 1, &tab);
     tab.pszText = const_cast<wchar_t*>(L"App Aliases");
     TabCtrl_InsertItem(tabs_, 2, &tab);
-    tab.pszText = const_cast<wchar_t*>(L"Web Searches");
+    tab.pszText = const_cast<wchar_t*>(L"Command Aliases");
     TabCtrl_InsertItem(tabs_, 3, &tab);
+    tab.pszText = const_cast<wchar_t*>(L"Web Searches");
+    TabCtrl_InsertItem(tabs_, 4, &tab);
     TabCtrl_SetCurSel(tabs_, static_cast<int>(kind_));
 
     list_ = AddControl(WC_LISTVIEWW, L"",
@@ -534,19 +613,35 @@ class ManagerWindow {
                         IDCANCEL);
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
     Refresh();
-    if (kind_ == library::ItemKind::AppAlias && !initialAppId_.empty()) {
-      const auto alias = std::find_if(
-          data_.appAliases.begin(), data_.appAliases.end(),
-          [&](const auto& item) { return item.appId == initialAppId_; });
-      if (alias == data_.appAliases.end()) {
+    if ((kind_ == library::ItemKind::AppAlias ||
+         kind_ == library::ItemKind::CommandAlias) &&
+        !initialAppId_.empty()) {
+      std::optional<std::size_t> sourceIndex;
+      if (kind_ == library::ItemKind::AppAlias) {
+        const auto alias = std::find_if(
+            data_.appAliases.begin(), data_.appAliases.end(),
+            [&](const auto& item) { return item.appId == initialAppId_; });
+        if (alias != data_.appAliases.end()) {
+          sourceIndex = static_cast<std::size_t>(
+              std::distance(data_.appAliases.begin(), alias));
+        }
+      } else {
+        const auto alias = std::find_if(
+            data_.commandAliases.begin(), data_.commandAliases.end(),
+            [&](const auto& item) { return item.stableId == initialAppId_; });
+        if (alias != data_.commandAliases.end()) {
+          sourceIndex = static_cast<std::size_t>(
+              std::distance(data_.commandAliases.begin(), alias));
+        }
+      }
+      if (!sourceIndex) {
         AddItem();
       } else {
-        const auto sourceIndex = static_cast<LPARAM>(
-            std::distance(data_.appAliases.begin(), alias));
         for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
           LVITEMW item{LVIF_PARAM};
           item.iItem = row;
-          if (ListView_GetItem(list_, &item) && item.lParam == sourceIndex) {
+          if (ListView_GetItem(list_, &item) &&
+              item.lParam == static_cast<LPARAM>(*sourceIndex)) {
             ListView_SetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED,
                                   LVIS_SELECTED | LVIS_FOCUSED);
             EditItem();
@@ -585,6 +680,10 @@ class ManagerWindow {
   bool Writable() const {
     if (kind_ == library::ItemKind::Snippet) return data_.snippetsWritable;
     if (kind_ == library::ItemKind::Quicklink) return data_.quicklinksWritable;
+    if (kind_ == library::ItemKind::CommandAlias) {
+      return data_.settingsWritable &&
+             static_cast<bool>(callbacks_.saveCommandAliases);
+    }
     return data_.settingsWritable;
   }
 
@@ -653,6 +752,16 @@ class ManagerWindow {
                   alias.appName.empty() ? L"Missing app" : alias.appName,
                   alias.alias, alias.appId);
       }
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      int row = 0;
+      for (const auto index :
+           library::SortedCommandAliasIndices(data_.commandAliases)) {
+        const auto& alias = data_.commandAliases[index];
+        InsertRow(row++, index,
+                  alias.commandName.empty() ? L"Missing command"
+                                            : alias.commandName,
+                  alias.alias, alias.stableId);
+      }
     } else {
       int row = 0;
       for (const auto index :
@@ -663,7 +772,10 @@ class ManagerWindow {
       }
     }
     const auto selected = SelectedIndex();
-    EnableWindow(add_, Writable());
+    const bool canAdd = Writable() &&
+                        (kind_ != library::ItemKind::CommandAlias ||
+                         data_.commandAliases.size() < commands::Catalog().size());
+    EnableWindow(add_, canAdd);
     EnableWindow(edit_, Writable() && selected.has_value());
     EnableWindow(remove_, Writable() && selected.has_value());
     EnableWindow(openFile_, kind_ == library::ItemKind::Snippet ||
@@ -675,8 +787,13 @@ class ManagerWindow {
         ? data_.snippetsMessage
         : (kind_ == library::ItemKind::Quicklink ? data_.quicklinksMessage
                                                   : data_.settingsMessage);
+    const bool integrationMissing =
+        kind_ == library::ItemKind::CommandAlias &&
+        !callbacks_.saveCommandAliases;
     SetWindowTextW(status_,
-                   message.empty()
+                   integrationMissing
+                       ? L"Command alias persistence is not connected."
+                       : message.empty()
                        ? (Writable() ? L"Changes are saved immediately."
                                      : L"Editing is unavailable.")
                        : message.c_str());
@@ -692,7 +809,8 @@ class ManagerWindow {
   void AddItem() {
     if (!Writable()) return;
     EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
-                        data_.appAliases, data_.availableApps,
+                        data_.appAliases, data_.commandAliases,
+                        data_.availableApps,
                         data_.webSearches, std::nullopt, initialAppId_);
     if (!editor.Run()) return;
     if (kind_ == library::ItemKind::Snippet) {
@@ -716,6 +834,13 @@ class ManagerWindow {
       ShowResult(result);
       if (result.succeeded) data_.appAliases = std::move(candidate);
       else if (callbacks_.reload) data_ = callbacks_.reload();
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      auto candidate = data_.commandAliases;
+      candidate.push_back(editor.CommandAlias());
+      const auto result = callbacks_.saveCommandAliases(candidate);
+      ShowResult(result);
+      if (result.succeeded) data_.commandAliases = std::move(candidate);
+      else if (callbacks_.reload) data_ = callbacks_.reload();
     } else {
       auto candidate = data_.webSearches;
       candidate.push_back(editor.WebSearch());
@@ -731,7 +856,8 @@ class ManagerWindow {
     const auto selected = SelectedIndex();
     if (!selected || !Writable()) return;
     EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
-                        data_.appAliases, data_.availableApps,
+                        data_.appAliases, data_.commandAliases,
+                        data_.availableApps,
                         data_.webSearches, selected);
     if (!editor.Run()) return;
     if (kind_ == library::ItemKind::Snippet) {
@@ -754,6 +880,13 @@ class ManagerWindow {
       const auto result = callbacks_.saveAppAliases(candidate);
       ShowResult(result);
       if (result.succeeded) data_.appAliases = std::move(candidate);
+      else if (callbacks_.reload) data_ = callbacks_.reload();
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      auto candidate = data_.commandAliases;
+      candidate[*selected] = editor.CommandAlias();
+      const auto result = callbacks_.saveCommandAliases(candidate);
+      ShowResult(result);
+      if (result.succeeded) data_.commandAliases = std::move(candidate);
       else if (callbacks_.reload) data_ = callbacks_.reload();
     } else {
       auto candidate = data_.webSearches;
@@ -794,6 +927,14 @@ class ManagerWindow {
       const auto result = callbacks_.saveAppAliases(candidate);
       ShowResult(result);
       if (result.succeeded) data_.appAliases = std::move(candidate);
+      else if (callbacks_.reload) data_ = callbacks_.reload();
+    } else if (kind_ == library::ItemKind::CommandAlias) {
+      auto candidate = data_.commandAliases;
+      candidate.erase(candidate.begin() +
+                      static_cast<std::ptrdiff_t>(*selected));
+      const auto result = callbacks_.saveCommandAliases(candidate);
+      ShowResult(result);
+      if (result.succeeded) data_.commandAliases = std::move(candidate);
       else if (callbacks_.reload) data_ = callbacks_.reload();
     } else {
       auto candidate = data_.webSearches;

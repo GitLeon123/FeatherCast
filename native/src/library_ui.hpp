@@ -13,6 +13,7 @@ struct ManagerData {
   std::vector<snippets::Snippet> snippets;
   std::vector<settings::Quicklink> quicklinks;
   std::vector<library::AppAlias> appAliases;
+  std::vector<library::CommandAlias> commandAliases;
   std::vector<library::AppChoice> availableApps;
   std::vector<library::WebSearch> webSearches;
   bool snippetsWritable = true;
@@ -30,6 +31,8 @@ struct ManagerCallbacks {
       const std::vector<settings::Quicklink>&)> saveQuicklinks;
   std::function<library::OperationResult(
       const std::vector<library::AppAlias>&)> saveAppAliases;
+  std::function<library::OperationResult(
+      const std::vector<library::CommandAlias>&)> saveCommandAliases;
   std::function<library::OperationResult(
       const std::vector<library::WebSearch>&)> saveWebSearches;
   std::function<library::OperationResult()> restoreDefaultWebSearches;

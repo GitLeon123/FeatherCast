@@ -1,5 +1,6 @@
 ﻿#include "calculator.hpp"
 #include "converter.hpp"
+#include "app_types.hpp"
 #include "background_executor.hpp"
 #include "core.hpp"
 #include "discovery.hpp"
@@ -651,6 +652,43 @@ int main() {
   assert(!clipboardHit.empty() && clipboardHit.front() == 4);
 
   {
+    SearchItem aliased;
+    aliased.id = L"resume-builder";
+    aliased.name = L"CV Builder";
+    aliased.aliases = {L"R\u00e9sum\u00e9"};
+    const std::wstring normalized = feathercast::core::Normalize(L"RESUME");
+    const auto score = feathercast::core::ScorePreparedItemDetailed(
+        normalized, feathercast::core::TokensNormalized(normalized),
+        feathercast::core::PrepareSearchItem(aliased), {});
+    assert(score.matchClass == MatchClass::ExactName);
+    assert(!Search(L"resume", {aliased}).empty());
+
+    using feathercast::core::AliasValidationError;
+    const auto valid =
+        feathercast::core::ValidateAlias(L"  R\u00e9sum\u00e9  ");
+    assert(valid.valid);
+    assert(valid.value == L"R\u00e9sum\u00e9");
+    assert(valid.normalized == L"resume");
+    assert(feathercast::core::AliasesEqual(L"R\u00e9sum\u00e9", L"RESUME"));
+    assert(feathercast::core::ValidateAlias(L"   ").error ==
+           AliasValidationError::Empty);
+    assert(feathercast::core::ValidateAlias(L"two\nlines").error ==
+           AliasValidationError::Multiline);
+    for (const auto* reserved : {L"@apps", L">shell", L":command"}) {
+      assert(feathercast::core::ValidateAlias(reserved).error ==
+             AliasValidationError::ReservedPrefix);
+    }
+
+    std::map<std::wstring, std::wstring> aliases;
+    assert(feathercast::core::SetUniqueAlias(aliases, L"settings", L"prefs"));
+    assert(feathercast::core::SetUniqueAlias(aliases, L"settings",
+                                             L"preferences"));
+    assert(!feathercast::core::SetUniqueAlias(aliases, L"other",
+                                              L"PREFERENCES"));
+    assert(aliases.size() == 1);
+  }
+
+  {
     std::vector<feathercast::core::PreparedSearchItem> prepared;
     for (const auto& item : items) prepared.push_back(feathercast::core::PrepareSearchItem(item));
     SearchOptions options;
@@ -903,6 +941,9 @@ int main() {
     original.pinnedApps = {L"app:pinned"};
     original.hiddenApps = {L"app:hidden"};
     original.appAliases[std::wstring(L"vs") + wchar_t(0xE4)] = L"line1\nline2\t\"quoted\"";  // key with a-umlaut
+    original.commandAliases[L"settings"] = L"prefs";
+    original.pinnedItems = {L"command:settings", L"snippet:sig"};
+    original.recentItems = {L"quicklink:docs"};
     original.usageStats[L"app:one"] = {42, 1750000000};
     original.compactMode = true;
     original.animationLevel = fs::AnimationLevel::Reduced;
@@ -916,9 +957,12 @@ int main() {
     original.privacyConsentVersion = 1;
     original.clipboardHistoryEnabled = true;
     original.clipboardHistoryLimit = 25;
+    original.clipboardRetentionDays = 14;
+    original.clipboardExcludedApps = {L"C:\\Secret\\Editor.exe"};
     original.fileIndexEnabled = true;
     original.fileIndexMaxEntries = 2500;
     original.fileIndexRoots = {L"C:\\Work", L"D:\\Projects"};
+    original.fileIndexExcludePatterns = {L"**\\.git\\**", L"*.tmp"};
     original.diagnosticsEnabled = true;
     original.quicklinks.push_back({L"docs", L"My \"Docs\"", L"C:\\Users\\Leon\\Docs"});
 
@@ -928,6 +972,9 @@ int main() {
     assert(copy.pinnedApps == original.pinnedApps);
     assert(copy.hiddenApps == original.hiddenApps);
     assert(copy.appAliases == original.appAliases);
+    assert(copy.commandAliases == original.commandAliases);
+    assert(copy.pinnedItems == original.pinnedItems);
+    assert(copy.recentItems == original.recentItems);
     assert(copy.usageStats.size() == 1);
     assert(copy.usageStats.at(L"app:one").launches == 42);
     assert(copy.usageStats.at(L"app:one").lastUsed == 1750000000);
@@ -943,9 +990,12 @@ int main() {
     assert(copy.privacyConsentVersion == original.privacyConsentVersion);
     assert(copy.clipboardHistoryEnabled == original.clipboardHistoryEnabled);
     assert(copy.clipboardHistoryLimit == original.clipboardHistoryLimit);
+    assert(copy.clipboardRetentionDays == original.clipboardRetentionDays);
+    assert(copy.clipboardExcludedApps == original.clipboardExcludedApps);
     assert(copy.fileIndexEnabled == original.fileIndexEnabled);
     assert(copy.fileIndexMaxEntries == original.fileIndexMaxEntries);
     assert(copy.fileIndexRoots == original.fileIndexRoots);
+    assert(copy.fileIndexExcludePatterns == original.fileIndexExcludePatterns);
     assert(copy.diagnosticsEnabled == original.diagnosticsEnabled);
     assert(copy.searchEngines == original.searchEngines);
     fs::Settings noSearchEngines;
@@ -960,6 +1010,40 @@ int main() {
     assert(copy.quicklinks[0].keyword == L"docs");
     assert(copy.quicklinks[0].name == L"My \"Docs\"");
     assert(copy.quicklinks[0].target == L"C:\\Users\\Leon\\Docs");
+
+    const auto versionTwo = fs::ParseSettingsDocument(
+        R"({"schemaVersion":2,"shortcut":"Ctrl+Space"})");
+    assert(versionTwo.status == fs::ParseStatus::Valid);
+    assert(versionTwo.documentVersion == 2);
+    assert(versionTwo.value.commandAliases.empty());
+    assert(versionTwo.value.pinnedItems.empty());
+    assert(versionTwo.value.recentItems.empty());
+    assert(versionTwo.value.clipboardRetentionDays == 0);
+    assert(versionTwo.value.clipboardExcludedApps.empty());
+    assert(versionTwo.value.fileIndexExcludePatterns.empty());
+
+    const auto versionThree = fs::ParseSettingsDocument(
+        R"({"schemaVersion":3,"commandAliases":{"settings":" prefs ","bad":"@apps","duplicate":"PREFS"},"pinnedItems":["command:settings"],"recentItems":["snippet:sig"],"clipboardRetentionDays":30,"clipboardExcludedApps":["C:\\Secret.exe"],"fileIndexExcludePatterns":["**\\node_modules\\**"]})");
+    assert(versionThree.status == fs::ParseStatus::Valid);
+    assert(versionThree.documentVersion == 3);
+    assert(versionThree.value.commandAliases.size() == 1);
+    assert(versionThree.value.commandAliases.at(L"settings") == L"prefs");
+    assert(versionThree.value.pinnedItems ==
+           (std::vector<std::wstring>{L"command:settings"}));
+    assert(versionThree.value.recentItems ==
+           (std::vector<std::wstring>{L"snippet:sig"}));
+    assert(versionThree.value.clipboardRetentionDays == 30);
+    assert(versionThree.value.clipboardExcludedApps ==
+           (std::vector<std::wstring>{L"C:\\Secret.exe"}));
+    assert(versionThree.value.fileIndexExcludePatterns ==
+           (std::vector<std::wstring>{L"**\\node_modules\\**"}));
+
+    const auto futureVersion =
+        fs::ParseSettingsDocument(R"({"schemaVersion":4})");
+    assert(futureVersion.status == fs::ParseStatus::UnsupportedVersion);
+    assert(futureVersion.documentVersion == 4);
+    assert(fs::SerializeSettings(original).find("\"schemaVersion\": 3") !=
+           std::string::npos);
 
     for (const auto level : {fs::AnimationLevel::Off,
                              fs::AnimationLevel::Reduced,
@@ -1018,6 +1102,39 @@ int main() {
     // (the old substring scanner got this wrong).
     const auto tricky = fs::ParseSettings(R"({"shortcut": "\"recentApps\": [\"fake\"]"})");
     assert(tricky.recentApps.empty());
+  }
+
+  {
+    namespace app = feathercast::app;
+
+    app::DisplayItem command;
+    command.isCommand = true;
+    command.command = app::CommandKind::Settings;
+    command.commandStableId = L"Settings";
+    assert(command.InvocationKey() == L"command:settings");
+    assert(command.Key() ==
+           L"cmd:" + std::to_wstring(static_cast<int>(command.command)));
+
+    app::DisplayItem snippetItem;
+    snippetItem.isSnippet = true;
+    snippetItem.snippet.keyword = L"R\u00e9sum\u00e9";
+    assert(snippetItem.InvocationKey() == L"snippet:resume");
+    assert(snippetItem.Key() == L"snippet:R\u00e9sum\u00e9");
+
+    app::DisplayItem quicklink;
+    quicklink.app.id = L"quicklink:D\u00f3cs";
+    quicklink.app.source = L"quicklink";
+    assert(quicklink.InvocationKey() == L"quicklink:docs");
+    assert(quicklink.Key() == L"quicklink:D\u00f3cs");
+
+    app::DisplayItem appItem;
+    appItem.app.id = L"app:Case-Sensitive-Identity";
+    assert(appItem.InvocationKey() == appItem.Key());
+
+    app::AliasTarget target{L"settings", L"command:settings", L"prefs"};
+    app::ActionTarget actionTarget = target;
+    assert(std::get<app::AliasTarget>(actionTarget).invocationKey ==
+           L"command:settings");
   }
 
   {

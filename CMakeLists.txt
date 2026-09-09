@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.22)
 
 if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
@@ -374,6 +374,15 @@ feathercast_apply_project_warnings(FeatherCastLibraryTests)
 feathercast_apply_project_warnings(FeatherCastSearchFilesTests)
 feathercast_apply_project_warnings(FeatherCastGameDiscoveryTests)
 
+add_executable(FeatherCastAccessibilitySmokeTests
+  native/tests/accessibility_smoke_tests.cpp
+)
+target_compile_features(FeatherCastAccessibilitySmokeTests PRIVATE cxx_std_23)
+target_include_directories(FeatherCastAccessibilitySmokeTests PRIVATE native/src)
+target_compile_definitions(FeatherCastAccessibilitySmokeTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FeatherCastAccessibilitySmokeTests PRIVATE oleacc oleaut32 user32 uuid)
+feathercast_apply_project_warnings(FeatherCastAccessibilitySmokeTests)
+
 enable_testing()
 add_test(NAME FeatherCastCoreTests COMMAND FeatherCastCoreTests)
 add_executable(FeatherCastProductivityBehaviorTests native/tests/productivity_behavior_tests.cpp)
@@ -401,6 +410,7 @@ add_test(NAME FeatherCastProductivityPackTests COMMAND FeatherCastProductivityPa
 add_test(NAME FeatherCastLibraryTests COMMAND FeatherCastLibraryTests)
 add_test(NAME FeatherCastSearchFilesTests COMMAND FeatherCastSearchFilesTests)
 add_test(NAME FeatherCastGameDiscoveryTests COMMAND FeatherCastGameDiscoveryTests)
+add_test(NAME FeatherCastAccessibilitySmokeTests COMMAND FeatherCastAccessibilitySmokeTests)
 add_test(NAME FeatherCastSilentLifecycleTests COMMAND FeatherCast --self-test)
 
 set_tests_properties(
@@ -417,6 +427,7 @@ set_tests_properties(
   FeatherCastProductivityPackTests
   FeatherCastLibraryTests
   FeatherCastGameDiscoveryTests
+  FeatherCastAccessibilitySmokeTests
   PROPERTIES TIMEOUT 30
 )
 set_tests_properties(

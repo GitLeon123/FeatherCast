@@ -12,6 +12,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -22,6 +23,7 @@ struct IndexRequest {
   std::vector<std::wstring> roots;
   std::size_t limit = 5000;
   bool contentEnabled = false;
+  std::vector<std::wstring> exclusionPatterns;
 };
 
 struct IndexStatus {
@@ -37,12 +39,16 @@ struct IndexStatus {
 };
 
 bool IsFixedLocalIndexRoot(const std::filesystem::path& path);
+bool MatchesRelativePathExclusion(
+    std::wstring_view relativePath,
+    const std::vector<std::wstring>& exclusionPatterns);
 
 std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
     const std::vector<storage::FileIndexEntry>& previous,
     std::vector<storage::FileIndexEntry> scanned,
     const std::vector<std::wstring>& configuredRoots,
-    const std::vector<std::wstring>& availableRoots, std::size_t limit);
+    const std::vector<std::wstring>& availableRoots, std::size_t limit,
+    const std::vector<std::wstring>& exclusionPatterns = {});
 
 class FileIndexService {
  public:

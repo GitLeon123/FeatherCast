@@ -108,6 +108,13 @@ enum class HitType {
   MaxResultsUp,
   ManageSnippets,
   ManageQuicklinks,
+  ManageCommandAliases,
+  ClipboardRetentionDaysDown,
+  ClipboardRetentionDaysUp,
+  AddClipboardExcludedApp,
+  RemoveClipboardExcludedApp,
+  AddFileIndexPattern,
+  RemoveFileIndexPattern,
 };
 
 enum class CommandKind {
@@ -244,6 +251,9 @@ enum class ActionKind {
   MoveWindowPreviousDisplay,
   MoveWindowNextDisplay,
   EditAppAlias,
+  EditAlias,
+  PinInvocation,
+  UnpinInvocation,
   Preview,
   CopyText,
   PasteText,
@@ -348,8 +358,15 @@ struct TextActionPayload {
   std::wstring value;
 };
 
+struct AliasTarget {
+  std::wstring stableId;
+  std::wstring invocationKey;
+  std::wstring currentAlias;
+};
+
 using ActionTarget =
-    std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload, ClipboardEntry>;
+    std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload,
+                 ClipboardEntry, AliasTarget>;
 
 struct DisplayItem {
   std::optional<feathercast::timers::Request> timerRequest;
@@ -377,6 +394,7 @@ struct DisplayItem {
   feathercast::symbols::Symbol symbol;
   CapabilityItem capability;
   CommandKind command = CommandKind::Settings;
+  std::wstring commandStableId;
   ActionKind action = ActionKind::None;
   ActionTarget actionTarget;
   std::wstring commandName;
@@ -388,6 +406,23 @@ struct DisplayItem {
   std::wstring webSearchLabel;
   std::wstring sectionTitle;
   std::size_t hiddenResultCount = 0;
+
+  std::wstring InvocationKey() const {
+    if (isCommand) {
+      return feathercast::core::StableInvocationKey(
+          L"command", !commandStableId.empty() ? commandStableId : commandName);
+    }
+    if (isSnippet) {
+      return feathercast::core::StableInvocationKey(L"snippet", snippet.keyword);
+    }
+    if (app.source == L"quicklink") {
+      constexpr std::wstring_view prefix = L"quicklink:";
+      const std::wstring token =
+          app.id.rfind(prefix, 0) == 0 ? app.id.substr(prefix.size()) : app.id;
+      return feathercast::core::StableInvocationKey(L"quicklink", token);
+    }
+    return Key();
+  }
 
   std::wstring Key() const {
     if (isSectionExpander) return L"expand:" + sectionTitle;
@@ -420,6 +455,9 @@ struct DisplayItem {
       } else if (const auto* textTarget =
                      std::get_if<TextActionPayload>(&actionTarget)) {
         target = textTarget->value;
+      } else if (const auto* aliasTarget =
+                     std::get_if<AliasTarget>(&actionTarget)) {
+        target = aliasTarget->invocationKey;
       }
       return L"act:" + std::to_wstring(static_cast<int>(action)) + L":" +
              target;

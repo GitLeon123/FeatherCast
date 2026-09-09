@@ -7,13 +7,19 @@
 namespace feathercast::commands {
 namespace {
 
-app::DisplayItem CommandItem(const CommandDescriptor& descriptor) {
+app::DisplayItem CommandItem(const CommandDescriptor& descriptor,
+                             const std::wstring* alias = nullptr) {
   app::DisplayItem item;
   item.isCommand = true;
   item.command = descriptor.kind;
+  item.commandStableId = descriptor.stableId;
   item.commandName = descriptor.label;
   item.commandDetail = descriptor.detail;
   item.commandKeywords = descriptor.keywords;
+  if (alias) {
+    const auto validation = core::ValidateAlias(*alias);
+    if (validation.valid) item.commandKeywords.push_back(validation.value);
+  }
   return item;
 }
 
@@ -45,6 +51,83 @@ app::DisplayItem TextActionItem(app::ActionKind kind, std::wstring label,
   item.commandDetail = std::move(detail);
   item.actionTarget = app::TextActionPayload{std::move(value)};
   return item;
+}
+
+app::DisplayItem InvocationActionItem(app::ActionKind kind,
+                                      std::wstring label,
+                                      std::wstring detail,
+                                      app::AliasTarget target) {
+  app::DisplayItem item;
+  item.isAction = true;
+  item.action = kind;
+  item.commandKeywords = {label, detail, target.currentAlias};
+  item.commandName = std::move(label);
+  item.commandDetail = std::move(detail);
+  item.actionTarget = std::move(target);
+  return item;
+}
+
+std::optional<app::AliasTarget> InvocationTarget(
+    const app::DisplayItem& item, const app::Settings& settings) {
+  app::AliasTarget target;
+  target.invocationKey = item.InvocationKey();
+  if (target.invocationKey.empty()) return std::nullopt;
+
+  if (item.isCommand) {
+    const CommandDescriptor* descriptor = !item.commandStableId.empty()
+        ? Find(item.commandStableId)
+        : Find(item.command);
+    if (!descriptor) return std::nullopt;
+    target.stableId = descriptor->stableId;
+    if (const auto alias = settings.commandAliases.find(target.stableId);
+        alias != settings.commandAliases.end()) {
+      target.currentAlias = alias->second;
+    }
+  } else if (item.isSnippet) {
+    target.stableId = item.snippet.keyword;
+    target.currentAlias = item.snippet.keyword;
+  } else if (item.app.source == L"quicklink") {
+    constexpr std::wstring_view prefix = L"quicklink:";
+    target.stableId = item.app.id.rfind(prefix, 0) == 0
+        ? item.app.id.substr(prefix.size())
+        : (!item.app.keywords.empty() ? item.app.keywords.front()
+                                      : item.app.name);
+    target.currentAlias = target.stableId;
+  } else {
+    return std::nullopt;
+  }
+  return target;
+}
+
+void AppendInvocationActions(std::vector<app::DisplayItem>& actions,
+                             const app::DisplayItem& item,
+                             const app::Settings& settings) {
+  auto target = InvocationTarget(item, settings);
+  if (!target) return;
+
+  const bool canonicalKeyword = item.isSnippet ||
+                                item.app.source == L"quicklink";
+  actions.push_back(InvocationActionItem(
+      app::ActionKind::EditAlias,
+      canonicalKeyword ? L"Edit Keyword"
+                       : (target->currentAlias.empty() ? L"Add Alias"
+                                                       : L"Edit Alias"),
+      canonicalKeyword
+          ? L"Change the canonical keyword used to find this item"
+          : L"Choose another search name for this command",
+      *target));
+
+  const bool pinned = std::find(settings.pinnedItems.begin(),
+                                settings.pinnedItems.end(),
+                                target->invocationKey) !=
+                      settings.pinnedItems.end();
+  actions.push_back(InvocationActionItem(
+      pinned ? app::ActionKind::UnpinInvocation
+             : app::ActionKind::PinInvocation,
+      pinned ? L"Remove from Favorites" : L"Add to Favorites",
+      pinned ? L"Remove this item from the launcher favorites"
+             : L"Show this item in launcher favorites",
+      std::move(*target)));
 }
 
 bool HasAppKey(const std::vector<std::wstring>& values,
@@ -190,13 +273,57 @@ const CommandDescriptor* Find(app::CommandKind kind) {
   return found == commands.end() ? nullptr : &*found;
 }
 
+const CommandDescriptor* Find(std::wstring_view stableId) {
+  const auto& commands = Catalog();
+  const auto found = std::find_if(
+      commands.begin(), commands.end(),
+      [&](const CommandDescriptor& command) {
+        return command.stableId == stableId;
+      });
+  return found == commands.end() ? nullptr : &*found;
+}
+
 std::vector<app::DisplayItem> BuildCommandItems() {
+  return BuildCommandItems({});
+}
+
+std::vector<app::DisplayItem> BuildCommandItems(
+    const std::map<std::wstring, std::wstring>& aliases) {
   std::vector<app::DisplayItem> items;
   items.reserve(Catalog().size());
   for (const auto& descriptor : Catalog()) {
-    items.push_back(CommandItem(descriptor));
+    const auto alias = aliases.find(descriptor.stableId);
+    items.push_back(CommandItem(
+        descriptor, alias == aliases.end() ? nullptr : &alias->second));
   }
   return items;
+}
+
+core::SearchItem BuildSearchItem(
+    const app::DisplayItem& command,
+    const std::map<std::wstring, std::wstring>& aliases) {
+  core::SearchItem item;
+  if (!command.isCommand) return item;
+  const CommandDescriptor* descriptor = !command.commandStableId.empty()
+      ? Find(command.commandStableId)
+      : Find(command.command);
+  if (!descriptor) return item;
+  item.id = command.InvocationKey();
+  if (item.id.empty()) {
+    item.id = core::StableInvocationKey(L"command", descriptor->stableId);
+  }
+  item.kind = L"command";
+  item.source = L"command";
+  item.name = command.commandName;
+  item.keywords = descriptor->keywords;
+  item.keywords.push_back(descriptor->stableId);
+  item.systemEssential = true;
+  if (const auto alias = aliases.find(descriptor->stableId);
+      alias != aliases.end()) {
+    const auto validation = core::ValidateAlias(alias->second);
+    if (validation.valid) item.aliases.push_back(validation.value);
+  }
+  return item;
 }
 
 std::vector<app::DisplayItem> BuildActions(
@@ -233,7 +360,11 @@ std::vector<app::DisplayItem> BuildActions(
                                  L"Next Display", L"Move to the next monitor", target));
     return actions;
   }
-  if (target.isCommand || target.isAction || target.isExtension ||
+  if (target.isCommand) {
+    AppendInvocationActions(actions, target, settings);
+    return actions;
+  }
+  if (target.isAction || target.isExtension ||
       target.isCapability || target.isRunCommand || target.isWebSearch) {
     return actions;
   }
@@ -282,6 +413,8 @@ std::vector<app::DisplayItem> BuildActions(
                                 L"Keep this entry when older history is removed", L"");
       pin.actionTarget = target.clipboard;
       actions.push_back(std::move(pin));
+    } else if (target.isSnippet) {
+      AppendInvocationActions(actions, target, settings);
     }
     return actions;
   }
@@ -314,12 +447,16 @@ std::vector<app::DisplayItem> BuildActions(
                                  L"Add or Edit Alias",
                                  L"Choose another search name for this app", target));
   }
-  actions.push_back(
-      HasAppKey(settings.pinnedApps, target.app)
-          ? ActionItem(app::ActionKind::Unpin, L"Unpin",
-                       L"Remove from pinned apps", target)
-          : ActionItem(app::ActionKind::Pin, L"Pin",
-                       L"Keep near the top of results", target));
+  if (target.app.source == L"quicklink") {
+    AppendInvocationActions(actions, target, settings);
+  } else {
+    actions.push_back(
+        HasAppKey(settings.pinnedApps, target.app)
+            ? ActionItem(app::ActionKind::Unpin, L"Unpin",
+                         L"Remove from pinned apps", target)
+            : ActionItem(app::ActionKind::Pin, L"Pin",
+                         L"Keep near the top of results", target));
+  }
   actions.push_back(
       HasAppKey(settings.hiddenApps, target.app)
           ? ActionItem(app::ActionKind::Unhide, L"Unhide",
@@ -327,6 +464,16 @@ std::vector<app::DisplayItem> BuildActions(
           : ActionItem(app::ActionKind::Hide, L"Hide",
                        L"Remove from launcher results", target));
   return actions;
+}
+
+bool IsPersonalizableInvocation(const app::DisplayItem& item) {
+  return !item.InvocationKey().empty() &&
+         (item.isCommand || item.isSnippet ||
+          item.app.source == L"quicklink");
+}
+
+bool RecordsRecentActivation(const app::DisplayItem& item) {
+  return IsPersonalizableInvocation(item) && !item.isAction;
 }
 
 bool ValidateCatalog(std::wstring* error) {

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <string>
@@ -391,7 +392,8 @@ class Storage {
   std::optional<ClipboardEntry> AddClipboardEntry(const std::wstring& text,
                                                   const std::wstring& preview,
                                                   long long capturedAt,
-                                                  size_t limit = 50) {
+                                                  size_t limit = 50,
+                                                  size_t retentionDays = 0) {
     if (!db_ || text.empty()) return std::nullopt;
     const auto protectedText = ProtectText(text);
     const auto protectedPreview = ProtectText(preview);
@@ -448,20 +450,9 @@ class Storage {
 
     if (!id) id = sqlite3_last_insert_rowid(db_);
 
-    {
-      Statement prune;
-      if (!prune.Prepare(db_,
-                         "DELETE FROM clipboard_history WHERE pinned=0 AND id NOT IN ("
-                         "SELECT id FROM clipboard_history WHERE pinned=0 ORDER BY captured_at DESC, id DESC LIMIT ?"
-                         ");")) {
-        Exec("ROLLBACK;");
-        return std::nullopt;
-      }
-      sqlite3_bind_int64(prune.get(), 1, static_cast<sqlite3_int64>(limit));
-      if (sqlite3_step(prune.get()) != SQLITE_DONE) {
-        Exec("ROLLBACK;");
-        return std::nullopt;
-      }
+    if (!PruneClipboardHistory(limit, retentionDays)) {
+      Exec("ROLLBACK;");
+      return std::nullopt;
     }
 
     if (!Exec("COMMIT;")) {
@@ -472,7 +463,8 @@ class Storage {
     return ClipboardEntry{id, text, preview, capturedAt, pinned};
   }
 
-  bool PinClipboard(long long id, bool pinned, std::size_t limit) {
+  bool PinClipboard(long long id, bool pinned, std::size_t limit,
+                    std::size_t retentionDays = 0) {
     if (!db_ || !Exec("BEGIN IMMEDIATE;")) return false;
     Statement update;
     if (!update.Prepare(db_, "UPDATE clipboard_history SET pinned=? WHERE id=? AND "
@@ -486,7 +478,7 @@ class Storage {
       SetError(SQLITE_CONSTRAINT, "The entry is unavailable or the limit of 100 favorites has been reached.");
       Exec("ROLLBACK;"); return false;
     }
-    if (!PruneClipboardHistory(limit) || !Exec("COMMIT;")) { Exec("ROLLBACK;"); return false; }
+    if (!PruneClipboardHistory(limit, retentionDays) || !Exec("COMMIT;")) { Exec("ROLLBACK;"); return false; }
     return true;
   }
 
@@ -550,18 +542,37 @@ class Storage {
     return Exec("DELETE FROM clipboard_history;");
   }
 
-  bool PruneClipboardHistory(size_t limit) {
+  bool PruneClipboardHistory(size_t limit, size_t retentionDays = 0) {
+    if (!db_) return false;
+    constexpr unsigned long long kSecondsPerDay = 24ULL * 60ULL * 60ULL;
+    const auto now = static_cast<long long>(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    const auto maximumDays = static_cast<unsigned long long>(
+        std::numeric_limits<long long>::max()) / kSecondsPerDay;
+    const auto boundedDays = std::min(
+        static_cast<unsigned long long>(retentionDays), maximumDays);
+    const auto retentionSeconds = static_cast<long long>(
+        boundedDays * kSecondsPerDay);
+    const long long cutoff = retentionSeconds > now ? 0 : now - retentionSeconds;
+
     Statement prune;
-    if (!db_ ||
-        !prune.Prepare(db_,
-                       "DELETE FROM clipboard_history WHERE pinned=0 AND id NOT IN ("
+    if (!prune.Prepare(db_,
+                       "DELETE FROM clipboard_history WHERE pinned=0 AND ("
+                       "(?<>0 AND captured_at<?) OR id NOT IN ("
                        "SELECT id FROM clipboard_history WHERE pinned=0 "
                        "ORDER BY captured_at DESC, id DESC LIMIT ?"
-                       ");")) {
+                       "));")) {
+      CaptureError();
       return false;
     }
-    sqlite3_bind_int64(prune.get(), 1, static_cast<sqlite3_int64>(limit));
-    return sqlite3_step(prune.get()) == SQLITE_DONE;
+    sqlite3_bind_int(prune.get(), 1, retentionDays == 0 ? 0 : 1);
+    sqlite3_bind_int64(prune.get(), 2, cutoff);
+    sqlite3_bind_int64(prune.get(), 3, static_cast<sqlite3_int64>(limit));
+    if (sqlite3_step(prune.get()) != SQLITE_DONE) {
+      CaptureError();
+      return false;
+    }
+    return true;
   }
 
  private:

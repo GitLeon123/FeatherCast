@@ -9,9 +9,11 @@
 int main() {
   using feathercast::library::SortedQuicklinkIndices;
   using feathercast::library::SortedAppAliasIndices;
+  using feathercast::library::SortedCommandAliasIndices;
   using feathercast::library::SortedSnippetIndices;
   using feathercast::library::SortedWebSearchIndices;
   using feathercast::library::ValidateAppAlias;
+  using feathercast::library::ValidateCommandAlias;
   using feathercast::library::ValidateQuicklink;
   using feathercast::library::ValidateSnippet;
   using feathercast::library::ValidateWebSearch;
@@ -54,6 +56,56 @@ int main() {
                           aliases));
   const auto aliasOrder = SortedAppAliasIndices(aliases);
   assert(aliasOrder.size() == 2 && aliasOrder[0] == 1 && aliasOrder[1] == 0);
+
+  using feathercast::library::CommandAlias;
+  const std::vector<feathercast::library::CommandChoice> commandChoices = {
+      {L"settings", L"Settings"},
+      {L"volume-up", L"Volume Up"},
+  };
+  const std::map<std::wstring, std::wstring> commandAliasMap = {
+      {L"settings", L"prefs"},
+      {L"removed-command", L"legacy"},
+  };
+  auto commandAliases = feathercast::library::BuildCommandAliases(
+      commandAliasMap, commandChoices);
+  assert(commandAliases.size() == 2);
+  assert(commandAliases[0].stableId == L"removed-command" &&
+         commandAliases[0].commandName.empty());
+  assert(commandAliases[1].stableId == L"settings" &&
+         commandAliases[1].commandName == L"Settings");
+  assert(!ValidateCommandAlias(commandAliases[0], commandAliases, aliases,
+                               snippets, quicklinks, 0));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"PREFS"}, commandAliases, aliases,
+      snippets, quicklinks));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"code"}, commandAliases, aliases,
+      snippets, quicklinks));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"sig"}, commandAliases, aliases,
+      snippets, quicklinks));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"docs"}, commandAliases, aliases,
+      snippets, quicklinks));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"@volume"}, commandAliases, aliases,
+      snippets, quicklinks));
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"two\nlines"}, commandAliases,
+      aliases, snippets, quicklinks));
+  commandAliases.push_back({L"volume-up", L"Volume Up", L"louder"});
+  assert(ValidateCommandAlias(
+      {L"volume-up", L"Volume Up", L"different"}, commandAliases,
+      aliases, snippets, quicklinks));
+  std::wstring commandAliasError;
+  const auto serializedAliases = feathercast::library::ToCommandAliasMap(
+      commandAliases, aliases, snippets, quicklinks, &commandAliasError);
+  assert(serializedAliases && commandAliasError.empty());
+  assert(serializedAliases->at(L"settings") == L"prefs");
+  assert(serializedAliases->at(L"volume-up") == L"louder");
+  const auto commandAliasOrder = SortedCommandAliasIndices(commandAliases);
+  assert(commandAliasOrder.size() == 3 && commandAliasOrder[0] == 0 &&
+         commandAliasOrder[1] == 1 && commandAliasOrder[2] == 2);
 
   using feathercast::library::WebSearch;
   std::vector<WebSearch> webSearches = {

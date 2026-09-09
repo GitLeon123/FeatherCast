@@ -106,7 +106,8 @@ class PersistenceService {
                               std::wstring* error = nullptr) const;
   StorageStartupState LoadStorageForStartup(std::size_t fileLimit,
                                             std::size_t clipboardLimit,
-                                            bool loadFiles = true);
+                                            bool loadFiles = true,
+                                            std::size_t clipboardRetentionDays = 0);
   // Loads the persisted file index on demand.  This keeps startup cheap when
   // the Files scope is not used while preserving the existing synchronous API
   // used by the UI thread for a small, bounded result set.
@@ -119,8 +120,9 @@ class PersistenceService {
   bool SaveSettings(settings::Settings settings);
   bool SaveSettingsAndWait(settings::Settings settings,
                            std::wstring* error = nullptr);
-  bool PruneClipboard(std::size_t limit);
-  bool PinClipboard(long long id, bool pinned, std::size_t limit);
+  bool PruneClipboard(std::size_t limit, std::size_t retentionDays = 0);
+  bool PinClipboard(long long id, bool pinned, std::size_t limit,
+                    std::size_t retentionDays = 0);
   bool LoadTimers();
   bool SaveTimers(timers::State state, std::vector<std::wstring> expiredNames = {});
   bool ReplaceFileIndex(std::vector<storage::FileIndexEntry> entries);
@@ -128,10 +130,12 @@ class PersistenceService {
   bool MergeFileIndex(std::vector<storage::FileIndexEntry> entries,
                       std::vector<std::wstring> configuredRoots,
                       std::vector<std::wstring> availableRoots,
-                      std::size_t limit, std::uint64_t generation);
+                      std::size_t limit, std::uint64_t generation,
+                      std::vector<std::wstring> exclusionPatterns = {});
   bool StoreClipboard(std::wstring text, std::wstring preview,
-                      long long capturedAt, std::size_t limit);
-  bool LoadClipboard(std::size_t limit);
+                      long long capturedAt, std::size_t limit,
+                      std::size_t retentionDays = 0);
+  bool LoadClipboard(std::size_t limit, std::size_t retentionDays = 0);
   bool Clear(app::StorageOperationKind kind);
 
  private:

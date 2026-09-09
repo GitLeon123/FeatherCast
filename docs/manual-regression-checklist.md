@@ -73,6 +73,11 @@ and then with pointer input.
 - Narrator exposes Search, the stable live Status node, Results, and Preview in
   that order. Loading, empty, error, and preview changes are announced without
   moving child IDs.
+- Run `FeatherCastAccessibilitySmokeTests` before the manual pass. It checks the
+  projection/model contract, child order, names, roles, states, focus,
+  selection, navigation, hit testing, and invocation without inspecting or
+  logging user queries or clipboard contents. Narrator, Accessibility Insights,
+  mixed-DPI bounds, and announcement timing remain manual checks.
 
 ## Settings and Persistence
 
@@ -242,8 +247,9 @@ Current-scale live smoke:
 - The settings window renders from the descriptor-backed metadata and retains
   keyboard/pointer focus behavior.
 
-The 150% and 200% passes, IME-specific input, Narrator/Accessibility Insights,
-forced graphics-device recreation, shutdown cleanup, and second-instance checks
-remain release-gate manual work. Current-build screenshots were captured during
-the smoke pass but are not checked in because launcher results can expose local
-application, file, and clipboard names.
+The 150% and 200% passes, mixed-DPI bounds, IME-specific input,
+Narrator/Accessibility Insights, suspend/resume, capture, forced graphics-device
+recreation, shutdown cleanup, and second-instance checks remain release-gate
+manual work. Current-build screenshots were captured during the smoke pass but
+are not checked in because launcher results can expose local application, file,
+and clipboard names.

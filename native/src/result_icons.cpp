@@ -86,8 +86,10 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::OpenLocation: return ResultIcon::Folder;
     case ActionKind::CopyPath:
     case ActionKind::CopyText: return ResultIcon::Copy;
-    case ActionKind::Pin: return ResultIcon::Pin;
-    case ActionKind::Unpin: return ResultIcon::PinOff;
+    case ActionKind::Pin:
+    case ActionKind::PinInvocation: return ResultIcon::Pin;
+    case ActionKind::Unpin:
+    case ActionKind::UnpinInvocation: return ResultIcon::PinOff;
     case ActionKind::Hide: return ResultIcon::EyeOff;
     case ActionKind::Unhide: return ResultIcon::Eye;
     case ActionKind::Switch: return ResultIcon::Windows;
@@ -109,7 +111,8 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::ArrangeWindow: return ResultIcon::WindowLayout;
     case ActionKind::MoveWindowPreviousDisplay:
     case ActionKind::MoveWindowNextDisplay: return ResultIcon::MultiMonitor;
-    case ActionKind::EditAppAlias: return ResultIcon::Edit;
+    case ActionKind::EditAppAlias:
+    case ActionKind::EditAlias: return ResultIcon::Edit;
     case ActionKind::PasteText: return ResultIcon::Clipboard;
     case ActionKind::None: return ResultIcon::Actions;
   }

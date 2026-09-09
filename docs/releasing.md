@@ -2,6 +2,10 @@
 
 FeatherCast releases are distributed through GitHub Releases for `GenericLeon0/FeatherCast`. The in-app updater checks the latest stable release and expects the Windows installer plus a SHA-256 sidecar file.
 
+The release candidate must also pass the
+[Release QA Checklist](release-qa-checklist.md), including accessibility,
+benchmark, package, and Authenticode gates for both application executables.
+
 ## Automated Release (preferred)
 
 Pushing a tag `vX.Y.Z` triggers `.github/workflows/ci.yml`: it builds, runs tests, packages via CPack, generates `.sha256` sidecars, and creates a **draft** GitHub Release with all assets attached. The updater ignores drafts, so verify the draft and publish it manually. The manual flow below remains as fallback.

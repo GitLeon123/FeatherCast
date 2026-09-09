@@ -172,6 +172,9 @@ int main() {
       std::pair{ActionKind::CopyPath, ResultIcon::Copy},
       std::pair{ActionKind::Pin, ResultIcon::Pin},
       std::pair{ActionKind::Unpin, ResultIcon::PinOff},
+      std::pair{ActionKind::PinInvocation, ResultIcon::Pin},
+      std::pair{ActionKind::UnpinInvocation, ResultIcon::PinOff},
+      std::pair{ActionKind::EditAlias, ResultIcon::Edit},
       std::pair{ActionKind::Hide, ResultIcon::EyeOff},
       std::pair{ActionKind::Unhide, ResultIcon::Eye},
       std::pair{ActionKind::Switch, ResultIcon::Windows},
@@ -313,9 +316,10 @@ int main() {
                     feathercast::app::HitType::AnimationLevel) == 1);
   const auto libraryControls = feathercast::settings_catalog::FocusOrder(
       feathercast::app::SettingsCategory::Library, context);
-  assert(libraryControls.size() == 2);
+  assert(libraryControls.size() == 3);
   assert(libraryControls[0] == feathercast::app::HitType::ManageSnippets);
   assert(libraryControls[1] == feathercast::app::HitType::ManageQuicklinks);
+  assert(libraryControls[2] == feathercast::app::HitType::ManageCommandAliases);
   const auto snippetsCapability = std::find_if(
       feathercast::capabilities::Catalog().begin(),
       feathercast::capabilities::Catalog().end(), [](const auto& item) {

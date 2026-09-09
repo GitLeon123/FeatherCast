@@ -9,9 +9,11 @@
 #include <cwctype>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace feathercast::core {
@@ -27,6 +29,7 @@ struct SearchItem {
   std::wstring launchTarget;
   std::wstring exe;
   std::vector<std::wstring> keywords;
+  std::vector<std::wstring> aliases;
   bool systemEssential = false;
   bool pinned = false;
   int usageCount = 0;
@@ -87,6 +90,75 @@ inline std::wstring FoldDiacritics(const std::wstring& value) {
 
 inline std::wstring Normalize(const std::wstring& value) {
   return Trim(FoldDiacritics(LowerInvariant(value)));
+}
+
+enum class AliasValidationError : unsigned char {
+  None,
+  Empty,
+  Multiline,
+  ReservedPrefix,
+};
+
+struct AliasValidationResult {
+  bool valid = false;
+  AliasValidationError error = AliasValidationError::Empty;
+  std::wstring value;
+  std::wstring normalized;
+};
+
+inline std::wstring NormalizeAlias(const std::wstring& value) {
+  return Normalize(value);
+}
+
+inline AliasValidationResult ValidateAlias(const std::wstring& value) {
+  if (value.find_first_of(L"\r\n") != std::wstring::npos) {
+    return {false, AliasValidationError::Multiline, {}, {}};
+  }
+  std::wstring trimmed = Trim(value);
+  if (trimmed.empty()) {
+    return {false, AliasValidationError::Empty, {}, {}};
+  }
+  if (trimmed.front() == L'@' || trimmed.front() == L'>' ||
+      trimmed.front() == L':') {
+    return {false, AliasValidationError::ReservedPrefix, {}, {}};
+  }
+  std::wstring normalized = NormalizeAlias(trimmed);
+  if (normalized.empty()) {
+    return {false, AliasValidationError::Empty, {}, {}};
+  }
+  return {true, AliasValidationError::None, std::move(trimmed),
+          std::move(normalized)};
+}
+
+inline bool AliasesEqual(const std::wstring& left,
+                         const std::wstring& right) {
+  const auto leftValidation = ValidateAlias(left);
+  const auto rightValidation = ValidateAlias(right);
+  return leftValidation.valid && rightValidation.valid &&
+         leftValidation.normalized == rightValidation.normalized;
+}
+
+inline bool SetUniqueAlias(
+    std::map<std::wstring, std::wstring>& aliases,
+    const std::wstring& targetId, const std::wstring& alias) {
+  const std::wstring trimmedTarget = Trim(targetId);
+  const auto validation = ValidateAlias(alias);
+  if (trimmedTarget.empty() || !validation.valid) return false;
+  for (const auto& [existingTarget, existingAlias] : aliases) {
+    if (existingTarget != trimmedTarget &&
+        NormalizeAlias(existingAlias) == validation.normalized) {
+      return false;
+    }
+  }
+  aliases[trimmedTarget] = validation.value;
+  return true;
+}
+
+inline std::wstring StableInvocationKey(std::wstring_view kind,
+                                        const std::wstring& stableId) {
+  const std::wstring normalized = Normalize(stableId);
+  if (kind.empty() || normalized.empty()) return L"";
+  return std::wstring(kind) + L":" + normalized;
 }
 
 inline std::vector<std::wstring> TokensNormalized(const std::wstring& value) {
@@ -243,6 +315,7 @@ enum class MatchClass : unsigned char {
 
 enum class SearchFieldKind : unsigned char {
   Name,
+  Alias,
   Keywords,
   Process,
   Path,
@@ -261,6 +334,7 @@ struct PreparedSearchItem {
   SearchItem item;
   std::vector<PreparedField> fields;
   std::wstring normalizedName;
+  std::vector<std::wstring> normalizedAliases;
   std::wstring lowerName;
 };
 
@@ -298,15 +372,25 @@ inline PreparedSearchItem PrepareSearchItem(const SearchItem& item) {
   prepared.item = item;
   prepared.normalizedName = Normalize(item.name);
   prepared.lowerName = Lower(item.name);
-  prepared.fields = {
-    PrepareField(item.name, 1.0, SearchFieldKind::Name),
-    PrepareField(JoinKeywords(item.keywords), 0.82,
-                 SearchFieldKind::Keywords),
-    PrepareField(item.processName, 0.7, SearchFieldKind::Process),
-    PrepareField(!item.targetPath.empty() ? item.targetPath :
-                 (!item.launchTarget.empty() ? item.launchTarget : item.exe),
-                 0.45, SearchFieldKind::Path),
-  };
+  prepared.fields.push_back(
+      PrepareField(item.name, 1.0, SearchFieldKind::Name));
+  for (const auto& alias : item.aliases) {
+    const auto validation = ValidateAlias(alias);
+    if (!validation.valid) continue;
+    prepared.normalizedAliases.push_back(validation.normalized);
+    prepared.fields.push_back(
+        PrepareField(validation.value, 1.0, SearchFieldKind::Alias));
+  }
+  prepared.fields.push_back(
+      PrepareField(JoinKeywords(item.keywords), 0.82,
+                   SearchFieldKind::Keywords));
+  prepared.fields.push_back(
+      PrepareField(item.processName, 0.7, SearchFieldKind::Process));
+  prepared.fields.push_back(PrepareField(
+      !item.targetPath.empty()
+          ? item.targetPath
+          : (!item.launchTarget.empty() ? item.launchTarget : item.exe),
+      0.45, SearchFieldKind::Path));
   return prepared;
 }
 
@@ -318,7 +402,7 @@ struct TextMatch {
 };
 
 inline MatchClass ExactOrPrefixClass(SearchFieldKind kind, bool exact) {
-  if (kind == SearchFieldKind::Name) {
+  if (kind == SearchFieldKind::Name || kind == SearchFieldKind::Alias) {
     return exact ? MatchClass::ExactName : MatchClass::NamePrefix;
   }
   if (kind == SearchFieldKind::Keywords || kind == SearchFieldKind::Process) {
@@ -341,7 +425,9 @@ inline TextMatch MatchPreparedText(const std::wstring& normalizedQuery,
             ExactOrPrefixClass(target.kind, false)};
   }
 
-  if (target.kind == SearchFieldKind::Name && !target.acronym.empty()) {
+  if ((target.kind == SearchFieldKind::Name ||
+       target.kind == SearchFieldKind::Alias) &&
+      !target.acronym.empty()) {
     if (target.acronym == q) return {3000.0, MatchClass::NamePrefix};
     if (target.acronym.rfind(q, 0) == 0) {
       return {2300.0 - std::min<int>(
@@ -355,7 +441,9 @@ inline TextMatch MatchPreparedText(const std::wstring& normalizedQuery,
   if (substring != std::wstring::npos) {
     const bool boundary = BoundaryBefore(raw, substring);
     MatchClass matchClass = MatchClass::General;
-    if (target.kind == SearchFieldKind::Name && boundary) {
+    if ((target.kind == SearchFieldKind::Name ||
+         target.kind == SearchFieldKind::Alias) &&
+        boundary) {
       matchClass = MatchClass::NameBoundary;
     }
     return {(boundary ? 2400.0 : 1800.0) -
@@ -483,6 +571,18 @@ inline ItemScore ScorePreparedItemDetailed(
   } else if (prepared.normalizedName.rfind(normalizedQuery, 0) == 0) {
     weakestClass = std::max(weakestClass, MatchClass::NamePrefix);
     textScore += 600.0;
+  }
+  for (const auto& normalizedAlias : prepared.normalizedAliases) {
+    if (normalizedAlias == normalizedQuery) {
+      weakestClass = MatchClass::ExactName;
+      textScore += 2500.0;
+      break;
+    }
+    if (normalizedAlias.rfind(normalizedQuery, 0) == 0) {
+      weakestClass = std::max(weakestClass, MatchClass::NamePrefix);
+      textScore += 600.0;
+      break;
+    }
   }
 
   const auto& item = prepared.item;

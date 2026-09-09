@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <queue>
 #include <set>
+#include <string_view>
 
 namespace feathercast::files {
 namespace {
@@ -56,17 +57,142 @@ bool FixedLocalRoot(const std::filesystem::path& path) {
   return !root.empty() && GetDriveTypeW(root.c_str()) == DRIVE_FIXED;
 }
 
+std::vector<std::wstring> NormalizedSegments(std::wstring_view value) {
+  std::vector<std::wstring> segments;
+  std::wstring segment;
+  const auto finishSegment = [&] {
+    if (segment.empty() || segment == L".") {
+      segment.clear();
+      return;
+    }
+    if (segment == L"..") {
+      if (!segments.empty() && segments.back() != L"..") {
+        segments.pop_back();
+      } else {
+        segments.push_back(std::move(segment));
+      }
+      segment.clear();
+      return;
+    }
+    segments.push_back(std::move(segment));
+    segment.clear();
+  };
+  for (const wchar_t ch : value) {
+    if (ch == L'/' || ch == L'\\') {
+      finishSegment();
+    } else {
+      segment.push_back(static_cast<wchar_t>(std::towlower(ch)));
+    }
+  }
+  finishSegment();
+  return segments;
+}
+
+bool MatchesSegment(std::wstring_view pattern, std::wstring_view value) {
+  std::vector<bool> previous(value.size() + 1);
+  std::vector<bool> current(value.size() + 1);
+  previous[0] = true;
+  for (const wchar_t patternCharacter : pattern) {
+    std::fill(current.begin(), current.end(), false);
+    if (patternCharacter == L'*') {
+      current[0] = previous[0];
+      for (std::size_t valueIndex = 1; valueIndex <= value.size();
+           ++valueIndex) {
+        current[valueIndex] = previous[valueIndex] || current[valueIndex - 1];
+      }
+    } else {
+      for (std::size_t valueIndex = 1; valueIndex <= value.size();
+           ++valueIndex) {
+        current[valueIndex] = previous[valueIndex - 1] &&
+                              patternCharacter == value[valueIndex - 1];
+      }
+    }
+    previous.swap(current);
+  }
+  return previous[value.size()];
+}
+
+bool MatchesSegments(const std::vector<std::wstring>& pattern,
+                     const std::vector<std::wstring>& path) {
+  std::vector<std::vector<bool>> matches(
+      pattern.size() + 1, std::vector<bool>(path.size() + 1));
+  matches[0][0] = true;
+  for (std::size_t patternIndex = 1; patternIndex <= pattern.size();
+       ++patternIndex) {
+    if (pattern[patternIndex - 1] == L"**") {
+      matches[patternIndex][0] = matches[patternIndex - 1][0];
+      for (std::size_t pathIndex = 1; pathIndex <= path.size(); ++pathIndex) {
+        matches[patternIndex][pathIndex] =
+            matches[patternIndex - 1][pathIndex] ||
+            matches[patternIndex][pathIndex - 1];
+      }
+      continue;
+    }
+    for (std::size_t pathIndex = 1; pathIndex <= path.size(); ++pathIndex) {
+      matches[patternIndex][pathIndex] =
+          matches[patternIndex - 1][pathIndex - 1] &&
+          MatchesSegment(pattern[patternIndex - 1], path[pathIndex - 1]);
+    }
+  }
+  return matches[pattern.size()][path.size()];
+}
+
+class RelativePathExclusionMatcher {
+ public:
+  explicit RelativePathExclusionMatcher(
+      const std::vector<std::wstring>& exclusionPatterns) {
+    patterns_.reserve(exclusionPatterns.size());
+    for (const auto& pattern : exclusionPatterns) {
+      auto segments = NormalizedSegments(pattern);
+      if (!segments.empty()) patterns_.push_back(std::move(segments));
+    }
+  }
+
+  bool Matches(std::wstring_view relativePath) const {
+    const auto pathSegments = NormalizedSegments(relativePath);
+    if (pathSegments.empty()) return false;
+    return std::any_of(
+        patterns_.begin(), patterns_.end(), [&](const auto& pattern) {
+          return MatchesSegments(pattern, pathSegments);
+        });
+  }
+
+ private:
+  std::vector<std::vector<std::wstring>> patterns_;
+};
+
+bool EntryMatchesExclusion(
+    const storage::FileIndexEntry& entry,
+    const RelativePathExclusionMatcher& exclusionMatcher) {
+  if (entry.path.empty() || entry.root.empty()) {
+    return false;
+  }
+  const auto relative = std::filesystem::path(entry.path).lexically_relative(
+      std::filesystem::path(entry.root));
+  if (relative.empty()) return false;
+  const auto relativeText = relative.generic_wstring();
+  if (relativeText == L".." || relativeText.starts_with(L"../")) return false;
+  return exclusionMatcher.Matches(relativeText);
+}
+
 }  // namespace
 
 bool IsFixedLocalIndexRoot(const std::filesystem::path& path) {
   return FixedLocalRoot(path);
 }
 
+bool MatchesRelativePathExclusion(
+    std::wstring_view relativePath,
+    const std::vector<std::wstring>& exclusionPatterns) {
+  return RelativePathExclusionMatcher(exclusionPatterns).Matches(relativePath);
+}
+
 std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
     const std::vector<storage::FileIndexEntry>& previous,
     std::vector<storage::FileIndexEntry> scanned,
     const std::vector<std::wstring>& configuredRoots,
-    const std::vector<std::wstring>& availableRoots, std::size_t limit) {
+    const std::vector<std::wstring>& availableRoots, std::size_t limit,
+    const std::vector<std::wstring>& exclusionPatterns) {
   auto normalized = [](const std::wstring& value) {
     std::wstring result =
         std::filesystem::path(value).lexically_normal().wstring();
@@ -78,8 +204,12 @@ std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
   };
   std::set<std::wstring> configured;
   std::set<std::wstring> available;
+  const RelativePathExclusionMatcher exclusionMatcher(exclusionPatterns);
   for (const auto& root : configuredRoots) configured.insert(normalized(root));
   for (const auto& root : availableRoots) available.insert(normalized(root));
+  std::erase_if(scanned, [&](const storage::FileIndexEntry& entry) {
+    return EntryMatchesExclusion(entry, exclusionMatcher);
+  });
 
   long long writeGeneration = 0;
   for (const auto& entry : scanned) {
@@ -87,7 +217,10 @@ std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
   }
   for (const auto& entry : previous) {
     const auto root = normalized(entry.root);
-    if (!configured.contains(root) || available.contains(root)) continue;
+    if (!configured.contains(root) || available.contains(root) ||
+        EntryMatchesExclusion(entry, exclusionMatcher)) {
+      continue;
+    }
     scanned.push_back(entry);
     writeGeneration = std::max(writeGeneration, entry.indexedAt);
   }
@@ -330,6 +463,8 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   status.generation = request.generation;
   status.configuredRoots = request.roots;
   const long long scan = NowMilliseconds();
+  const RelativePathExclusionMatcher exclusionMatcher(
+      request.exclusionPatterns);
   // Keep only the newest `limit` entries while traversing. The previous
   // implementation retained every path and trimmed only after the complete
   // recursive scan, which made a large Documents tree consume hundreds of MB.
@@ -359,6 +494,10 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
            !ec && it != end; it.increment(ec)) {
         if (token.stop_requested() || !IsCurrent(request.generation)) return status;
         const auto path = it->path();
+        const auto relative = path.lexically_relative(root).generic_wstring();
+        if (exclusionMatcher.Matches(relative)) {
+          continue;
+        }
         const DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES ||
             (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |

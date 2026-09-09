@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -30,6 +31,50 @@ int main() {
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
   std::filesystem::create_directories(root);
+
+  {
+    const auto retentionDatabase = root / L"clipboard-retention.db";
+    feathercast::storage::Storage storage;
+    assert(storage.Open(retentionDatabase));
+    const auto now = static_cast<long long>(std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now()));
+    constexpr long long kDay = 24LL * 60LL * 60LL;
+    const auto pinnedOld = storage.AddClipboardEntry(
+        L"pinned old", L"pinned old", now - 30 * kDay, 10);
+    assert(pinnedOld);
+    assert(storage.PinClipboard(pinnedOld->id, true, 10));
+    const auto expired = storage.AddClipboardEntry(
+        L"expired", L"expired", now - 8 * kDay, 10);
+    const auto recent = storage.AddClipboardEntry(
+        L"recent", L"recent", now - kDay, 10);
+    assert(expired && recent);
+
+    assert(storage.PruneClipboardHistory(1, 7));
+    const auto retained = storage.LoadClipboardHistory(10);
+    assert(retained.size() == 2);
+    assert(retained.front().id == pinnedOld->id && retained.front().pinned);
+    assert(retained.back().id == recent->id && !retained.back().pinned);
+    assert(std::none_of(retained.begin(), retained.end(), [&](const auto& item) {
+      return item.id == expired->id;
+    }));
+
+    const auto newest = storage.AddClipboardEntry(
+        L"newest", L"newest", now, 1, 7);
+    assert(newest);
+    const auto countPruned = storage.LoadClipboardHistory(10);
+    assert(countPruned.size() == 2);
+    assert(countPruned.front().id == pinnedOld->id);
+    assert(countPruned.back().id == newest->id);
+
+    assert(storage.ClearClipboardHistory());
+    const auto countOnlyOld = storage.AddClipboardEntry(
+        L"count only old", L"count only old", now - 365 * kDay, 10);
+    assert(countOnlyOld);
+    assert(storage.PruneClipboardHistory(10, 0));
+    const auto countOnly = storage.LoadClipboardHistory(10);
+    assert(countOnly.size() == 1 && countOnly.front().id == countOnlyOld->id);
+    storage.Close();
+  }
 
   std::mutex mutex;
   std::condition_variable cv;

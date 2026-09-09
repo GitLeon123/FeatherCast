@@ -10,17 +10,19 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "core.hpp"
 #include "extension_protocol.hpp"  // Utf8ToWide / WideToUtf8
 #include "json.hpp"
 
 namespace feathercast::settings {
 
-inline constexpr int kCurrentSettingsSchemaVersion = 2;
+inline constexpr int kCurrentSettingsSchemaVersion = 3;
 
 enum class AnimationLevel {
   Off,
@@ -101,6 +103,9 @@ struct PrivacySettings {
   bool fileContentIndexEnabled = false;
   std::vector<std::wstring> roots;
   int retention = 50;
+  int retentionDays = 0;
+  std::vector<std::wstring> clipboardExcludedApps;
+  std::vector<std::wstring> fileIndexExcludePatterns;
 };
 
 struct Settings {
@@ -113,6 +118,11 @@ struct Settings {
   std::vector<std::wstring> pinnedApps;
   std::vector<std::wstring> hiddenApps;
   std::map<std::wstring, std::wstring> appAliases;
+  // Stable command id -> one user-defined alias. Invocation collections use
+  // the stable keys produced by DisplayItem::InvocationKey().
+  std::map<std::wstring, std::wstring> commandAliases;
+  std::vector<std::wstring> pinnedItems;
+  std::vector<std::wstring> recentItems;
   struct UsageStat {
     int launches = 0;
     long long lastUsed = 0;
@@ -136,10 +146,14 @@ struct Settings {
   int privacyConsentVersion = 0;
   bool clipboardHistoryEnabled = false;
   int clipboardHistoryLimit = 50;
+  // Zero keeps the existing count-only retention behavior.
+  int clipboardRetentionDays = 0;
+  std::vector<std::wstring> clipboardExcludedApps;
   bool fileIndexEnabled = false;
   bool fileContentIndexEnabled = false;
   int fileIndexMaxEntries = 5000;
   std::vector<std::wstring> fileIndexRoots;
+  std::vector<std::wstring> fileIndexExcludePatterns;
   bool diagnosticsEnabled = false;
   // Web search prefixes: keyword -> URL template containing "%s" for the query.
   std::map<std::wstring, std::wstring> searchEngines =
@@ -153,6 +167,9 @@ struct Settings {
       fileContentIndexEnabled,
       fileIndexRoots,
       clipboardHistoryLimit,
+      clipboardRetentionDays,
+      clipboardExcludedApps,
+      fileIndexExcludePatterns,
     };
   }
 };
@@ -306,6 +323,27 @@ inline std::map<std::wstring, std::wstring> ReadStringObject(const Value& root, 
   return out;
 }
 
+inline std::map<std::wstring, std::wstring> ReadCommandAliases(
+    const Value& root, std::string_view key) {
+  std::map<std::wstring, std::wstring> out;
+  std::set<std::wstring> normalizedAliases;
+  const Value* value = root.Find(key);
+  if (!value || value->type != Value::Type::Object) return out;
+
+  for (const auto& member : value->object) {
+    const std::wstring targetId = feathercast::core::Trim(Utf8ToWide(member.key));
+    if (targetId.empty() || member.value.type != Value::Type::String) continue;
+    const auto validation =
+        feathercast::core::ValidateAlias(Utf8ToWide(member.value.str));
+    if (!validation.valid ||
+        !normalizedAliases.insert(validation.normalized).second) {
+      continue;
+    }
+    out[targetId] = validation.value;
+  }
+  return out;
+}
+
 // Missing or malformed fields keep their defaults (same lenient behavior as
 // the previous scanner, but keys inside string values can no longer match).
 inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
@@ -324,6 +362,9 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   settings.pinnedApps = ReadStringArray(*root, "pinnedApps");
   settings.hiddenApps = ReadStringArray(*root, "hiddenApps");
   settings.appAliases = ReadStringObject(*root, "appAliases");
+  settings.commandAliases = ReadCommandAliases(*root, "commandAliases");
+  settings.pinnedItems = ReadStringArray(*root, "pinnedItems");
+  settings.recentItems = ReadStringArray(*root, "recentItems");
   if (const Value* stats = root->Find("usageStats"); stats && stats->type == Value::Type::Object) {
     for (const auto& member : stats->object) {
       if (member.value.type != Value::Type::Object) continue;
@@ -358,10 +399,15 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   ReadInt(*root, "privacyConsentVersion", settings.privacyConsentVersion);
   ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
   ReadInt(*root, "clipboardHistoryLimit", settings.clipboardHistoryLimit);
+  ReadInt(*root, "clipboardRetentionDays", settings.clipboardRetentionDays);
+  settings.clipboardExcludedApps =
+      ReadStringArray(*root, "clipboardExcludedApps");
   ReadBool(*root, "fileIndexEnabled", settings.fileIndexEnabled);
   ReadBool(*root, "fileContentIndexEnabled", settings.fileContentIndexEnabled);
   ReadInt(*root, "fileIndexMaxEntries", settings.fileIndexMaxEntries);
   settings.fileIndexRoots = ReadStringArray(*root, "fileIndexRoots");
+  settings.fileIndexExcludePatterns =
+      ReadStringArray(*root, "fileIndexExcludePatterns");
   ReadBool(*root, "diagnosticsEnabled", settings.diagnosticsEnabled);
   if (const Value* engines = root->Find("searchEngines");
       engines && engines->type == Value::Type::Object) {
@@ -468,6 +514,15 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"appAliases\": ";
   detail::WriteStringObject(out, settings.appAliases);
   out << ",\n";
+  out << "  \"commandAliases\": ";
+  detail::WriteStringObject(out, settings.commandAliases);
+  out << ",\n";
+  out << "  \"pinnedItems\": ";
+  detail::WriteStringArray(out, settings.pinnedItems);
+  out << ",\n";
+  out << "  \"recentItems\": ";
+  detail::WriteStringArray(out, settings.recentItems);
+  out << ",\n";
   out << "  \"usageStats\": {";
   {
     bool first = true;
@@ -499,12 +554,20 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"privacyConsentVersion\": " << settings.privacyConsentVersion << ",\n";
   out << "  \"clipboardHistoryEnabled\": " << (settings.clipboardHistoryEnabled ? "true" : "false") << ",\n";
   out << "  \"clipboardHistoryLimit\": " << settings.clipboardHistoryLimit << ",\n";
+  out << "  \"clipboardRetentionDays\": " << settings.clipboardRetentionDays
+      << ",\n";
+  out << "  \"clipboardExcludedApps\": ";
+  detail::WriteStringArray(out, settings.clipboardExcludedApps);
+  out << ",\n";
   out << "  \"fileIndexEnabled\": " << (settings.fileIndexEnabled ? "true" : "false") << ",\n";
   out << "  \"fileContentIndexEnabled\": "
       << (settings.fileContentIndexEnabled ? "true" : "false") << ",\n";
   out << "  \"fileIndexMaxEntries\": " << settings.fileIndexMaxEntries << ",\n";
   out << "  \"fileIndexRoots\": ";
   detail::WriteStringArray(out, settings.fileIndexRoots);
+  out << ",\n";
+  out << "  \"fileIndexExcludePatterns\": ";
+  detail::WriteStringArray(out, settings.fileIndexExcludePatterns);
   out << ",\n";
   out << "  \"diagnosticsEnabled\": " << (settings.diagnosticsEnabled ? "true" : "false") << ",\n";
   out << "  \"searchEngines\": ";

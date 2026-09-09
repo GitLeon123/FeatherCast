@@ -20,5 +20,7 @@ LeanCast-*.zip
 LeanCast-*.exe
 FeatherCast-*.zip
 FeatherCast-*.exe
+FeatherCast-*/
 *.sha256
 /FeatherCast.png
+screen_test.png

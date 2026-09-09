@@ -1,5 +1,7 @@
 #include "library.hpp"
 
+#include "core.hpp"
+
 #include <algorithm>
 #include <cwctype>
 #include <numeric>
@@ -30,6 +32,45 @@ bool HasDuplicateKeyword(const T& values, const std::wstring& keyword,
     if (NormalizeKeyword(key(values[index])) == normalized) return true;
   }
   return false;
+}
+
+std::optional<std::wstring> AliasFormatError(const std::wstring& value) {
+  const auto validation = core::ValidateAlias(value);
+  if (validation.valid) {
+    if (validation.value.size() > 64) {
+      return L"Alias must not exceed 64 characters.";
+    }
+    return std::nullopt;
+  }
+  switch (validation.error) {
+    case core::AliasValidationError::Multiline:
+      return L"Alias must be a single line.";
+    case core::AliasValidationError::ReservedPrefix:
+      return L"Alias must not begin with @, >, or :.";
+    case core::AliasValidationError::Empty:
+    case core::AliasValidationError::None:
+      return L"Alias is required.";
+  }
+  return L"Alias is invalid.";
+}
+
+bool CanonicalAliasCollision(
+    const std::wstring& alias, const std::vector<AppAlias>& appAliases,
+    const std::vector<snippets::Snippet>& snippets,
+    const std::vector<settings::Quicklink>& quicklinks) {
+  const std::wstring normalized = core::NormalizeAlias(alias);
+  return std::any_of(appAliases.begin(), appAliases.end(),
+                     [&](const AppAlias& item) {
+                       return core::NormalizeAlias(item.alias) == normalized;
+                     }) ||
+         std::any_of(snippets.begin(), snippets.end(),
+                     [&](const snippets::Snippet& item) {
+                       return core::NormalizeAlias(item.keyword) == normalized;
+                     }) ||
+         std::any_of(quicklinks.begin(), quicklinks.end(),
+                     [&](const settings::Quicklink& item) {
+                       return core::NormalizeAlias(item.keyword) == normalized;
+                     });
 }
 
 template <typename T, typename Name, typename Keyword>
@@ -99,6 +140,70 @@ std::optional<std::wstring> ValidateAppAlias(
   return std::nullopt;
 }
 
+std::optional<std::wstring> ValidateCommandAlias(
+    const CommandAlias& candidate,
+    const std::vector<CommandAlias>& existing,
+    const std::vector<AppAlias>& appAliases,
+    const std::vector<snippets::Snippet>& snippets,
+    const std::vector<settings::Quicklink>& quicklinks,
+    std::optional<std::size_t> editingIndex) {
+  if (Trim(candidate.stableId).empty()) return L"Command is required.";
+  if (const auto error = AliasFormatError(candidate.alias)) return error;
+  const std::wstring normalized = core::NormalizeAlias(candidate.alias);
+  for (std::size_t index = 0; index < existing.size(); ++index) {
+    if (editingIndex && *editingIndex == index) continue;
+    if (NormalizeKeyword(existing[index].stableId) ==
+        NormalizeKeyword(candidate.stableId)) {
+      return L"This command already has an alias.";
+    }
+    if (core::NormalizeAlias(existing[index].alias) == normalized) {
+      return L"Another command already uses this alias.";
+    }
+  }
+  if (CanonicalAliasCollision(candidate.alias, appAliases, snippets,
+                              quicklinks)) {
+    return L"An app, snippet, or quicklink already uses this alias.";
+  }
+  return std::nullopt;
+}
+
+std::vector<CommandAlias> BuildCommandAliases(
+    const std::map<std::wstring, std::wstring>& aliases,
+    const std::vector<CommandChoice>& commands) {
+  std::vector<CommandAlias> result;
+  result.reserve(aliases.size());
+  for (const auto& [stableId, alias] : aliases) {
+    const auto command = std::find_if(
+        commands.begin(), commands.end(), [&](const CommandChoice& choice) {
+          return choice.stableId == stableId;
+        });
+    result.push_back(
+        {stableId, command == commands.end() ? L"" : command->name, alias});
+  }
+  return result;
+}
+
+std::optional<std::map<std::wstring, std::wstring>> ToCommandAliasMap(
+    const std::vector<CommandAlias>& aliases,
+    const std::vector<AppAlias>& appAliases,
+    const std::vector<snippets::Snippet>& snippets,
+    const std::vector<settings::Quicklink>& quicklinks,
+    std::wstring* error) {
+  std::map<std::wstring, std::wstring> result;
+  for (std::size_t index = 0; index < aliases.size(); ++index) {
+    if (const auto validation = ValidateCommandAlias(
+            aliases[index], aliases, appAliases, snippets, quicklinks,
+            index)) {
+      if (error) *error = *validation;
+      return std::nullopt;
+    }
+    const auto validated = core::ValidateAlias(aliases[index].alias);
+    result[Trim(aliases[index].stableId)] = validated.value;
+  }
+  if (error) error->clear();
+  return result;
+}
+
 std::optional<std::wstring> ValidateWebSearch(
     const WebSearch& candidate, const std::vector<WebSearch>& existing,
     std::optional<std::size_t> editingIndex) {
@@ -148,6 +253,16 @@ std::vector<std::size_t> SortedAppAliasIndices(
     const std::vector<AppAlias>& values) {
   return SortedIndices(
       values, [](const auto& item) { return item.appName; },
+      [](const auto& item) { return item.alias; });
+}
+
+std::vector<std::size_t> SortedCommandAliasIndices(
+    const std::vector<CommandAlias>& values) {
+  return SortedIndices(
+      values,
+      [](const auto& item) {
+        return item.commandName.empty() ? item.stableId : item.commandName;
+      },
       [](const auto& item) { return item.alias; });
 }
 

@@ -3,6 +3,7 @@
 #include "app_types.hpp"
 
 #include <optional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,9 +33,17 @@ struct ActionDescriptor {
 
 const std::vector<CommandDescriptor>& Catalog();
 const CommandDescriptor* Find(app::CommandKind kind);
+const CommandDescriptor* Find(std::wstring_view stableId);
 std::vector<app::DisplayItem> BuildCommandItems();
+std::vector<app::DisplayItem> BuildCommandItems(
+    const std::map<std::wstring, std::wstring>& aliases);
+core::SearchItem BuildSearchItem(
+    const app::DisplayItem& command,
+    const std::map<std::wstring, std::wstring>& aliases = {});
 std::vector<app::DisplayItem> BuildActions(
     const app::DisplayItem& target, const app::Settings& settings);
+bool IsPersonalizableInvocation(const app::DisplayItem& item);
+bool RecordsRecentActivation(const app::DisplayItem& item);
 bool ValidateCatalog(std::wstring* error = nullptr);
 
 }  // namespace feathercast::commands

@@ -122,6 +122,10 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Action, L"Manage Quicklinks",
        L"Create, edit, and delete keyword shortcuts for URLs, files, and folders.",
        L"Manage quicklinks"},
+      {L"library.command-aliases", SettingsCategory::Library, HitType::ManageCommandAliases,
+       ControlKind::Action, L"Manage Command Aliases",
+       L"Assign custom keywords to built-in commands.",
+       L"Manage command aliases"},
       {L"privacy.clipboard", SettingsCategory::Privacy, HitType::ClipboardHistoryToggle,
        ControlKind::Toggle, L"Clipboard History",
        L"Store copied text locally for launcher search and paste.", L"Clipboard history"},
@@ -133,6 +137,22 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Increment, L"Clipboard Retention",
        L"Maximum number of text entries retained locally.",
        L"Increase clipboard history retention", Requirement::ClipboardEnabled},
+      {L"privacy.clipboard-days.down", SettingsCategory::Privacy, HitType::ClipboardRetentionDaysDown,
+       ControlKind::Decrement, L"Clipboard Retention (Days)",
+       L"Maximum age in days before clipboard entries expire (0 for unlimited).",
+       L"Decrease clipboard retention days", Requirement::ClipboardEnabled},
+      {L"privacy.clipboard-days.up", SettingsCategory::Privacy, HitType::ClipboardRetentionDaysUp,
+       ControlKind::Increment, L"Clipboard Retention (Days)",
+       L"Maximum age in days before clipboard entries expire (0 for unlimited).",
+       L"Increase clipboard retention days", Requirement::ClipboardEnabled},
+      {L"privacy.clipboard-exclude-app", SettingsCategory::Privacy, HitType::AddClipboardExcludedApp,
+       ControlKind::Action, L"Exclude App from Clipboard",
+       L"Prevent clipboard capture when a specific application is active.",
+       L"Exclude app from clipboard", Requirement::ClipboardEnabled},
+      {L"privacy.clipboard-remove-excluded-app", SettingsCategory::Privacy, HitType::RemoveClipboardExcludedApp,
+       ControlKind::Action, L"Remove Excluded App",
+       L"Remove an excluded app rule.",
+       L"Remove excluded app from clipboard", Requirement::ClipboardEnabled},
       {L"privacy.file-index", SettingsCategory::Privacy, HitType::FileIndexToggle,
        ControlKind::Toggle, L"Files & Folders Index",
        L"Index selected local folders for launcher search.", L"Files and folders index"},
@@ -149,6 +169,14 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Increment, L"File Index Limit",
        L"Maximum number of files and folders stored locally.",
        L"Increase file index limit", Requirement::FileIndexEnabled},
+      {L"privacy.add-file-pattern", SettingsCategory::Privacy, HitType::AddFileIndexPattern,
+       ControlKind::Action, L"Add Exclusion Pattern",
+       L"Exclude matching files or folders using glob patterns.",
+       L"Add file index exclusion pattern", Requirement::FileIndexEnabled},
+      {L"privacy.remove-file-pattern", SettingsCategory::Privacy, HitType::RemoveFileIndexPattern,
+       ControlKind::Action, L"Remove Exclusion Pattern",
+       L"Remove a configured glob exclusion pattern.",
+       L"Remove file index exclusion pattern", Requirement::FileIndexEnabled},
       {L"privacy.add-root", SettingsCategory::Privacy, HitType::AddFileRoot,
        ControlKind::Action, L"Add Indexed Folder", L"Add a folder to the local index.",
        L"Add file index folder", Requirement::FileIndexEnabled},
@@ -295,6 +323,11 @@ std::wstring AccessibleValue(app::HitType hit,
     case HitType::ClipboardLimitDown:
     case HitType::ClipboardLimitUp:
       return std::to_wstring(settings.clipboardHistoryLimit) + L" entries";
+    case HitType::ClipboardRetentionDaysDown:
+    case HitType::ClipboardRetentionDaysUp:
+      return settings.clipboardRetentionDays == 0
+                 ? L"Unlimited"
+                 : (std::to_wstring(settings.clipboardRetentionDays) + L" days");
     case HitType::FileIndexLimitDown:
     case HitType::FileIndexLimitUp:
       return std::to_wstring(settings.fileIndexMaxEntries) + L" entries";

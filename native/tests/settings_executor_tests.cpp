@@ -63,9 +63,9 @@ int main() {
     assert(captureRoundTrip.value.recordRegionShortcut == L"Ctrl+Shift+4");
 
     const auto future = settings::ParseSettingsDocument(
-        R"({"schemaVersion":3,"shortcut":"DoNotLoad"})");
+        R"({"schemaVersion":4,"shortcut":"DoNotLoad"})");
     assert(future.status == settings::ParseStatus::UnsupportedVersion);
-    assert(future.documentVersion == 3);
+    assert(future.documentVersion == 4);
     assert(future.value.shortcut == L"Alt+Space");
 
     assert(settings::ParseSettingsDocument(R"({"schemaVersion":1.5})").status ==
@@ -86,7 +86,7 @@ int main() {
 
     assert(settings::ParseSettings(R"({"shortcut":)").shortcut == L"Alt+Space");
     const auto serialized = settings::SerializeSettings(settings::Settings{});
-    assert(serialized.find("\"schemaVersion\": 2") != std::string::npos);
+    assert(serialized.find("\"schemaVersion\": 3") != std::string::npos);
     assert(serialized.find("\"screenshotFullscreenShortcut\": \"none\"") !=
            std::string::npos);
     assert(serialized.find("\"screenshotRegionShortcut\": \"none\"") !=

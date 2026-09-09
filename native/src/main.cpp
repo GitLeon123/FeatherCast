@@ -2146,12 +2146,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     constexpr std::array disabledCandidates = {
       HitType::ClipboardLimitDown,
       HitType::ClipboardLimitUp,
+      HitType::ClipboardRetentionDaysDown,
+      HitType::ClipboardRetentionDaysUp,
+      HitType::AddClipboardExcludedApp,
+      HitType::RemoveClipboardExcludedApp,
       HitType::FileIndexLimitDown,
       HitType::FileIndexLimitUp,
       HitType::FileContentIndexToggle,
       HitType::AddFileRoot,
       HitType::RemoveFileRoot,
       HitType::ClearFileRoots,
+      HitType::AddFileIndexPattern,
+      HitType::RemoveFileIndexPattern,
       HitType::RebuildFileIndex,
       HitType::ClearClipboardData,
       HitType::ClearFileIndexData,
@@ -2995,7 +3001,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               if (!event.entry) {
                 ReportPersistenceFailure(event.error.message.empty() ? L"Clipboard history could not be saved." : Utf8ToWide(event.error.message));
               } else if (settings_.clipboardHistoryEnabled) {
-                persistence_.LoadClipboard(ClipboardHistoryLimit());
+                persistence_.LoadClipboard(ClipboardHistoryLimit(),
+                                           settings_.clipboardRetentionDays);
               }
             } else if constexpr (std::is_same_v<
                                      Event,
@@ -4351,115 +4358,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // panel. Clip the transient blur to the same transformed bounds and remove
   // the temporary region once the visual is at rest.
   void UpdateSurfaceBlurClip(
-      GlassSurface& surface, HWND hwnd, const D2D1_MATRIX_3X2_F& transform,
-      double scale, double opacity,
-      const feathercast::motion::AnimatedBounds* bounds, float radius) {
-    if (!hwnd || !BlurAppliedForWindow(hwnd)) {
-      ClearSurfaceBlurClip(surface, hwnd);
-      return;
-    }
-
-    const bool transient =
-        std::abs(scale - 1.0) > 0.001 || std::abs(opacity - 1.0) > 0.001 ||
-        (bounds && bounds->Active());
-    if (!transient) {
-      ClearSurfaceBlurClip(surface, hwnd);
-      return;
-    }
-
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    const float width = static_cast<float>(std::max<LONG>(1, client.right));
-    const float height = static_cast<float>(std::max<LONG>(1, client.bottom));
-    const auto transformPoint = [&](float x, float y) {
-      return D2D1::Point2F(
-          x * transform._11 + y * transform._21 + transform._31,
-          x * transform._12 + y * transform._22 + transform._32);
-    };
-    const std::array<D2D1_POINT_2F, 4> corners = {
-        transformPoint(0.0f, 0.0f), transformPoint(width, 0.0f),
-        transformPoint(0.0f, height), transformPoint(width, height)};
-    float left = corners[0].x;
-    float top = corners[0].y;
-    float right = corners[0].x;
-    float bottom = corners[0].y;
-    for (const auto& corner : corners) {
-      left = std::min(left, corner.x);
-      top = std::min(top, corner.y);
-      right = std::max(right, corner.x);
-      bottom = std::max(bottom, corner.y);
-    }
-
-    // Match the DComp opacity with a gently shrinking blur footprint. This
-    // keeps a zero-opacity panel from leaving a full-size blur behind it.
-    const float blurScale = static_cast<float>(std::sqrt(
-        std::clamp(opacity, 0.0, 1.0)));
-    const float centerX = (left + right) * 0.5f;
-    const float centerY = (top + bottom) * 0.5f;
-    const float halfWidth = (right - left) * 0.5f * blurScale;
-    const float halfHeight = (bottom - top) * 0.5f * blurScale;
-    left = centerX - halfWidth;
-    right = centerX + halfWidth;
-    top = centerY - halfHeight;
-    bottom = centerY + halfHeight;
-
-    RECT clip{
-        std::clamp(static_cast<LONG>(std::floor(left)), 0L,
-                   static_cast<LONG>(width)),
-        std::clamp(static_cast<LONG>(std::floor(top)), 0L,
-                   static_cast<LONG>(height)),
-        std::clamp(static_cast<LONG>(std::ceil(right)), 0L,
-                   static_cast<LONG>(width)),
-        std::clamp(static_cast<LONG>(std::ceil(bottom)), 0L,
-                   static_cast<LONG>(height)),
-    };
-    if (clip.right <= clip.left) {
-      clip.right = std::min<LONG>(static_cast<LONG>(width), clip.left + 1);
-    }
-    if (clip.bottom <= clip.top) {
-      clip.bottom = std::min<LONG>(static_cast<LONG>(height), clip.top + 1);
-    }
-
-    const float transformScale = std::min(
-        std::hypot(transform._11, transform._12),
-        std::hypot(transform._21, transform._22));
-    const int corner = std::max(
-        2, static_cast<int>(std::lround(radius * GetWindowScale(hwnd) *
-                                         std::max(0.01f, transformScale) *
-                                         std::max(0.02f, blurScale) * 2.0f)));
-    if (surface.blurClipActive && surface.blurClip.left == clip.left &&
-        surface.blurClip.top == clip.top &&
-        surface.blurClip.right == clip.right &&
-        surface.blurClip.bottom == clip.bottom &&
-        surface.blurClipCorner == corner) {
-      return;
-    }
-
-    HRGN region = CreateRoundRectRgn(clip.left, clip.top, clip.right + 1,
-                                     clip.bottom + 1, corner, corner);
-    if (!region) return;
-    if (!SetWindowRgn(hwnd, region, TRUE)) {
-      DeleteObject(region);
-      return;
-    }
-    surface.blurClipActive = true;
-    surface.blurClip = clip;
-    surface.blurClipCorner = corner;
+      GlassSurface& surface, HWND hwnd, const D2D1_MATRIX_3X2_F& /*transform*/,
+      double /*scale*/, double /*opacity*/,
+      const feathercast::motion::AnimatedBounds* /*bounds*/, float /*radius*/) {
+    ClearSurfaceBlurClip(surface, hwnd);
   }
 
   HRESULT SetSurfaceVisualState(
       GlassSurface& surface, HWND hwnd, double scale, bool topAnchored,
       double opacity, const feathercast::motion::AnimatedBounds* bounds) {
     if (!surface.visual || !hwnd) return S_OK;
+
     RECT client{};
     GetClientRect(hwnd, &client);
     const float width = static_cast<float>(std::max(1L, client.right));
     const float height = static_cast<float>(std::max(1L, client.bottom));
     const float anchorY = topAnchored ? 0.0f : height * 0.5f;
+
     const auto scaleTransform = D2D1::Matrix3x2F::Scale(
         static_cast<float>(std::clamp(scale, 0.01, 1.0)),
         static_cast<float>(std::clamp(scale, 0.01, 1.0)),
         D2D1::Point2F(width * 0.5f, anchorY));
+
     const auto boundsTransform = SurfaceBoundsTransform(bounds);
     const auto transform = scaleTransform * boundsTransform;
     const D2D_MATRIX_3X2_F compositionTransform{
@@ -4467,13 +4387,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         transform._22, transform._31, transform._32};
     HRESULT result = surface.visual->SetTransform(compositionTransform);
     if (FAILED(result)) return result;
-    const float radius = hwnd == settingsHwnd_ ? theme_.settingsRadius
-                                                : theme_.overlayRadius;
-    UpdateSurfaceBlurClip(surface, hwnd, transform, scale, opacity, bounds,
-                          radius);
+
+    ClearSurfaceBlurClip(surface, hwnd);
+
     if (surface.visual3) {
-      result = surface.visual3->SetOpacity(
-          static_cast<float>(std::clamp(opacity, 0.0, 1.0)));
+      const bool blurApplied = BlurAppliedForWindow(hwnd);
+      // When DWM blur-behind is active, modulating DirectComposition visual opacity
+      // to 0 does not hide the window—it strips away the dark background tint
+      // and leaves a naked, exposed DWM blur rectangle behind.
+      // Retain a baseline tint (min 0.35) when blur is active so the dark background
+      // always covers the backdrop blur during transitions, while still providing
+      // a visible, smooth fade effect.
+      const float minOpacity = blurApplied ? 0.35f : 0.0f;
+      const float targetOpacity = static_cast<float>(
+          std::clamp(opacity, static_cast<double>(minOpacity), 1.0));
+      result = surface.visual3->SetOpacity(targetOpacity);
       if (FAILED(result)) return result;
     }
     return S_OK;
@@ -4503,11 +4431,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ApplySurfaceVisualStates();
   }
 
+  bool IsWindowTransitioning(HWND hwnd) const {
+    if (hwnd == hwnd_) {
+      return overlayClosing_ || overlaySurfaceScale_.Active() ||
+             (animating_ && overlayRevealTimeline_.Active());
+    }
+    if (hwnd == settingsHwnd_) {
+      return settingsClosing_ || settingsSurfaceScale_.Active();
+    }
+    if (hwnd == volumeHwnd_) {
+      return volumeClosing_ || volumeSurfaceScale_.Active();
+    }
+    return false;
+  }
+
   // Resizes a surface's swap chain to match a committed native window size.
   // Animated intermediate geometry is handled by DirectComposition and never
   // reaches this function once per frame.
   void ResizeGlassSurface(GlassSurface& surface, HWND hwnd, UINT width, UINT height) {
     if (!surface.swapChain || !surface.dc) return;
+    if (IsWindowTransitioning(hwnd)) return;
     width = std::max<UINT>(1, width);
     height = std::max<UINT>(1, height);
     surface.dc->SetTarget(nullptr);
@@ -4981,7 +4924,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       std::size_t unpinned = 0;
       std::erase_if(clipboardHistory_, [&](const auto& item) { return !item.pinned && ++unpinned > limit; });
     }
-    if (!persistence_.PruneClipboard(limit)) {
+    if (!persistence_.PruneClipboard(limit, settings_.clipboardRetentionDays)) {
       ReportPersistenceFailure(L"The persistence worker is unavailable.");
     }
     MarkSearchDataChanged();
@@ -4990,8 +4933,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   size_t FileIndexLimit() const {
     return static_cast<size_t>(std::clamp(settings_.fileIndexMaxEntries,
-                                         MIN_FILE_INDEX_ENTRIES,
-                                         MAX_FILE_INDEX_ENTRIES));
+                                          MIN_FILE_INDEX_ENTRIES,
+                                          MAX_FILE_INDEX_ENTRIES));
   }
 
   void PromptForPrivacyConsentIfNeeded() {
@@ -5031,7 +4974,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void LoadPersistentState() {
     const auto state = persistence_.LoadStorageForStartup(
-        FileIndexLimit(), ClipboardHistoryLimit(), false);
+        FileIndexLimit(), ClipboardHistoryLimit(), false,
+        settings_.clipboardRetentionDays);
     if (!state.opened) {
       const auto& error = state.error;
       const std::wstring detail =
@@ -5120,6 +5064,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     request.generation = ++fileIndexGeneration_;
     request.limit = FileIndexLimit();
     request.contentEnabled = settings_.fileContentIndexEnabled;
+    request.exclusionPatterns = settings_.fileIndexExcludePatterns;
     if (settings_.fileIndexEnabled) request.roots = ResolvedFileIndexRoots();
     if (!fileIndexService_.Reconfigure(std::move(request))) {
       ReportBackgroundFailure(L"The live file index worker is unavailable.");
@@ -5176,7 +5121,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const auto entryCount = status.entries.size();
     if (!persistence_.MergeFileIndex(
             std::move(status.entries), status.configuredRoots,
-            status.availableRoots, FileIndexLimit(), status.generation)) {
+            status.availableRoots, FileIndexLimit(), status.generation,
+            settings_.fileIndexExcludePatterns)) {
       ReportPersistenceFailure(L"The persistence worker is unavailable.");
     }
     fileIndexStatus_ = std::move(status);
@@ -5874,7 +5820,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::vector<DisplayItem> BuiltInCommands() const {
-    return feathercast::commands::BuildCommandItems();
+    return feathercast::commands::BuildCommandItems(settings_.commandAliases);
+  }
+
+  std::vector<DisplayItem> BuiltInCommands(const Settings& settings) const {
+    return feathercast::commands::BuildCommandItems(settings.commandAliases);
   }
 
   std::vector<DisplayItem> ActionsFor(const DisplayItem& target) const {
@@ -6141,20 +6091,66 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (snapshotSettings.showOpenWindows) {
       for (const auto& window : windows) windowItems.push_back(WindowDisplay(window));
     }
-    auto commandItems = BuiltInCommands();
+    auto commandItems = BuiltInCommands(snapshotSettings);
 
     // Empty-state buckets.
     {
       std::map<std::wstring, DisplayItem> byId;
+      std::map<std::wstring, DisplayItem> byInvocationKey;
+
       for (const auto& item : appItems) {
         for (const auto& key : AppKeys(item.app)) byId[key] = item;
+        const auto invKey = item.InvocationKey();
+        if (!invKey.empty()) byInvocationKey[invKey] = item;
+      }
+      for (const auto& item : snap->snippetItems) {
+        const auto invKey = item.InvocationKey();
+        if (!invKey.empty()) byInvocationKey[invKey] = item;
+      }
+      for (const auto& item : commandItems) {
+        const auto invKey = item.InvocationKey();
+        if (!invKey.empty()) byInvocationKey[invKey] = item;
+      }
+
+      std::set<std::wstring> seenFavorites;
+      for (const auto& key : snapshotSettings.pinnedItems) {
+        if (key.empty() || seenFavorites.contains(key)) continue;
+        auto it = byInvocationKey.find(key);
+        if (it != byInvocationKey.end()) {
+          snap->pinned.push_back(it->second);
+          seenFavorites.insert(key);
+        }
       }
       for (const auto& item : appItems) {
-        if (ContainsAnyAppKey(snapshotSettings.pinnedApps, item.app)) snap->pinned.push_back(item);
+        if (ContainsAnyAppKey(snapshotSettings.pinnedApps, item.app)) {
+          const auto invKey = item.InvocationKey();
+          if (!invKey.empty() && !seenFavorites.contains(invKey)) {
+            snap->pinned.push_back(item);
+            seenFavorites.insert(invKey);
+          }
+        }
+      }
+
+      std::set<std::wstring> seenRecents;
+      for (const auto& key : snapshotSettings.recentItems) {
+        if (key.empty() || seenFavorites.contains(key) || seenRecents.contains(key)) continue;
+        auto it = byInvocationKey.find(key);
+        if (it != byInvocationKey.end()) {
+          snap->recent.push_back(it->second);
+          seenRecents.insert(key);
+        }
       }
       for (const auto& id : snapshotSettings.recentApps) {
-        if (byId.contains(id)) snap->recent.push_back(byId[id]);
+        if (byId.contains(id)) {
+          const auto& item = byId[id];
+          const auto invKey = item.InvocationKey();
+          if (!seenFavorites.contains(invKey) && !seenRecents.contains(invKey)) {
+            snap->recent.push_back(item);
+            seenRecents.insert(invKey);
+          }
+        }
       }
+
       for (const auto& item : appItems) {
         if (!item.app.isGame &&
             (item.app.systemEssential || item.app.source == L"alias" ||
@@ -6432,6 +6428,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       out.source = L"snippet";
       out.name = item.snippet.name;
       out.keywords = item.commandKeywords;
+      if (!item.snippet.keyword.empty()) {
+        out.aliases.push_back(item.snippet.keyword);
+      }
       out.systemEssential = true;
     } else if (item.isClipboard) {
       out.id = item.Key();
@@ -6440,6 +6439,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       out.name = item.clipboard.preview;
       out.keywords = item.commandKeywords;
       out.lastUsed = item.clipboard.capturedAt;
+      out.pinned = item.clipboard.pinned;
     } else if (item.isRunCommand) {
       out.id = item.Key();
       out.kind = L"run";
@@ -6463,12 +6463,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       out.keywords.push_back(item.utility->value);
       out.systemEssential = true;
     } else if (item.isCommand) {
-      out.id = item.Key();
-      out.kind = L"command";
-      out.source = L"command";
-      out.name = item.commandName;
-      out.keywords = item.commandKeywords;
-      out.systemEssential = true;
+      out = feathercast::commands::BuildSearchItem(item, searchSettings.commandAliases);
     } else if (item.isAction) {
       out.id = item.Key();
       out.kind = L"action";
@@ -6494,14 +6489,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       out.keywords = item.app.keywords;
       out.systemEssential = item.app.systemEssential;
       out.pinned = ContainsAnyAppKey(searchSettings.pinnedApps, item.app);
+      if (item.app.source == L"quicklink") {
+        constexpr std::wstring_view prefix = L"quicklink:";
+        const std::wstring keyword = item.app.id.rfind(prefix, 0) == 0
+            ? item.app.id.substr(prefix.size())
+            : (!item.app.keywords.empty() ? item.app.keywords.front() : L"");
+        if (!keyword.empty()) out.aliases.push_back(keyword);
+      }
       for (const auto& key : AppKeys(item.app)) {
         if (auto alias = searchSettings.appAliases.find(key); alias != searchSettings.appAliases.end()) {
           out.keywords.push_back(alias->second);
+          out.aliases.push_back(alias->second);
         }
         if (auto usage = searchSettings.usageStats.find(key); usage != searchSettings.usageStats.end()) {
           out.usageCount = std::max(out.usageCount, usage->second.launches);
           out.lastUsed = std::max(out.lastUsed, usage->second.lastUsed);
         }
+      }
+    }
+    const auto invocationKey = item.InvocationKey();
+    if (!invocationKey.empty()) {
+      if (std::find(searchSettings.pinnedItems.begin(), searchSettings.pinnedItems.end(), invocationKey) != searchSettings.pinnedItems.end()) {
+        out.pinned = true;
       }
     }
     return out;
@@ -6969,6 +6978,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     overlayRestoreCandidate_.reset();
     pendingOverlayClose_.reset();
     overlayClosing_ = false;
+    overlaySurfaceScale_.Snap(1.0);
+    overlayOpacity_.Snap(1.0);
     CancelPointerPress(hwnd_);
     KillTimer(hwnd_, 1);
     KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
@@ -7021,16 +7032,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                   L" reason=" +
                   std::to_wstring(static_cast<int>(reason)));
 
-    if (restoreFocus && FadeAnimationsAllowed()) {
+    if (restoreFocus && (FadeAnimationsAllowed() || SpatialAnimationsAllowed())) {
       pendingOverlayClose_ = close;
       overlayClosing_ = true;
       CancelPointerPress(hwnd_);
       KillTimer(hwnd_, 1);
       overlayOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
-      // Keep the DWM blur and the DirectComposition panel on the same close
-      // timeline.  Fading only the visual leaves the HWND-sized blur behind
-      // until the window is finally hidden.
-      overlaySurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+      overlaySurfaceScale_.Retarget(kSurfaceScaleStart, kSurfaceCloseSeconds,
                                      SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
@@ -7204,6 +7212,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void FinishHideVolumeControl(HWND restoreTarget) {
     volumeClosing_ = false;
+    volumeSurfaceScale_.Snap(1.0);
+    volumeOpacity_.Snap(1.0);
     pendingVolumeRestore_ = nullptr;
     volumeRestoreWindow_ = nullptr;
     volumeVisible_ = false;
@@ -7223,11 +7233,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void HideVolumeControl(bool restoreFocus) {
     if (!volumeVisible_) return;
     HWND restoreTarget = restoreFocus ? volumeRestoreWindow_ : nullptr;
-    if (restoreFocus && FadeAnimationsAllowed() && !volumeClosing_) {
+    if (restoreFocus && (FadeAnimationsAllowed() || SpatialAnimationsAllowed()) && !volumeClosing_) {
       pendingVolumeRestore_ = restoreTarget;
       volumeClosing_ = true;
       volumeOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
-      volumeSurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+      volumeSurfaceScale_.Retarget(kSurfaceScaleStart, kSurfaceCloseSeconds,
                                    SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
@@ -7302,6 +7312,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (const auto& [keyword, urlTemplate] : settings_.searchEngines) {
       data.webSearches.push_back({keyword, urlTemplate});
     }
+    std::vector<feathercast::library::CommandChoice> commandChoices;
+    for (const auto& command : feathercast::commands::Catalog()) {
+      commandChoices.push_back({std::wstring(command.stableId), std::wstring(command.label)});
+    }
+    data.commandAliases = feathercast::library::BuildCommandAliases(settings_.commandAliases, commandChoices);
     std::sort(data.availableApps.begin(), data.availableApps.end(),
               [](const auto& left, const auto& right) {
                 return feathercast::library::NormalizeKeyword(left.name) <
@@ -7390,6 +7405,37 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return {true, L"App aliases saved."};
   }
 
+  feathercast::library::OperationResult SaveManagedCommandAliases(
+      const std::vector<feathercast::library::CommandAlias>& candidate) {
+    if (settingsPersistenceBlocked_) {
+      return {false, L"settings.json is protected from automatic writes."};
+    }
+    std::vector<feathercast::snippets::Snippet> currentSnippets;
+    {
+      std::lock_guard lock(dataMutex_);
+      currentSnippets = snippets_;
+    }
+    std::vector<feathercast::library::AppAlias> appAliases;
+    for (const auto& [appId, alias] : settings_.appAliases) {
+      appAliases.push_back({appId, L"", alias});
+    }
+    std::wstring error;
+    const auto aliasMap = feathercast::library::ToCommandAliasMap(
+        candidate, appAliases, currentSnippets, settings_.quicklinks, &error);
+    if (!aliasMap) {
+      return {false, error.empty() ? L"Invalid command alias." : error};
+    }
+    Settings next = settings_;
+    next.commandAliases = *aliasMap;
+    if (!persistence_.SaveSettingsAndWait(next, &error)) {
+      return {false, error.empty() ? L"Could not save settings.json." : error};
+    }
+    settings_ = std::move(next);
+    MarkSearchDataChanged();
+    RequestSearch();
+    return {true, L"Command aliases saved."};
+  }
+
   feathercast::library::OperationResult SaveManagedWebSearches(
       const std::vector<feathercast::library::WebSearch>& candidate) {
     if (settingsPersistenceBlocked_) {
@@ -7456,6 +7502,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     };
     callbacks.saveAppAliases = [this](const auto& aliases) {
       return SaveManagedAppAliases(aliases);
+    };
+    callbacks.saveCommandAliases = [this](const auto& aliases) {
+      return SaveManagedCommandAliases(aliases);
     };
     callbacks.saveWebSearches = [this](const auto& searches) {
       return SaveManagedWebSearches(searches);
@@ -7527,6 +7576,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void FinishHideSettings() {
     settingsClosing_ = false;
+    settingsSurfaceScale_.Snap(1.0);
+    settingsOpacity_.Snap(1.0);
     CancelPointerPress(settingsHwnd_);
     const auto effects =
         feathercast::ui::SettingsController::Close(settingsState_);
@@ -7537,11 +7588,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void HideSettings(bool animate = true) {
     if (!settingsHwnd_ || !IsWindowVisible(settingsHwnd_)) return;
-    if (animate && FadeAnimationsAllowed() && !settingsClosing_) {
+    if (animate && (FadeAnimationsAllowed() || SpatialAnimationsAllowed()) && !settingsClosing_) {
       settingsClosing_ = true;
       CancelPointerPress(settingsHwnd_);
       settingsOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
-      settingsSurfaceScale_.Retarget(0.98, kSurfaceCloseSeconds,
+      settingsSurfaceScale_.Retarget(kSurfaceScaleStart, kSurfaceCloseSeconds,
                                       SpatialAnimationsAllowed());
       RequestAnimationFrame();
       return;
@@ -7874,7 +7925,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   static constexpr double kSelectionHoverSettleSeconds = 0.055;
   static constexpr double kSelectionKeyboardSettleSeconds = 0.090;
   static constexpr double kSurfaceOpenSeconds = 0.150;
-  static constexpr double kSurfaceCloseSeconds = 0.090;
+  static constexpr double kSurfaceCloseSeconds = 0.110;
+  static constexpr double kSurfaceScaleStart = 0.94;
   static constexpr double kOverlayResizeSeconds = 0.140;
   static constexpr double kSettingsResizeSeconds = 0.160;
   static constexpr double kOverlayScrollSeconds = 0.085;
@@ -7956,7 +8008,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (SpatialAnimationsAllowed()) {
-      scale.Snap(0.98);
+      scale.Snap(kSurfaceScaleStart);
       scale.Retarget(1.0, kSurfaceOpenSeconds, true);
     } else {
       scale.Snap(1.0);
@@ -8360,15 +8412,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FinishCancelConfirmation();
     }
     if (overlayClosing_ && pendingOverlayClose_ &&
-        !overlayOpacity_.Active() && overlayOpacity_.Value() <= 0.001) {
+        !overlaySurfaceScale_.Active() &&
+        (!overlayOpacity_.Active() || overlayOpacity_.Value() <= 0.001)) {
       FinishHideOverlay(*pendingOverlayClose_);
     }
-    if (settingsClosing_ && !settingsOpacity_.Active() &&
-        settingsOpacity_.Value() <= 0.001) {
+    if (settingsClosing_ &&
+        !settingsSurfaceScale_.Active() &&
+        (!settingsOpacity_.Active() || settingsOpacity_.Value() <= 0.001)) {
       FinishHideSettings();
     }
-    if (volumeClosing_ && !volumeOpacity_.Active() &&
-        volumeOpacity_.Value() <= 0.001) {
+    if (volumeClosing_ &&
+        !volumeSurfaceScale_.Active() &&
+        (!volumeOpacity_.Active() || volumeOpacity_.Value() <= 0.001)) {
       FinishHideVolumeControl(pendingVolumeRestore_);
     }
 
@@ -10144,10 +10199,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         h += kSettSection + 4 * kSettRow;
         break;
       case SettingsCategory::Library:
-        h += kSettSection + 2 * kSettRow;
+        h += kSettSection + 3 * kSettRow;
         break;
       case SettingsCategory::Privacy:
-        h += kSettSection + 6 * kSettRow + 3 * kSettMaint;
+        h += kSettSection + 9 * kSettRow + 3 * kSettMaint;
         break;
       case SettingsCategory::Extensions:
         h += kSettSection + kSettRow +
@@ -10653,6 +10708,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawSettingsButton(
             {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
             L"Manage", HitType::ManageQuicklinks);
+        y += kSettRow;
+        const std::size_t commandAliasCount = settings_.commandAliases.size();
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::ManageCommandAliases, contentLeft,
+            contentRight - 150.0f, true,
+            commandAliasCount == 0
+                ? L"No command aliases configured."
+                : (std::to_wstring(commandAliasCount) +
+                   (commandAliasCount == 1 ? L" command alias configured." :
+                                             L" command aliases configured.")));
+        DrawSettingsButton(
+            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Manage", HitType::ManageCommandAliases);
         break;
       }
 
@@ -10672,6 +10740,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawStepper(y, kSettRow, std::to_wstring(ClipboardHistoryLimit()),
                     HitType::ClipboardLimitDown, HitType::ClipboardLimitUp,
                     contentRight, clipboardControls);
+        y += kSettRow;
+        DrawCatalogSettingRowLabel(y, kSettRow,
+                                   HitType::ClipboardRetentionDaysDown, contentLeft,
+                                   contentRight - 176, clipboardControls);
+        DrawStepper(y, kSettRow,
+                    settings_.clipboardRetentionDays == 0
+                        ? L"Unlimited"
+                        : (std::to_wstring(settings_.clipboardRetentionDays) + L" days"),
+                    HitType::ClipboardRetentionDaysDown, HitType::ClipboardRetentionDaysUp,
+                    contentRight, clipboardControls);
+        y += kSettRow;
+        const std::size_t excludedAppCount = settings_.clipboardExcludedApps.size();
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::AddClipboardExcludedApp, contentLeft,
+            contentRight - 260, clipboardControls,
+            excludedAppCount == 0
+                ? L"No apps excluded."
+                : (std::to_wstring(excludedAppCount) +
+                   (excludedAppCount == 1 ? L" app excluded." : L" apps excluded.")));
+        DrawSettingsButton(
+            {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f, y + 48.0f},
+            L"Exclude App...", HitType::AddClipboardExcludedApp, clipboardControls);
+        DrawSettingsButton(
+            {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Remove...", HitType::RemoveClipboardExcludedApp,
+            clipboardControls && excludedAppCount > 0);
         y += kSettRow;
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::FileIndexToggle, contentLeft,
@@ -10702,6 +10796,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawStepper(y, kSettRow, std::to_wstring(FileIndexLimit()),
                     HitType::FileIndexLimitDown, HitType::FileIndexLimitUp,
                     contentRight, fileIndexControls);
+        y += kSettRow;
+        const std::size_t patternCount = settings_.fileIndexExcludePatterns.size();
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::AddFileIndexPattern, contentLeft,
+            contentRight - 260, fileIndexControls,
+            patternCount == 0
+                ? L"No exclusion patterns configured."
+                : (std::to_wstring(patternCount) +
+                   (patternCount == 1 ? L" exclusion pattern configured." : L" exclusion patterns configured.")));
+        DrawSettingsButton(
+            {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f, y + 48.0f},
+            L"Add Pattern...", HitType::AddFileIndexPattern, fileIndexControls);
+        DrawSettingsButton(
+            {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Remove...", HitType::RemoveFileIndexPattern,
+            fileIndexControls && patternCount > 0);
         y += kSettRow;
         DrawCatalogSettingRowLabel(y, kSettRow, HitType::DiagnosticsToggle,
                                    contentLeft, contentRight - 66);
@@ -11960,6 +12070,174 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return selected.lexically_normal().wstring();
   }
 
+  std::optional<std::wstring> PickExecutable() {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog)))) {
+      return std::nullopt;
+    }
+    FILEOPENDIALOGOPTIONS options{};
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    dialog->SetTitle(L"Choose an application executable to exclude");
+    static constexpr COMDLG_FILTERSPEC filters[] = {
+        {L"Executables (*.exe)", L"*.exe"},
+        {L"All Files (*.*)", L"*.*"}
+    };
+    dialog->SetFileTypes(ARRAYSIZE(filters), filters);
+    if (FAILED(dialog->Show(settingsHwnd_))) return std::nullopt;
+
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(&item))) return std::nullopt;
+    PWSTR rawPath = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) || !rawPath) {
+      return std::nullopt;
+    }
+    CoMemPtr<wchar_t> pathOwner(rawPath);
+    const std::filesystem::path selected(rawPath);
+    return selected.filename().wstring();
+  }
+
+  struct PromptDialogData {
+    const wchar_t* prompt = nullptr;
+    std::wstring initialText;
+    std::wstring result;
+    bool ok = false;
+    HFONT font = nullptr;
+  };
+
+  static LRESULT CALLBACK PromptDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* data = reinterpret_cast<PromptDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+      case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        data = reinterpret_cast<PromptDialogData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+        data->font = CreateFontIndirectW(&metrics.lfMessageFont);
+
+        HWND lbl = CreateWindowExW(0, L"STATIC", data->prompt,
+                                   WS_CHILD | WS_VISIBLE, 16, 16, 380, 40,
+                                   hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (data->font) SendMessageW(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", data->initialText.c_str(),
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    16, 60, 380, 24, hwnd, reinterpret_cast<HMENU>(101),
+                                    GetModuleHandleW(nullptr), nullptr);
+        if (data->font) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SetFocus(edit);
+
+        HWND btnOk = CreateWindowExW(0, L"BUTTON", L"OK",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                     210, 96, 90, 28, hwnd, reinterpret_cast<HMENU>(IDOK),
+                                     GetModuleHandleW(nullptr), nullptr);
+        if (data->font) SendMessageW(btnOk, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+
+        HWND btnCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         306, 96, 90, 28, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
+                                         GetModuleHandleW(nullptr), nullptr);
+        if (data->font) SendMessageW(btnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+        return 0;
+      }
+      case WM_COMMAND: {
+        const int id = LOWORD(wParam);
+        if (id == IDOK) {
+          HWND edit = GetDlgItem(hwnd, 101);
+          int len = GetWindowTextLengthW(edit);
+          std::wstring text(len + 1, L'\0');
+          int copied = GetWindowTextW(edit, text.data(), len + 1);
+          text.resize(std::max(0, copied));
+          if (data) {
+            data->result = std::move(text);
+            data->ok = true;
+          }
+          DestroyWindow(hwnd);
+          return 0;
+        } else if (id == IDCANCEL) {
+          DestroyWindow(hwnd);
+          return 0;
+        }
+        break;
+      }
+      case WM_DESTROY: {
+        if (data && data->font) {
+          DeleteObject(data->font);
+          data->font = nullptr;
+        }
+        PostQuitMessage(0);
+        return 0;
+      }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+  }
+
+  std::optional<std::wstring> PromptTextInput(HWND owner, const wchar_t* title,
+                                             const wchar_t* prompt,
+                                             const std::wstring& initial = L"") {
+    static const bool registered = [] {
+      WNDCLASSEXW wc{sizeof(wc)};
+      wc.lpfnWndProc = &PromptDialogProc;
+      wc.hInstance = GetModuleHandleW(nullptr);
+      wc.lpszClassName = L"FeatherCastPromptDialog";
+      wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+      wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+      return RegisterClassExW(&wc) != 0;
+    }();
+    if (!registered) return std::nullopt;
+
+    PromptDialogData data;
+    data.prompt = prompt;
+    data.initialText = initial;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                               L"FeatherCastPromptDialog", title,
+                               WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 428, 170,
+                               owner, nullptr, GetModuleHandleW(nullptr), &data);
+    if (!dlg) return std::nullopt;
+
+    RECT windowRect{};
+    RECT ownerRect{};
+    GetWindowRect(dlg, &windowRect);
+    if (!owner || !GetWindowRect(owner, &ownerRect)) {
+      SystemParametersInfoW(SPI_GETWORKAREA, 0, &ownerRect, 0);
+    }
+    const int width = windowRect.right - windowRect.left;
+    const int height = windowRect.bottom - windowRect.top;
+    const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
+    const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
+    SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    MSG msg{};
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+      if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+        SendMessageW(dlg, WM_COMMAND, IDCANCEL, 0);
+        continue;
+      }
+      if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+        SendMessageW(dlg, WM_COMMAND, IDOK, 0);
+        continue;
+      }
+      if (!IsDialogMessageW(dlg, &msg)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
+    }
+    EnableWindow(owner, TRUE);
+    SetActiveWindow(owner);
+
+    if (data.ok) return feathercast::core::Trim(data.result);
+    return std::nullopt;
+  }
+
   void HandleSettingsHit(HitType type) {
     if (!SettingsControlEnabled(type)) return;
     switch (type) {
@@ -11980,6 +12258,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         break;
       case HitType::ManageQuicklinks:
         OpenLibraryManager(feathercast::library::ItemKind::Quicklink);
+        break;
+      case HitType::ManageCommandAliases:
+        OpenLibraryManager(feathercast::library::ItemKind::CommandAlias);
         break;
       case HitType::RecordShortcut:
         recordingCaptureShortcut_ = -1;
@@ -12128,6 +12409,103 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         PersistSettings();
         ApplyClipboardHistoryLimit();
         break;
+      case HitType::ClipboardRetentionDaysDown: {
+        static constexpr int kRetentionSteps[] = {0, 7, 14, 30, 60, 90, 180, 365};
+        int current = settings_.clipboardRetentionDays;
+        int next = 0;
+        for (int i = static_cast<int>(std::size(kRetentionSteps)) - 1; i >= 0; --i) {
+          if (kRetentionSteps[i] < current) {
+            next = kRetentionSteps[i];
+            break;
+          }
+        }
+        if (next != settings_.clipboardRetentionDays) {
+          settings_.clipboardRetentionDays = next;
+          PersistSettings();
+          ApplyClipboardHistoryLimit();
+        }
+        break;
+      }
+      case HitType::ClipboardRetentionDaysUp: {
+        static constexpr int kRetentionSteps[] = {0, 7, 14, 30, 60, 90, 180, 365};
+        int current = settings_.clipboardRetentionDays;
+        int next = kRetentionSteps[std::size(kRetentionSteps) - 1];
+        for (int step : kRetentionSteps) {
+          if (step > current) {
+            next = step;
+            break;
+          }
+        }
+        if (next != settings_.clipboardRetentionDays) {
+          settings_.clipboardRetentionDays = next;
+          PersistSettings();
+          ApplyClipboardHistoryLimit();
+        }
+        break;
+      }
+      case HitType::AddClipboardExcludedApp: {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) break;
+        AppendMenuW(menu, MF_STRING, 1, L"Browse executable file (.exe)...");
+        AppendMenuW(menu, MF_STRING, 2, L"Enter process or executable name...");
+        RECT settingsRect{};
+        GetWindowRect(settingsHwnd_, &settingsRect);
+        const UINT selected = TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+            settingsRect.left + 260, settingsRect.top + 180, 0,
+            settingsHwnd_, nullptr);
+        DestroyMenu(menu);
+        std::optional<std::wstring> candidate;
+        if (selected == 1) {
+          candidate = PickExecutable();
+        } else if (selected == 2) {
+          candidate = PromptTextInput(
+              settingsHwnd_, L"Exclude App",
+              L"Enter executable or process name (e.g. keepass.exe or 1Password):");
+        }
+        if (candidate && !candidate->empty()) {
+          const std::wstring trimmed = feathercast::core::Trim(*candidate);
+          if (!trimmed.empty()) {
+            bool exists = false;
+            for (const auto& existing : settings_.clipboardExcludedApps) {
+              if (_wcsicmp(existing.c_str(), trimmed.c_str()) == 0) {
+                exists = true;
+                break;
+              }
+            }
+            if (!exists) {
+              settings_.clipboardExcludedApps.push_back(trimmed);
+              PersistSettings();
+              ResizeSettingsWindow();
+            }
+          }
+        }
+        break;
+      }
+      case HitType::RemoveClipboardExcludedApp: {
+        if (settings_.clipboardExcludedApps.empty()) break;
+        HMENU menu = CreatePopupMenu();
+        if (!menu) break;
+        for (std::size_t i = 0; i < settings_.clipboardExcludedApps.size(); ++i) {
+          AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(i + 1),
+                      settings_.clipboardExcludedApps[i].c_str());
+        }
+        RECT settingsRect{};
+        GetWindowRect(settingsHwnd_, &settingsRect);
+        const UINT selected = TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+            settingsRect.left + 260, settingsRect.top + 180, 0,
+            settingsHwnd_, nullptr);
+        DestroyMenu(menu);
+        if (selected > 0 && selected <= settings_.clipboardExcludedApps.size()) {
+          settings_.clipboardExcludedApps.erase(
+              settings_.clipboardExcludedApps.begin() +
+              static_cast<std::ptrdiff_t>(selected - 1));
+          PersistSettings();
+          ResizeSettingsWindow();
+        }
+        break;
+      }
       case HitType::FileIndexToggle:
         settings_.privacyConsentVersion = 1;
         settings_.fileIndexEnabled = !settings_.fileIndexEnabled;
@@ -12234,6 +12612,79 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         PersistSettings();
         if (settings_.fileIndexEnabled) ConfigureFileIndex();
         break;
+      case HitType::AddFileIndexPattern: {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) break;
+        AppendMenuW(menu, MF_STRING, 1, L"Enter custom pattern...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 2, L"node_modules/**");
+        AppendMenuW(menu, MF_STRING, 3, L".git/**");
+        AppendMenuW(menu, MF_STRING, 4, L"*.tmp");
+        AppendMenuW(menu, MF_STRING, 5, L"target/**");
+        AppendMenuW(menu, MF_STRING, 6, L"build/**");
+        RECT settingsRect{};
+        GetWindowRect(settingsHwnd_, &settingsRect);
+        const UINT selected = TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+            settingsRect.left + 260, settingsRect.top + 180, 0,
+            settingsHwnd_, nullptr);
+        DestroyMenu(menu);
+        std::wstring patternToAdd;
+        if (selected == 1) {
+          if (const auto prompt = PromptTextInput(
+                  settingsHwnd_, L"Exclude Pattern",
+                  L"Enter glob pattern (e.g. node_modules/** or *.log):")) {
+            patternToAdd = *prompt;
+          }
+        } else if (selected == 2) patternToAdd = L"node_modules/**";
+        else if (selected == 3) patternToAdd = L".git/**";
+        else if (selected == 4) patternToAdd = L"*.tmp";
+        else if (selected == 5) patternToAdd = L"target/**";
+        else if (selected == 6) patternToAdd = L"build/**";
+
+        patternToAdd = feathercast::core::Trim(patternToAdd);
+        if (!patternToAdd.empty()) {
+          bool exists = false;
+          for (const auto& existing : settings_.fileIndexExcludePatterns) {
+            if (_wcsicmp(existing.c_str(), patternToAdd.c_str()) == 0) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists) {
+            settings_.fileIndexExcludePatterns.push_back(patternToAdd);
+            PersistSettings();
+            if (settings_.fileIndexEnabled) ConfigureFileIndex();
+            ResizeSettingsWindow();
+          }
+        }
+        break;
+      }
+      case HitType::RemoveFileIndexPattern: {
+        if (settings_.fileIndexExcludePatterns.empty()) break;
+        HMENU menu = CreatePopupMenu();
+        if (!menu) break;
+        for (std::size_t i = 0; i < settings_.fileIndexExcludePatterns.size(); ++i) {
+          AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(i + 1),
+                      settings_.fileIndexExcludePatterns[i].c_str());
+        }
+        RECT settingsRect{};
+        GetWindowRect(settingsHwnd_, &settingsRect);
+        const UINT selected = TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+            settingsRect.left + 260, settingsRect.top + 180, 0,
+            settingsHwnd_, nullptr);
+        DestroyMenu(menu);
+        if (selected > 0 && selected <= settings_.fileIndexExcludePatterns.size()) {
+          settings_.fileIndexExcludePatterns.erase(
+              settings_.fileIndexExcludePatterns.begin() +
+              static_cast<std::ptrdiff_t>(selected - 1));
+          PersistSettings();
+          if (settings_.fileIndexEnabled) ConfigureFileIndex();
+          ResizeSettingsWindow();
+        }
+        break;
+      }
       case HitType::RebuildFileIndex:
         SetSettingsStatus(StatusSeverity::Info, L"Rebuilding the file index...");
         if (!fileIndexService_.Rebuild()) {
@@ -12573,6 +13024,24 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  void TrackRecentInvocationKey(const std::wstring& invKey) {
+    if (invKey.empty()) return;
+    std::vector<std::wstring> next{invKey};
+    for (const auto& existing : settings_.recentItems) {
+      if (existing != invKey) next.push_back(existing);
+      if (next.size() >= RECENT_LIMIT) break;
+    }
+    settings_.recentItems = std::move(next);
+  }
+
+  void TrackRecentInvocation(const DisplayItem& item) {
+    if (!feathercast::commands::RecordsRecentActivation(item)) return;
+    const std::wstring invKey = item.InvocationKey();
+    if (invKey.empty()) return;
+    TrackRecentInvocationKey(invKey);
+    PersistSettings();
+  }
+
   void Activate(DisplayItem item, bool asAdmin) {
     if (item.isSectionExpander) {
       expandedSections_.insert(item.sectionTitle);
@@ -12603,6 +13072,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       return;
     }
+    TrackRecentInvocation(item);
     DebugLaunchLog(L"Activate: isSnippet=" + std::to_wstring(item.isSnippet) +
                    L" isClipboard=" + std::to_wstring(item.isClipboard) +
                    L" isSymbol=" + std::to_wstring(item.isSymbol) +
@@ -13253,6 +13723,40 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       return;
     }
+
+    if (const auto* aliasTarget = std::get_if<AliasTarget>(&item.actionTarget)) {
+      if (item.action == ActionKind::EditAlias) {
+        HideOverlay(OverlayCloseReason::Action);
+        if (aliasTarget->invocationKey.rfind(L"cmd:", 0) == 0) {
+          OpenLibraryManager(feathercast::library::ItemKind::CommandAlias, aliasTarget->stableId);
+        } else if (aliasTarget->invocationKey.rfind(L"snippet:", 0) == 0) {
+          OpenLibraryManager(feathercast::library::ItemKind::Snippet, aliasTarget->stableId);
+        } else if (aliasTarget->invocationKey.rfind(L"quicklink:", 0) == 0) {
+          OpenLibraryManager(feathercast::library::ItemKind::Quicklink, aliasTarget->stableId);
+        }
+        return;
+      }
+      if (item.action == ActionKind::PinInvocation) {
+        const auto& key = aliasTarget->invocationKey;
+        if (!key.empty() && !ContainsValue(settings_.pinnedItems, key)) {
+          settings_.pinnedItems.insert(settings_.pinnedItems.begin(), key);
+          PersistSettings();
+        }
+        actionMode_ = false;
+        RequestSearch();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      }
+      if (item.action == ActionKind::UnpinInvocation) {
+        RemoveValue(settings_.pinnedItems, aliasTarget->invocationKey);
+        PersistSettings();
+        actionMode_ = false;
+        RequestSearch();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      }
+    }
+
     const auto* appTarget = std::get_if<AppEntry>(&item.actionTarget);
     if (!appTarget) return;
     const AppEntry& app = *appTarget;
@@ -13296,13 +13800,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case ActionKind::Pin:
         if (!id.empty() && !ContainsValue(settings_.pinnedApps, id)) settings_.pinnedApps.insert(settings_.pinnedApps.begin(), id);
+        {
+          const std::wstring invKey = feathercast::core::StableInvocationKey(L"app", id);
+          if (!invKey.empty() && !ContainsValue(settings_.pinnedItems, invKey)) {
+            settings_.pinnedItems.insert(settings_.pinnedItems.begin(), invKey);
+          }
+        }
         PersistSettings();
         actionMode_ = false;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case ActionKind::Unpin:
-        for (const auto& key : AppKeys(app)) RemoveValue(settings_.pinnedApps, key);
+        for (const auto& key : AppKeys(app)) {
+          RemoveValue(settings_.pinnedApps, key);
+          RemoveValue(settings_.pinnedItems, feathercast::core::StableInvocationKey(L"app", key));
+        }
         PersistSettings();
         actionMode_ = false;
         RequestSearch();
@@ -13355,8 +13868,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return std::wstring(buffer, buffer + length);
   }
 
+  bool IsForegroundAppClipboardExcluded() const {
+    if (settings_.clipboardExcludedApps.empty()) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return false;
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    wchar_t exePath[MAX_PATH]{};
+    DWORD size = static_cast<DWORD>(std::size(exePath));
+    const BOOL success = QueryFullProcessImageNameW(process, 0, exePath, &size);
+    CloseHandle(process);
+    if (!success || size == 0) return false;
+
+    const std::filesystem::path path(exePath);
+    const std::wstring filename = path.filename().wstring();
+    const std::wstring stem = path.stem().wstring();
+
+    for (const auto& excluded : settings_.clipboardExcludedApps) {
+      if (_wcsicmp(filename.c_str(), excluded.c_str()) == 0 ||
+          _wcsicmp(stem.c_str(), excluded.c_str()) == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void OnClipboardUpdate() {
     if (!settings_.clipboardHistoryEnabled || settings_.privacyConsentVersion < 1) return;
+    if (IsForegroundAppClipboardExcluded()) return;
     auto text = ReadClipboardText();
     if (!text || Trim(*text).empty()) return;
     if (internalClipboardText_ && *text == *internalClipboardText_) {
@@ -13373,7 +13916,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const std::wstring storedText = *text;
     const size_t retention = ClipboardHistoryLimit();
     if (!persistence_.StoreClipboard(storedText, preview, capturedAt,
-                                     retention)) {
+                                     retention, settings_.clipboardRetentionDays)) {
       ReportPersistenceFailure(L"The persistence worker is unavailable.");
     }
     MarkSearchDataChanged();  // clipboard history feeds the search corpus
@@ -13599,6 +14142,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     auto& usage = settings_.usageStats[id];
     usage.launches = std::min(usage.launches + 1, 1000000);
     usage.lastUsed = UnixNow();
+    TrackRecentInvocationKey(feathercast::core::StableInvocationKey(L"app", id));
     PersistSettings();
   }
 
