@@ -104,6 +104,11 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"results.store-apps", SettingsCategory::Results, HitType::ShowStoreAppsToggle,
        ControlKind::Toggle, L"Store and system apps",
        L"Include AppsFolder, Store, and system alias entries.", L"Store and system apps"},
+      {L"results.auto-height", SettingsCategory::Results,
+       HitType::AutoFitResultHeightToggle, ControlKind::Toggle,
+       L"Auto-fit Result Height",
+       L"Resize the normal overlay to fit its results instead of keeping a fixed height.",
+       L"Auto-fit result height"},
       {L"results.width.down", SettingsCategory::Results, HitType::OverlayWidthDown,
        ControlKind::Decrement, L"Overlay Width", L"Width of the search overlay window.",
        L"Decrease overlay width"},
@@ -318,6 +323,8 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
     case HitType::StartupToggle: return settings.startOnStartup;
     case HitType::UpdateChecksToggle: return settings.updateChecksEnabled;
     case HitType::CompactToggle: return settings.compactMode;
+    case HitType::AutoFitResultHeightToggle:
+      return settings.autoFitResultHeight;
     case HitType::ShowWindowsToggle: return settings.showOpenWindows;
     case HitType::ShowStoreAppsToggle: return settings.showStoreApps;
     case HitType::ClipboardHistoryToggle: return settings.clipboardHistoryEnabled;

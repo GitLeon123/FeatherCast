@@ -22,9 +22,9 @@ struct Color {
 
 struct Theme {
   std::wstring fontFamily = L"Segoe UI Variable Text";
-  // Obsidian dark panel at ~85 % opacity over real DirectComposition transparency.
-  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.85f};
-  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.85f};
+  // Obsidian dark panel at ~92 % opacity over real DirectComposition transparency.
+  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.92f};
+  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.92f};
   Color border{1.0f, 1.0f, 1.0f, 0.08f};
   Color divider{1.0f, 1.0f, 1.0f, 0.08f};
   // surface: #18181B – modern Tailwind Zinc-900 slate grey.
@@ -149,8 +149,8 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
   file <<
       "{\n"
       "  \"fontFamily\": \"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI\",\n"
-      "  \"overlayBackground\": \"#101012D9\",\n"
-      "  \"settingsBackground\": \"#101012D9\",\n"
+      "  \"overlayBackground\": \"#101012EB\",\n"
+      "  \"settingsBackground\": \"#101012EB\",\n"
       "  \"border\": \"#FFFFFF14\",\n"
       "  \"divider\": \"#FFFFFF14\",\n"
       "  \"surface\": \"#18181B\",\n"

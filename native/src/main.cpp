@@ -6277,10 +6277,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (targetWidth <= 0.0 || targetHeight <= 0.0) {
       return D2D1::Matrix3x2F::Identity();
     }
+    // The native window is already at the target bounds while the visual
+    // animates. Keep the ratio above 1.0 as well so a shrinking window can
+    // visually interpolate from its previous, larger size.
     const float scaleX = static_cast<float>(
-        std::clamp(bounds->width.Value() / targetWidth, 0.01, 1.0));
+        std::max(bounds->width.Value() / targetWidth, 0.01));
     const float scaleY = static_cast<float>(
-        std::clamp(bounds->height.Value() / targetHeight, 0.01, 1.0));
+        std::max(bounds->height.Value() / targetHeight, 0.01));
     const float translateX = static_cast<float>(
         bounds->left.Value() - bounds->left.Target());
     const float translateY = static_cast<float>(
@@ -10290,15 +10293,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   int CurrentHeight() const {
     if (confirmation_) return settings_.compactMode ? 300 : WIN_HEIGHT;
-    if (!settings_.compactMode) return WIN_HEIGHT;
-    if (Trim(query_).empty() && !actionMode_ && browseView_ == BrowseView::None) return COMPACT_BASE_HEIGHT;
+    const bool resultsVisible = !Trim(query_).empty() || actionMode_ ||
+                                browseView_ != BrowseView::None;
+    if (!settings_.compactMode &&
+        (!settings_.autoFitResultHeight || !resultsVisible)) {
+      return WIN_HEIGHT;
+    }
+    if (settings_.compactMode && Trim(query_).empty() && !actionMode_ &&
+        browseView_ == BrowseView::None) {
+      return COMPACT_BASE_HEIGHT;
+    }
     const MONITORINFO mi = OverlayMonitorInfo();
     HMONITOR monitor = overlayMonitor_;
     if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
     const float scale = std::max(1.0f, GetMonitorScale(monitor));
     const int maxHeight = static_cast<int>(
         (static_cast<float>(mi.rcWork.bottom - mi.rcWork.top) / scale) * 0.7f);
-    return std::clamp(COMPACT_BASE_HEIGHT + ResultsContentHeight(), COMPACT_BASE_HEIGHT, maxHeight);
+    const int footerHeight = settings_.compactMode ? 0 : 40;
+    const int baseHeight = COMPACT_BASE_HEIGHT + footerHeight;
+    return std::clamp(baseHeight + ResultsContentHeight(), baseHeight, maxHeight);
   }
 
   void ApplyWindowSize() {
@@ -11407,7 +11420,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                       : overlayBlurApplied_;
     feathercast::theme::Color background = settings ? theme_.settingsBackground : theme_.overlayBackground;
     background.a = highContrast_ ? 1.0f
-                                 : std::min(background.a, blurApplied ? 0.72f : 0.85f);
+                                 : std::min(background.a, blurApplied ? 0.82f : 0.92f);
 
     // Blur is hosted by a separate popup, so keep this content surface rounded
     // to the same silhouette instead of painting a rectangle behind its corners.
@@ -13062,8 +13075,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         h += kSettSection + kSettShortcut;
         break;
       case SettingsCategory::General:
-      case SettingsCategory::Results:
         h += kSettSection + 4 * kSettRow;
+        break;
+      case SettingsCategory::Results:
+        h += kSettSection + 5 * kSettRow;
         break;
       case SettingsCategory::Library:
         h += kSettSection + 3 * kSettRow;
@@ -13586,6 +13601,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                    contentLeft, contentRight - 66);
         DrawSwitch(y, kSettRow, settings_.showStoreApps,
                    HitType::ShowStoreAppsToggle, contentLeft, contentRight);
+        y += kSettRow;
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::AutoFitResultHeightToggle, contentLeft,
+            contentRight - 66);
+        DrawSwitch(y, kSettRow, settings_.autoFitResultHeight,
+                   HitType::AutoFitResultHeightToggle, contentLeft,
+                   contentRight);
         y += kSettRow;
         DrawCatalogSettingRowLabel(y, kSettRow, HitType::OverlayWidthDown,
                                    contentLeft, contentRight - 176);
@@ -16114,6 +16136,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case HitType::CompactToggle:
         settings_.compactMode = !settings_.compactMode;
         PersistSettings();
+        ApplyWindowSize();
+        break;
+      case HitType::AutoFitResultHeightToggle:
+        settings_.autoFitResultHeight = !settings_.autoFitResultHeight;
+        PersistSettings();
+        ApplyWindowSize();
         break;
       case HitType::AnimationLevel: {
         const auto next = settings_.animationLevel == AnimationLevel::Full

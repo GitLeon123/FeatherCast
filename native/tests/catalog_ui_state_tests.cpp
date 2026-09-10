@@ -335,7 +335,16 @@ int main() {
          feathercast::settings_catalog::Role(*compactDescriptor) ==
              feathercast::settings_catalog::AccessibleRole::CheckButton);
   assert(feathercast::settings_catalog::AccessibleValue(
-             feathercast::app::HitType::CompactToggle, settingValues) == L"On");
+              feathercast::app::HitType::CompactToggle, settingValues) == L"On");
+  const auto* autoFitDescriptor = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::AutoFitResultHeightToggle);
+  assert(autoFitDescriptor &&
+         feathercast::settings_catalog::Role(*autoFitDescriptor) ==
+             feathercast::settings_catalog::AccessibleRole::CheckButton);
+  settingValues.autoFitResultHeight = false;
+  assert(feathercast::settings_catalog::AccessibleValue(
+             feathercast::app::HitType::AutoFitResultHeightToggle,
+             settingValues) == L"Off");
   assert(feathercast::settings_catalog::AccessibleValue(
              feathercast::app::HitType::OverlayWidthDown, settingValues) ==
          L"720 DIP");
