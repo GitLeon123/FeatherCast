@@ -21,6 +21,9 @@ enum class Requirement {
   ExistingRecordRegionShortcut,
   ClipboardEnabled,
   FileIndexEnabled,
+  ExistingClipboardExcludedApp,
+  ExistingFileIndexPattern,
+  ExistingFileIndexRoot,
   StorageIdle,
   ExtensionsIdle,
   CustomAccent,
@@ -53,6 +56,9 @@ struct CatalogContext {
   bool hasRecordRegionShortcut = false;
   bool clipboardEnabled = false;
   bool fileIndexEnabled = false;
+  bool hasClipboardExcludedApps = false;
+  bool hasFileIndexExcludePatterns = false;
+  bool hasFileIndexRoots = false;
   bool storageIdle = true;
   bool extensionsIdle = true;
   bool customAccent = false;
@@ -71,6 +77,7 @@ std::wstring AccessibleValue(app::HitType hit,
                              const app::Settings& settings);
 std::vector<app::HitType> FocusOrder(app::SettingsCategory category,
                                      const CatalogContext& context);
+std::vector<app::HitType> AccessibilityOrder(app::SettingsCategory category);
 bool ValidateCatalog(std::wstring* error = nullptr);
 
 }  // namespace feathercast::settings_catalog

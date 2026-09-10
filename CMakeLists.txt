@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.9.3 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.9.4 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,7 +73,6 @@ add_library(FeatherCastRuntime STATIC
 )
 
 target_include_directories(FeatherCastRuntime PUBLIC native/src)
-target_compile_features(FeatherCastRuntime PUBLIC cxx_std_23)
 target_compile_definitions(FeatherCastRuntime PUBLIC
   UNICODE
   _UNICODE
@@ -104,7 +103,6 @@ add_library(FeatherCastUi STATIC
 )
 
 target_include_directories(FeatherCastUi PUBLIC native/src)
-target_compile_features(FeatherCastUi PUBLIC cxx_std_23)
 target_compile_definitions(FeatherCastUi PUBLIC
   UNICODE
   _UNICODE
@@ -271,34 +269,9 @@ add_executable(FeatherCastGameDiscoveryTests
   native/tests/game_discovery_tests.cpp
 )
 
-target_compile_features(FeatherCastCoreTests PRIVATE cxx_std_23)
 target_include_directories(FeatherCastCoreTests PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(FeatherCastCoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(FeatherCastCoreTests PRIVATE FeatherCastSQLite advapi32 normaliz wintrust crypt32)
-
-target_compile_features(FeatherCastPluginHost PRIVATE cxx_std_23)
-target_compile_features(FeatherCastTestExtension PRIVATE cxx_std_23)
-target_compile_features(FeatherCastV1TestExtension PRIVATE cxx_std_23)
-target_compile_features(FeatherCastBadApiExtension PRIVATE cxx_std_23)
-target_compile_features(FeatherCastPluginHostTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastSearchBenchmarks PRIVATE cxx_std_23)
-target_compile_features(FeatherCastFileSearchBenchmarks PRIVATE cxx_std_23)
-target_compile_features(FeatherCastSettingsExecutorTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastStorageTrustTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastInteractionStateTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastUiEventQueueTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastPerformanceGovernorTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastPerformanceSelfTest PRIVATE cxx_std_23)
-target_compile_features(FeatherCastPersistenceServiceTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastSearchCoordinatorTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastDiscoveryServiceTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastCatalogUiStateTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastBackgroundServicesTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastRuntimeLifecycleTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastProductivityPackTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastLibraryTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastSearchFilesTests PRIVATE cxx_std_23)
-target_compile_features(FeatherCastGameDiscoveryTests PRIVATE cxx_std_23)
 
 target_include_directories(FeatherCastTestExtension PRIVATE native/src)
 target_include_directories(FeatherCastV1TestExtension PRIVATE native/src)
@@ -395,7 +368,6 @@ feathercast_apply_project_warnings(FeatherCastGameDiscoveryTests)
 add_executable(FeatherCastAccessibilitySmokeTests
   native/tests/accessibility_smoke_tests.cpp
 )
-target_compile_features(FeatherCastAccessibilitySmokeTests PRIVATE cxx_std_23)
 target_include_directories(FeatherCastAccessibilitySmokeTests PRIVATE native/src)
 target_compile_definitions(FeatherCastAccessibilitySmokeTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(FeatherCastAccessibilitySmokeTests PRIVATE oleacc oleaut32 user32 uuid)

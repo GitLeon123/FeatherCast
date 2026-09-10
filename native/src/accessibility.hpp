@@ -15,6 +15,7 @@ struct Item {
   std::wstring value;
   std::wstring description;
   std::wstring defaultAction;
+  std::wstring key;
   LONG role = ROLE_SYSTEM_LISTITEM;
   LONG state = STATE_SYSTEM_FOCUSABLE;
   RECT screenRect{};
@@ -148,15 +149,30 @@ class Window final : public IAccessible {
   HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT* focus) override {
     if (!focus) return E_POINTER;
     VariantInit(focus);
+    const LONG child = model_->AccessibleFocusedChild(hwnd_);
     focus->vt = VT_I4;
-    focus->lVal = model_->AccessibleFocusedChild(hwnd_);
+    const auto items = Items();
+    if (child > 0 && child <= static_cast<LONG>(items.size()) &&
+        (items[static_cast<size_t>(child - 1)].state &
+         (STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_UNAVAILABLE |
+          STATE_SYSTEM_INVISIBLE)) == STATE_SYSTEM_FOCUSABLE) {
+      focus->lVal = child;
+    } else {
+      focus->lVal = CHILDID_SELF;
+    }
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT* selection) override {
     if (!selection) return E_POINTER;
     VariantInit(selection);
+    const LONG child = model_->AccessibleSelectedChild(hwnd_);
     selection->vt = VT_I4;
-    selection->lVal = model_->AccessibleSelectedChild(hwnd_);
+    const auto items = Items();
+    if (child > 0 && child <= static_cast<LONG>(items.size())) {
+      selection->lVal = child;
+    } else {
+      selection->lVal = CHILDID_SELF;
+    }
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT child, BSTR* action) override {
@@ -169,7 +185,12 @@ class Window final : public IAccessible {
   }
   HRESULT STDMETHODCALLTYPE accSelect(LONG flags, VARIANT child) override {
     const auto id = ChildId(child);
-    if (!id) return E_INVALIDARG;
+    if (!id || !ItemFor(child)) return E_INVALIDARG;
+    const auto item = ItemFor(child);
+    if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0 ||
+        (item->state & STATE_SYSTEM_FOCUSABLE) == 0) {
+      return E_ACCESSDENIED;
+    }
     if ((flags & (SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION)) != 0) {
       model_->AccessibleFocusChild(hwnd_, *id);
       return S_OK;
@@ -198,6 +219,12 @@ class Window final : public IAccessible {
     VariantInit(destination);
     const LONG count = static_cast<LONG>(Items().size());
     LONG id = IsSelf(start) ? 0 : start.lVal;
+    if (!IsSelf(start) && (start.vt != VT_I4 || id <= 0 || id > count)) {
+      return E_INVALIDARG;
+    }
+    if (id == 0 && direction != NAVDIR_FIRSTCHILD && direction != NAVDIR_LASTCHILD) {
+      return S_FALSE;
+    }
     if (direction == NAVDIR_FIRSTCHILD && id == 0 && count > 0) id = 1;
     else if (direction == NAVDIR_LASTCHILD && id == 0 && count > 0) id = count;
     else if (direction == NAVDIR_NEXT && id > 0 && id < count) ++id;
@@ -225,14 +252,22 @@ class Window final : public IAccessible {
   }
   HRESULT STDMETHODCALLTYPE accDoDefaultAction(VARIANT child) override {
     const auto id = ChildId(child);
-    if (!id) return E_INVALIDARG;
+    if (!id || !ItemFor(child)) return E_INVALIDARG;
+    const auto item = ItemFor(child);
+    if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0) {
+      return E_ACCESSDENIED;
+    }
     model_->AccessibleInvokeChild(hwnd_, *id);
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE put_accValue(VARIANT child, BSTR value) override {
     const auto id = ChildId(child);
-    if (!id) return E_INVALIDARG;
+    if (!id || !ItemFor(child)) return E_INVALIDARG;
+    const auto item = ItemFor(child);
+    if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0) {
+      return E_ACCESSDENIED;
+    }
     return model_->AccessibleSetValue(hwnd_, *id, value ? value : L"");
   }
 

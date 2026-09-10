@@ -61,6 +61,9 @@ class TestModel final : public feathercast::accessibility::Model {
 
   HRESULT AccessibleSetValue(HWND, int child,
                              const std::wstring& value) override {
+    if (child == feathercast::accessibility_projection::SearchChild()) {
+      focusedChild = child;
+    }
     valueRequests.emplace_back(child, value);
     return S_OK;
   }
@@ -306,6 +309,37 @@ void VerifyAccessibleModelTransport() {
   assert(accessible->accSelect(SELFLAG_TAKEFOCUS,
                                Child(CHILDID_SELF)) == E_INVALIDARG);
   assert(accessible->accDoDefaultAction(Child(CHILDID_SELF)) == E_INVALIDARG);
+
+  // A model update must never expose a stale numeric child as focus. This
+  // covers a focused result disappearing and the same reset after editing the
+  // search field or moving focus to the settings gear.
+  model.focusedChild = resultChild;
+  assert(accessible->accSelect(SELFLAG_TAKEFOCUS, Child(resultChild)) == S_OK);
+  replacement = SysAllocString(L"meeting");
+  assert(accessible->put_accValue(Child(SearchChild()), replacement) == S_OK);
+  SysFreeString(replacement);
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == SearchChild());
+
+  model.focusedChild = SettingsChild();
+  replacement = SysAllocString(L"gear then type");
+  assert(accessible->put_accValue(Child(SearchChild()), replacement) == S_OK);
+  SysFreeString(replacement);
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == SearchChild());
+
+  model.focusedChild = resultChild;
+  model.items.pop_back();
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == CHILDID_SELF);
+  assert(accessible->get_accSelection(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == CHILDID_SELF);
+  assert(accessible->get_accName(Child(resultChild), &text) == E_INVALIDARG);
+  assert(accessible->accSelect(SELFLAG_TAKEFOCUS, Child(resultChild)) ==
+         E_INVALIDARG);
+
+  assert(ResultFocus(L"result:notepad") != SearchFocus());
+  assert(SettingsFocus() != CloseSettingsFocus());
 
   accessible->Release();
 }

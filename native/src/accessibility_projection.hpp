@@ -5,8 +5,32 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace feathercast::accessibility_projection {
+
+enum class FocusKind {
+  Search,
+  Result,
+  Settings,
+  CloseSettings,
+};
+
+struct FocusTarget {
+  FocusKind kind = FocusKind::Search;
+  std::wstring key;
+
+  bool operator==(const FocusTarget&) const = default;
+};
+
+inline FocusTarget SearchFocus() { return {FocusKind::Search, {}}; }
+inline FocusTarget ResultFocus(std::wstring key) {
+  return {FocusKind::Result, std::move(key)};
+}
+inline FocusTarget SettingsFocus() { return {FocusKind::Settings, {}}; }
+inline FocusTarget CloseSettingsFocus() {
+  return {FocusKind::CloseSettings, {}};
+}
 
 constexpr int SearchChild() { return 1; }
 constexpr int StatusChild() { return 2; }

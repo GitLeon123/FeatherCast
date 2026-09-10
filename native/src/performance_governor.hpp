@@ -10,7 +10,7 @@ namespace feathercast::performance {
 
 // Quality is deliberately ordered from cheapest to most expensive.  The
 // governor never changes the user's persisted animation preference; it only
-// supplies a temporary ceiling while the process is under pressure.
+// supplies a temporary work ceiling while the process is under pressure.
 enum class QualityTier : std::uint8_t {
   Critical = 0,
   Reduced = 1,
@@ -26,10 +26,11 @@ struct HardwareProfile {
 struct WorkPolicy {
   QualityTier tier = QualityTier::Full;
   std::size_t eventBatch = 32;
-  std::uint32_t animationIntervalMs = 16;
   std::size_t searchWorkers = 2;
   std::size_t pluginWorkers = 2;
   std::size_t iconPromotionsPerTick = 2;
+  std::size_t markdownPrewarmLimit = 16;
+  std::uint32_t richPreviewDelayMs = 120;
   bool allowBlurDuringMotion = true;
   bool allowRichPreview = true;
   bool allowMaintenance = true;
@@ -59,17 +60,20 @@ class PerformanceGovernor {
     policy.interactive = interactive;
     policy.eventBatch = tier == QualityTier::Critical ? 12 :
                         (tier == QualityTier::Reduced ? 24 : 40);
-    policy.animationIntervalMs = tier == QualityTier::Critical ? 33 : 16;
     policy.searchWorkers = tier == QualityTier::Critical ? 1 :
                            (tier == QualityTier::Reduced ? 1 : 2);
     policy.pluginWorkers = tier == QualityTier::Full ? 2 : 1;
     policy.iconPromotionsPerTick = tier == QualityTier::Critical ? 1 :
                                    (tier == QualityTier::Reduced ? 2 : 4);
+    // These are temporary visual-cost limits. They never modify the user's
+    // persisted animation setting: Reduced trims prewarming and delays a
+    // preview, while Critical also removes blur and rich preview work.
+    policy.markdownPrewarmLimit = tier == QualityTier::Critical ? 0 :
+                                  (tier == QualityTier::Reduced ? 4 : 16);
+    policy.richPreviewDelayMs = tier == QualityTier::Critical ? 800 :
+                                (tier == QualityTier::Reduced ? 320 : 120);
     policy.allowBlurDuringMotion = tier == QualityTier::Full;
-    // Markdown/image previews are useful but expendable. Keep them out of the
-    // constrained path so Reduced mode is input-first as soon as pressure is
-    // detected, not only after the governor reaches Critical.
-    policy.allowRichPreview = tier == QualityTier::Full;
+    policy.allowRichPreview = tier != QualityTier::Critical;
     policy.allowMaintenance = tier == QualityTier::Full && !interactive;
     return policy;
   }

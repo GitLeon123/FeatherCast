@@ -26,7 +26,7 @@ native/
   src/core.hpp             # Pure fuzzy search core used by app and tests
   src/main.cpp             # Win32 app, UI, discovery, settings, icons, tray
   tests/core_tests.cpp     # Core fuzzy/search tests
-scripts/gen-icons.ps1      # Generates build/icon.ico, icon.png, tray.png
+scripts/gen-icons.ps1      # Generates build/icon.ico and icon.png
 build/                     # Generated icon assets used by native resources
 ```
 

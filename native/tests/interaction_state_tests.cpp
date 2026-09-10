@@ -178,6 +178,36 @@ int main() {
   }
 
   {
+    constexpr std::int64_t kQpcFrequency = 10'000'000;
+    const auto period60 =
+        feathercast::motion::DisplayFramePeriodQpc(kQpcFrequency, 60);
+    const auto period120 =
+        feathercast::motion::DisplayFramePeriodQpc(kQpcFrequency, 120);
+    const auto period144 =
+        feathercast::motion::DisplayFramePeriodQpc(kQpcFrequency, 144);
+    assert(period60 == 166'667);
+    assert(period120 == 83'333);
+    assert(period144 == 69'444);
+    assert(period60 > period120 && period120 > period144);
+
+    feathercast::motion::DisplayFrameClock clock;
+    clock.Start(100, period60);
+    assert(clock.Active());
+    assert(clock.Period() == period60);
+    assert(clock.NextDeadline() == 100 + period60);
+
+    clock.Advance(100 + period60);
+    assert(clock.NextDeadline() == 100 + 2 * period60);
+    clock.Advance(100 + 3 * period60 + 5);
+    assert(clock.NextDeadline() == 100 + 3 * period60 + 5 + period60);
+
+    clock.Reset();
+    assert(!clock.Active());
+    assert(clock.Period() == 0);
+    assert(clock.NextDeadline() == 0);
+  }
+
+  {
     feathercast::motion::AnimatedBounds bounds;
     bounds.Snap(100.0, 200.0, 400.0, 300.0);
     bounds.Retarget(90.0, 190.0, 420.0, 320.0, 0.16, true);

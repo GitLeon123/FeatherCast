@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <optional>
 
 namespace feathercast::motion {
@@ -22,6 +23,46 @@ inline double NormalizedProgress(double elapsedSeconds, double durationSeconds) 
   if (durationSeconds <= 0.0) return 1.0;
   return std::clamp(elapsedSeconds / durationSeconds, 0.0, 1.0);
 }
+
+inline std::int64_t DisplayFramePeriodQpc(std::int64_t qpcFrequency,
+                                          std::uint32_t refreshRateHz) {
+  if (qpcFrequency <= 0 || refreshRateHz == 0) return 1;
+  const auto refresh = static_cast<std::int64_t>(refreshRateHz);
+  return std::max<std::int64_t>(
+      1, (qpcFrequency + refresh / 2) / refresh);
+}
+
+// Keeps one future deadline per display frame. A late frame is re-anchored to
+// the next period instead of catching up with a burst of immediate wakeups.
+class DisplayFrameClock {
+ public:
+  void Start(std::int64_t now, std::int64_t period) {
+    period_ = std::max<std::int64_t>(1, period);
+    nextDeadline_ = now + period_;
+  }
+
+  void Reset() {
+    period_ = 0;
+    nextDeadline_ = 0;
+  }
+
+  bool Active() const { return period_ > 0; }
+  std::int64_t Period() const { return period_; }
+  std::int64_t NextDeadline() const { return nextDeadline_; }
+
+  void Advance(std::int64_t now) {
+    if (!Active()) return;
+    if (nextDeadline_ <= now) {
+      nextDeadline_ = now + period_;
+    } else {
+      nextDeadline_ += period_;
+    }
+  }
+
+ private:
+  std::int64_t period_ = 0;
+  std::int64_t nextDeadline_ = 0;
+};
 
 // Keeps the animation message queue coalesced. A queued frame represents the
 // latest state, so older intermediate frames must never accumulate behind it.

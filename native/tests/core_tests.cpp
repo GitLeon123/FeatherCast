@@ -525,6 +525,8 @@ int main() {
     const auto parsed = feathercast::theme::ParseThemeJson(
         "{\"fontFamily\":\"Cascadia Mono\","
         "\"overlayBackground\":\"#11223380\","
+        "\"success\":\"#204060\","
+        "\"recording\":\"#B02030\","
         "\"textPrimary\":\"not-a-color\","
         "\"rowRadius\":12,"
         "\"controlRadius\":500}");
@@ -532,6 +534,8 @@ int main() {
     assert(std::fabs(parsed.overlayBackground.r - (0x11 / 255.0f)) < 0.001);
     assert(std::fabs(parsed.overlayBackground.a - (0x80 / 255.0f)) < 0.001);
     assert(std::fabs(parsed.textPrimary.r - feathercast::theme::Theme{}.textPrimary.r) < 0.001);
+    assert(std::fabs(parsed.success.r - (0x20 / 255.0f)) < 0.001);
+    assert(std::fabs(parsed.recording.b - (0x30 / 255.0f)) < 0.001);
     assert(parsed.rowRadius == 12.0f);
     assert(parsed.controlRadius == 20.0f);
 

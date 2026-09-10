@@ -1,4 +1,4 @@
-﻿# Generates the FeatherCast icon (build/icon.ico, build/icon.png, build/tray.png)
+﻿# Generates the FeatherCast icon (build/icon.ico, build/icon.png)
 # from the checked-in source artwork.
 Add-Type -AssemblyName System.Drawing
 
@@ -55,10 +55,6 @@ $bw.Write([uint32]22)     # offset (6 + 16)
 $bw.Write($pngBytes)
 $bw.Flush(); $bw.Dispose(); $fs.Dispose()
 
-# 32px tray PNG
-$tray = New-IconBitmap $source 32
-$trayPath = Join-Path $buildDir "tray.png"
-$tray.Save($trayPath, [System.Drawing.Imaging.ImageFormat]::Png)
-
-$big.Dispose(); $tray.Dispose(); $source.Dispose()
-Write-Host "Icons generated in $buildDir : icon.ico, icon.png, tray.png"
+# The tray icon uses the same embedded application icon resource.
+$big.Dispose(); $source.Dispose()
+Write-Host "Icons generated in $buildDir : icon.ico, icon.png"

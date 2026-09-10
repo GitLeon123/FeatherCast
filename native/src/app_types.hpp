@@ -273,6 +273,7 @@ struct HitTarget {
   RectF rect;
   HitType type = HitType::Result;
   int index = -1;
+  bool enabled = true;
 };
 
 struct PointerPress {

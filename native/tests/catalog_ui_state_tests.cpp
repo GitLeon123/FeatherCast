@@ -281,6 +281,35 @@ int main() {
   assert(std::find(privacy.begin(), privacy.end(),
                    feathercast::app::HitType::ClipboardLimitDown) !=
          privacy.end());
+  const auto accessibilityPrivacy =
+      feathercast::settings_catalog::AccessibilityOrder(
+          feathercast::app::SettingsCategory::Privacy);
+  assert(std::find(accessibilityPrivacy.begin(), accessibilityPrivacy.end(),
+                   feathercast::app::HitType::RemoveClipboardExcludedApp) !=
+         accessibilityPrivacy.end());
+  const auto* removeExcluded = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::RemoveClipboardExcludedApp);
+  assert(removeExcluded &&
+         removeExcluded->requirement ==
+             feathercast::settings_catalog::Requirement::ExistingClipboardExcludedApp);
+  assert(!feathercast::settings_catalog::Enabled(*removeExcluded, context));
+  context.hasClipboardExcludedApps = true;
+  assert(feathercast::settings_catalog::Enabled(*removeExcluded, context));
+  context.storageIdle = false;
+  assert(!feathercast::settings_catalog::Enabled(*removeExcluded, context));
+  context.storageIdle = true;
+  context.fileIndexEnabled = true;
+  const auto* removePattern = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::RemoveFileIndexPattern);
+  const auto* removeRoot = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::RemoveFileRoot);
+  assert(removePattern && removeRoot);
+  assert(!feathercast::settings_catalog::Enabled(*removePattern, context));
+  assert(!feathercast::settings_catalog::Enabled(*removeRoot, context));
+  context.hasFileIndexExcludePatterns = true;
+  context.hasFileIndexRoots = true;
+  assert(feathercast::settings_catalog::Enabled(*removePattern, context));
+  assert(feathercast::settings_catalog::Enabled(*removeRoot, context));
   const auto* clipboardLimit = feathercast::settings_catalog::Find(
       feathercast::app::HitType::ClipboardLimitDown);
   assert(clipboardLimit);

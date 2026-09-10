@@ -39,6 +39,8 @@ struct Theme {
   Color textDim{0.45f, 0.45f, 0.50f, 1.0f};
   Color sectionText{0.62f, 0.64f, 0.74f, 1.0f};
   Color danger{1.0f, 0.36f, 0.36f, 1.0f};
+  Color success{0.30f, 0.78f, 0.48f, 1.0f};
+  Color recording{0.95f, 0.18f, 0.20f, 1.0f};
   Color accentFallback{0.36f, 0.42f, 1.0f, 1.0f};
   float overlayRadius = 10.0f;
   float settingsRadius = 10.0f;
@@ -110,6 +112,8 @@ inline Theme ParseThemeJson(const std::string& json, const Theme& defaults = The
   ApplyColor(json, "textDim", theme.textDim);
   ApplyColor(json, "sectionText", theme.sectionText);
   ApplyColor(json, "danger", theme.danger);
+  ApplyColor(json, "success", theme.success);
+  ApplyColor(json, "recording", theme.recording);
   ApplyColor(json, "accentFallback", theme.accentFallback);
 
   ApplyFloat(json, "overlayRadius", theme.overlayRadius, 0.0f, 32.0f);
@@ -158,6 +162,8 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
       "  \"textDim\": \"#737380\",\n"
       "  \"sectionText\": \"#9EA3BD\",\n"
       "  \"danger\": \"#FF5C5C\",\n"
+      "  \"success\": \"#4DC77A\",\n"
+      "  \"recording\": \"#F22E33\",\n"
       "  \"accentFallback\": \"#5B6CFF\",\n"
       "  \"overlayRadius\": 10,\n"
       "  \"settingsRadius\": 10,\n"

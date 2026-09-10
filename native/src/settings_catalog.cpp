@@ -154,7 +154,7 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"privacy.clipboard-remove-excluded-app", SettingsCategory::Privacy, HitType::RemoveClipboardExcludedApp,
        ControlKind::Action, L"Remove Excluded App",
        L"Remove an excluded app rule.",
-       L"Remove excluded app from clipboard", Requirement::ClipboardEnabled},
+       L"Remove excluded app from clipboard", Requirement::ExistingClipboardExcludedApp},
       {L"privacy.file-index", SettingsCategory::Privacy, HitType::FileIndexToggle,
        ControlKind::Toggle, L"Files & Folders Index",
        L"Index selected local folders for launcher search.", L"Files and folders index"},
@@ -178,14 +178,14 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"privacy.remove-file-pattern", SettingsCategory::Privacy, HitType::RemoveFileIndexPattern,
        ControlKind::Action, L"Remove Exclusion Pattern",
        L"Remove a configured glob exclusion pattern.",
-       L"Remove file index exclusion pattern", Requirement::FileIndexEnabled},
+       L"Remove file index exclusion pattern", Requirement::ExistingFileIndexPattern},
       {L"privacy.add-root", SettingsCategory::Privacy, HitType::AddFileRoot,
        ControlKind::Action, L"Add Indexed Folder", L"Add a folder to the local index.",
        L"Add file index folder", Requirement::FileIndexEnabled},
       {L"privacy.remove-root", SettingsCategory::Privacy, HitType::RemoveFileRoot,
        ControlKind::Action, L"Remove Indexed Folder",
        L"Remove one configured folder from the local index.",
-       L"Remove indexed folder", Requirement::FileIndexEnabled},
+       L"Remove indexed folder", Requirement::ExistingFileIndexRoot},
       {L"privacy.default-roots", SettingsCategory::Privacy, HitType::ClearFileRoots,
        ControlKind::Action, L"Use Default Folders",
        L"Index Desktop, Documents, and Downloads.", L"Use default file index folders",
@@ -200,10 +200,10 @@ const std::vector<SettingDescriptor>& Catalog() {
        L"Enable diagnostics"},
       {L"privacy.clear-clipboard", SettingsCategory::Privacy, HitType::ClearClipboardData,
        ControlKind::Action, L"Delete Clipboard Data", L"Delete saved clipboard entries.",
-       L"Delete clipboard data", Requirement::StorageIdle},
+       L"Delete clipboard data", Requirement::ClipboardEnabled},
       {L"privacy.clear-files", SettingsCategory::Privacy, HitType::ClearFileIndexData,
        ControlKind::Action, L"Delete File Index", L"Delete the disposable local file index.",
-       L"Delete file index", Requirement::StorageIdle},
+       L"Delete file index", Requirement::FileIndexEnabled},
       {L"privacy.open-data", SettingsCategory::Privacy, HitType::OpenLocalDataFolder,
        ControlKind::Action, L"Open Local Data", L"Open logs, cache, database, and updates.",
        L"Open local data folder"},
@@ -299,6 +299,12 @@ bool Enabled(const SettingDescriptor& descriptor,
       return context.clipboardEnabled && context.storageIdle;
     case Requirement::FileIndexEnabled:
       return context.fileIndexEnabled && context.storageIdle;
+    case Requirement::ExistingClipboardExcludedApp:
+      return context.clipboardEnabled && context.hasClipboardExcludedApps && context.storageIdle;
+    case Requirement::ExistingFileIndexPattern:
+      return context.fileIndexEnabled && context.hasFileIndexExcludePatterns && context.storageIdle;
+    case Requirement::ExistingFileIndexRoot:
+      return context.fileIndexEnabled && context.hasFileIndexRoots && context.storageIdle;
     case Requirement::StorageIdle: return context.storageIdle;
     case Requirement::ExtensionsIdle: return context.extensionsIdle;
     case Requirement::CustomAccent: return context.customAccent;
@@ -372,6 +378,14 @@ std::vector<app::HitType> FocusOrder(app::SettingsCategory category,
     if (control.category == category && Enabled(control, context)) {
       order.push_back(control.hit);
     }
+  }
+  return order;
+}
+
+std::vector<app::HitType> AccessibilityOrder(app::SettingsCategory category) {
+  std::vector<app::HitType> order;
+  for (const auto& control : Catalog()) {
+    if (control.category == category) order.push_back(control.hit);
   }
   return order;
 }
