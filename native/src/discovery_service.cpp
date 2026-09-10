@@ -1,5 +1,7 @@
 #include "discovery_service.hpp"
 
+#include <windows.h>
+
 #include <utility>
 
 namespace feathercast::discovery_runtime {
@@ -63,6 +65,7 @@ bool DiscoveryService::IsCurrent(std::uint64_t generation) const {
 }
 
 void DiscoveryService::WorkerLoop(std::stop_token stopToken) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     app::DiscoveryRequest request;
     Worker worker;

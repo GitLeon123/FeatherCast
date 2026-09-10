@@ -51,6 +51,15 @@ class ExtensionManager {
     StartQueryWorker();
   }
 
+  void SetInteractive(bool interactive) {
+    interactive_.store(interactive, std::memory_order_release);
+  }
+
+  void SetConcurrencyLimit(std::size_t limit) {
+    queryConcurrencyLimit_.store(std::max<std::size_t>(1, limit),
+                                 std::memory_order_release);
+  }
+
   void CancelQuery() {
     std::lock_guard lock(queryMutex_);
     pendingQuery_.reset();
@@ -147,6 +156,7 @@ class ExtensionManager {
       }
       pendingQuery_ = PendingQuery{std::move(query), generation};
       latestRequestedGeneration_ = generation;
+      lastQueryRequestTick_.store(GetTickCount64(), std::memory_order_release);
     }
     queryCv_.notify_one();
   }
@@ -248,6 +258,7 @@ class ExtensionManager {
   void StartQueryWorker() {
     if (queryThread_.joinable()) return;
     queryThread_ = std::jthread([this](std::stop_token stopToken) {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
       for (;;) {
         PendingQuery pending;
         {
@@ -263,6 +274,18 @@ class ExtensionManager {
         }
 
         std::vector<QueryResultItem> results;
+        // Plugin hosts are deliberately idle while the user is typing.  The
+        // normal search path remains responsive; extension results arrive
+        // after a short quiet period and are discarded if they are stale.
+        while (interactive_.load(std::memory_order_acquire) &&
+               !stop_.load(std::memory_order_acquire) &&
+               !stopToken.stop_requested()) {
+          const ULONGLONG elapsed =
+              GetTickCount64() -
+              lastQueryRequestTick_.load(std::memory_order_acquire);
+          if (elapsed >= kInteractiveQueryIdleMs) break;
+          Sleep(static_cast<DWORD>(kInteractiveQueryIdleMs - elapsed));
+        }
         try {
           results = QueryPlugins(pending.query, stopToken);
         } catch (...) {
@@ -296,10 +319,13 @@ class ExtensionManager {
     std::mutex resultsMutex;
     std::atomic<size_t> nextPlugin = 0;
     std::vector<std::jthread> workers;
-    const size_t workerCount = std::min<size_t>(4, plugins.size());
+    const size_t workerCount = std::min(
+        queryConcurrencyLimit_.load(std::memory_order_acquire),
+        plugins.size());
     workers.reserve(workerCount);
     for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
       workers.emplace_back([&](std::stop_token workerStop) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         try {
           for (;;) {
             const size_t pluginIndex =
@@ -440,7 +466,6 @@ class ExtensionManager {
         !AssignProcessToJobObject(job, process.hProcess)) {
       if (job) CloseHandle(job);
       TerminateProcess(process.hProcess, 0);
-      WaitForSingleObject(process.hProcess, 1000);
       CloseHandleIfSet(process.hThread);
       CloseHandleIfSet(process.hProcess);
       CloseHandleIfSet(parentStdinWrite);
@@ -451,7 +476,6 @@ class ExtensionManager {
     if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
       CloseHandle(job);
       TerminateProcess(process.hProcess, 0);
-      WaitForSingleObject(process.hProcess, 1000);
       CloseHandleIfSet(process.hThread);
       CloseHandleIfSet(process.hProcess);
       CloseHandleIfSet(parentStdinWrite);
@@ -560,7 +584,6 @@ class ExtensionManager {
     if (plugin.process) {
       if (WaitForSingleObject(plugin.process, 0) == WAIT_TIMEOUT) {
         TerminateProcess(plugin.process, 0);
-        WaitForSingleObject(plugin.process, 1000);
       }
       CloseHandleIfSet(plugin.process);
     }
@@ -598,6 +621,10 @@ class ExtensionManager {
   unsigned long long runningGeneration_ = 0;
   unsigned long long latestRequestedGeneration_ = 0;
   std::atomic<bool> stop_ = false;
+  std::atomic<bool> interactive_ = false;
+  std::atomic<std::size_t> queryConcurrencyLimit_ = 2;
+  std::atomic<ULONGLONG> lastQueryRequestTick_ = 0;
+  static constexpr ULONGLONG kInteractiveQueryIdleMs = 90;
 };
 
 }  // namespace feathercast::extensions

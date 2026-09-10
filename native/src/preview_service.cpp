@@ -150,6 +150,7 @@ void PreviewService::Invalidate(std::uint64_t generation) {
 }
 
 void PreviewService::WorkerLoop(std::stop_token token) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   for (;;) {
     Request request;

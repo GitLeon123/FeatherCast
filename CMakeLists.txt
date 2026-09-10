@@ -223,6 +223,14 @@ add_executable(FeatherCastUiEventQueueTests
   native/tests/ui_event_queue_tests.cpp
 )
 
+add_executable(FeatherCastPerformanceGovernorTests
+  native/tests/performance_governor_tests.cpp
+)
+
+add_executable(FeatherCastPerformanceSelfTest
+  native/tests/performance_self_test.cpp
+)
+
 add_executable(FeatherCastPersistenceServiceTests
   native/tests/persistence_service_tests.cpp
 )
@@ -279,6 +287,8 @@ target_compile_features(FeatherCastSettingsExecutorTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastStorageTrustTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastInteractionStateTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastUiEventQueueTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastPerformanceGovernorTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastPerformanceSelfTest PRIVATE cxx_std_23)
 target_compile_features(FeatherCastPersistenceServiceTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastSearchCoordinatorTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastDiscoveryServiceTests PRIVATE cxx_std_23)
@@ -300,6 +310,8 @@ target_include_directories(FeatherCastSettingsExecutorTests PRIVATE native/src)
 target_include_directories(FeatherCastStorageTrustTests PRIVATE native/src third_party/sqlite)
 target_include_directories(FeatherCastInteractionStateTests PRIVATE native/src)
 target_include_directories(FeatherCastUiEventQueueTests PRIVATE native/src)
+target_include_directories(FeatherCastPerformanceGovernorTests PRIVATE native/src)
+target_include_directories(FeatherCastPerformanceSelfTest PRIVATE native/src)
 target_include_directories(FeatherCastPersistenceServiceTests PRIVATE native/src third_party/sqlite)
 target_include_directories(FeatherCastSearchCoordinatorTests PRIVATE native/src)
 target_include_directories(FeatherCastDiscoveryServiceTests PRIVATE native/src)
@@ -320,6 +332,8 @@ target_compile_definitions(FeatherCastSettingsExecutorTests PRIVATE UNICODE _UNI
 target_compile_definitions(FeatherCastStorageTrustTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastInteractionStateTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastUiEventQueueTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastPerformanceGovernorTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastPerformanceSelfTest PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastPersistenceServiceTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastSearchCoordinatorTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastDiscoveryServiceTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -341,6 +355,7 @@ target_link_libraries(FeatherCastProductivityPackTests PRIVATE FeatherCastRuntim
 target_link_libraries(FeatherCastLibraryTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchFilesTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastGameDiscoveryTests PRIVATE FeatherCastRuntime)
+target_link_libraries(FeatherCastPerformanceSelfTest PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchBenchmarks PRIVATE normaliz)
 target_link_libraries(FeatherCastFileSearchBenchmarks PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastStorageTrustTests PRIVATE FeatherCastSQLite advapi32 crypt32)
@@ -364,6 +379,8 @@ feathercast_apply_project_warnings(FeatherCastInteractionStateTests)
 feathercast_apply_project_warnings(FeatherCastRuntime)
 feathercast_apply_project_warnings(FeatherCastUi)
 feathercast_apply_project_warnings(FeatherCastUiEventQueueTests)
+feathercast_apply_project_warnings(FeatherCastPerformanceGovernorTests)
+feathercast_apply_project_warnings(FeatherCastPerformanceSelfTest)
 feathercast_apply_project_warnings(FeatherCastPersistenceServiceTests)
 feathercast_apply_project_warnings(FeatherCastSearchCoordinatorTests)
 feathercast_apply_project_warnings(FeatherCastDiscoveryServiceTests)
@@ -401,6 +418,12 @@ add_test(NAME FeatherCastSettingsExecutorTests COMMAND FeatherCastSettingsExecut
 add_test(NAME FeatherCastStorageTrustTests COMMAND FeatherCastStorageTrustTests)
 add_test(NAME FeatherCastInteractionStateTests COMMAND FeatherCastInteractionStateTests)
 add_test(NAME FeatherCastUiEventQueueTests COMMAND FeatherCastUiEventQueueTests)
+add_test(NAME FeatherCastPerformanceGovernorTests COMMAND FeatherCastPerformanceGovernorTests)
+add_test(NAME FeatherCastPerformanceSelfTest
+  COMMAND FeatherCastPerformanceSelfTest
+    $<TARGET_FILE:FeatherCastPluginHost>
+    $<TARGET_FILE:FeatherCastTestExtension>
+)
 add_test(NAME FeatherCastPersistenceServiceTests COMMAND FeatherCastPersistenceServiceTests)
 add_test(NAME FeatherCastSearchCoordinatorTests COMMAND FeatherCastSearchCoordinatorTests)
 add_test(NAME FeatherCastDiscoveryServiceTests COMMAND FeatherCastDiscoveryServiceTests)
@@ -420,6 +443,8 @@ set_tests_properties(
   FeatherCastStorageTrustTests
   FeatherCastInteractionStateTests
   FeatherCastUiEventQueueTests
+  FeatherCastPerformanceGovernorTests
+  FeatherCastPerformanceSelfTest
   FeatherCastPersistenceServiceTests
   FeatherCastSearchCoordinatorTests
   FeatherCastDiscoveryServiceTests

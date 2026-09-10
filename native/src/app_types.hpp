@@ -568,6 +568,7 @@ struct QueryRequest {
   BrowseView browseView = BrowseView::None;
   bool compactClear = false;
   int limit = 0;
+  std::size_t maxWorkers = 0;
   long long now = 0;
   feathercast::clock_utilities::ClockSnapshot clock;
   const std::atomic<unsigned long long>* latestGeneration = nullptr;

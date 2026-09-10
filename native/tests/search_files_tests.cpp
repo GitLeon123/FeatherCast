@@ -587,6 +587,35 @@ int main() {
   }
 
   {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::shared_ptr<const std::vector<feathercast::app::AppEntry>> projected;
+    std::uint64_t projectedGeneration = 0;
+    feathercast::files::FileSearchService service(
+        databasePath, {}, {},
+        [&](feathercast::files::PreparedFileIndex value) {
+          {
+            std::lock_guard lock(mutex);
+            projectedGeneration = value.generation;
+            projected = std::move(value.files);
+          }
+          ready.notify_one();
+        });
+    service.Start();
+    assert(service.UpdateStorageFilesAsync(
+        {Entry(root / L"projected.txt", L"immutable", 50, 50)}, 44));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(3), [&] {
+        return projectedGeneration == 44 && projected != nullptr;
+      }));
+    }
+    assert(projected->size() == 1);
+    assert((*projected)[0].name == L"projected.txt");
+    service.Stop();
+  }
+
+  {
     feathercast::storage::Storage storage;
     assert(storage.Open(databasePath));
     assert(storage.ClearFileIndex());

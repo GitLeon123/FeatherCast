@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
@@ -95,6 +97,7 @@ class Executor {
   }
 
   void WorkerLoop(std::stop_token stopToken) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
       Task task;
       {

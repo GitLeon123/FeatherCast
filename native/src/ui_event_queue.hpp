@@ -2,6 +2,7 @@
 
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -12,6 +13,11 @@ template <typename Event>
 class UiEventQueue {
  public:
   using Notifier = std::function<void()>;
+
+  struct DrainResult {
+    std::vector<Event> events;
+    bool more = false;
+  };
 
   explicit UiEventQueue(Notifier notifier = {})
       : notifier_(std::move(notifier)) {}
@@ -38,18 +44,30 @@ class UiEventQueue {
     return true;
   }
 
-  std::vector<Event> Drain() {
-    std::vector<Event> drained;
+  DrainResult Drain(std::size_t maxCount) {
+    DrainResult result;
+    Notifier notifier;
     {
       std::lock_guard lock(mutex_);
-      drained.reserve(events_.size());
-      while (!events_.empty()) {
-        drained.push_back(std::move(events_.front()));
+      const std::size_t count = std::min(maxCount, events_.size());
+      result.events.reserve(count);
+      for (std::size_t index = 0; index < count; ++index) {
+        result.events.push_back(std::move(events_.front()));
         events_.pop_front();
       }
-      notificationPending_ = false;
+      result.more = !events_.empty();
+      notificationPending_ = result.more;
+      if (result.more) notifier = notifier_;
     }
-    return drained;
+    // The message that caused this drain has already been consumed. Re-arm a
+    // single notification for the remainder without invoking user code while
+    // the queue mutex is held.
+    if (notifier) notifier();
+    return result;
+  }
+
+  std::vector<Event> Drain() {
+    return Drain(std::numeric_limits<std::size_t>::max()).events;
   }
 
   void Close() {
@@ -68,6 +86,11 @@ class UiEventQueue {
   bool Empty() const {
     std::lock_guard lock(mutex_);
     return events_.empty();
+  }
+
+  std::size_t Size() const {
+    std::lock_guard lock(mutex_);
+    return events_.size();
   }
 
  private:

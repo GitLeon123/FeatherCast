@@ -63,6 +63,10 @@ class FileIndexService {
   void Start();
   void Stop();
   void Pause();
+  // Indexing remains cancellable while the launcher is interactive. The
+  // worker uses this signal to yield between filesystem operations instead of
+  // competing with keyboard and pointer input at full speed.
+  void SetInteractive(bool interactive);
   bool Reconfigure(IndexRequest request);
   bool Rebuild();
   bool IsCurrent(std::uint64_t generation) const;
@@ -84,6 +88,7 @@ class FileIndexService {
   std::vector<std::unique_ptr<Watcher>> watchers_;
   std::mutex watchersMutex_;
   std::atomic<std::uint64_t> currentGeneration_ = 0;
+  std::atomic<bool> interactive_ = false;
   bool stopping_ = false;
   std::atomic<bool> paused_ = false;
   bool rebuildPending_ = false;

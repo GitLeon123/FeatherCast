@@ -24,5 +24,8 @@ std::optional<int> ReadDefaultOutputVolumePercent();
 bool SetDefaultOutputVolumePercent(int percent);
 bool StepDefaultOutputVolume(bool increase);
 bool ToggleDefaultOutputMute();
+// Keep the endpoint alive while the compact volume surface is open so repeated
+// key repeats do not recreate the MMDevice enumerator for every tick.
+void SetDefaultOutputEndpointCacheEnabled(bool enabled);
 
 }  // namespace feathercast::audio

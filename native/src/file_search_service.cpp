@@ -3,6 +3,8 @@
 #include "extension_protocol.hpp"
 #include "sqlite3.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cwctype>
 #include <map>
@@ -18,6 +20,22 @@ app::DisplayItem Display(app::AppEntry entry, bool contentMatch = false) {
   item.app = std::move(entry);
   item.commandDetail = contentMatch ? L"Content match" : L"File or folder";
   return item;
+}
+
+app::AppEntry ProjectStorageEntry(const storage::FileIndexEntry& entry) {
+  app::AppEntry app;
+  app.id = L"file:" + entry.path;
+  app.name = entry.name;
+  app.path = entry.path;
+  app.source = L"file";
+  app.launchType = app::LaunchType::Exe;
+  app.launchTarget = entry.path;
+  app.iconKey = entry.iconKey.empty() ? entry.path : entry.iconKey;
+  app.fileIsDirectory = entry.isDirectory;
+  app.fileLastWriteTime = entry.lastWriteTime;
+  app.fileSize = entry.size;
+  app.fileIndexedAt = entry.indexedAt;
+  return app;
 }
 
 core::SearchItem Searchable(const app::AppEntry& entry) {
@@ -64,16 +82,19 @@ std::string FtsExpression(const std::wstring& terms) {
 }  // namespace
 
 struct FileSearchService::Corpus {
+  std::uint64_t generation = 0;
   std::vector<app::AppEntry> files;
   std::vector<core::PreparedSearchItem> prepared;
   std::map<std::wstring, std::size_t> byPath;
 };
 
 FileSearchService::FileSearchService(std::filesystem::path databasePath,
-                                     ResultSink sink, ErrorSink errors)
+                                     ResultSink sink, ErrorSink errors,
+                                     ProjectionSink projection)
     : databasePath_(std::move(databasePath)),
       sink_(std::move(sink)),
       errors_(std::move(errors)),
+      projectionSink_(std::move(projection)),
       corpus_(std::make_shared<Corpus>()) {}
 
 FileSearchService::~FileSearchService() { Stop(); }
@@ -91,6 +112,8 @@ void FileSearchService::Stop() {
     if (!worker_.joinable()) return;
     stopping_ = true;
     pending_.reset();
+    pendingFiles_.reset();
+    pendingStorageFiles_.reset();
     worker_.request_stop();
   }
   cv_.notify_all();
@@ -102,7 +125,39 @@ void FileSearchService::Stop() {
 }
 
 void FileSearchService::UpdateFiles(std::vector<app::AppEntry> files) {
+  auto corpus = BuildCorpus(std::move(files), 0);
+  std::lock_guard lock(mutex_);
+  corpus_ = std::move(corpus);
+}
+
+bool FileSearchService::UpdateFilesAsync(std::vector<app::AppEntry> files,
+                                         std::uint64_t generation) {
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_ || !worker_.joinable()) return false;
+    pendingFiles_ = std::move(files);
+    pendingFilesGeneration_ = generation;
+  }
+  cv_.notify_one();
+  return true;
+}
+
+bool FileSearchService::UpdateStorageFilesAsync(
+    std::vector<storage::FileIndexEntry> entries, std::uint64_t generation) {
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_ || !worker_.joinable()) return false;
+    pendingStorageFiles_ = std::move(entries);
+    pendingStorageFilesGeneration_ = generation;
+  }
+  cv_.notify_one();
+  return true;
+}
+
+std::shared_ptr<FileSearchService::Corpus> FileSearchService::BuildCorpus(
+    std::vector<app::AppEntry> files, std::uint64_t generation) {
   auto corpus = std::make_shared<Corpus>();
+  corpus->generation = generation;
   std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
     if (left.fileLastWriteTime != right.fileLastWriteTime) {
       return left.fileLastWriteTime > right.fileLastWriteTime;
@@ -115,8 +170,7 @@ void FileSearchService::UpdateFiles(std::vector<app::AppEntry> files) {
     corpus->prepared.push_back(core::PrepareSearchItem(Searchable(corpus->files[index])));
     corpus->byPath[NormalizePath(corpus->files[index].path)] = index;
   }
-  std::lock_guard lock(mutex_);
-  corpus_ = std::move(corpus);
+  return corpus;
 }
 
 bool FileSearchService::Query(FileQuery query) {
@@ -134,19 +188,67 @@ void FileSearchService::Invalidate(unsigned long long generation) {
   generation_.store(generation, std::memory_order_release);
   std::lock_guard lock(mutex_);
   pending_.reset();
+  pendingFiles_.reset();
+  pendingStorageFiles_.reset();
 }
 
 void FileSearchService::WorkerLoop(std::stop_token token) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     FileQuery query;
+    std::vector<app::AppEntry> files;
+    std::vector<storage::FileIndexEntry> storageFiles;
+    std::uint64_t filesGeneration = 0;
+    std::uint64_t storageFilesGeneration = 0;
+    bool updateCorpus = false;
+    bool projectStorageFiles = false;
     {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] {
-        return stopping_ || token.stop_requested() || pending_.has_value();
+        return stopping_ || token.stop_requested() || pending_.has_value() ||
+               pendingFiles_.has_value() || pendingStorageFiles_.has_value();
       });
       if (stopping_ || token.stop_requested()) return;
-      query = std::move(*pending_);
-      pending_.reset();
+      // Corpus publication has priority over a stale query. The next loop
+      // iteration will coalesce and execute the newest query against it.
+      if (pendingStorageFiles_) {
+        storageFiles = std::move(*pendingStorageFiles_);
+        pendingStorageFiles_.reset();
+        storageFilesGeneration = pendingStorageFilesGeneration_;
+        projectStorageFiles = true;
+      } else if (pendingFiles_) {
+        files = std::move(*pendingFiles_);
+        pendingFiles_.reset();
+        filesGeneration = pendingFilesGeneration_;
+        updateCorpus = true;
+      } else {
+        query = std::move(*pending_);
+        pending_.reset();
+      }
+    }
+    if (projectStorageFiles) {
+      files.reserve(storageFiles.size());
+      for (const auto& entry : storageFiles) {
+        if (!entry.path.empty() && !entry.name.empty()) {
+          files.push_back(ProjectStorageEntry(entry));
+        }
+      }
+      filesGeneration = storageFilesGeneration;
+      updateCorpus = true;
+    }
+    if (updateCorpus) {
+      auto corpus = BuildCorpus(std::move(files), filesGeneration);
+      auto projected = std::make_shared<const std::vector<app::AppEntry>>(
+          corpus->files);
+      {
+        std::lock_guard lock(mutex_);
+        corpus_ = std::move(corpus);
+      }
+      if (projectStorageFiles && projectionSink_) {
+        projectionSink_(PreparedFileIndex{filesGeneration,
+                                           std::move(projected)});
+      }
+      continue;
     }
     try {
       auto result = Compute(query);
@@ -183,6 +285,7 @@ app::ResultsCollection FileSearchService::Compute(const FileQuery& query) {
   } else {
     core::SearchOptions options;
     options.limit = static_cast<std::size_t>(query.limit);
+    options.maxWorkers = query.maxWorkers;
     options.generation = query.generation;
     options.latestGeneration = &generation_;
     const auto order = core::SearchPrepared(query.terms, corpus->prepared, {}, options);

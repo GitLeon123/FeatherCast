@@ -10,7 +10,11 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
+ComPtr<IAudioEndpointVolume> cachedEndpoint;
+bool endpointCacheEnabled = false;
+
 ComPtr<IAudioEndpointVolume> DefaultOutputEndpoint() {
+  if (endpointCacheEnabled && cachedEndpoint) return cachedEndpoint;
   ComPtr<IMMDeviceEnumerator> enumerator;
   if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                               IID_PPV_ARGS(enumerator.GetAddressOf())))) {
@@ -29,6 +33,7 @@ ComPtr<IAudioEndpointVolume> DefaultOutputEndpoint() {
                                            volume.GetAddressOf())))) {
     return nullptr;
   }
+  if (endpointCacheEnabled) cachedEndpoint = volume;
   return volume;
 }
 
@@ -39,7 +44,10 @@ std::optional<int> ReadDefaultOutputVolumePercent() {
   if (!volume) return std::nullopt;
 
   float scalar = 0.0f;
-  if (FAILED(volume->GetMasterVolumeLevelScalar(&scalar))) return std::nullopt;
+  if (FAILED(volume->GetMasterVolumeLevelScalar(&scalar))) {
+    cachedEndpoint.Reset();
+    return std::nullopt;
+  }
   return ClampPercent(static_cast<int>(std::lround(scalar * 100.0f)));
 }
 
@@ -47,14 +55,18 @@ bool SetDefaultOutputVolumePercent(int percent) {
   const auto volume = DefaultOutputEndpoint();
   if (!volume) return false;
   const float scalar = static_cast<float>(ClampPercent(percent)) / 100.0f;
-  return SUCCEEDED(volume->SetMasterVolumeLevelScalar(scalar, nullptr));
+  const bool succeeded = SUCCEEDED(volume->SetMasterVolumeLevelScalar(scalar, nullptr));
+  if (!succeeded) cachedEndpoint.Reset();
+  return succeeded;
 }
 
 bool StepDefaultOutputVolume(bool increase) {
   const auto volume = DefaultOutputEndpoint();
   if (!volume) return false;
-  return SUCCEEDED(increase ? volume->VolumeStepUp(nullptr)
-                            : volume->VolumeStepDown(nullptr));
+  const bool succeeded = SUCCEEDED(increase ? volume->VolumeStepUp(nullptr)
+                                            : volume->VolumeStepDown(nullptr));
+  if (!succeeded) cachedEndpoint.Reset();
+  return succeeded;
 }
 
 bool ToggleDefaultOutputMute() {
@@ -62,8 +74,18 @@ bool ToggleDefaultOutputMute() {
   if (!volume) return false;
 
   BOOL muted = FALSE;
-  if (FAILED(volume->GetMute(&muted))) return false;
-  return SUCCEEDED(volume->SetMute(!muted, nullptr));
+  if (FAILED(volume->GetMute(&muted))) {
+    cachedEndpoint.Reset();
+    return false;
+  }
+  const bool succeeded = SUCCEEDED(volume->SetMute(!muted, nullptr));
+  if (!succeeded) cachedEndpoint.Reset();
+  return succeeded;
+}
+
+void SetDefaultOutputEndpointCacheEnabled(bool enabled) {
+  endpointCacheEnabled = enabled;
+  if (!enabled) cachedEndpoint.Reset();
 }
 
 }  // namespace feathercast::audio

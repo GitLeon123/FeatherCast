@@ -20,16 +20,23 @@ int main() {
   assert(queue.Push(IconResolved{L"two"}));
   assert(notifications.load() == 1);
 
-  auto events = queue.Drain();
-  assert(events.size() == 2);
-  assert(std::get<IconResolved>(events[0]).key == L"one");
-  assert(std::get<IconResolved>(events[1]).key == L"two");
+  auto partial = queue.Drain(1);
+  assert(partial.events.size() == 1);
+  assert(partial.more);
+  assert(std::get<IconResolved>(partial.events.front()).key == L"one");
+  // A partial drain must re-arm exactly one notification for the remainder.
+  assert(notifications.load() == 2);
+
+  auto remainder = queue.Drain(1);
+  assert(remainder.events.size() == 1);
+  assert(!remainder.more);
+  assert(std::get<IconResolved>(remainder.events.front()).key == L"two");
   assert(queue.Empty());
 
   assert(queue.Push(BackgroundTaskFailed{
       BackgroundSubsystem::Persistence, L"save failed"}));
-  assert(notifications.load() == 2);
-  events = queue.Drain();
+  assert(notifications.load() == 3);
+  auto events = queue.Drain();
   assert(events.size() == 1);
   assert(std::get<BackgroundTaskFailed>(events.front()).message ==
          L"save failed");

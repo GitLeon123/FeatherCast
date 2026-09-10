@@ -1,5 +1,7 @@
 #include "search_coordinator.hpp"
 
+#include <windows.h>
+
 #include <utility>
 
 namespace feathercast::search {
@@ -53,6 +55,7 @@ void SearchCoordinator::Invalidate(std::uint64_t generation) {
 }
 
 void SearchCoordinator::WorkerLoop(std::stop_token stopToken) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     app::QueryRequest request;
     Processor processor;
@@ -143,6 +146,7 @@ bool SnapshotCoordinator::UpdateCorpus(app::SnapshotBuildRequest request) {
 }
 
 void SnapshotCoordinator::WorkerLoop(std::stop_token stopToken) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     app::SnapshotBuildRequest request;
     Builder builder;

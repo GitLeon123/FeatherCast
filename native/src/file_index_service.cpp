@@ -290,6 +290,11 @@ void FileIndexService::Pause() {
   cv_.notify_all();
 }
 
+void FileIndexService::SetInteractive(bool interactive) {
+  interactive_.store(interactive, std::memory_order_release);
+  cv_.notify_all();
+}
+
 bool FileIndexService::Reconfigure(IndexRequest request) {
   currentGeneration_.store(request.generation, std::memory_order_release);
   {
@@ -471,9 +476,15 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   std::priority_queue<storage::FileIndexEntry,
                       std::vector<storage::FileIndexEntry>, OlderEntryFirst>
       newest;
+  std::size_t interactionYieldCounter = 0;
+  const auto YieldDuringInteraction = [&] {
+    if (!interactive_.load(std::memory_order_acquire)) return;
+    if ((++interactionYieldCounter & 63u) == 0) Sleep(1);
+  };
 
   for (const auto& configured : request.roots) {
     if (token.stop_requested() || !IsCurrent(request.generation)) return status;
+    YieldDuringInteraction();
     const std::filesystem::path root(configured);
     std::error_code rootError;
     if (!FixedLocalRoot(root) ||
@@ -493,6 +504,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
                ec), end;
            !ec && it != end; it.increment(ec)) {
         if (token.stop_requested() || !IsCurrent(request.generation)) return status;
+        YieldDuringInteraction();
         const auto path = it->path();
         const auto relative = path.lexically_relative(root).generic_wstring();
         if (exclusionMatcher.Matches(relative)) {
@@ -555,6 +567,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   if (request.contentEnabled) {
     for (auto& entry : discovered) {
       if (token.stop_requested() || !IsCurrent(request.generation)) return status;
+      YieldDuringInteraction();
       if (entry.isDirectory) continue;
       auto extraction = file_content::Extract(entry.path,
                                               file_content::kMaxIndexedBytes,

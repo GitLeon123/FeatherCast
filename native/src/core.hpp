@@ -343,6 +343,10 @@ struct SearchOptions {
   long long now = 0;
   unsigned long long generation = 0;
   const std::atomic<unsigned long long>* latestGeneration = nullptr;
+  // Zero keeps the historical automatic choice. A caller that shares a
+  // machine with the UI can force a smaller cap and avoid transient worker
+  // oversubscription on large corpora.
+  size_t maxWorkers = 0;
 };
 
 inline std::wstring AcronymFromTokens(
@@ -630,10 +634,14 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
   const std::vector<std::wstring> queryTokens =
       TokensNormalized(normalizedQuery);
   if (options.limit == 0) return {};
-  const unsigned hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
-  const size_t workerCount = items.size() >= 20000
+  const unsigned hardwareThreads =
+      std::max(1u, std::thread::hardware_concurrency());
+  const size_t automaticWorkers = items.size() >= 20000
       ? std::min<size_t>(4, hardwareThreads)
       : 1;
+  const size_t workerCount = options.maxWorkers == 0
+      ? automaticWorkers
+      : std::clamp(options.maxWorkers, size_t{1}, automaticWorkers);
   std::vector<std::vector<Scored>> buckets(workerCount);
   auto better = [](const Scored& a, const Scored& b) {
     if (BetterItemScore(a.score, b.score)) return true;

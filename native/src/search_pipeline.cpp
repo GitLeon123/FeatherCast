@@ -289,6 +289,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     } else {
       core::SearchOptions options;
       options.limit = snapshot->pool.size();
+      options.maxWorkers = request.maxWorkers;
       options.now = request.now;
       options.generation = request.generation;
       options.latestGeneration = request.latestGeneration;
@@ -399,6 +400,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       // Search the whole corpus before bucketing so a lower-scoring app is
       // still promoted ahead of a higher-scoring setting or command.
       options.limit = request.limit > 0 ? snapshot->pool.size() : 0;
+      options.maxWorkers = request.maxWorkers;
       options.now = request.now;
       options.generation = request.generation;
       options.latestGeneration = request.latestGeneration;
