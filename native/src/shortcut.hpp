@@ -58,6 +58,11 @@ inline std::wstring Lower(std::wstring value) {
 
 inline UINT VkFromName(std::wstring name) {
   name = Lower(Trim(std::move(name)));
+  if (name == L"print screen" || name == L"printscreen" ||
+      name == L"prtsc" || name == L"prtscn" || name == L"prt sc" ||
+      name == L"prt scn" || name == L"prntscrn" || name == L"snapshot") {
+    return VK_SNAPSHOT;
+  }
   if (name == L"space") return VK_SPACE;
   if (name == L"return" || name == L"enter") return VK_RETURN;
   if (name == L"tab") return VK_TAB;
@@ -95,6 +100,7 @@ inline std::wstring KeyName(UINT vk) {
   if (vk >= L'0' && vk <= L'9') return std::wstring(1, static_cast<wchar_t>(vk));
   if (vk >= VK_F1 && vk <= VK_F12) return L"F" + std::to_wstring(vk - VK_F1 + 1);
   switch (vk) {
+    case VK_SNAPSHOT: return L"Print Screen";
     case VK_SPACE: return L"Space";
     case VK_RETURN: return L"Return";
     case VK_TAB: return L"Tab";
@@ -205,6 +211,12 @@ class ShortcutRecorder {
         return {};
       }
 
+      // Print Screen is the one supported bare key. Windows may claim it for
+      // Snipping Tool, so it must be recordable without a modifier as well.
+      if (!AnyModifierPressed() && vk == VK_SNAPSHOT) {
+        return Finish(FormatShortcut(false, false, false, false, vk));
+      }
+
       if (AnyModifierPressed()) {
         singleModifierChord_ = true;
         const auto key = KeyName(vk);
@@ -312,6 +324,17 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
       spec.display = FormatShortcut(false, false, false, false, 0, true, mod);
       return spec;
     }
+
+    // Print Screen is intentionally allowed without a modifier. Other bare
+    // keys remain invalid so an accidental key press cannot replace the
+    // launch shortcut.
+    const UINT bareKey = VkFromName(parts[0]);
+    if (bareKey == VK_SNAPSHOT) {
+      spec.vk = bareKey;
+      spec.valid = true;
+      spec.display = KeyName(bareKey);
+      return spec;
+    }
   }
 
   bool hasModifier = false;
@@ -342,6 +365,14 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
 inline HotKeySpec ToHotKeySpec(const ShortcutSpec& shortcut) {
   HotKeySpec hotKey;
   if (!shortcut.valid || shortcut.singleModifier || shortcut.vk == 0) return hotKey;
+
+  // RegisterHotKey cannot reliably reserve the physical Print Screen key on
+  // Windows. Keep it on the low-level hook, which also lets capture settings
+  // use the bare key instead of forcing a fake modifier.
+  if (shortcut.vk == VK_SNAPSHOT && !shortcut.ctrl && !shortcut.alt &&
+      !shortcut.shift && !shortcut.win) {
+    return hotKey;
+  }
 
   if (shortcut.ctrl) hotKey.modifiers |= MOD_CONTROL;
   if (shortcut.alt) hotKey.modifiers |= MOD_ALT;

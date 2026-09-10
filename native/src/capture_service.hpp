@@ -1,11 +1,14 @@
 #pragma once
 
+#include "screenshot_editor.hpp"
+
 #include <windows.h>
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -17,6 +20,8 @@ enum class CaptureOperation { Screenshot, Recording };
 enum class CaptureScope { Fullscreen, Region };
 enum class CaptureState {
   Idle,
+  PreparingScreenshot,
+  ScreenshotEditing,
   StartingScreenshot,
   StartingRecording,
   Recording,
@@ -25,10 +30,12 @@ enum class CaptureState {
 };
 enum class CaptureEventKind {
   Started,
+  ScreenshotReady,
   Paused,
   Resumed,
   Stopping,
   Completed,
+  ScreenshotOutputFailed,
   Failed,
 };
 
@@ -60,6 +67,7 @@ struct CaptureEvent {
   std::wstring message;
   std::chrono::milliseconds elapsed{};
   bool clipboardSucceeded = false;
+  std::shared_ptr<const screenshot::Draft> screenshotDraft;
 };
 
 [[nodiscard]] PixelRect NormalizeRect(PixelRect rect) noexcept;
@@ -88,8 +96,14 @@ class CaptureService {
   CaptureService& operator=(const CaptureService&) = delete;
 
   void SetCallback(Callback callback);
-  bool StartScreenshot(
-      PixelRect bounds, CaptureScope scope = CaptureScope::Region);
+  bool PrepareScreenshot(
+      PixelRect sourceBounds, CaptureScope scope = CaptureScope::Region);
+  bool FinalizeScreenshot(
+      std::shared_ptr<const screenshot::Draft> draft,
+      screenshot::Rect crop,
+      std::vector<screenshot::Annotation> annotations,
+      screenshot::Destination destination);
+  bool CancelScreenshot();
   bool StartRecording(
       PixelRect bounds, CaptureScope scope = CaptureScope::Region);
   bool Pause();

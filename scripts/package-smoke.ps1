@@ -45,7 +45,8 @@ try {
     $InstallRoot = Join-Path $temporaryRoot (
       "feathercast-package-smoke-install-" + [Guid]::NewGuid().ToString("N"))
   }
-  $installArguments = @("/S", ('/D="' + $InstallRoot + '"'))
+  # NSIS requires /D= to be the final argument and does not accept quotes.
+  $installArguments = @("/S", ("/D=" + $InstallRoot))
   $install = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
   if ($install.ExitCode -ne 0) { throw "NSIS install failed." }
   $uninstaller = Join-Path $InstallRoot "Uninstall.exe"

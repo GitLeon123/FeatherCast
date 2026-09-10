@@ -1,10 +1,12 @@
 #include "clock_utilities.hpp"
 #include "audio_volume.hpp"
 #include "capture_service.hpp"
+#include "screenshot_rasterizer.hpp"
 #include "command_catalog.hpp"
 #include "core.hpp"
 #include "network_client.hpp"
 #include "search_pipeline.hpp"
+#include "shortcut.hpp"
 #include "test_framework.hpp"
 #include "system_settings.hpp"
 #include "ui_state.hpp"
@@ -67,6 +69,23 @@ int main() {
   using feathercast::ui::CaptureUiState;
   using feathercast::ui::PixelPoint;
   using feathercast::ui::PixelRect;
+
+  {
+    const auto printScreen = feathercast::shortcut::ParseShortcut(L"Print Screen");
+    assert(printScreen.valid && printScreen.vk == VK_SNAPSHOT);
+    assert(printScreen.display == L"Print Screen");
+    assert(!feathercast::shortcut::ToHotKeySpec(printScreen).supported);
+
+    feathercast::shortcut::ShortcutRecorder recorder;
+    const auto recorded = recorder.Handle(VK_SNAPSHOT, true, false);
+    assert(recorded.done && recorded.shortcut == L"Print Screen");
+
+    feathercast::shortcut::ShortcutRuntime runtime;
+    const auto down = runtime.Handle(printScreen, VK_SNAPSHOT, true, false, {});
+    assert(down.consume && down.toggle);
+    const auto up = runtime.Handle(printScreen, VK_SNAPSHOT, false, true, {});
+    assert(up.consume && !up.toggle);
+  }
 
   CaptureUiState capture;
   assert(CaptureUiController::Begin(
@@ -185,12 +204,140 @@ int main() {
          L"FeatherCast Recording 2026-07-29 14-05-06 (3).partial.mp4");
 
   feathercast::capture::CaptureService invalidCapture;
-  assert(!invalidCapture.StartScreenshot({0, 0, 1, 100}));
+  assert(!invalidCapture.PrepareScreenshot({0, 0, 1, 100}));
   assert(!invalidCapture.StartRecording({0, 0, 47, 100}));
   assert(!invalidCapture.StartRecording({0, 0, 100, 47}));
   assert(!invalidCapture.StartRecording({0, 0, 4097, 100}));
   assert(!invalidCapture.StartRecording({0, 0, 100, 2305}));
   assert(invalidCapture.State() == feathercast::capture::CaptureState::Idle);
+
+  {
+  using namespace feathercast::screenshot;
+  EditorState screenshotEditor;
+  assert(EditorController::BeginPreparing(screenshotEditor,
+                                           {-1920, -200, 1920, 1080}));
+  assert(screenshotEditor.phase == Phase::Preparing);
+  assert(!EditorController::BeginPreparing(screenshotEditor,
+                                            {-1920, -200, 1920, 1080}));
+  assert(EditorController::SetReady(screenshotEditor));
+  assert(screenshotEditor.phase == Phase::Selecting);
+  assert(EditorController::BeginSelection(screenshotEditor, {-2500, -500}));
+  assert(EditorController::UpdateSelection(screenshotEditor, {-100, 100}));
+  assert(EditorController::FinishSelection(screenshotEditor, {-100, 100}));
+  assert(screenshotEditor.phase == Phase::Editing);
+  assert(screenshotEditor.selection ==
+         (feathercast::screenshot::Rect{-1920, -200, -100, 100}));
+  assert(EditorController::HitTestHandle(screenshotEditor, {-1920, -200}) ==
+         Handle::TopLeft);
+  assert(EditorController::HitTestHandle(screenshotEditor, {-1010, -50}) ==
+         Handle::Move);
+  assert(EditorController::BeginSelectionEdit(screenshotEditor, {-1010, -50}));
+  assert(EditorController::UpdateSelectionEdit(screenshotEditor, {1800, 900}));
+  assert(EditorController::FinishSelectionEdit(screenshotEditor));
+  assert(screenshotEditor.selection &&
+         screenshotEditor.selection->right <= screenshotEditor.sourceBounds.right &&
+         screenshotEditor.selection->bottom <= screenshotEditor.sourceBounds.bottom);
+  assert(EditorController::BeginSelectionEdit(
+      screenshotEditor, {screenshotEditor.selection->left,
+                         screenshotEditor.selection->top}));
+  assert(EditorController::UpdateSelectionEdit(screenshotEditor,
+                                                {-2500, -500}));
+  assert(EditorController::FinishSelectionEdit(screenshotEditor));
+  assert(screenshotEditor.selection &&
+         screenshotEditor.selection->left >= screenshotEditor.sourceBounds.left &&
+         screenshotEditor.selection->top >= screenshotEditor.sourceBounds.top);
+  assert(EditorController::SetTool(screenshotEditor, Tool::Rectangle));
+  assert(EditorController::BeginAnnotation(screenshotEditor, {-1000, 0}));
+  assert(EditorController::CommitAnnotation(screenshotEditor, {-800, 100}));
+  assert(screenshotEditor.annotations.size() == 1);
+  assert(EditorController::Undo(screenshotEditor));
+  assert(screenshotEditor.annotations.empty() && screenshotEditor.redo.size() == 1);
+  assert(EditorController::Redo(screenshotEditor));
+  assert(screenshotEditor.annotations.size() == 1);
+  assert(EditorController::SetTool(screenshotEditor, Tool::Text));
+  assert(EditorController::BeginAnnotation(screenshotEditor, {-700, 150}));
+  assert(EditorController::UpdateAnnotation(screenshotEditor, {-400, 210}));
+  assert(EditorController::CommitText(screenshotEditor, L"Note"));
+  assert(screenshotEditor.annotations.size() == 2);
+  assert(EditorController::SetTool(screenshotEditor, Tool::Line));
+  assert(EditorController::BeginAnnotation(screenshotEditor, {-700, 260}));
+  assert(EditorController::CommitAnnotation(screenshotEditor, {-400, 260}));
+  assert(screenshotEditor.annotations.size() == 3);
+  assert(EditorController::BeginOutput(screenshotEditor, Destination::File));
+  assert(screenshotEditor.phase == Phase::Saving);
+  assert(EditorController::OutputFailed(screenshotEditor));
+  assert(screenshotEditor.phase == Phase::Editing);
+  assert(EditorController::BeginOutput(screenshotEditor, Destination::Clipboard));
+  assert(screenshotEditor.phase == Phase::Copying);
+  assert(EditorController::Complete(screenshotEditor));
+  assert(screenshotEditor.phase == Phase::Idle);
+
+  Draft draft;
+  draft.sourceBounds = {-2, -3, 16, 13};
+  draft.width = 18;
+  draft.height = 16;
+  draft.stride = draft.width * 4;
+  auto draftPixels = std::make_shared<std::vector<std::uint8_t>>(
+      static_cast<std::size_t>(draft.stride) * draft.height,
+      static_cast<std::uint8_t>(255));
+  for (std::uint32_t y = 0; y < draft.height; ++y) {
+    for (std::uint32_t x = 0; x < draft.width; ++x) {
+      auto* pixel = draftPixels->data() +
+                    static_cast<std::size_t>(y) * draft.stride + x * 4;
+      pixel[0] = static_cast<std::uint8_t>(x * 7);
+      pixel[1] = static_cast<std::uint8_t>(y * 9);
+      pixel[2] = static_cast<std::uint8_t>(x + y);
+      pixel[3] = 255;
+    }
+  }
+  draft.pixels = draftPixels;
+  const feathercast::screenshot::Rect crop{-1, -1, 7, 5};
+  const auto rendered = Render(draft, crop, {});
+  assert(rendered && rendered->Valid());
+  assert(rendered->width == 8 && rendered->height == 6 &&
+         rendered->stride == 32);
+  const auto* firstRendered = rendered->pixels.data();
+  const auto* firstSource = draft.pixels->data() +
+                            static_cast<std::size_t>(2) * draft.stride + 4;
+  assert(firstRendered[0] == firstSource[0] &&
+         firstRendered[1] == firstSource[1] &&
+         firstRendered[2] == firstSource[2] && firstRendered[3] == 255);
+  const auto untouched = Render(draft, crop,
+                                {Annotation{Tool::Rectangle,
+                                            {-100, -100, -50, -50}, {}, {},
+                                            {255, 0, 0, 255}, 2, 24}});
+  assert(untouched && untouched->pixels == rendered->pixels);
+  const auto clippedRectangle = Render(
+      draft, crop,
+      {Annotation{Tool::Rectangle, {-4, -5, 3, 1}, {}, {},
+                  {255, 0, 0, 255}, 1, 24}});
+  assert(clippedRectangle && clippedRectangle->pixels != rendered->pixels);
+  const auto* untouchedCorner = rendered->pixels.data();
+  const auto* clippedCorner = clippedRectangle->pixels.data();
+  assert(std::equal(untouchedCorner, untouchedCorner + 4, clippedCorner));
+  Annotation pixelate;
+  pixelate.tool = Tool::Pixelate;
+  pixelate.bounds = {-1, -1, 5, 5};
+  const auto pixelated = Render(draft, crop, {pixelate});
+  assert(pixelated && pixelated->pixels != rendered->pixels);
+  for (int y = 0; y < 6; ++y) {
+    const auto* originalPixel = rendered->pixels.data() +
+                                static_cast<std::size_t>(y) * rendered->stride +
+                                7 * 4;
+    const auto* pixelatedPixel = pixelated->pixels.data() +
+                                 static_cast<std::size_t>(y) * pixelated->stride +
+                                 7 * 4;
+    assert(std::equal(originalPixel, originalPixel + 4, pixelatedPixel));
+  }
+  Annotation blur;
+  blur.tool = Tool::Blur;
+  blur.bounds = {-1, -1, 5, 5};
+  const auto blurred = Render(draft, crop, {blur});
+  assert(blurred && blurred->pixels != rendered->pixels);
+  for (std::size_t index = 3; index < blurred->pixels.size(); index += 4) {
+    assert(blurred->pixels[index] == 255);
+  }
+  }
 
   assert(feathercast::audio::ClampPercent(-1) == 0);
   assert(feathercast::audio::ClampPercent(42) == 42);

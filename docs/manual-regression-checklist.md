@@ -117,12 +117,25 @@ and then with pointer input.
 - Full-screen capture targets the monitor under the pointer. Full-screen and
   region screenshots save valid PNGs at 100%, 150%, and 200% scaling, including
   negative-origin and mixed-DPI displays.
+- Pressing `Print Screen` opens the region selector and then the static
+  screenshot editor; it does not save or copy automatically.
+- The screenshot shortcut recorder accepts bare `Print Screen`. If Windows
+  opens Snipping Tool instead, disable `Settings > Accessibility > Keyboard >
+  Use the Print Screen button to open screen snipping` and try again.
 - Region selection works in every drag direction and across monitors. The
   saved image has the selected physical-pixel dimensions, with uncovered gaps
   in irregular monitor layouts rendered black.
+- Full-screen and region captures open one static editor. No file or clipboard
+  entry exists before Save or Copy; Ctrl+S saves only a PNG and Ctrl+C copies
+  only the final image. The first region drag remains editable and can be
+  moved or resized with all eight handles.
+- Rectangle, ellipse, line, arrow, freehand, text, blur, and pixelate tools
+  show a live gesture preview and render in physical coordinates. Color, stroke
+  width, Ctrl+Z/Ctrl+Y history, and Esc gesture cancellation work without
+  changing pixels outside an annotation or the final crop.
 - Screenshots save under `Pictures\FeatherCast`, copy successfully into
   another app, and use collision suffixes without replacing an existing file.
-  A clipboard failure retains the saved PNG and reports the warning.
+  File or clipboard failures retain the editor and expose a retryable error.
 - Full-screen and cross-monitor region recordings play in Windows Media Player
   as silent H.264 MP4 files with the pointer visible. Odd capture dimensions
   retain every selected pixel through even-size edge padding.

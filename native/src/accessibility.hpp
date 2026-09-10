@@ -26,6 +26,9 @@ class Model {
   virtual std::wstring AccessibleWindowName(HWND hwnd) const = 0;
   virtual std::vector<Item> AccessibleItems(HWND hwnd) const = 0;
   virtual int AccessibleFocusedChild(HWND hwnd) const = 0;  // one-based; 0 = root
+  virtual int AccessibleSelectedChild(HWND hwnd) const {
+    return AccessibleFocusedChild(hwnd);
+  }
   virtual void AccessibleFocusChild(HWND hwnd, int child) = 0;
   virtual void AccessibleInvokeChild(HWND hwnd, int child) = 0;
   virtual HRESULT AccessibleSetValue(HWND, int, const std::wstring&) {
@@ -150,7 +153,11 @@ class Window final : public IAccessible {
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT* selection) override {
-    return get_accFocus(selection);
+    if (!selection) return E_POINTER;
+    VariantInit(selection);
+    selection->vt = VT_I4;
+    selection->lVal = model_->AccessibleSelectedChild(hwnd_);
+    return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT child, BSTR* action) override {
     if (!action) return E_POINTER;

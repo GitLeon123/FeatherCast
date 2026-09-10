@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.9.1 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.9.2 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +61,7 @@ add_library(FeatherCastRuntime STATIC
   native/src/settings_catalog.cpp
   native/src/background_services.cpp
   native/src/capture_service.cpp
+  native/src/screenshot_rasterizer.cpp
   native/src/network_client.cpp
   native/src/file_content.cpp
   native/src/file_index_service.cpp

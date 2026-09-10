@@ -24,8 +24,11 @@ may mutate live window state.
 - `PreviewService` reads bounded metadata/text/image payloads on demand and
   suppresses stale generations. WIC decoding produces CPU pixels; Direct2D
   bitmap creation remains on the UI thread.
-- `CaptureService` owns the native screenshot/recording worker: GDI/WIC writes
-  PNG screenshots, while Windows Graphics Capture and Media Foundation produce
+- `CaptureService` owns the native screenshot/recording worker. Screenshot
+  preparation captures an immutable CPU draft with GDI; the UI editor keeps
+  crop and annotation state on the UI thread, and finalization rasterizes the
+  selected physical pixels before writing a PNG or publishing `CF_DIBV5` to the
+  clipboard. Windows Graphics Capture and Media Foundation continue to produce
   silent H.264 MP4 recordings. It reports typed lifecycle events to the UI.
 - `SearchCoordinator` coalesces queries; `SnapshotCoordinator` prepares
   immutable corpus snapshots by revision. `search_pipeline::ComputeResults`
@@ -48,9 +51,10 @@ may mutate live window state.
 `FeatherCastUi` owns UI-thread-only overlay/settings state and controllers. UI
 state transitions and descriptor projections are pure and unit tested. Direct2D
 resources are render-target-bound and must never be touched by runtime workers.
-The region selector and capture-excluded recording controls remain UI-thread
-windows; only physical-pixel bounds and typed capture requests cross to the
-worker.
+The screenshot editor, region selector, and capture-excluded recording controls
+remain UI-thread windows; only physical-pixel bounds, immutable drafts, and
+typed capture requests cross to the worker. Drafts are never backed by a file
+or clipboard entry before explicit screenshot finalization.
 `FeatherCastApp` retains reference aliases for legacy rendering and routing code,
 but the referenced values live exclusively in `OverlayState` and
 `SettingsState`; new interaction state must be added to those production models.

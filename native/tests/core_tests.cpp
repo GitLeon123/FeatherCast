@@ -1191,6 +1191,25 @@ int main() {
   }
 
   {
+    const auto printScreen = ParseShortcut(L"Print Screen");
+    assert(printScreen.valid);
+    assert(printScreen.vk == VK_SNAPSHOT);
+    assert(printScreen.display == L"Print Screen");
+    assert(!ToHotKeySpec(printScreen).supported);
+    assert(ShouldHandleInLowLevelHook(printScreen, false));
+
+    ShortcutRecorder recorder;
+    AssertRecorded(recorder.Handle(VK_SNAPSHOT, true, false),
+                   L"Print Screen");
+
+    const auto controlPrintScreen = ParseShortcut(L"Control+Print Screen");
+    assert(controlPrintScreen.valid);
+    assert(controlPrintScreen.ctrl);
+    assert(controlPrintScreen.vk == VK_SNAPSHOT);
+    assert(ToHotKeySpec(controlPrintScreen).supported);
+  }
+
+  {
     ShortcutRecorder recorder;
     AssertRecordingPending(recorder.Handle(VK_CONTROL, true, false));
     AssertRecorded(recorder.Handle(VK_SPACE, true, false), L"Control+Space");

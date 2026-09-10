@@ -32,9 +32,121 @@ enum ControlId : int {
   IdValue,
 };
 
-void UseDefaultFont(HWND control) {
+constexpr UINT kBaseDpi = 96;
+constexpr int kWorkAreaInset = 24;
+
+int ScaleForDpi(int logicalPixels, UINT dpi) {
+  return MulDiv(logicalPixels, static_cast<int>(std::max<UINT>(kBaseDpi, dpi)),
+                static_cast<int>(kBaseDpi));
+}
+
+UINT SystemDpi() {
+  using GetDpiForSystemProc = UINT(WINAPI*)();
+  if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+    if (auto proc = reinterpret_cast<GetDpiForSystemProc>(
+            GetProcAddress(user32, "GetDpiForSystem"))) {
+      if (const UINT dpi = proc()) return dpi;
+    }
+  }
+  return kBaseDpi;
+}
+
+UINT DpiForWindow(HWND window) {
+  using GetDpiForWindowProc = UINT(WINAPI*)(HWND);
+  if (window) {
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+      if (auto proc = reinterpret_cast<GetDpiForWindowProc>(
+              GetProcAddress(user32, "GetDpiForWindow"))) {
+        if (const UINT dpi = proc(window)) return dpi;
+      }
+    }
+  }
+  return 0;
+}
+
+UINT DpiForMonitor(HMONITOR monitor) {
+  if (!monitor) return SystemDpi();
+  using GetDpiForMonitorProc = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+  HMODULE shcore = GetModuleHandleW(L"shcore.dll");
+  bool loaded = false;
+  if (!shcore) {
+    shcore = LoadLibraryW(L"shcore.dll");
+    loaded = shcore != nullptr;
+  }
+  UINT dpiX = kBaseDpi;
+  UINT dpiY = kBaseDpi;
+  if (shcore) {
+    if (auto proc = reinterpret_cast<GetDpiForMonitorProc>(
+            GetProcAddress(shcore, "GetDpiForMonitor"))) {
+      proc(monitor, 0 /* MDT_EFFECTIVE_DPI */, &dpiX, &dpiY);
+    }
+  }
+  if (loaded) FreeLibrary(shcore);
+  return dpiX > 0 ? dpiX : SystemDpi();
+}
+
+HMONITOR ReferenceMonitor(HWND reference) {
+  if (reference && IsWindow(reference) && IsWindowVisible(reference)) {
+    return MonitorFromWindow(reference, MONITOR_DEFAULTTONEAREST);
+  }
+  POINT cursor{};
+  if (GetCursorPos(&cursor)) {
+    return MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+  }
+  if (reference && IsWindow(reference)) {
+    return MonitorFromWindow(reference, MONITOR_DEFAULTTONEAREST);
+  }
+  return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTONEAREST);
+}
+
+UINT DpiForReference(HWND reference) {
+  if (reference && IsWindow(reference) && IsWindowVisible(reference)) {
+    if (const UINT dpi = DpiForWindow(reference)) return dpi;
+  }
+  return DpiForMonitor(ReferenceMonitor(reference));
+}
+
+RECT WorkAreaFor(HWND reference) {
+  MONITORINFO info{sizeof(info)};
+  if (GetMonitorInfoW(ReferenceMonitor(reference), &info)) return info.rcWork;
+  RECT work{};
+  if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) return work;
+  return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN),
+              GetSystemMetrics(SM_CYSCREEN)};
+}
+
+SIZE FitWindowSize(HWND reference, int logicalWidth, int logicalHeight) {
+  const UINT dpi = DpiForReference(reference);
+  const RECT work = WorkAreaFor(reference);
+  const int inset = ScaleForDpi(kWorkAreaInset, dpi);
+  const int maxWidth = std::max(
+      1, static_cast<int>(work.right - work.left) - inset * 2);
+  const int maxHeight = std::max(
+      1, static_cast<int>(work.bottom - work.top) - inset * 2);
+  return SIZE{
+      std::min(std::max(1, ScaleForDpi(logicalWidth, dpi)), maxWidth),
+      std::min(std::max(1, ScaleForDpi(logicalHeight, dpi)), maxHeight)};
+}
+
+HFONT CreateDialogFont(HWND window) {
+  NONCLIENTMETRICSW metrics{sizeof(metrics)};
+  if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
+                             &metrics, 0)) {
+    return nullptr;
+  }
+  LOGFONTW font = metrics.lfMessageFont;
+  const UINT systemDpi = SystemDpi();
+  const UINT targetDpi = std::max(kBaseDpi, DpiForWindow(window));
+  font.lfHeight = MulDiv(font.lfHeight, static_cast<int>(targetDpi),
+                         static_cast<int>(std::max(kBaseDpi, systemDpi)));
+  return CreateFontIndirectW(&font);
+}
+
+void UseDefaultFont(HWND control, HFONT font = nullptr) {
   SendMessageW(control, WM_SETFONT,
-               reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+               reinterpret_cast<WPARAM>(font ? font
+                                              : GetStockObject(DEFAULT_GUI_FONT)),
+               TRUE);
 }
 
 void SetAccessibleName(HWND control, const wchar_t* name) {
@@ -59,15 +171,26 @@ std::wstring ControlText(HWND control) {
 
 void CenterOwnedWindow(HWND window, HWND owner) {
   RECT windowRect{};
-  RECT ownerRect{};
   GetWindowRect(window, &windowRect);
-  if (!owner || !GetWindowRect(owner, &ownerRect)) {
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &ownerRect, 0);
+  RECT centerRect{};
+  if (!owner || !IsWindowVisible(owner) || !GetWindowRect(owner, &centerRect)) {
+    centerRect = WorkAreaFor(owner);
   }
+  const RECT work = WorkAreaFor(owner);
   const int width = windowRect.right - windowRect.left;
   const int height = windowRect.bottom - windowRect.top;
-  const int left = ownerRect.left + (ownerRect.right - ownerRect.left - width) / 2;
-  const int top = ownerRect.top + (ownerRect.bottom - ownerRect.top - height) / 2;
+  const int centeredLeft =
+      centerRect.left + (centerRect.right - centerRect.left - width) / 2;
+  const int centeredTop =
+      centerRect.top + (centerRect.bottom - centerRect.top - height) / 2;
+  const int workLeft = static_cast<int>(work.left);
+  const int workTop = static_cast<int>(work.top);
+  const int workRight = static_cast<int>(work.right);
+  const int workBottom = static_cast<int>(work.bottom);
+  const int left = std::clamp(centeredLeft, workLeft,
+                              std::max(workLeft, workRight - width));
+  const int top = std::clamp(centeredTop, workTop,
+                             std::max(workTop, workBottom - height));
   SetWindowPos(window, nullptr, left, top, 0, 0,
                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -111,6 +234,10 @@ class EditorWindow {
     }
   }
 
+  ~EditorWindow() {
+    if (font_) DeleteObject(font_);
+  }
+
   bool Run() {
     Register();
     const wchar_t* title = L"Edit Library Item";
@@ -125,11 +252,13 @@ class EditorWindow {
     } else {
       title = editingIndex_ ? L"Edit Web Search" : L"Add Web Search";
     }
+    const SIZE windowSize = FitWindowSize(
+        owner_, 570, kind_ == library::ItemKind::Snippet ? 430 : 285);
     hwnd_ = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kEditorClass, title,
-        WS_CAPTION | WS_SYSMENU | WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 570,
-        kind_ == library::ItemKind::Snippet ? 430 : 285, owner_, nullptr,
-        GetModuleHandleW(nullptr), this);
+        WS_CAPTION | WS_SYSMENU | WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT,
+        windowSize.cx, windowSize.cy, owner_, nullptr, GetModuleHandleW(nullptr),
+        this);
     if (!hwnd_) return false;
     CenterOwnedWindow(hwnd_, owner_);
     EnableWindow(owner_, FALSE);
@@ -202,6 +331,23 @@ class EditorWindow {
         GetModuleHandleW(nullptr), nullptr);
     UseDefaultFont(control);
     return control;
+  }
+
+  void RefreshFont() {
+    HFONT next = CreateDialogFont(hwnd_);
+    if (!next) return;
+    const HFONT previous = font_;
+    font_ = next;
+    for (HWND control : {nameLabel_, name_, keywordLabel_, keyword_, valueLabel_,
+                         value_, save_, cancel_}) {
+      UseDefaultFont(control, font_);
+    }
+    if (previous) DeleteObject(previous);
+  }
+
+  void LayoutCurrentClient() const {
+    RECT client{};
+    if (GetClientRect(hwnd_, &client)) Layout(client.right, client.bottom);
   }
 
   void CreateControls() {
@@ -326,42 +472,56 @@ class EditorWindow {
   }
 
   void Layout(int width, int height) const {
-    constexpr int margin = 18;
-    constexpr int labelHeight = 20;
-    constexpr int editHeight = 27;
-    constexpr int gap = 12;
+    const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
+    const auto px = [dpi](int logicalPixels) {
+      return ScaleForDpi(logicalPixels, dpi);
+    };
+    const int margin = px(18);
+    const int labelHeight = px(20);
+    const int editHeight = px(27);
+    const int gap = px(12);
+    const int contentWidth = std::max(1, width - 2 * margin);
     int y = margin;
     if (kind_ != library::ItemKind::WebSearch) {
-      MoveWindow(nameLabel_, margin, y, width - 2 * margin, labelHeight, TRUE);
+      MoveWindow(nameLabel_, margin, y, contentWidth, labelHeight, TRUE);
       y += labelHeight;
-      MoveWindow(name_, margin, y, width - 2 * margin,
+      MoveWindow(name_, margin, y, contentWidth,
                  (kind_ == library::ItemKind::AppAlias ||
                   kind_ == library::ItemKind::CommandAlias)
-                     ? 240
+                     ? px(240)
                      : editHeight,
                  TRUE);
       y += editHeight + gap;
     }
-    MoveWindow(keywordLabel_, margin, y, width - 2 * margin, labelHeight, TRUE);
+    MoveWindow(keywordLabel_, margin, y, contentWidth, labelHeight, TRUE);
     y += labelHeight;
-    MoveWindow(keyword_, margin, y, width - 2 * margin, editHeight, TRUE);
+    MoveWindow(keyword_, margin, y, contentWidth, editHeight, TRUE);
     y += editHeight + gap;
     if (kind_ == library::ItemKind::AppAlias ||
         kind_ == library::ItemKind::CommandAlias) {
-      MoveWindow(cancel_, width - margin - 90, height - margin - 30, 90, 30,
-                 TRUE);
-      MoveWindow(save_, width - margin - 90 - gap - 90,
-                 height - margin - 30, 90, 30, TRUE);
+      const int buttonWidth = px(90);
+      const int buttonHeight = px(30);
+      const int buttonsTop = std::max(y, height - margin - buttonHeight);
+      MoveWindow(cancel_, std::max(margin, width - margin - buttonWidth),
+                 buttonsTop, buttonWidth, buttonHeight, TRUE);
+      MoveWindow(save_, std::max(margin, width - margin - buttonWidth - gap -
+                                         buttonWidth),
+                 buttonsTop, buttonWidth, buttonHeight, TRUE);
       return;
     }
-    MoveWindow(valueLabel_, margin, y, width - 2 * margin, labelHeight, TRUE);
+    MoveWindow(valueLabel_, margin, y, contentWidth, labelHeight, TRUE);
     y += labelHeight;
-    const int buttonsTop = height - margin - 30;
-    MoveWindow(value_, margin, y, width - 2 * margin,
+    const int buttonWidth = px(90);
+    const int buttonHeight = px(30);
+    const int buttonsTop = std::max(y + editHeight,
+                                   height - margin - buttonHeight);
+    MoveWindow(value_, margin, y, contentWidth,
                std::max(editHeight, buttonsTop - y - gap), TRUE);
-    MoveWindow(cancel_, width - margin - 90, buttonsTop, 90, 30, TRUE);
-    MoveWindow(save_, width - margin - 90 - gap - 90, buttonsTop, 90, 30,
-               TRUE);
+    MoveWindow(cancel_, std::max(margin, width - margin - buttonWidth),
+               buttonsTop, buttonWidth, buttonHeight, TRUE);
+    MoveWindow(save_, std::max(margin, width - margin - buttonWidth - gap -
+                                      buttonWidth),
+               buttonsTop, buttonWidth, buttonHeight, TRUE);
   }
 
   void Accept() {
@@ -439,10 +599,24 @@ class EditorWindow {
     switch (message) {
       case WM_CREATE:
         CreateControls();
+        RefreshFont();
         return 0;
       case WM_SIZE:
         Layout(LOWORD(lParam), HIWORD(lParam));
         return 0;
+      case WM_DPICHANGED: {
+        const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        if (suggested) {
+          SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                       suggested->right - suggested->left,
+                       suggested->bottom - suggested->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        RefreshFont();
+        LayoutCurrentClient();
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        return 0;
+      }
       case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
           Accept();
@@ -462,6 +636,7 @@ class EditorWindow {
 
   HWND owner_ = nullptr;
   HWND hwnd_ = nullptr;
+  HFONT font_ = nullptr;
   library::ItemKind kind_ = library::ItemKind::Snippet;
   std::vector<snippets::Snippet> snippets_;
   std::vector<settings::Quicklink> quicklinks_;
@@ -498,17 +673,22 @@ class ManagerWindow {
         kind_(initialKind),
         initialAppId_(std::move(initialAppId)) {}
 
+  ~ManagerWindow() {
+    if (font_) DeleteObject(font_);
+  }
+
   void Run() {
     Register();
     INITCOMMONCONTROLSEX controls{sizeof(controls),
                                   ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&controls);
+    const SIZE windowSize = FitWindowSize(owner_, 760, 530);
     hwnd_ = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kManagerClass,
         L"FeatherCast Library",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 760, 530, owner_, nullptr,
-        GetModuleHandleW(nullptr), this);
+        CW_USEDEFAULT, CW_USEDEFAULT, windowSize.cx, windowSize.cy, owner_,
+        nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return;
     CenterOwnedWindow(hwnd_, owner_);
     EnableWindow(owner_, FALSE);
@@ -570,6 +750,23 @@ class ManagerWindow {
     return control;
   }
 
+  void RefreshFont() {
+    HFONT next = CreateDialogFont(hwnd_);
+    if (!next) return;
+    const HFONT previous = font_;
+    font_ = next;
+    for (HWND control : {tabs_, list_, add_, edit_, remove_, reload_, openFile_,
+                         close_, status_}) {
+      UseDefaultFont(control, font_);
+    }
+    if (previous) DeleteObject(previous);
+  }
+
+  void LayoutCurrentClient() const {
+    RECT client{};
+    if (GetClientRect(hwnd_, &client)) Layout(client.right, client.bottom);
+  }
+
   void CreateControls() {
     tabs_ = AddControl(WC_TABCONTROLW, L"", WS_TABSTOP, IdTabs);
     TCITEMW tab{TCIF_TEXT};
@@ -594,13 +791,14 @@ class ManagerWindow {
         list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH};
     column.pszText = const_cast<wchar_t*>(L"Name");
-    column.cx = 190;
+    const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
+    column.cx = ScaleForDpi(190, dpi);
     ListView_InsertColumn(list_, 0, &column);
     column.pszText = const_cast<wchar_t*>(L"Keyword");
-    column.cx = 130;
+    column.cx = ScaleForDpi(130, dpi);
     ListView_InsertColumn(list_, 1, &column);
     column.pszText = const_cast<wchar_t*>(L"Text / Target");
-    column.cx = 360;
+    column.cx = ScaleForDpi(360, dpi);
     ListView_InsertColumn(list_, 2, &column);
 
     add_ = AddControl(WC_BUTTONW, L"Add", WS_TABSTOP, IdAdd);
@@ -612,6 +810,7 @@ class ManagerWindow {
     close_ = AddControl(WC_BUTTONW, L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON,
                         IDCANCEL);
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
+    RefreshFont();
     Refresh();
     if ((kind_ == library::ItemKind::AppAlias ||
          kind_ == library::ItemKind::CommandAlias) &&
@@ -654,27 +853,43 @@ class ManagerWindow {
   }
 
   void Layout(int width, int height) const {
-    constexpr int margin = 14;
-    constexpr int tabHeight = 30;
-    constexpr int buttonWidth = 90;
-    constexpr int buttonHeight = 30;
-    constexpr int gap = 8;
-    MoveWindow(tabs_, margin, margin, width - 2 * margin, tabHeight, TRUE);
-    const int buttonsTop = height - margin - buttonHeight;
-    const int statusTop = buttonsTop - 28;
-    MoveWindow(list_, margin, margin + tabHeight + 6, width - 2 * margin,
-               statusTop - (margin + tabHeight + 12), TRUE);
-    MoveWindow(status_, margin, statusTop, width - 2 * margin, 22, TRUE);
+    const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
+    const auto px = [dpi](int logicalPixels) {
+      return ScaleForDpi(logicalPixels, dpi);
+    };
+    const int margin = px(14);
+    const int tabHeight = px(30);
+    const int buttonHeight = px(30);
+    const int gap = px(8);
+    const int contentWidth = std::max(1, width - 2 * margin);
+    const int listTop = margin + tabHeight + px(6);
+    const int closeWidth = std::min(px(90), std::max(px(72), contentWidth / 6));
+    const int specialWidth = std::min(px(118), std::max(px(96), contentWidth / 5));
+    const int closeX = std::max(margin, width - margin - closeWidth);
+    const int specialX = std::max(margin, closeX - gap - specialWidth);
+    const int actionSpace = std::max(1, specialX - margin - gap * 4);
+    const int actionWidth = std::max(1, std::min(px(90), actionSpace / 4));
+    const int buttonsTop = std::max(listTop, height - margin - buttonHeight);
+    const int statusTop = std::max(listTop, buttonsTop - px(28));
+    const int listHeight = std::max(1, statusTop - listTop - px(12));
+    MoveWindow(tabs_, margin, margin, contentWidth, tabHeight, TRUE);
+    MoveWindow(list_, margin, listTop, contentWidth, listHeight, TRUE);
+    MoveWindow(status_, margin, statusTop, contentWidth, px(22), TRUE);
+    const int listColumnWidth = std::max(1, contentWidth - px(4));
+    const int nameColumn = listColumnWidth * 28 / 100;
+    const int keywordColumn = listColumnWidth * 20 / 100;
+    ListView_SetColumnWidth(list_, 0, std::max(1, nameColumn));
+    ListView_SetColumnWidth(list_, 1, std::max(1, keywordColumn));
+    ListView_SetColumnWidth(
+        list_, 2, std::max(1, listColumnWidth - nameColumn - keywordColumn));
     int x = margin;
     for (HWND button : {add_, edit_, remove_, reload_}) {
-      MoveWindow(button, x, buttonsTop, buttonWidth, buttonHeight, TRUE);
-      x += buttonWidth + gap;
+      MoveWindow(button, x, buttonsTop, actionWidth, buttonHeight, TRUE);
+      x += actionWidth + gap;
     }
-    constexpr int specialButtonWidth = 118;
-    MoveWindow(openFile_, x, buttonsTop, specialButtonWidth, buttonHeight,
+    MoveWindow(openFile_, specialX, buttonsTop, specialWidth, buttonHeight,
                TRUE);
-    MoveWindow(close_, width - margin - buttonWidth, buttonsTop, buttonWidth,
-               buttonHeight, TRUE);
+    MoveWindow(close_, closeX, buttonsTop, closeWidth, buttonHeight, TRUE);
   }
 
   bool Writable() const {
@@ -955,6 +1170,34 @@ class ManagerWindow {
       case WM_SIZE:
         Layout(LOWORD(lParam), HIWORD(lParam));
         return 0;
+      case WM_GETMINMAXINFO: {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        if (limits) {
+          const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
+          const RECT work = WorkAreaFor(hwnd_);
+          const int inset = ScaleForDpi(kWorkAreaInset, dpi);
+          const int maxWidth = std::max(
+              1, static_cast<int>(work.right - work.left) - inset * 2);
+          const int maxHeight = std::max(
+              1, static_cast<int>(work.bottom - work.top) - inset * 2);
+          limits->ptMinTrackSize.x = std::min(ScaleForDpi(520, dpi), maxWidth);
+          limits->ptMinTrackSize.y = std::min(ScaleForDpi(360, dpi), maxHeight);
+        }
+        return 0;
+      }
+      case WM_DPICHANGED: {
+        const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        if (suggested) {
+          SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                       suggested->right - suggested->left,
+                       suggested->bottom - suggested->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        RefreshFont();
+        LayoutCurrentClient();
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        return 0;
+      }
       case WM_NOTIFY: {
         const auto* header = reinterpret_cast<NMHDR*>(lParam);
         if (header->idFrom == IdTabs && header->code == TCN_SELCHANGE) {
@@ -1008,6 +1251,7 @@ class ManagerWindow {
 
   HWND owner_ = nullptr;
   HWND hwnd_ = nullptr;
+  HFONT font_ = nullptr;
   ManagerData data_;
   ManagerCallbacks callbacks_;
   library::ItemKind kind_ = library::ItemKind::Snippet;

@@ -1,5 +1,7 @@
 #include "capture_service.hpp"
 
+#include "screenshot_rasterizer.hpp"
+
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
@@ -23,6 +25,7 @@
 #include <exception>
 #include <format>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -610,14 +613,66 @@ class CaptureService::Impl {
     callback_ = std::move(callback);
   }
 
-  bool StartScreenshot(PixelRect bounds, CaptureScope scope) {
-    bounds = NormalizeRect(bounds);
-    if (bounds.Width() < 2 || bounds.Height() < 2) return false;
-    return StartWorker(CaptureState::StartingScreenshot,
-                       CaptureOperation::Screenshot, scope, bounds,
-                       [this, bounds, scope](std::stop_token token) {
-                         ScreenshotWorker(bounds, scope, token);
+  bool PrepareScreenshot(PixelRect sourceBounds, CaptureScope scope) {
+    sourceBounds = NormalizeRect(sourceBounds);
+    if (sourceBounds.Width() < 2 || sourceBounds.Height() < 2) return false;
+    return StartWorker(CaptureState::PreparingScreenshot,
+                       CaptureOperation::Screenshot, scope, sourceBounds,
+                       [this, sourceBounds, scope](std::stop_token token) {
+                         PrepareScreenshotWorker(sourceBounds, scope, token);
                        });
+  }
+
+  bool FinalizeScreenshot(
+      std::shared_ptr<const screenshot::Draft> draft, screenshot::Rect crop,
+      std::vector<screenshot::Annotation> annotations,
+      screenshot::Destination destination) {
+    if (!draft || !draft->Valid()) return false;
+    crop = screenshot::Normalize(crop);
+    if (crop.Empty() || crop.left < draft->sourceBounds.left ||
+        crop.top < draft->sourceBounds.top ||
+        crop.right > draft->sourceBounds.right ||
+        crop.bottom > draft->sourceBounds.bottom) {
+      return false;
+    }
+    std::jthread finished;
+    {
+      std::lock_guard lock(mutex_);
+      if (state_ != CaptureState::ScreenshotEditing) return false;
+      finished = std::move(worker_);
+    }
+    if (finished.joinable()) finished.join();
+    const PixelRect bounds{crop.left, crop.top, crop.right, crop.bottom};
+    if (bounds.Width() < 2 || bounds.Height() < 2) return false;
+    {
+      std::lock_guard lock(mutex_);
+      if (state_ != CaptureState::ScreenshotEditing) return false;
+      const CaptureScope scope = scope_;
+      state_ = CaptureState::StartingScreenshot;
+      stopRequested_ = false;
+      worker_ = std::jthread(
+          [this, draft = std::move(draft), crop,
+           annotations = std::move(annotations), destination,
+           scope](std::stop_token token) mutable {
+            ScreenshotOutputWorker(std::move(draft), crop,
+                                   std::move(annotations), destination, scope,
+                                   token);
+          });
+    }
+    return true;
+  }
+
+  bool CancelScreenshot() {
+    CaptureState current = state_.load();
+    if (current == CaptureState::ScreenshotEditing) {
+      state_ = CaptureState::Idle;
+      return true;
+    }
+    if (current == CaptureState::PreparingScreenshot ||
+        current == CaptureState::StartingScreenshot) {
+      return Stop();
+    }
+    return false;
   }
 
   bool StartRecording(PixelRect bounds, CaptureScope scope) {
@@ -748,43 +803,115 @@ class CaptureService::Impl {
           Elapsed(), false});
   }
 
-  void ScreenshotWorker(PixelRect bounds, CaptureScope scope,
-                        std::stop_token token) {
-    std::filesystem::path temporary;
+  void PrepareScreenshotWorker(PixelRect sourceBounds, CaptureScope scope,
+                               std::stop_token token) {
     try {
       ComApartment apartment;
       Emit({CaptureEventKind::Started, CaptureOperation::Screenshot, scope,
-            bounds});
+            sourceBounds});
       if (token.stop_requested() || stopRequested_) {
         Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
-                  scope, bounds, {}, L"Screenshot canceled."});
+                  scope, sourceBounds, {}, L"Screenshot canceled."});
         return;
       }
-      auto pixels = CaptureDesktopPixels(bounds);
+      const std::uint64_t pixelCount =
+          static_cast<std::uint64_t>(sourceBounds.Width()) *
+          static_cast<std::uint64_t>(sourceBounds.Height());
+      if (pixelCount == 0 || pixelCount > 40ULL * 1000 * 1000) {
+        throw std::runtime_error(
+            "The desktop is too large to keep a screenshot preview in memory.");
+      }
+      auto pixels = CaptureDesktopPixels(sourceBounds);
+      if (token.stop_requested() || stopRequested_) {
+        Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+                  scope, sourceBounds, {}, L"Screenshot canceled."});
+        return;
+      }
       for (std::size_t index = 3; index < pixels.size(); index += 4) {
         pixels[index] = 0xFF;
       }
-      const auto output = NextOutputPaths(CaptureOperation::Screenshot);
-      temporary = output.partialPath;
-      EncodePng(temporary, pixels, bounds.Width(), bounds.Height());
-      if (!MoveFileExW(temporary.c_str(), output.finalPath.c_str(),
-                       MOVEFILE_WRITE_THROUGH)) {
-        winrt::check_hresult(HRESULT_FROM_WIN32(GetLastError()));
+      auto draft = std::make_shared<screenshot::Draft>();
+      draft->sourceBounds = {sourceBounds.left, sourceBounds.top,
+                             sourceBounds.right, sourceBounds.bottom};
+      draft->width = static_cast<std::uint32_t>(sourceBounds.Width());
+      draft->height = static_cast<std::uint32_t>(sourceBounds.Height());
+      draft->stride = draft->width * 4u;
+      draft->pixels = std::make_shared<const std::vector<std::uint8_t>>(
+          std::move(pixels));
+      state_ = CaptureState::ScreenshotEditing;
+      Emit({CaptureEventKind::ScreenshotReady, CaptureOperation::Screenshot,
+            scope, sourceBounds, {}, {}, {}, false, std::move(draft)});
+    } catch (...) {
+      Fail(CaptureOperation::Screenshot, scope, sourceBounds);
+    }
+  }
+
+  void ScreenshotOutputWorker(
+      std::shared_ptr<const screenshot::Draft> draft, screenshot::Rect crop,
+      std::vector<screenshot::Annotation> annotations,
+      screenshot::Destination destination, CaptureScope scope,
+      std::stop_token token) {
+    std::filesystem::path temporary;
+    try {
+      ComApartment apartment;
+      if (token.stop_requested() || stopRequested_) {
+        Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+                  scope, {crop.left, crop.top, crop.right, crop.bottom}, {},
+                  L"Screenshot canceled."});
+        return;
       }
-      temporary.clear();
-      const bool clipboard =
-          PublishClipboard(pixels, bounds.Width(), bounds.Height());
+      std::wstring renderError;
+      const auto rendered = screenshot::Render(*draft, crop, annotations,
+                                               &renderError);
+      if (!rendered) {
+        state_ = CaptureState::ScreenshotEditing;
+        Emit({CaptureEventKind::ScreenshotOutputFailed,
+              CaptureOperation::Screenshot, scope,
+              {crop.left, crop.top, crop.right, crop.bottom}, {}, renderError,
+              {}, false, std::move(draft)});
+        return;
+      }
+
+      const PixelRect outputBounds{crop.left, crop.top, crop.right, crop.bottom};
+      if (destination == screenshot::Destination::File) {
+        const auto output = NextOutputPaths(CaptureOperation::Screenshot);
+        temporary = output.partialPath;
+        EncodePng(temporary, rendered->pixels,
+                  static_cast<int>(rendered->width),
+                  static_cast<int>(rendered->height));
+        if (!MoveFileExW(temporary.c_str(), output.finalPath.c_str(),
+                         MOVEFILE_WRITE_THROUGH)) {
+          winrt::check_hresult(HRESULT_FROM_WIN32(GetLastError()));
+        }
+        temporary.clear();
+        Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+                  scope, outputBounds, output.finalPath, {}, {}, false});
+        return;
+      }
+
+      if (!PublishClipboard(rendered->pixels, static_cast<int>(rendered->width),
+                            static_cast<int>(rendered->height))) {
+        throw std::runtime_error(
+            "Windows could not copy the screenshot to the clipboard.");
+      }
       Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
-                scope, bounds, output.finalPath,
-                clipboard ? L""
-                          : L"Screenshot saved, but the clipboard was busy.",
-                {}, clipboard});
+                scope, outputBounds, {}, {}, {}, true});
     } catch (...) {
       if (!temporary.empty()) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
       }
-      Fail(CaptureOperation::Screenshot, scope, bounds);
+      if (token.stop_requested() || stopRequested_) {
+        Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+                  scope, {crop.left, crop.top, crop.right, crop.bottom}, {},
+                  L"Screenshot canceled."});
+        return;
+      }
+      state_ = CaptureState::ScreenshotEditing;
+      Emit({CaptureEventKind::ScreenshotOutputFailed,
+            CaptureOperation::Screenshot, scope,
+            {crop.left, crop.top, crop.right, crop.bottom}, temporary,
+            CurrentExceptionMessage(), {}, false, std::move(draft)});
     }
   }
 
@@ -954,8 +1081,19 @@ CaptureService::~CaptureService() { delete impl_; }
 void CaptureService::SetCallback(Callback callback) {
   impl_->SetCallback(std::move(callback));
 }
-bool CaptureService::StartScreenshot(PixelRect bounds, CaptureScope scope) {
-  return impl_->StartScreenshot(bounds, scope);
+bool CaptureService::PrepareScreenshot(PixelRect sourceBounds,
+                                       CaptureScope scope) {
+  return impl_->PrepareScreenshot(sourceBounds, scope);
+}
+bool CaptureService::FinalizeScreenshot(
+    std::shared_ptr<const screenshot::Draft> draft, screenshot::Rect crop,
+    std::vector<screenshot::Annotation> annotations,
+    screenshot::Destination destination) {
+  return impl_->FinalizeScreenshot(std::move(draft), crop,
+                                   std::move(annotations), destination);
+}
+bool CaptureService::CancelScreenshot() {
+  return impl_->CancelScreenshot();
 }
 bool CaptureService::StartRecording(PixelRect bounds, CaptureScope scope) {
   return impl_->StartRecording(bounds, scope);

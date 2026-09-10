@@ -284,7 +284,8 @@ jobs:
           if (Test-Path $installRoot) {
             Remove-Item -LiteralPath $installRoot -Recurse -Force
           }
-          $installArguments = @('/S', ('/D="' + $installRoot + '"'))
+          # NSIS requires /D= to be the final argument and does not accept quotes.
+          $installArguments = @('/S', ('/D=' + $installRoot))
 
           # Exercise a real in-place upgrade when a published predecessor exists.
           $previousTag = $null

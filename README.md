@@ -24,8 +24,8 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - Native Library manager for creating, editing, and deleting snippets and quicklinks
 - Local time, date, ISO-week, Unix-time, and UUID utilities
 - Searchable Windows settings plus volume, media playback, and Show Desktop commands
-- Full-display and cross-monitor region screenshots saved as PNG and copied to
-  the clipboard
+- Full-display and cross-monitor region screenshots with a native editor for
+  crop handles, annotations, blur, pixelate, and undo/redo
 - Silent full-display and cross-monitor region screen recording with an
   excluded Pause/Resume/Stop control bar
 - Searchable “Discover FeatherCast” guide with feature examples and shortcuts
@@ -69,6 +69,13 @@ Clipboard History** also deletes favorites.
 | Open Settings | Gear button or tray menu |
 | Browse feature guide | Search for `help` or `Discover FeatherCast` |
 
+`Print Screen` opens the region selector and then the screenshot editor. The
+selection remains editable until you choose Save or Copy; nothing is written
+automatically. The regular configurable screenshot shortcuts remain available
+for fullscreen and region capture. If Windows opens Snipping Tool instead, go
+to Settings > Accessibility > Keyboard and turn off “Use the Print Screen
+button to open screen snipping”.
+
 Useful searches include `time`, `date`, `week number`, `unix timestamp`,
 `generate uuid`, `screenshot`, `record screen`, `display settings`, `volume
 up`, and `play or pause media`.
@@ -93,8 +100,14 @@ sync owned libraries or store launcher credentials.
 
 The tray icon runs in the background. Left-click opens search; right-click opens the menu.
 
-Screenshots are saved under `Pictures\FeatherCast` and are copied to the
-clipboard. Silent H.264 MP4 recordings are saved under `Videos\FeatherCast`.
+Screenshots open in a static native editor. Nothing is written to disk or the
+clipboard until you choose **Save** or **Copy**. Save writes a PNG under
+`Pictures\FeatherCast`; Copy publishes only the final image to the clipboard.
+Drag the initial region, then move or resize it with the eight handles. The
+toolbar supports boxes, ovals, lines, arrows, freehand marks, text, blur,
+pixelate, colors, and stroke width. `Ctrl+S`, `Ctrl+C`, `Ctrl+Z`, and `Ctrl+Y`
+save, copy, undo, and redo; `Esc` cancels the current gesture before closing
+the editor. Silent H.264 MP4 recordings are saved under `Videos\FeatherCast`.
 Fullscreen capture uses the display under the pointer; region selection can
 span displays. The four optional direct capture shortcuts are unassigned until
 configured in Settings.

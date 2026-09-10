@@ -432,6 +432,7 @@ class Storage {
                           "(text, preview, captured_at, content_hash, encrypted, id, pinned) "
                           "VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                           "text=excluded.text,preview=excluded.preview,captured_at=excluded.captured_at;")) {
+        CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
@@ -443,6 +444,7 @@ class Storage {
       else sqlite3_bind_null(insert.get(), 5);
       sqlite3_bind_int(insert.get(), 6, pinned ? 1 : 0);
       if (sqlite3_step(insert.get()) != SQLITE_DONE) {
+        CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
