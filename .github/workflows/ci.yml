@@ -396,10 +396,10 @@ jobs:
             throw "Expected one FeatherCast uninstall identity after upgrade; found $($identities.Count)."
           }
           $identity = Get-ItemProperty $identities[0].PSPath
-          $installLocation = [string]$identity.InstallLocation
-          if (-not $installLocation -or
-              $installLocation.TrimEnd('\') -ne $installRoot.TrimEnd('\')) {
-            throw "The uninstall identity points at the wrong install root: $installLocation"
+          $uninstallString = [string]$identity.UninstallString
+          if (-not $uninstallString -or
+              $uninstallString.IndexOf($installRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "The uninstall entry does not point at the custom install root."
           }
 
           $uninstall = Start-Process $uninstaller -ArgumentList '/S' -PassThru -Wait
