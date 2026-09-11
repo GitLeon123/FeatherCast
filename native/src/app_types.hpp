@@ -294,6 +294,7 @@ struct ShortcutInfo {
   std::wstring cwd;
   std::wstring iconPath;
   int iconIndex = 0;
+  std::wstring appUserModelId;
 };
 
 struct AppEntry {

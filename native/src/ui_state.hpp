@@ -128,9 +128,32 @@ struct PixelRect {
   constexpr bool operator==(const PixelRect&) const = default;
 };
 
+inline PixelRect Normalize(PixelRect rect) noexcept {
+  if (rect.left > rect.right) std::swap(rect.left, rect.right);
+  if (rect.top > rect.bottom) std::swap(rect.top, rect.bottom);
+  return rect;
+}
+
+inline PixelRect Clamp(PixelRect rect, PixelRect bounds,
+                       int minimumSize = 2) noexcept {
+  bounds = Normalize(bounds);
+  rect = Normalize(rect);
+  if (bounds.Width() <= 0 || bounds.Height() <= 0) return bounds;
+  const int minWidth = std::max(1, std::min(minimumSize, bounds.Width()));
+  const int minHeight = std::max(1, std::min(minimumSize, bounds.Height()));
+  const int width = std::clamp(rect.Width(), minWidth, bounds.Width());
+  const int height = std::clamp(rect.Height(), minHeight, bounds.Height());
+  rect.left = std::clamp(rect.left, bounds.left, bounds.right - width);
+  rect.top = std::clamp(rect.top, bounds.top, bounds.bottom - height);
+  rect.right = rect.left + width;
+  rect.bottom = rect.top + height;
+  return rect;
+}
+
 struct CaptureUiState {
   CapturePhase phase = CapturePhase::Idle;
   CaptureShortcutTarget target = CaptureShortcutTarget::None;
+  PixelRect sourceBounds;
   std::optional<PixelPoint> selectionStart;
   std::optional<PixelPoint> selectionEnd;
   std::uint64_t elapsedMilliseconds = 0;
@@ -138,14 +161,20 @@ struct CaptureUiState {
   int controlHover = -1;
 };
 
+enum class CaptureKey { Left, Up, Right, Down, Enter, Escape };
+
+enum class CaptureKeyboardResult { Ignored, Moved, Confirmed, Cancelled };
+
 class CaptureUiController {
  public:
-  static bool Begin(CaptureUiState& state, CaptureShortcutTarget target) {
+  static bool Begin(CaptureUiState& state, CaptureShortcutTarget target,
+                    PixelRect sourceBounds = {}) {
     if (state.phase != CapturePhase::Idle ||
         target == CaptureShortcutTarget::None) {
       return false;
     }
     state.target = target;
+    state.sourceBounds = Normalize(sourceBounds);
     state.selectionStart.reset();
     state.selectionEnd.reset();
     state.elapsedMilliseconds = 0;
@@ -169,8 +198,34 @@ class CaptureUiController {
     return true;
   }
 
+  static void SetBounds(CaptureUiState& state, PixelRect bounds) {
+    state.sourceBounds = Normalize(bounds);
+    if (state.selectionStart && state.sourceBounds.Width() > 0 &&
+        state.sourceBounds.Height() > 0) {
+      state.selectionStart = PixelPoint{
+          std::clamp(state.selectionStart->x, state.sourceBounds.left,
+                     state.sourceBounds.right),
+          std::clamp(state.selectionStart->y, state.sourceBounds.top,
+                     state.sourceBounds.bottom)};
+    }
+    if (state.selectionEnd && state.sourceBounds.Width() > 0 &&
+        state.sourceBounds.Height() > 0) {
+      state.selectionEnd = PixelPoint{
+          std::clamp(state.selectionEnd->x, state.sourceBounds.left,
+                     state.sourceBounds.right),
+          std::clamp(state.selectionEnd->y, state.sourceBounds.top,
+                     state.sourceBounds.bottom)};
+    }
+  }
+
   static bool BeginSelection(CaptureUiState& state, PixelPoint point) {
     if (!IsSelecting(state)) return false;
+    if (state.sourceBounds.Width() > 0 && state.sourceBounds.Height() > 0) {
+      point.x = std::clamp(point.x, state.sourceBounds.left,
+                           state.sourceBounds.right);
+      point.y = std::clamp(point.y, state.sourceBounds.top,
+                           state.sourceBounds.bottom);
+    }
     state.selectionStart = point;
     state.selectionEnd = point;
     return true;
@@ -178,6 +233,12 @@ class CaptureUiController {
 
   static bool UpdateSelection(CaptureUiState& state, PixelPoint point) {
     if (!IsSelecting(state) || !state.selectionStart) return false;
+    if (state.sourceBounds.Width() > 0 && state.sourceBounds.Height() > 0) {
+      point.x = std::clamp(point.x, state.sourceBounds.left,
+                           state.sourceBounds.right);
+      point.y = std::clamp(point.y, state.sourceBounds.top,
+                           state.sourceBounds.bottom);
+    }
     state.selectionEnd = point;
     return true;
   }
@@ -188,6 +249,98 @@ class CaptureUiController {
                       ? CapturePhase::StartingScreenshot
                       : CapturePhase::StartingRecording;
     return true;
+  }
+
+  static bool EnsureKeyboardSelection(CaptureUiState& state) {
+    if (!IsSelecting(state) || state.sourceBounds.Width() < 2 ||
+        state.sourceBounds.Height() < 2) {
+      return false;
+    }
+    if (state.selectionStart && state.selectionEnd) return true;
+    const PixelRect bounds = Normalize(state.sourceBounds);
+    const int width = std::min(bounds.Width(), std::max(2, std::min(320,
+                                                                      bounds.Width())));
+    const int height = std::min(bounds.Height(), std::max(2, std::min(200,
+                                                                        bounds.Height())));
+    const int left = bounds.left + (bounds.Width() - width) / 2;
+    const int top = bounds.top + (bounds.Height() - height) / 2;
+    state.selectionStart = PixelPoint{left, top};
+    state.selectionEnd = PixelPoint{left + width, top + height};
+    return true;
+  }
+
+  static bool MoveKeyboardSelection(CaptureUiState& state, int horizontal,
+                                    int vertical, bool resize,
+                                    int step = 1) {
+    if (!EnsureKeyboardSelection(state) || (horizontal == 0 && vertical == 0)) {
+      return false;
+    }
+    const auto before = SelectionRect(state);
+    if (!before) return false;
+    PixelRect next = *before;
+    const PixelRect bounds = Normalize(state.sourceBounds);
+    const int increment = std::max(1, step);
+    if (resize) {
+      if (horizontal < 0) next.right = std::max(next.left + 2,
+                                                 next.right - increment);
+      if (horizontal > 0) next.right = std::min(bounds.right,
+                                                 next.right + increment);
+      if (vertical < 0) next.bottom = std::max(next.top + 2,
+                                               next.bottom - increment);
+      if (vertical > 0) next.bottom = std::min(bounds.bottom,
+                                               next.bottom + increment);
+    } else {
+      const int dx = horizontal == 0 ? 0 : (horizontal < 0 ? -increment : increment);
+      const int dy = vertical == 0 ? 0 : (vertical < 0 ? -increment : increment);
+      const int width = next.Width();
+      const int height = next.Height();
+      next.left = std::clamp(next.left + dx, bounds.left,
+                             bounds.right - width);
+      next.top = std::clamp(next.top + dy, bounds.top,
+                            bounds.bottom - height);
+      next.right = next.left + width;
+      next.bottom = next.top + height;
+    }
+    next = Clamp(next, bounds);
+    state.selectionStart = PixelPoint{next.left, next.top};
+    state.selectionEnd = PixelPoint{next.right, next.bottom};
+    return before != next;
+  }
+
+  static bool ConfirmSelection(CaptureUiState& state) {
+    if (!IsSelecting(state)) return false;
+    const auto selection = SelectionRect(state);
+    if (!selection || selection->Width() < 2 || selection->Height() < 2) {
+      return false;
+    }
+    state.phase = state.phase == CapturePhase::SelectingScreenshot
+                      ? CapturePhase::StartingScreenshot
+                      : CapturePhase::StartingRecording;
+    return true;
+  }
+
+  static CaptureKeyboardResult HandleSelectionKey(
+      CaptureUiState& state, CaptureKey key, bool shift = false,
+      bool control = false) {
+    if (key == CaptureKey::Escape) return CaptureKeyboardResult::Cancelled;
+    if (key == CaptureKey::Enter) {
+      return ConfirmSelection(state) ? CaptureKeyboardResult::Confirmed
+                                     : CaptureKeyboardResult::Ignored;
+    }
+    int horizontal = 0;
+    int vertical = 0;
+    switch (key) {
+      case CaptureKey::Left: horizontal = -1; break;
+      case CaptureKey::Right: horizontal = 1; break;
+      case CaptureKey::Up: vertical = -1; break;
+      case CaptureKey::Down: vertical = 1; break;
+      case CaptureKey::Enter:
+      case CaptureKey::Escape: return CaptureKeyboardResult::Ignored;
+    }
+    return MoveKeyboardSelection(state, horizontal, vertical, shift,
+                                 control ? 10 : 1)
+               ? CaptureKeyboardResult::Moved
+               : CaptureKeyboardResult::Ignored;
   }
 
   static std::optional<PixelRect> SelectionRect(const CaptureUiState& state) {

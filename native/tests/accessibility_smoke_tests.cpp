@@ -344,10 +344,134 @@ void VerifyAccessibleModelTransport() {
   accessible->Release();
 }
 
+void VerifyScreenshotEditorAccessibility() {
+  using namespace feathercast::accessibility;
+
+  Item selectButton;
+  selectButton.name = L"Select";
+  selectButton.defaultAction = L"Select";
+  selectButton.role = ROLE_SYSTEM_PUSHBUTTON;
+  selectButton.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_FOCUSED;
+  selectButton.screenRect = RECT{10, 10, 70, 42};
+
+  Item undoButton;
+  undoButton.name = L"Undo";
+  undoButton.defaultAction = L"Undo";
+  undoButton.role = ROLE_SYSTEM_PUSHBUTTON;
+  undoButton.state = STATE_SYSTEM_UNAVAILABLE;
+  undoButton.screenRect = RECT{74, 10, 130, 42};
+
+  Item textItem;
+  textItem.name = L"Annotation text";
+  textItem.value = L"Header note";
+  textItem.description = L"Type the text to place on the screenshot.";
+  textItem.defaultAction = L"Edit annotation text";
+  textItem.role = ROLE_SYSTEM_TEXT;
+  textItem.state = STATE_SYSTEM_FOCUSABLE;
+  textItem.screenRect = RECT{100, 100, 300, 150};
+
+  Item cropItem;
+  cropItem.name = L"Screenshot selection";
+  cropItem.description =
+      L"Use arrow keys to move. Hold Shift to resize and Ctrl for 10 pixel increments.";
+  cropItem.defaultAction = L"Move or resize selection";
+  cropItem.role = ROLE_SYSTEM_SLIDER;
+  cropItem.value = L"x 100, y 100, 200 by 150 pixels";
+  cropItem.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE;
+  cropItem.screenRect = RECT{100, 100, 300, 250};
+
+  Item statusItem;
+  statusItem.name = L"Screenshot status";
+  statusItem.value = L"Preparing screenshot...";
+  statusItem.role = ROLE_SYSTEM_STATICTEXT;
+  statusItem.state = STATE_SYSTEM_READONLY;
+  statusItem.screenRect = RECT{16, 700, 984, 730};
+
+  TestModel model;
+  model.items = {std::move(selectButton), std::move(undoButton),
+                 std::move(textItem), std::move(cropItem),
+                 std::move(statusItem)};
+  model.focusedChild = 1;
+
+  auto* accessible = new Window(&model, nullptr);
+
+  LONG childCount = 0;
+  assert(accessible->get_accChildCount(&childCount) == S_OK);
+  assert(childCount == 5);
+
+  BSTR text = nullptr;
+  VARIANT role;
+  VARIANT state;
+
+  // Child 1: Select button
+  assert(accessible->get_accName(Child(1), &text) == S_OK);
+  assert(TakeString(text) == L"Select");
+  assert(accessible->get_accRole(Child(1), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_PUSHBUTTON);
+  assert(accessible->get_accState(Child(1), &state) == S_OK);
+  assert((state.lVal & STATE_SYSTEM_FOCUSED) != 0);
+
+  // Child 2: Undo button (unavailable)
+  assert(accessible->get_accName(Child(2), &text) == S_OK);
+  assert(TakeString(text) == L"Undo");
+  assert(accessible->get_accState(Child(2), &state) == S_OK);
+  assert((state.lVal & STATE_SYSTEM_UNAVAILABLE) != 0);
+
+  // Child 3: Text item
+  assert(accessible->get_accName(Child(3), &text) == S_OK);
+  assert(TakeString(text) == L"Annotation text");
+  assert(accessible->get_accValue(Child(3), &text) == S_OK);
+  assert(TakeString(text) == L"Header note");
+  assert(accessible->get_accRole(Child(3), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_TEXT);
+
+  // Child 4: Crop / selection slider
+  assert(accessible->get_accName(Child(4), &text) == S_OK);
+  assert(TakeString(text) == L"Screenshot selection");
+  assert(accessible->get_accValue(Child(4), &text) == S_OK);
+  assert(TakeString(text) == L"x 100, y 100, 200 by 150 pixels");
+  assert(accessible->get_accRole(Child(4), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_SLIDER);
+
+  // Child 5: Status text
+  assert(accessible->get_accName(Child(5), &text) == S_OK);
+  assert(TakeString(text) == L"Screenshot status");
+  assert(accessible->get_accValue(Child(5), &text) == S_OK);
+  assert(TakeString(text) == L"Preparing screenshot...");
+  assert(accessible->get_accRole(Child(5), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_STATICTEXT);
+
+  // Focus
+  VARIANT focus;
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == 1);
+
+  // Hit testing
+  VARIANT hit;
+  assert(accessible->accHitTest(25, 25, &hit) == S_OK);
+  assert(hit.vt == VT_I4 && hit.lVal == 1);
+  assert(accessible->accHitTest(200, 200, &hit) == S_OK);
+  assert(hit.vt == VT_I4 && hit.lVal == 4);
+
+  // Navigation
+  VARIANT destination;
+  assert(accessible->accNavigate(NAVDIR_FIRSTCHILD, Child(CHILDID_SELF),
+                                 &destination) == S_OK);
+  assert(destination.lVal == 1);
+  assert(accessible->accNavigate(NAVDIR_NEXT, Child(1), &destination) == S_OK);
+  assert(destination.lVal == 2);
+  assert(accessible->accNavigate(NAVDIR_LASTCHILD, Child(CHILDID_SELF),
+                                 &destination) == S_OK);
+  assert(destination.lVal == 5);
+
+  accessible->Release();
+}
+
 }  // namespace
 
 int main() {
   VerifyLiveStatusProjection();
   VerifyAccessibleModelTransport();
+  VerifyScreenshotEditorAccessibility();
   return 0;
 }
