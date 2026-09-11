@@ -1,4 +1,4 @@
-﻿#include "calculator.hpp"
+#include "calculator.hpp"
 #include "converter.hpp"
 #include "app_types.hpp"
 #include "background_executor.hpp"
@@ -1161,6 +1161,128 @@ int main() {
       return std::find(terminalKeywords.begin(), terminalKeywords.end(), word) != terminalKeywords.end();
     };
     assert(has(L"wt") && has(L"shell") && has(L"terminal"));
+
+    // Test ShouldMergeApps and MergeAppEntries
+    feathercast::app::AppEntry shortcutApp;
+    shortcutApp.id = L"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Discord.lnk";
+    shortcutApp.name = L"Discord";
+    shortcutApp.targetPath = L"C:\\Users\\User\\AppData\\Local\\Discord\\app-1.0.9000\\Discord.exe";
+    shortcutApp.launchType = feathercast::app::LaunchType::Shortcut;
+    shortcutApp.launchTarget = shortcutApp.id;
+    shortcutApp.source = L"shortcut";
+    shortcutApp.adminSupported = true;
+
+    feathercast::app::AppEntry appsFolderApp;
+    appsFolderApp.id = L"start:com.squirrel.Discord.Discord";
+    appsFolderApp.name = L"Discord";
+    appsFolderApp.appUserModelId = L"com.squirrel.Discord.Discord";
+    appsFolderApp.launchType = feathercast::app::LaunchType::AppsFolder;
+    appsFolderApp.launchTarget = L"com.squirrel.Discord.Discord";
+    appsFolderApp.source = L"start";
+    appsFolderApp.adminSupported = false;
+
+    // Same name, AppsFolder lacks targetPath -> must merge
+    assert(fd::ShouldMergeApps(shortcutApp, appsFolderApp));
+    assert(fd::ShouldMergeApps(appsFolderApp, shortcutApp));
+
+    // When merging AppsFolder into Shortcut, preserve shortcut launchType and add AUMID
+    auto mergedA = shortcutApp;
+    fd::MergeAppEntries(mergedA, appsFolderApp);
+    assert(mergedA.name == L"Discord");
+    assert(mergedA.launchType == feathercast::app::LaunchType::Shortcut);
+    assert(mergedA.targetPath == shortcutApp.targetPath);
+    assert(mergedA.appUserModelId == L"com.squirrel.Discord.Discord");
+    assert(mergedA.adminSupported == true);
+
+    // When merging Shortcut into AppsFolder, upgrade launchType to Shortcut and keep AUMID
+    auto mergedB = appsFolderApp;
+    fd::MergeAppEntries(mergedB, shortcutApp);
+    assert(mergedB.name == L"Discord");
+    assert(mergedB.launchType == feathercast::app::LaunchType::Shortcut);
+    assert(mergedB.targetPath == shortcutApp.targetPath);
+    assert(mergedB.appUserModelId == L"com.squirrel.Discord.Discord");
+    assert(mergedB.adminSupported == true);
+
+    // Desktop shortcut and Start Menu shortcut pointing to same executable
+    feathercast::app::AppEntry desktopApp;
+    desktopApp.id = L"C:\\Users\\User\\Desktop\\Discord.lnk";
+    desktopApp.name = L"Discord";
+    desktopApp.targetPath = L"c:/users/user/appdata/local/discord/app-1.0.9000/discord.exe";
+    desktopApp.launchType = feathercast::app::LaunchType::Shortcut;
+    desktopApp.launchTarget = desktopApp.id;
+    desktopApp.source = L"shortcut";
+    assert(fd::ShouldMergeApps(shortcutApp, desktopApp));
+
+    // Two apps with same name but DIFFERENT target executables (e.g. Unity versions) must NOT merge
+    feathercast::app::AppEntry unity1;
+    unity1.id = L"C:\\Shortcuts\\Unity1.lnk";
+    unity1.name = L"Unity";
+    unity1.targetPath = L"C:\\Program Files\\Unity\\6000.4\\Editor\\Unity.exe";
+
+    feathercast::app::AppEntry unity2;
+    unity2.id = L"C:\\Shortcuts\\Unity2.lnk";
+    unity2.name = L"Unity";
+    unity2.targetPath = L"C:\\Program Files\\Unity\\6000.6\\Editor\\Unity.exe";
+
+    assert(!fd::ShouldMergeApps(unity1, unity2));
+
+    // App with unexpanded %windir% target and expanded target must match
+    feathercast::app::AppEntry rawWindirApp;
+    rawWindirApp.id = L"C:\\Shortcuts\\Magnify.lnk";
+    rawWindirApp.name = L"Magnify";
+    rawWindirApp.targetPath = L"%windir%\\system32\\magnify.exe";
+
+    feathercast::app::AppEntry expandedWindirApp;
+    expandedWindirApp.id = L"start:{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\magnify.exe";
+    expandedWindirApp.name = L"Magnifier";
+    wchar_t winDir[MAX_PATH]{};
+    GetWindowsDirectoryW(winDir, MAX_PATH);
+    expandedWindirApp.targetPath = std::wstring(winDir) + L"\\system32\\magnify.exe";
+
+    assert(fd::ShouldMergeApps(rawWindirApp, expandedWindirApp));
+
+    // StripCopySuffix & CleanName tests
+    assert(fd::CleanName(L"Developer Command Prompt for VS (2)") == L"Developer Command Prompt for VS");
+    assert(fd::CleanName(L"x64 Native Tools Command Prompt for VS (2).lnk") == L"x64 Native Tools Command Prompt for VS");
+    assert(fd::CleanName(L"App - Copy.lnk") == L"App");
+    assert(fd::CleanName(L"App - Kopie.lnk") == L"App");
+    assert(fd::CleanName(L"App - Kopie (2).lnk") == L"App");
+    assert(fd::CleanName(L"Python 3.14 (64-bit)") == L"Python 3.14 (64-bit)");
+    assert(fd::CleanName(L"PowerShell 7 (x64)") == L"PowerShell 7 (x64)");
+
+    // DisambiguateShortcutName tests
+    assert(fd::DisambiguateShortcutName(L"Unity", L"C:\\Programs\\Unity 6000.4.4f1\\Unity.lnk") == L"Unity 6000.4.4f1");
+    assert(fd::DisambiguateShortcutName(L"Report a Problem with Unity", L"C:\\Programs\\Unity 6000.4.4f1\\Report a Problem with Unity.lnk") == L"Report a Problem with Unity (Unity 6000.4.4f1)");
+    assert(fd::DisambiguateShortcutName(L"Discord", L"C:\\Programs\\Discord\\Discord.lnk") == L"Discord");
+    assert(fd::DisambiguateShortcutName(L"Python 3.14 (64-bit)", L"C:\\Programs\\Python 3.14\\Python 3.14 (64-bit).lnk") == L"Python 3.14 (64-bit)");
+
+    // IsHostExecutable tests
+    assert(fd::IsHostExecutable(L"C:\\Windows\\System32\\cmd.exe"));
+    assert(fd::IsHostExecutable(L"powershell.exe"));
+    assert(fd::IsHostExecutable(L"C:\\Windows\\SysWOW64\\msiexec.exe"));
+    assert(!fd::IsHostExecutable(L"C:\\Program Files\\Discord\\Discord.exe"));
+    assert(!fd::IsHostExecutable(L"C:\\Program Files\\Unity\\Editor\\Unity.exe"));
+
+    // Host executables with different names must NOT merge
+    feathercast::app::AppEntry cmdApp1;
+    cmdApp1.id = L"C:\\Shortcuts\\Prompt1.lnk";
+    cmdApp1.name = L"Developer Command Prompt for VS";
+    cmdApp1.targetPath = L"C:\\Windows\\System32\\cmd.exe";
+
+    feathercast::app::AppEntry cmdApp2;
+    cmdApp2.id = L"C:\\Shortcuts\\Prompt2.lnk";
+    cmdApp2.name = L"Node.js command prompt";
+    cmdApp2.targetPath = L"C:\\Windows\\System32\\cmd.exe";
+
+    assert(!fd::ShouldMergeApps(cmdApp1, cmdApp2));
+
+    // Host executables with same clean name DO merge (e.g. duplicate (2) shortcut)
+    feathercast::app::AppEntry cmdAppCopy;
+    cmdAppCopy.id = L"C:\\Shortcuts\\PromptCopy.lnk";
+    cmdAppCopy.name = fd::CleanName(L"Developer Command Prompt for VS (2)");
+    cmdAppCopy.targetPath = L"C:\\Windows\\System32\\cmd.exe";
+
+    assert(fd::ShouldMergeApps(cmdApp1, cmdAppCopy));
   }
 
   {

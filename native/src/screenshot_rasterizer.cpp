@@ -9,12 +9,15 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <new>
+#include <string_view>
 #include <utility>
 
 namespace feathercast::screenshot {
 namespace {
 
 constexpr std::uint64_t kMaxRenderedPixels = 40ULL * 1000 * 1000;
+constexpr std::uint64_t kMaxRenderWorkingBytes = 768ULL * 1024 * 1024;
 
 void SetError(std::wstring* error, const wchar_t* message) {
   if (error) *error = message;
@@ -165,10 +168,20 @@ void DrawArrow(RenderedImage& image, Point first, Point second,
 
 void DrawText(RenderedImage& image, const Annotation& annotation, Rect crop) {
   if (annotation.text.empty()) return;
+  const LocalRect local = Clip(
+      ToLocal(AnnotationTextBounds(annotation), crop),
+      static_cast<int>(image.width), static_cast<int>(image.height));
+  if (local.Empty()) return;
+  const std::size_t width = static_cast<std::size_t>(local.right - local.left);
+  const std::size_t height = static_cast<std::size_t>(local.bottom - local.top);
+  if (width == 0 || height == 0 ||
+      width > std::numeric_limits<std::size_t>::max() / height / 4) {
+    return;
+  }
   BITMAPINFO info{};
   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  info.bmiHeader.biWidth = static_cast<LONG>(image.width);
-  info.bmiHeader.biHeight = -static_cast<LONG>(image.height);
+  info.bmiHeader.biWidth = static_cast<LONG>(width);
+  info.bmiHeader.biHeight = -static_cast<LONG>(height);
   info.bmiHeader.biPlanes = 1;
   info.bmiHeader.biBitCount = 32;
   info.bmiHeader.biCompression = BI_RGB;
@@ -182,30 +195,50 @@ void DrawText(RenderedImage& image, const Annotation& annotation, Rect crop) {
     if (dc) DeleteDC(dc);
     return;
   }
-  std::memcpy(bits, image.pixels.data(), image.pixels.size());
+  for (std::size_t row = 0; row < height; ++row) {
+    std::memcpy(static_cast<std::uint8_t*>(bits) + row * width * 4,
+                image.pixels.data() +
+                    static_cast<std::size_t>(local.top) * image.stride +
+                    row * image.stride + static_cast<std::size_t>(local.left) * 4,
+                width * 4);
+  }
   const HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
   const int fontHeight = -static_cast<int>(std::max<std::uint32_t>(12,
                                                                     annotation.fontSize));
+  std::wstring family = annotation.fontFamily;
+  const std::size_t comma = family.find(L',');
+  if (comma != std::wstring::npos) family.resize(comma);
+  const auto first = family.find_first_not_of(L" \t");
+  const auto last = family.find_last_not_of(L" \t");
+  family = first == std::wstring::npos
+               ? L"Segoe UI"
+               : family.substr(first, last - first + 1);
   HFONT font = CreateFontW(fontHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
                            FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                           DEFAULT_PITCH | FF_DONTCARE, family.c_str());
   const HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, RGB(annotation.color.red, annotation.color.green,
                        annotation.color.blue));
-  RECT target{annotation.bounds.left - crop.left,
-              annotation.bounds.top - crop.top,
-              annotation.bounds.right - crop.left,
-              annotation.bounds.bottom - crop.top};
+  RECT target{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
   DrawTextW(dc, annotation.text.c_str(), static_cast<int>(annotation.text.size()),
             &target, DT_NOPREFIX | DT_WORDBREAK | DT_EXPANDTABS);
   if (previousFont) SelectObject(dc, previousFont);
   if (font) DeleteObject(font);
   if (previousBitmap) SelectObject(dc, previousBitmap);
-  std::memcpy(image.pixels.data(), bits, image.pixels.size());
-  for (std::size_t index = 3; index < image.pixels.size(); index += 4) {
-    image.pixels[index] = 255;
+  for (std::size_t row = 0; row < height; ++row) {
+    std::memcpy(image.pixels.data() +
+                    static_cast<std::size_t>(local.top) * image.stride +
+                    row * image.stride + static_cast<std::size_t>(local.left) * 4,
+                static_cast<const std::uint8_t*>(bits) + row * width * 4,
+                width * 4);
+    for (std::size_t column = 0; column < width; ++column) {
+      image.pixels[static_cast<std::size_t>(local.top) * image.stride +
+                   row * image.stride +
+                   (static_cast<std::size_t>(local.left) + column) * 4 + 3] =
+          255;
+    }
   }
   DeleteObject(bitmap);
   DeleteDC(dc);
@@ -324,77 +357,119 @@ std::optional<RenderedImage> Render(const Draft& draft, Rect crop,
     return std::nullopt;
   }
 
-  const std::size_t sourceX = static_cast<std::size_t>(crop.left -
-                                                       draft.sourceBounds.left);
-  const std::size_t sourceY = static_cast<std::size_t>(crop.top -
-                                                       draft.sourceBounds.top);
-  RenderedImage result;
-  result.width = static_cast<std::uint32_t>(crop.Width());
-  result.height = static_cast<std::uint32_t>(crop.Height());
-  result.stride = result.width * 4;
-  result.pixels.resize(static_cast<std::size_t>(result.stride) * result.height);
-  for (std::uint32_t row = 0; row < result.height; ++row) {
-    const auto* source = draft.pixels->data() +
-                         (sourceY + row) * draft.stride + sourceX * 4;
-    std::memcpy(result.pixels.data() + static_cast<std::size_t>(row) * result.stride,
-                source, result.stride);
+  const std::uint64_t outputBytes = pixels * 4;
+  const std::uint64_t sourceBytes = draft.pixels->size();
+  if (sourceBytes > kMaxRenderWorkingBytes ||
+      outputBytes > kMaxRenderWorkingBytes - sourceBytes) {
+    SetError(error, L"The screenshot needs too much memory to process safely.");
+    return std::nullopt;
   }
-  for (std::size_t index = 3; index < result.pixels.size(); index += 4) {
-    result.pixels[index] = 255;
-  }
-
+  std::uint64_t peakBytes = sourceBytes + outputBytes;
   for (const auto& annotation : annotations) {
-    switch (annotation.tool) {
-      case Tool::Blur:
-        ApplyBlur(result, ToLocal(annotation.bounds, crop));
-        break;
-      case Tool::Pixelate:
-        ApplyPixelate(result, ToLocal(annotation.bounds, crop));
-        break;
-      case Tool::Rectangle:
-        DrawRectangle(result, ToLocal(annotation.bounds, crop),
-                      annotation.strokeWidth, annotation.color);
-        break;
-      case Tool::Ellipse:
-        DrawEllipse(result, ToLocal(annotation.bounds, crop),
-                    annotation.strokeWidth, annotation.color);
-        break;
-      case Tool::Line:
-      case Tool::Arrow: {
-        auto points = PointsFor(annotation);
-        if (points.size() >= 2) {
-          Point first{points.front().x - crop.left,
-                      points.front().y - crop.top};
-          Point last{points.back().x - crop.left, points.back().y - crop.top};
-          if (annotation.tool == Tool::Arrow) {
-            DrawArrow(result, first, last, annotation.strokeWidth,
-                      annotation.color);
-          } else {
-            DrawLine(result, first, last, annotation.strokeWidth,
-                     annotation.color);
-          }
-        }
-        break;
-      }
-      case Tool::Freehand: {
-        const auto points = PointsFor(annotation);
-        for (std::size_t index = 1; index < points.size(); ++index) {
-          DrawLine(result,
-                   {points[index - 1].x - crop.left,
-                    points[index - 1].y - crop.top},
-                   {points[index].x - crop.left, points[index].y - crop.top},
-                   annotation.strokeWidth, annotation.color);
-        }
-        break;
-      }
-      case Tool::Text:
-        DrawText(result, annotation, crop);
-        break;
-      case Tool::Select:
-        break;
+    if (annotation.tool != Tool::Blur && annotation.tool != Tool::Text) {
+      continue;
     }
+    const LocalRect local = Clip(
+        ToLocal(annotation.bounds, crop), static_cast<int>(crop.Width()),
+        static_cast<int>(crop.Height()));
+    const std::uint64_t area =
+        static_cast<std::uint64_t>(std::max(0, local.right - local.left)) *
+        static_cast<std::uint64_t>(std::max(0, local.bottom - local.top));
+    const std::uint64_t scratchBytes =
+        area > std::numeric_limits<std::uint64_t>::max() / 8
+            ? std::numeric_limits<std::uint64_t>::max()
+            : area * (annotation.tool == Tool::Blur ? 8 : 4);
+    if (scratchBytes > std::numeric_limits<std::uint64_t>::max() -
+                            sourceBytes - outputBytes ||
+        sourceBytes + outputBytes + scratchBytes > kMaxRenderWorkingBytes) {
+      SetError(error,
+               L"The screenshot needs too much memory to process safely.");
+      return std::nullopt;
+    }
+    peakBytes = std::max(peakBytes, sourceBytes + outputBytes + scratchBytes);
   }
-  return result;
+  (void)peakBytes;
+
+  try {
+    const std::size_t sourceX = static_cast<std::size_t>(
+        crop.left - draft.sourceBounds.left);
+    const std::size_t sourceY = static_cast<std::size_t>(
+        crop.top - draft.sourceBounds.top);
+    RenderedImage result;
+    result.width = static_cast<std::uint32_t>(crop.Width());
+    result.height = static_cast<std::uint32_t>(crop.Height());
+    result.stride = result.width * 4;
+    result.pixels.resize(
+        static_cast<std::size_t>(result.stride) * result.height);
+    for (std::uint32_t row = 0; row < result.height; ++row) {
+      const auto* source = draft.pixels->data() +
+                           (sourceY + row) * draft.stride + sourceX * 4;
+      std::memcpy(result.pixels.data() +
+                      static_cast<std::size_t>(row) * result.stride,
+                  source, result.stride);
+    }
+    for (std::size_t index = 3; index < result.pixels.size(); index += 4) {
+      result.pixels[index] = 255;
+    }
+
+    for (const auto& annotation : annotations) {
+      switch (annotation.tool) {
+        case Tool::Blur:
+          ApplyBlur(result, ToLocal(annotation.bounds, crop));
+          break;
+        case Tool::Pixelate:
+          ApplyPixelate(result, ToLocal(annotation.bounds, crop));
+          break;
+        case Tool::Rectangle:
+          DrawRectangle(result, ToLocal(annotation.bounds, crop),
+                        annotation.strokeWidth, annotation.color);
+          break;
+        case Tool::Ellipse:
+          DrawEllipse(result, ToLocal(annotation.bounds, crop),
+                      annotation.strokeWidth, annotation.color);
+          break;
+        case Tool::Line:
+        case Tool::Arrow: {
+          auto points = PointsFor(annotation);
+          if (points.size() >= 2) {
+            Point first{points.front().x - crop.left,
+                        points.front().y - crop.top};
+            Point last{points.back().x - crop.left,
+                       points.back().y - crop.top};
+            if (annotation.tool == Tool::Arrow) {
+              DrawArrow(result, first, last, annotation.strokeWidth,
+                        annotation.color);
+            } else {
+              DrawLine(result, first, last, annotation.strokeWidth,
+                       annotation.color);
+            }
+          }
+          break;
+        }
+        case Tool::Freehand: {
+          const auto points = PointsFor(annotation);
+          for (std::size_t index = 1; index < points.size(); ++index) {
+            DrawLine(result,
+                     {points[index - 1].x - crop.left,
+                      points[index - 1].y - crop.top},
+                     {points[index].x - crop.left,
+                      points[index].y - crop.top},
+                     annotation.strokeWidth, annotation.color);
+          }
+          break;
+        }
+        case Tool::Text:
+          DrawText(result, annotation, crop);
+          break;
+        case Tool::Select:
+          break;
+      }
+    }
+    return result;
+  } catch (const std::bad_alloc&) {
+    SetError(error, L"The screenshot needs too much memory to process safely.");
+    return std::nullopt;
+  }
 }
 
 }  // namespace feathercast::screenshot

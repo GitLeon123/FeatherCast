@@ -339,6 +339,248 @@ int main() {
   }
   }
 
+  // Regression coverage: screenshot responsive toolbar layout, focus traversal,
+  // keyboard navigation, text editing commands, and DIP/physical geometry.
+  {
+    using namespace feathercast::screenshot;
+    using Rect = feathercast::screenshot::Rect;
+
+    // 1. Responsive toolbar layout at wide, narrow, and synthetic DIP widths.
+    {
+      const auto wide = BuildToolbarLayout(1200.0f, 800.0f);
+      assert(!wide.buttons.empty());
+      assert(wide.bar.Width() > 0.0f && wide.bar.Height() > 0.0f);
+      assert(wide.footer.top >= wide.bar.bottom);
+      assert(wide.footer.bottom <= 800.0f);
+      for (const auto& btn : wide.buttons) {
+        assert(btn.rect.left >= 0.0f && btn.rect.right <= 1200.0f);
+        assert(btn.rect.top >= 0.0f && btn.rect.bottom <= 800.0f);
+        assert(btn.rect.Width() > 0.0f && btn.rect.Height() > 0.0f);
+      }
+
+      // 1366x768 at 200% DPI = 683 x 384 DIPs
+      const auto medium = BuildToolbarLayout(683.0f, 384.0f);
+      assert(medium.rows >= 2);
+      assert(medium.bar.right <= 683.0f);
+      assert(medium.footer.bottom <= 384.0f);
+      assert(medium.footer.top >= medium.bar.bottom);
+      for (const auto& btn : medium.buttons) {
+        assert(btn.rect.left >= 0.0f && btn.rect.right <= 683.0f);
+        assert(btn.rect.top >= 0.0f && btn.rect.bottom <= 384.0f);
+        assert(btn.rect.Width() > 0.0f && btn.rect.Height() > 0.0f);
+      }
+
+      // Narrow DIP width (400x300 DIPs)
+      const auto narrow = BuildToolbarLayout(400.0f, 300.0f);
+      assert(narrow.rows >= 3);
+      for (const auto& btn : narrow.buttons) {
+        assert(btn.rect.left >= 0.0f && btn.rect.right <= 400.0f);
+        assert(btn.rect.top >= 0.0f && btn.rect.bottom <= 300.0f);
+        assert(btn.rect.Width() > 0.0f && btn.rect.Height() > 0.0f);
+      }
+
+      // Synthetic tiny width (120x80 DIPs)
+      const auto tiny = BuildToolbarLayout(120.0f, 80.0f);
+      assert(tiny.rows > 1);
+      for (const auto& btn : tiny.buttons) {
+        assert(btn.rect.left >= 0.0f && btn.rect.right <= 120.0f);
+        assert(btn.rect.top >= 0.0f && btn.rect.bottom <= 80.0f);
+      }
+
+      // Hit testing agrees with button rect
+      const auto& selectBtn = wide.buttons.front();
+      assert(ToolbarContains(selectBtn, {selectBtn.rect.left + 1.0f, selectBtn.rect.top + 1.0f}));
+      assert(!ToolbarContains(selectBtn, {selectBtn.rect.right + 5.0f, selectBtn.rect.bottom + 5.0f}));
+    }
+
+    // 2. Disabled-control focus traversal
+    {
+      const auto layout = BuildToolbarLayout(800.0f, 600.0f);
+      std::vector<bool> enabled(layout.buttons.size(), true);
+      // Disable Undo (index 9) and Redo (index 10)
+      assert(layout.buttons[9].action == ToolbarAction::Undo);
+      assert(layout.buttons[10].action == ToolbarAction::Redo);
+      enabled[9] = false;
+      enabled[10] = false;
+
+      const auto focusable = ToolbarFocusableIndices(layout, enabled);
+      assert(std::find(focusable.begin(), focusable.end(), 9) == focusable.end());
+      assert(std::find(focusable.begin(), focusable.end(), 10) == focusable.end());
+      assert(std::find(focusable.begin(), focusable.end(), 8) != focusable.end());
+      assert(std::find(focusable.begin(), focusable.end(), 11) != focusable.end());
+
+      // Focus sequence skips 9 and 10
+      const auto it8 = std::find(focusable.begin(), focusable.end(), 8);
+      assert(it8 != focusable.end());
+      const auto nextIt = std::next(it8);
+      assert(nextIt != focusable.end() && *nextIt == 11);
+    }
+
+    // 3. Selection keyboard movement and resizing (Editor)
+    {
+      EditorState state;
+      const Rect bounds{0, 0, 1000, 800};
+      assert(EditorController::Begin(state, bounds));
+      assert(state.phase == Phase::Selecting);
+
+      // EnsureKeyboardSelection creates a centered default selection
+      assert(EditorController::EnsureKeyboardSelection(state));
+      assert(state.selection.has_value());
+      const Rect initial = *state.selection;
+      assert(initial.Width() == 320 && initial.Height() == 200);
+
+      // Arrow keys move by 1 pixel
+      assert(EditorController::HandleKeyboard(state, EditorKey::Right, false, false) == KeyboardResult::Moved);
+      assert(state.selection->left == initial.left + 1);
+      assert(state.selection->right == initial.right + 1);
+      assert(state.selection->Width() == initial.Width());
+
+      // Arrow keys with Ctrl move by 10 pixels
+      assert(EditorController::HandleKeyboard(state, EditorKey::Down, false, true) == KeyboardResult::Moved);
+      assert(state.selection->top == initial.top + 10);
+      assert(state.selection->bottom == initial.bottom + 10);
+
+      // Shift + arrow resizes trailing edge by 1 pixel
+      const Rect beforeResize = *state.selection;
+      assert(EditorController::HandleKeyboard(state, EditorKey::Right, true, false) == KeyboardResult::Moved);
+      assert(state.selection->left == beforeResize.left);
+      assert(state.selection->right == beforeResize.right + 1);
+      assert(state.selection->Width() == beforeResize.Width() + 1);
+
+      // Shift + Ctrl + arrow resizes trailing edge by 10 pixels
+      assert(EditorController::HandleKeyboard(state, EditorKey::Down, true, true) == KeyboardResult::Moved);
+      assert(state.selection->bottom == beforeResize.bottom + 10);
+
+      // Enter confirms selection and moves to Phase::Editing
+      assert(EditorController::HandleKeyboard(state, EditorKey::Enter) == KeyboardResult::Confirmed);
+      assert(state.phase == Phase::Editing);
+      assert(state.tool == Tool::Select);
+
+      // Escape cancels
+      assert(EditorController::HandleKeyboard(state, EditorKey::Escape) == KeyboardResult::Cancelled);
+
+      // Boundary clamping: cannot move past right edge
+      state.selection = Rect{990, 790, 1000, 800};
+      assert(EditorController::HandleKeyboard(state, EditorKey::Right, false, true) == KeyboardResult::Ignored);
+      assert(state.selection->right == 1000);
+
+      // Cannot resize below minimum size (2x2)
+      state.selection = Rect{100, 100, 102, 102};
+      assert(EditorController::HandleKeyboard(state, EditorKey::Left, true, false) == KeyboardResult::Ignored);
+      assert(state.selection->Width() >= 2);
+    }
+
+    // 4. Region selector keyboard movement and resizing (CaptureUiState)
+    {
+      using feathercast::ui::CaptureKey;
+      using feathercast::ui::CaptureKeyboardResult;
+      using feathercast::ui::CaptureUiController;
+      using feathercast::ui::CaptureUiState;
+
+      CaptureUiState captureState;
+      assert(CaptureUiController::Begin(
+          captureState, feathercast::ui::CaptureShortcutTarget::ScreenshotRegion,
+          {0, 0, 1920, 1080}));
+      assert(CaptureUiController::EnsureKeyboardSelection(captureState));
+      assert(captureState.selectionStart && captureState.selectionEnd);
+      const auto initialRect = *CaptureUiController::SelectionRect(captureState);
+
+      // Move right 1px
+      assert(CaptureUiController::HandleSelectionKey(
+                 captureState, CaptureKey::Right, false, false) ==
+             CaptureKeyboardResult::Moved);
+      assert(CaptureUiController::SelectionRect(captureState)->left ==
+             initialRect.left + 1);
+
+      // Move down 10px with Ctrl
+      assert(CaptureUiController::HandleSelectionKey(
+                 captureState, CaptureKey::Down, false, true) ==
+             CaptureKeyboardResult::Moved);
+      assert(CaptureUiController::SelectionRect(captureState)->top ==
+             initialRect.top + 10);
+
+      // Resize with Shift
+      const auto beforeResize = *CaptureUiController::SelectionRect(captureState);
+      assert(CaptureUiController::HandleSelectionKey(
+                 captureState, CaptureKey::Right, true, false) ==
+             CaptureKeyboardResult::Moved);
+      assert(CaptureUiController::SelectionRect(captureState)->Width() ==
+             beforeResize.Width() + 1);
+
+      // Confirm with Enter
+      assert(CaptureUiController::HandleSelectionKey(
+                 captureState, CaptureKey::Enter) ==
+             CaptureKeyboardResult::Confirmed);
+      assert(captureState.phase ==
+             feathercast::ui::CapturePhase::StartingScreenshot);
+
+      // Escape cancels
+      assert(CaptureUiController::HandleSelectionKey(
+                 captureState, CaptureKey::Escape) ==
+             CaptureKeyboardResult::Cancelled);
+    }
+
+    // 5. Text editing commands
+    {
+      EditorState state;
+      assert(EditorController::Begin(
+          state, {0, 0, 800, 600}, Rect{50, 50, 400, 300}));
+      assert(EditorController::SetTool(state, Tool::Text));
+      assert(EditorController::BeginAnnotation(state, {100, 100}));
+      assert(EditorController::UpdateAnnotation(state, {300, 150}));
+
+      // Committing empty text fails and cancels gesture
+      assert(!EditorController::CommitText(state, L""));
+      assert(state.annotations.empty());
+      assert(!state.gestureStart.has_value());
+
+      // Valid text commit succeeds
+      assert(EditorController::BeginAnnotation(state, {100, 100}));
+      assert(EditorController::UpdateAnnotation(state, {300, 150}));
+      assert(EditorController::CommitText(state, L"Sample note"));
+      assert(state.annotations.size() == 1);
+      assert(state.annotations.front().tool == Tool::Text);
+      assert(state.annotations.front().text == L"Sample note");
+      assert(!state.gestureStart.has_value());
+
+      // Cancel gesture resets without committing
+      assert(EditorController::BeginAnnotation(state, {150, 150}));
+      assert(EditorController::CancelGesture(state));
+      assert(!state.gestureStart.has_value());
+      assert(state.annotations.size() == 1);
+    }
+
+    // 6. Preview/final annotation geometry & DIP/physical conversions
+    {
+      // AnnotationTextBounds padding
+      Annotation textAnno;
+      textAnno.bounds = {10, 20, 110, 70};
+      const Rect textBounds = AnnotationTextBounds(textAnno);
+      assert(textBounds.left == 12 && textBounds.top == 22 &&
+             textBounds.right == 108 && textBounds.bottom == 68);
+
+      // DIP <-> Physical pixel conversions across 100%, 150%, 200%
+      const float scales[] = {1.0f, 1.5f, 2.0f};
+      for (const float scale : scales) {
+        const Point origin{-1920, -200};
+        const Rect physicalRect{-1800, -100, -1400, 300};
+        const DipRect dipRect = PixelToDip(physicalRect, origin, scale);
+        const Rect roundtrip = DipToPixel(dipRect, origin, scale);
+        assert(std::abs(roundtrip.left - physicalRect.left) <= 1);
+        assert(std::abs(roundtrip.top - physicalRect.top) <= 1);
+        assert(std::abs(roundtrip.right - physicalRect.right) <= 1);
+        assert(std::abs(roundtrip.bottom - physicalRect.bottom) <= 1);
+      }
+
+      // ClampRect bounds checking
+      const Rect bounds{0, 0, 500, 500};
+      const Rect outOfBounds{-50, -50, 600, 600};
+      const Rect clamped = ClampRect(outOfBounds, bounds);
+      assert(clamped.left >= 0 && clamped.top >= 0 &&
+             clamped.right <= 500 && clamped.bottom <= 500);
+    }
+  }
+
   assert(feathercast::audio::ClampPercent(-1) == 0);
   assert(feathercast::audio::ClampPercent(42) == 42);
   assert(feathercast::audio::ClampPercent(101) == 100);

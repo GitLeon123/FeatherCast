@@ -59,6 +59,7 @@
 #include <malloc.h>
 #include <cmath>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <commdlg.h>
 #include <d2d1.h>
 #include <d2d1_1.h>
@@ -72,6 +73,7 @@
 #include <powrprof.h>
 #include <propidl.h>
 #include <propkey.h>
+#include <propsys.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -178,29 +180,7 @@ constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
 constexpr UINT RENDER_RETRY_INTERVAL_MS = 8;
 constexpr UINT RENDER_RECOVERY_MAX_DELAY_MS = 1000;
 
-enum class ScreenshotToolbarAction {
-  Select,
-  Rectangle,
-  Ellipse,
-  Line,
-  Arrow,
-  Freehand,
-  Text,
-  Blur,
-  Pixelate,
-  Undo,
-  Redo,
-  ColorAccent,
-  ColorRed,
-  ColorYellow,
-  ColorWhite,
-  ColorBlack,
-  StrokeDown,
-  StrokeUp,
-  Save,
-  Copy,
-  Cancel,
-};
+using ScreenshotToolbarAction = feathercast::screenshot::ToolbarAction;
 
 struct ScreenshotToolbarButton {
   RectF rect;
@@ -339,6 +319,8 @@ using feathercast::core::Lower;
 using feathercast::core::Trim;
 using feathercast::discovery::BaseNameNoExt;
 using feathercast::discovery::CleanName;
+using feathercast::discovery::DisambiguateShortcutName;
+using feathercast::discovery::IsHostExecutable;
 using feathercast::discovery::IsSystemEssentialName;
 using feathercast::discovery::KeywordsFor;
 using feathercast::discovery::NameKey;
@@ -1257,7 +1239,14 @@ bool LoadShortcut(const std::wstring& lnkPath, ShortcutInfo& info) {
 
   wchar_t target[MAX_PATH]{};
   WIN32_FIND_DATAW findData{};
-  if (SUCCEEDED(link->GetPath(target, MAX_PATH, &findData, SLGP_RAWPATH))) info.target = target;
+  if (SUCCEEDED(link->GetPath(target, MAX_PATH, &findData, SLGP_RAWPATH))) {
+    wchar_t expanded[MAX_PATH]{};
+    if (ExpandEnvironmentStringsW(target, expanded, MAX_PATH) > 0) {
+      info.target = expanded;
+    } else {
+      info.target = target;
+    }
+  }
 
   wchar_t args[4096]{};
   if (SUCCEEDED(link->GetArguments(args, 4096))) info.args = args;
@@ -1270,6 +1259,18 @@ bool LoadShortcut(const std::wstring& lnkPath, ShortcutInfo& info) {
   if (SUCCEEDED(link->GetIconLocation(icon, MAX_PATH, &iconIndex))) {
     info.iconPath = icon;
     info.iconIndex = iconIndex;
+  }
+
+  ComPtr<IPropertyStore> propStore;
+  if (SUCCEEDED(link.As(&propStore))) {
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    if (SUCCEEDED(propStore->GetValue(PKEY_AppUserModel_ID, &pv))) {
+      if (pv.vt == VT_LPWSTR && pv.pwszVal) {
+        info.appUserModelId = pv.pwszVal;
+      }
+      PropVariantClear(&pv);
+    }
   }
   return true;
 }
@@ -2052,7 +2053,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // Keep the physical Print Screen key useful out of the box. If the user
     // assigned it in Settings, the configured shortcut runtime above wins and
     // selects that action instead of silently forcing the default region flow.
-    if (vk == VK_SNAPSHOT && !HasConfiguredPrintScreenShortcut()) {
+    if (vk == VK_SNAPSHOT && !HasConfiguredPrintScreenShortcut() &&
+        !modifiers.ctrl && !modifiers.alt && !modifiers.shift &&
+        !modifiers.win) {
       if (down && !printScreenPressed_) {
         printScreenPressed_ = true;
         if (hwnd_) {
@@ -2095,37 +2098,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RECT client{};
     GetClientRect(hwnd, &client);
     auto screenRect = [&](RectF rect) {
-      return RECT{
-        origin.x + static_cast<LONG>(rect.left * scale),
-        origin.y + static_cast<LONG>(rect.top * scale),
-        origin.x + static_cast<LONG>(rect.right * scale),
-        origin.y + static_cast<LONG>(rect.bottom * scale),
-      };
+      const auto physical = feathercast::screenshot::DipToPixel(
+          {rect.left, rect.top, rect.right, rect.bottom}, {0, 0}, scale);
+      return RECT{origin.x + physical.left, origin.y + physical.top,
+                  origin.x + physical.right, origin.y + physical.bottom};
     };
 
     if (hwnd == captureSelectorHwnd_ && ScreenshotEditorActive()) {
-      const auto buttons = ScreenshotToolbarItems(
-          static_cast<float>(client.right) / scale);
-      for (std::size_t index = 0; index < buttons.size(); ++index) {
+      const float width = static_cast<float>(client.right) / scale;
+      const float height = static_cast<float>(client.bottom) / scale;
+      const auto layout = ScreenshotToolbarContract(width, height);
+      const auto buttons = ScreenshotToolbarItems(width, height);
+      const bool parentFocused = GetFocus() == hwnd;
+      for (std::size_t index = 0; index < layout.buttons.size(); ++index) {
         Item button;
-        button.name = buttons[index].label;
+        button.name = layout.buttons[index].label;
         button.defaultAction = button.name;
         button.role = ROLE_SYSTEM_PUSHBUTTON;
-        button.state = STATE_SYSTEM_FOCUSABLE;
-        if (static_cast<int>(index) == screenshotEditor_.focusIndex) {
+        const auto action = layout.buttons[index].action;
+        const bool enabled = ScreenshotToolbarActionAvailable(action);
+        button.state = enabled ? STATE_SYSTEM_FOCUSABLE
+                               : STATE_SYSTEM_UNAVAILABLE;
+        if (enabled && parentFocused &&
+            static_cast<int>(index) == screenshotEditor_.focusIndex) {
           button.state |= STATE_SYSTEM_FOCUSED;
-        }
-        const auto action = buttons[index].action;
-        if ((action == ScreenshotToolbarAction::Undo &&
-             screenshotEditor_.annotations.empty()) ||
-            (action == ScreenshotToolbarAction::Redo &&
-             screenshotEditor_.redo.empty()) ||
-            ((action == ScreenshotToolbarAction::Save ||
-              action == ScreenshotToolbarAction::Copy) &&
-             (screenshotEditor_.phase !=
-                  feathercast::screenshot::Phase::Editing ||
-              !screenshotEditor_.selection))) {
-          button.state |= STATE_SYSTEM_UNAVAILABLE;
         }
         if (action == ScreenshotToolbarAction::ColorAccent ||
             action == ScreenshotToolbarAction::ColorRed ||
@@ -2140,7 +2136,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           button.value = std::to_wstring(screenshotEditor_.strokeWidth) +
                          L" pixels";
         }
-        button.screenRect = screenRect(buttons[index].rect);
+        button.screenRect = screenRect({layout.buttons[index].rect.left,
+                                        layout.buttons[index].rect.top,
+                                        layout.buttons[index].rect.right,
+                                        layout.buttons[index].rect.bottom});
         items.push_back(std::move(button));
       }
       if (screenshotTextEditing_) {
@@ -2151,35 +2150,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         text.defaultAction = L"Edit annotation text";
         text.role = ROLE_SYSTEM_TEXT;
         text.state = STATE_SYSTEM_FOCUSABLE;
-        if (screenshotEditor_.focusIndex == static_cast<int>(buttons.size())) {
+        if ((parentFocused && screenshotEditor_.focusIndex ==
+                                 static_cast<int>(buttons.size())) ||
+            (screenshotTextEditHwnd_ && GetFocus() == screenshotTextEditHwnd_)) {
           text.state |= STATE_SYSTEM_FOCUSED;
         }
-        RectF textRect{16, 108, 300, 144};
-        if (screenshotEditor_.gesturePoints.size() >= 2) {
-          textRect = ScreenshotLocalRect(
-              {screenshotEditor_.gesturePoints.front().x,
-               screenshotEditor_.gesturePoints.front().y,
-               screenshotEditor_.gesturePoints.back().x,
-               screenshotEditor_.gesturePoints.back().y});
-        }
+        const auto textBounds = ScreenshotTextAnnotationBounds();
+        const RectF textRect = ScreenshotLocalRect(textBounds);
         text.screenRect = screenRect(textRect);
         items.push_back(std::move(text));
       }
       Item selection;
       selection.name = L"Screenshot selection";
       selection.description =
-          L"Move or resize the selection with the eight handles.";
-      selection.role = ROLE_SYSTEM_STATICTEXT;
+          L"Use arrow keys to move. Hold Shift to resize and Ctrl for 10 pixel increments.";
+      selection.defaultAction = L"Move or resize selection";
+      selection.role = ROLE_SYSTEM_SLIDER;
       selection.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE;
+      const int selectionIndex = static_cast<int>(layout.buttons.size()) +
+                                 (screenshotTextEditing_ ? 1 : 0);
+      if (parentFocused && screenshotEditor_.focusIndex == selectionIndex) {
+        selection.state |= STATE_SYSTEM_FOCUSED;
+      }
       if (const auto current = screenshotEditor_.selection) {
-        selection.value = std::to_wstring(current->Width()) + L" by " +
+        selection.value = L"x " + std::to_wstring(current->left) + L", y " +
+                          std::to_wstring(current->top) + L", " +
+                          std::to_wstring(current->Width()) + L" by " +
                           std::to_wstring(current->Height()) + L" pixels";
+        selection.screenRect = screenRect(ScreenshotLocalRect(*current));
       } else {
         selection.value = L"No region selected";
+        selection.screenRect = screenRect({0, 0, width, height});
       }
-      selection.screenRect = screenRect({0, 0,
-                                         static_cast<float>(client.right) / scale,
-                                         static_cast<float>(client.bottom) / scale});
       items.push_back(std::move(selection));
       if (!screenshotStatus_.empty()) {
         Item status;
@@ -2190,9 +2192,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                           ? ROLE_SYSTEM_STATICTEXT
                           : ROLE_SYSTEM_ALERT;
         status.state = STATE_SYSTEM_READONLY;
-        status.screenRect = screenRect({16, 108,
-                                         static_cast<float>(client.right) / scale - 16,
-                                         136});
+        const auto& footer = layout.footer;
+        status.screenRect = screenRect({footer.left, footer.top, footer.right,
+                                        footer.bottom});
         items.push_back(std::move(status));
       }
       return items;
@@ -2200,20 +2202,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (hwnd == captureSelectorHwnd_) {
       Item selector;
-      selector.name = L"Screen region selector";
+      selector.name = L"Screen region selection";
       selector.description =
-          L"Drag to select a region. Press Escape or right-click to cancel.";
+          L"Use arrow keys to move. Hold Shift to resize and Enter to confirm. Press Escape to cancel.";
+      selector.defaultAction = L"Move or resize selection";
+      selector.role = ROLE_SYSTEM_SLIDER;
+      selector.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE;
+      if (GetFocus() == hwnd) selector.state |= STATE_SYSTEM_FOCUSED;
       if (const auto selection =
               feathercast::ui::CaptureUiController::SelectionRect(
                   captureUiState_)) {
-        selector.value = std::to_wstring(selection->Width()) + L" by " +
+        selector.value = L"x " + std::to_wstring(selection->left) + L", y " +
+                         std::to_wstring(selection->top) + L", " +
+                         std::to_wstring(selection->Width()) + L" by " +
                          std::to_wstring(selection->Height()) + L" pixels";
+        selector.screenRect = {selection->left, selection->top,
+                               selection->right, selection->bottom};
+      } else {
+        selector.value = L"No region selected";
+        selector.screenRect = {origin.x, origin.y, origin.x + client.right,
+                               origin.y + client.bottom};
       }
-      selector.role = ROLE_SYSTEM_STATICTEXT;
-      selector.state = STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE |
-                       STATE_SYSTEM_FOCUSED;
-      selector.screenRect = {origin.x, origin.y, origin.x + client.right,
-                             origin.y + client.bottom};
       items.push_back(std::move(selector));
       return items;
     }
@@ -2640,9 +2649,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   int AccessibleFocusedChild(HWND hwnd) const override {
     if (hwnd == captureSelectorHwnd_ && ScreenshotEditorActive()) {
-      return screenshotEditor_.focusIndex + 1;
+      RECT client{};
+      GetClientRect(hwnd, &client);
+      const float scale = GetWindowScale(hwnd);
+      const auto buttons = ScreenshotToolbarItems(
+          static_cast<float>(client.right) / scale,
+          static_cast<float>(client.bottom) / scale);
+      const int textChild = static_cast<int>(buttons.size()) + 1;
+      if (screenshotTextEditHwnd_ && GetFocus() == screenshotTextEditHwnd_) {
+        return textChild;
+      }
+      const auto focusable = ScreenshotFocusableIndices(
+          static_cast<float>(client.right) / scale,
+          static_cast<float>(client.bottom) / scale, screenshotTextEditing_);
+      const auto focused = std::find(focusable.begin(), focusable.end(),
+                                     screenshotEditor_.focusIndex);
+      if (GetFocus() != hwnd) return 0;
+      if (focused != focusable.end()) {
+        const int virtualIndex = screenshotEditor_.focusIndex;
+        return virtualIndex + 1;
+      }
+      return focusable.empty() ? 0 : focusable.front() + 1;
     }
-    if (hwnd == captureSelectorHwnd_) return 1;
+    if (hwnd == captureSelectorHwnd_) return GetFocus() == hwnd ? 1 : 0;
     if (hwnd == recordingControlHwnd_) {
       return captureUiState_.controlFocus + 1;
     }
@@ -2700,18 +2729,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void AccessibleFocusChild(HWND hwnd, int child) override {
     if (hwnd == captureSelectorHwnd_) {
       if (ScreenshotEditorActive()) {
+        RECT client{};
+        GetClientRect(captureSelectorHwnd_, &client);
+        const float scale = GetWindowScale(captureSelectorHwnd_);
         const auto buttons = ScreenshotToolbarItems(
-            static_cast<float>(GetWindowWidth(captureSelectorHwnd_)) /
-            GetWindowScale(captureSelectorHwnd_));
+            static_cast<float>(client.right) / scale,
+            static_cast<float>(client.bottom) / scale);
         if (child > 0 && child <= static_cast<int>(buttons.size())) {
-          screenshotEditor_.focusIndex = child - 1;
+          const auto& button = buttons[static_cast<size_t>(child - 1)];
+          if (!ScreenshotToolbarActionAvailable(button.action)) return;
+          SetScreenshotFocusIndex(child - 1);
           SetFocus(captureSelectorHwnd_);
-          InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
         } else if (screenshotTextEditing_ &&
                    child == static_cast<int>(buttons.size()) + 1) {
-          screenshotEditor_.focusIndex = static_cast<int>(buttons.size());
+          SetScreenshotFocusIndex(static_cast<int>(buttons.size()));
+          SetFocus(screenshotTextEditHwnd_ ? screenshotTextEditHwnd_
+                                           : captureSelectorHwnd_);
+        } else if (child == static_cast<int>(buttons.size()) +
+                              (screenshotTextEditing_ ? 2 : 1)) {
+          SetScreenshotFocusIndex(static_cast<int>(buttons.size()) +
+                                  (screenshotTextEditing_ ? 1 : 0));
           SetFocus(captureSelectorHwnd_);
-          InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
         }
       } else if (child == 1) {
         SetFocus(captureSelectorHwnd_);
@@ -2775,16 +2813,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void AccessibleInvokeChild(HWND hwnd, int child) override {
     if (hwnd == captureSelectorHwnd_) {
       if (ScreenshotEditorActive()) {
+        RECT client{};
+        GetClientRect(captureSelectorHwnd_, &client);
+        const float scale = GetWindowScale(captureSelectorHwnd_);
         const auto buttons = ScreenshotToolbarItems(
-            static_cast<float>(GetWindowWidth(captureSelectorHwnd_)) /
-            GetWindowScale(captureSelectorHwnd_));
+            static_cast<float>(client.right) / scale,
+            static_cast<float>(client.bottom) / scale);
         if (child > 0 && child <= static_cast<int>(buttons.size())) {
-          screenshotEditor_.focusIndex = child - 1;
-          ApplyScreenshotToolbarAction(buttons[static_cast<size_t>(child - 1)].action);
+          const auto& button = buttons[static_cast<size_t>(child - 1)];
+          if (!ScreenshotToolbarActionAvailable(button.action)) return;
+          SetScreenshotFocusIndex(child - 1);
+          ApplyScreenshotToolbarAction(button.action);
         } else if (screenshotTextEditing_ &&
                    child == static_cast<int>(buttons.size()) + 1) {
-          screenshotEditor_.focusIndex = static_cast<int>(buttons.size());
+          SetScreenshotFocusIndex(static_cast<int>(buttons.size()));
+          SetFocus(screenshotTextEditHwnd_ ? screenshotTextEditHwnd_
+                                           : captureSelectorHwnd_);
+        } else if (child == static_cast<int>(buttons.size()) +
+                              (screenshotTextEditing_ ? 2 : 1)) {
+          SetScreenshotFocusIndex(static_cast<int>(buttons.size()) +
+                                  (screenshotTextEditing_ ? 1 : 0));
           SetFocus(captureSelectorHwnd_);
+        }
+      } else if (child == 1) {
+        SetFocus(captureSelectorHwnd_);
+        if (feathercast::ui::CaptureUiController::ConfirmSelection(
+                captureUiState_)) {
+          CompleteCaptureSelection();
         }
       }
       return;
@@ -2830,12 +2885,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   HRESULT AccessibleSetValue(HWND hwnd, int child,
                              const std::wstring& value) override {
     if (hwnd == captureSelectorHwnd_ && ScreenshotEditorActive()) {
+      RECT client{};
+      GetClientRect(captureSelectorHwnd_, &client);
+      const float scale = GetWindowScale(captureSelectorHwnd_);
       const auto buttons = ScreenshotToolbarItems(
-          static_cast<float>(GetWindowWidth(captureSelectorHwnd_)) /
-          GetWindowScale(captureSelectorHwnd_));
+          static_cast<float>(client.right) / scale,
+          static_cast<float>(client.bottom) / scale);
       if (child == static_cast<int>(buttons.size()) + 1 &&
           screenshotTextEditing_) {
         screenshotTextBuffer_ = value;
+        if (screenshotTextEditHwnd_) {
+          SetWindowTextW(screenshotTextEditHwnd_, value.c_str());
+        }
         InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
         return S_OK;
       }
@@ -3253,7 +3314,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (volumeVisible_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
         if (captureSelectorHwnd_ &&
             IsWindowVisible(captureSelectorHwnd_)) {
-          InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+          InvalidateScreenshotPreviewCache();
+          RedrawWindow(captureSelectorHwnd_, nullptr, nullptr,
+                       RDW_INVALIDATE | RDW_NOERASE);
         }
         if (recordingControlHwnd_ &&
             IsWindowVisible(recordingControlHwnd_)) {
@@ -3525,7 +3588,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     using feathercast::screenshot::Phase;
     if (event.kind == CaptureEventKind::Started) {
       if (screenshotEditor_.phase == Phase::Preparing) {
-        screenshotStatus_ = L"Preparing a static screenshot preview...";
+        screenshotStatus_ = L"Preparing screenshot\u2026";
         InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
       }
       return;
@@ -3537,7 +3600,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       screenshotDraft_ = event.screenshotDraft;
       screenshotDraftBitmap_.Reset();
+      InvalidateScreenshotPreviewCache();
       captureVirtualBounds_ = event.bounds;
+      if (screenshotCaptureUiExcluded_ && captureSelectorHwnd_) {
+        SetWindowDisplayAffinity(captureSelectorHwnd_, WDA_NONE);
+        screenshotCaptureUiExcluded_ = false;
+      }
       const bool fullscreen =
           screenshotTarget_ ==
           feathercast::ui::CaptureShortcutTarget::ScreenshotFullscreen;
@@ -3891,12 +3959,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     screenshotTarget_ = target;
-    screenshotDraft_.reset();
+      screenshotDraft_.reset();
     screenshotDraftBitmap_.Reset();
-    screenshotStatus_ = L"Preparing a static screenshot preview...";
+    InvalidateScreenshotPreviewCache();
+    screenshotStatus_ = L"Preparing screenshot\u2026";
+    screenshotEditor_.fontFamily = theme_.fontFamily;
     captureVirtualBounds_ = source;
     HideFeatherCastForCapture();
     DwmFlush();
+    screenshotCaptureUiExcluded_ =
+        captureSelectorHwnd_ && SetWindowDisplayAffinity(
+                                  captureSelectorHwnd_,
+                                  WDA_EXCLUDEFROMCAPTURE) != FALSE;
+    if (screenshotCaptureUiExcluded_) ShowScreenshotEditor();
     if (!captureService_.PrepareScreenshot(source, scope)) {
       feathercast::screenshot::EditorController::Cancel(screenshotEditor_);
       screenshotTarget_ = feathercast::ui::CaptureShortcutTarget::None;
@@ -3922,6 +3997,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                  RDW_INVALIDATE | RDW_NOERASE);
     SetForegroundWindow(captureSelectorHwnd_);
     SetFocus(captureSelectorHwnd_);
+    NormalizeScreenshotFocus(true);
+    UpdateScreenshotTextEditWindow();
     NotifyWinEvent(EVENT_OBJECT_SHOW, captureSelectorHwnd_, OBJID_CLIENT,
                    CHILDID_SELF);
     UpdateBackgroundState();
@@ -3931,11 +4008,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
     screenshotTextEditing_ = false;
     screenshotTextBuffer_.clear();
+    DestroyScreenshotTextEdit(false);
+    if (screenshotCaptureUiExcluded_ && captureSelectorHwnd_) {
+      SetWindowDisplayAffinity(captureSelectorHwnd_, WDA_NONE);
+      screenshotCaptureUiExcluded_ = false;
+    }
     if (hideWindow && captureSelectorHwnd_) {
       ShowWindow(captureSelectorHwnd_, SW_HIDE);
     }
     screenshotDraftBitmap_.Reset();
     screenshotDraft_.reset();
+    InvalidateScreenshotPreviewCache();
     screenshotStatus_.clear();
     screenshotTarget_ = feathercast::ui::CaptureShortcutTarget::None;
     feathercast::screenshot::EditorController::Cancel(screenshotEditor_);
@@ -3975,6 +4058,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     captureVirtualBounds_ = {left, top, left + width, top + height};
+    feathercast::ui::CaptureUiController::SetBounds(
+        captureUiState_, {left, top, left + width, top + height});
     SetWindowPos(captureSelectorHwnd_, HWND_TOPMOST, left, top, width, height,
                  SWP_SHOWWINDOW);
     RedrawWindow(captureSelectorHwnd_, nullptr, nullptr,
@@ -4086,7 +4171,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       BeginScreenshotCapture(target);
       return;
     }
-    if (!feathercast::ui::CaptureUiController::Begin(captureUiState_, target)) {
+    const auto selectorBounds =
+        CaptureScopeFor(target) == feathercast::capture::CaptureScope::Region
+            ? VirtualDesktopBounds()
+            : feathercast::capture::PixelRect{};
+    if (!feathercast::ui::CaptureUiController::Begin(
+            captureUiState_, target,
+            {selectorBounds.left, selectorBounds.top, selectorBounds.right,
+             selectorBounds.bottom})) {
       ShowTrayNotification(L"FeatherCast Capture",
                            L"A capture is already in progress.");
       return;
@@ -4111,6 +4203,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             captureUiState_, {screenPoint.x, screenPoint.y})) {
       return;
     }
+    CompleteCaptureSelection();
+  }
+
+  void CompleteCaptureSelection() {
+    using feathercast::ui::CaptureUiController;
     const auto selection = CaptureUiController::SelectionRect(captureUiState_);
     if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
     ShowWindow(captureSelectorHwnd_, SW_HIDE);
@@ -4170,72 +4267,107 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
-  std::vector<ScreenshotToolbarButton> ScreenshotToolbarItems(
-      float width) const {
-    const float barWidth = std::min(1160.0f, std::max(280.0f, width - 24.0f));
-    const float left = (width - barWidth) * 0.5f;
-    constexpr float gap = 4.0f;
-    constexpr float rowHeight = 32.0f;
-    std::vector<ScreenshotToolbarButton> buttons;
-    auto add = [&](float x, float y, float buttonWidth,
-                   ScreenshotToolbarAction action, const wchar_t* label) {
-      buttons.push_back({{x, y, x + buttonWidth, y + rowHeight}, action,
-                         label});
-    };
+  bool ScreenshotToolbarActionAvailable(ScreenshotToolbarAction action) const {
+    using Phase = feathercast::screenshot::Phase;
+    if (action == ScreenshotToolbarAction::Cancel) return ScreenshotEditorActive();
+    if (screenshotEditor_.phase != Phase::Editing ||
+        screenshotTextEditing_) {
+      return false;
+    }
+    switch (action) {
+      case ScreenshotToolbarAction::Undo:
+        return !screenshotEditor_.annotations.empty();
+      case ScreenshotToolbarAction::Redo:
+        return !screenshotEditor_.redo.empty();
+      case ScreenshotToolbarAction::Save:
+      case ScreenshotToolbarAction::Copy:
+        return screenshotEditor_.selection &&
+               screenshotEditor_.selection->Width() >= 2 &&
+               screenshotEditor_.selection->Height() >= 2;
+      default:
+        return true;
+    }
+  }
 
-    const std::array<std::pair<ScreenshotToolbarAction, const wchar_t*>, 9>
-        tools = {{{ScreenshotToolbarAction::Select, L"Select"},
-                  {ScreenshotToolbarAction::Rectangle, L"Rectangle"},
-                  {ScreenshotToolbarAction::Ellipse, L"Ellipse"},
-                  {ScreenshotToolbarAction::Line, L"Line"},
-                  {ScreenshotToolbarAction::Arrow, L"Arrow"},
-                  {ScreenshotToolbarAction::Freehand, L"Freehand"},
-                  {ScreenshotToolbarAction::Text, L"Text"},
-                  {ScreenshotToolbarAction::Blur, L"Blur"},
-                  {ScreenshotToolbarAction::Pixelate, L"Pixelate"}}};
-    const auto toolWidth = [](ScreenshotToolbarAction action) {
-      switch (action) {
-        case ScreenshotToolbarAction::Select: return 62.0f;
-        case ScreenshotToolbarAction::Rectangle: return 78.0f;
-        case ScreenshotToolbarAction::Ellipse: return 64.0f;
-        case ScreenshotToolbarAction::Arrow: return 58.0f;
-        case ScreenshotToolbarAction::Freehand: return 76.0f;
-        case ScreenshotToolbarAction::Pixelate: return 70.0f;
-        default: return 52.0f;
+  std::vector<int> ScreenshotFocusableIndices(float width, float height,
+                                              bool textEditing) const {
+    const auto buttons = ScreenshotToolbarItems(width, height);
+    std::vector<int> indices;
+    indices.reserve(buttons.size() + 2);
+    for (std::size_t index = 0; index < buttons.size(); ++index) {
+      if (ScreenshotToolbarActionAvailable(buttons[index].action)) {
+        indices.push_back(static_cast<int>(index));
       }
-    };
-    float x = left + 12.0f;
-    for (const auto [action, label] : tools) {
-      const float buttonWidth = toolWidth(action);
-      add(x, 14.0f, buttonWidth, action, label);
-      x += buttonWidth + gap;
     }
-    add(x + 8.0f, 14.0f, 58.0f, ScreenshotToolbarAction::Undo, L"Undo");
-    x += 70.0f;
-    add(x, 14.0f, 58.0f, ScreenshotToolbarAction::Redo, L"Redo");
-
-    x = left + 12.0f;
-    const std::array<std::pair<ScreenshotToolbarAction, const wchar_t*>, 5>
-        colors = {{{ScreenshotToolbarAction::ColorAccent, L"Accent color"},
-                   {ScreenshotToolbarAction::ColorRed, L"Red color"},
-                   {ScreenshotToolbarAction::ColorYellow, L"Yellow color"},
-                   {ScreenshotToolbarAction::ColorWhite, L"White color"},
-                   {ScreenshotToolbarAction::ColorBlack, L"Black color"}}};
-    for (const auto [action, label] : colors) {
-      add(x, 54.0f, 30.0f, action, label);
-      x += 34.0f;
+    if (textEditing) indices.push_back(static_cast<int>(buttons.size()));
+    // The selection/crop is always the final interactive editor control.  It
+    // remains focusable while the preview is being prepared or selected so
+    // keyboard-only users have a stable entry point.
+    if (ScreenshotEditorActive()) {
+      indices.push_back(static_cast<int>(buttons.size()) +
+                        (textEditing ? 1 : 0));
     }
-    add(x + 8.0f, 54.0f, 68.0f, ScreenshotToolbarAction::StrokeDown,
-        L"Stroke -");
-    add(x + 80.0f, 54.0f, 68.0f, ScreenshotToolbarAction::StrokeUp,
-        L"Stroke +");
+    return indices;
+  }
 
-    float actionX = std::max(x + 160.0f, left + barWidth - 252.0f);
-    add(actionX, 54.0f, 76.0f, ScreenshotToolbarAction::Save, L"Save");
-    add(actionX + 80.0f, 54.0f, 76.0f, ScreenshotToolbarAction::Copy,
-        L"Copy");
-    add(actionX + 160.0f, 54.0f, 76.0f, ScreenshotToolbarAction::Cancel,
-        L"Cancel");
+  bool IsScreenshotFocusIndexFocusable(int index) const {
+    RECT client{};
+    if (!captureSelectorHwnd_ || !GetClientRect(captureSelectorHwnd_, &client)) {
+      return false;
+    }
+    const float scale = GetWindowScale(captureSelectorHwnd_);
+    const auto focusable = ScreenshotFocusableIndices(
+        static_cast<float>(client.right) / scale,
+        static_cast<float>(client.bottom) / scale, screenshotTextEditing_);
+    return std::find(focusable.begin(), focusable.end(), index) !=
+           focusable.end();
+  }
+
+  void SetScreenshotFocusIndex(int index, bool invalidate = true) {
+    if (!ScreenshotEditorActive()) return;
+    const int previousChild = AccessibleFocusedChild(captureSelectorHwnd_);
+    screenshotEditor_.focusIndex = index;
+    const int nextChild = AccessibleFocusedChild(captureSelectorHwnd_);
+    if (previousChild != nextChild) {
+      NotifyWinEvent(EVENT_OBJECT_FOCUS, captureSelectorHwnd_, OBJID_CLIENT,
+                     nextChild);
+    }
+    if (invalidate) InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+  }
+
+  void NormalizeScreenshotFocus(bool preferSelection = false) {
+    if (!ScreenshotEditorActive()) return;
+    RECT client{};
+    if (!GetClientRect(captureSelectorHwnd_, &client)) return;
+    const float scale = GetWindowScale(captureSelectorHwnd_);
+    const auto focusable = ScreenshotFocusableIndices(
+        static_cast<float>(client.right) / scale,
+        static_cast<float>(client.bottom) / scale, screenshotTextEditing_);
+    if (focusable.empty()) return;
+    int target = screenshotEditor_.focusIndex;
+    if (preferSelection || !IsScreenshotFocusIndexFocusable(target)) {
+      target = preferSelection ? focusable.back() : focusable.front();
+    }
+    if (target != screenshotEditor_.focusIndex) {
+      SetScreenshotFocusIndex(target);
+    }
+  }
+
+  feathercast::screenshot::ToolbarLayout ScreenshotToolbarContract(
+      float width, float height) const {
+    return feathercast::screenshot::BuildToolbarLayout(width, height);
+  }
+
+  std::vector<ScreenshotToolbarButton> ScreenshotToolbarItems(
+      float width, float height) const {
+    const auto layout = ScreenshotToolbarContract(width, height);
+    std::vector<ScreenshotToolbarButton> buttons;
+    buttons.reserve(layout.buttons.size());
+    for (const auto& button : layout.buttons) {
+      buttons.push_back({{button.rect.left, button.rect.top, button.rect.right,
+                          button.rect.bottom},
+                         button.action, button.label});
+    }
     return buttons;
   }
 
@@ -4325,7 +4457,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ApplyScreenshotToolbarAction(ScreenshotToolbarAction action) {
     using namespace feathercast::screenshot;
-    if (!ScreenshotEditorActive()) return;
+    if (!ScreenshotToolbarActionAvailable(action)) return;
     if (screenshotTextEditing_ && action != ScreenshotToolbarAction::Cancel) {
       FinishScreenshotTextEditing(false);
     }
@@ -4376,6 +4508,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           break;
       }
     }
+    InvalidateScreenshotPreviewCache();
+    NormalizeScreenshotFocus();
     InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
     NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_,
                    OBJID_CLIENT, 1);
@@ -4385,10 +4519,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RECT client{};
     GetClientRect(captureSelectorHwnd_, &client);
     const float scale = GetWindowScale(captureSelectorHwnd_);
-    const auto buttons = ScreenshotToolbarItems(
-        static_cast<float>(client.right) / scale);
-    for (std::size_t index = 0; index < buttons.size(); ++index) {
-      if (PointInRect(buttons[index].rect, x, y)) {
+    const auto layout = ScreenshotToolbarContract(
+        static_cast<float>(client.right) / scale,
+        static_cast<float>(client.bottom) / scale);
+    for (std::size_t index = 0; index < layout.buttons.size(); ++index) {
+      if (feathercast::screenshot::ToolbarContains(
+              layout.buttons[index], {x, y}) &&
+          ScreenshotToolbarActionAvailable(layout.buttons[index].action)) {
         return static_cast<int>(index);
       }
     }
@@ -4397,6 +4534,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool FinishScreenshotTextEditing(bool reportEmpty) {
     if (!screenshotTextEditing_) return false;
+    if (screenshotTextEditHwnd_) {
+      const int length = GetWindowTextLengthW(screenshotTextEditHwnd_);
+      std::wstring value(static_cast<size_t>(std::max(0, length)) + 1,
+                         L'\0');
+      if (length > 0) {
+        const int copied = GetWindowTextW(
+            screenshotTextEditHwnd_, value.data(), length + 1);
+        value.resize(static_cast<size_t>(std::max(0, copied)));
+      } else {
+        value.clear();
+      }
+      screenshotTextBuffer_ = std::move(value);
+    }
     const bool committed = !screenshotTextBuffer_.empty() &&
                            feathercast::screenshot::EditorController::CommitText(
                                screenshotEditor_,
@@ -4405,23 +4555,212 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       feathercast::screenshot::EditorController::CancelGesture(
           screenshotEditor_);
     }
-    screenshotTextBuffer_.clear();
     screenshotTextEditing_ = false;
+    DestroyScreenshotTextEdit(true);
+    screenshotTextBuffer_.clear();
+    InvalidateScreenshotPreviewCache();
+    RECT client{};
+    GetClientRect(captureSelectorHwnd_, &client);
+    const float scale = GetWindowScale(captureSelectorHwnd_);
     const auto buttons = ScreenshotToolbarItems(
-        static_cast<float>(GetWindowWidth(captureSelectorHwnd_)) /
-        GetWindowScale(captureSelectorHwnd_));
+        static_cast<float>(client.right) / scale,
+        static_cast<float>(client.bottom) / scale);
     const auto textButton = std::find_if(
         buttons.begin(), buttons.end(), [](const ScreenshotToolbarButton& button) {
           return button.action == ScreenshotToolbarAction::Text;
         });
     if (textButton != buttons.end()) {
-      screenshotEditor_.focusIndex = static_cast<int>(
-          std::distance(buttons.begin(), textButton));
+      SetScreenshotFocusIndex(static_cast<int>(
+          std::distance(buttons.begin(), textButton)));
     }
     screenshotStatus_ = reportEmpty && !committed
                             ? L"Type some text before placing it."
                             : L"";
+    if (captureSelectorHwnd_) {
+      InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_,
+                     OBJID_CLIENT, CHILDID_SELF);
+    }
     return committed;
+  }
+
+  feathercast::screenshot::Rect ScreenshotTextAnnotationBounds() const {
+    using feathercast::screenshot::ClampRect;
+    using feathercast::screenshot::Normalize;
+    if (!screenshotEditor_.gestureStart) return {};
+    const auto& points = screenshotEditor_.gesturePoints;
+    feathercast::screenshot::Rect result;
+    if (points.size() >= 2) {
+      result = Normalize({points.front().x, points.front().y, points.back().x,
+                          points.back().y});
+    } else {
+      const auto start = *screenshotEditor_.gestureStart;
+      result = {start.x, start.y, start.x + 220, start.y + 48};
+    }
+    if (result.Width() < 2 || result.Height() < 2) {
+      const auto start = *screenshotEditor_.gestureStart;
+      result = {start.x, start.y, start.x + 220, start.y + 48};
+    }
+    return ClampRect(result, screenshotEditor_.sourceBounds);
+  }
+
+  void UpdateScreenshotTextEditWindow(bool activate = false) {
+    if (!screenshotTextEditHwnd_ || !screenshotTextEditing_ ||
+        !screenshotEditor_.gestureStart) {
+      return;
+    }
+    RECT client{};
+    GetClientRect(captureSelectorHwnd_, &client);
+    const float scale = GetWindowScale(captureSelectorHwnd_);
+    const auto local = ScreenshotLocalRect(ScreenshotTextAnnotationBounds());
+    const auto physical = feathercast::screenshot::DipToPixel(
+        {local.left, local.top, local.right, local.bottom}, {0, 0}, scale);
+    const int clientWidth = std::max(1L, client.right);
+    const int clientHeight = std::max(1L, client.bottom);
+    int left = std::clamp(physical.left, 0, std::max(0, clientWidth - 1));
+    int top = std::clamp(physical.top, 0, std::max(0, clientHeight - 1));
+    int right = std::clamp(physical.right, left + 1, clientWidth);
+    int bottom = std::clamp(physical.bottom, top + 1, clientHeight);
+    if (right <= left) {
+      left = std::max(0, clientWidth - 1);
+      right = clientWidth;
+    }
+    if (bottom <= top) {
+      top = std::max(0, clientHeight - 1);
+      bottom = clientHeight;
+    }
+    RECT target{left, top, right, bottom};
+    SetWindowPos(screenshotTextEditHwnd_, HWND_TOP, target.left, target.top,
+                 target.right - target.left, target.bottom - target.top,
+                 activate ? SWP_SHOWWINDOW : SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (activate) {
+      SetFocus(screenshotTextEditHwnd_);
+      SendMessageW(screenshotTextEditHwnd_, EM_SETSEL,
+                   static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+    }
+  }
+
+  static LRESULT CALLBACK ScreenshotTextEditSubclassProc(
+      HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId,
+      DWORD_PTR refData) {
+    UNREFERENCED_PARAMETER(subclassId);
+    auto* app = reinterpret_cast<FeatherCastApp*>(refData);
+    if (app && msg == WM_KEYDOWN) {
+      const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+      if (wParam == VK_ESCAPE) {
+        app->CancelScreenshotTextEditing();
+        return 0;
+      }
+      if (wParam == VK_RETURN && !control) {
+        app->FinishScreenshotTextEditing(true);
+        return 0;
+      }
+      if (control && (wParam == 'S')) {
+        app->FinishScreenshotTextEditing(false);
+        app->FinalizeScreenshot(feathercast::screenshot::Destination::File);
+        return 0;
+      }
+    }
+    if (app && msg == WM_IME_STARTCOMPOSITION) {
+      app->PositionScreenshotImeCandidate(hwnd);
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+  }
+
+  void PositionScreenshotImeCandidate(HWND edit) const {
+    if (!edit) return;
+    HIMC context = ImmGetContext(edit);
+    if (!context) return;
+    POINT caret{};
+    if (const LRESULT position = SendMessageW(edit, EM_POSFROMCHAR, 0, 0);
+        position != -1) {
+      caret.x = GET_X_LPARAM(position);
+      caret.y = GET_Y_LPARAM(position);
+    }
+    COMPOSITIONFORM composition{CFS_POINT, {caret.x, caret.y}, {}};
+    ImmSetCompositionWindow(context, &composition);
+    CANDIDATEFORM candidate{0, CFS_CANDIDATEPOS, {caret.x, caret.y}};
+    ImmSetCandidateWindow(context, &candidate);
+    ImmReleaseContext(edit, context);
+  }
+
+  bool BeginScreenshotTextEditing() {
+    if (!captureSelectorHwnd_ || screenshotEditor_.phase !=
+                                      feathercast::screenshot::Phase::Editing ||
+        !screenshotEditor_.gestureStart) {
+      return false;
+    }
+    screenshotTextBuffer_.clear();
+    screenshotTextEditing_ = true;
+    if (!screenshotTextEditHwnd_) {
+      screenshotTextEditHwnd_ = CreateWindowExW(
+          WS_EX_CLIENTEDGE, L"EDIT", L"",
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL |
+              ES_WANTRETURN,
+          0, 0, 1, 1, captureSelectorHwnd_, nullptr,
+          instance_, this);
+      if (!screenshotTextEditHwnd_) {
+        screenshotTextEditing_ = false;
+        return false;
+      }
+      SetWindowSubclass(screenshotTextEditHwnd_,
+                        &FeatherCastApp::ScreenshotTextEditSubclassProc, 1,
+                        reinterpret_cast<DWORD_PTR>(this));
+      SendMessageW(screenshotTextEditHwnd_, EM_SETLIMITTEXT, 8192, 0);
+      SendMessageW(screenshotTextEditHwnd_, WM_SETFONT,
+                   reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+                   TRUE);
+    }
+    SetWindowTextW(screenshotTextEditHwnd_, L"");
+    UpdateScreenshotTextEditWindow(true);
+    RECT client{};
+    GetClientRect(captureSelectorHwnd_, &client);
+    const float clientScale = GetWindowScale(captureSelectorHwnd_);
+    const auto buttons = ScreenshotToolbarItems(
+        static_cast<float>(client.right) / clientScale,
+        static_cast<float>(client.bottom) / clientScale);
+    SetScreenshotFocusIndex(static_cast<int>(buttons.size()));
+    InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_, OBJID_CLIENT,
+                   static_cast<LONG>(buttons.size() + 1));
+    return true;
+  }
+
+  void DestroyScreenshotTextEdit(bool focusParent) {
+    HWND edit = screenshotTextEditHwnd_;
+    screenshotTextEditHwnd_ = nullptr;
+    if (edit) {
+      RemoveWindowSubclass(edit, &FeatherCastApp::ScreenshotTextEditSubclassProc,
+                           1);
+      DestroyWindow(edit);
+    }
+    if (focusParent && captureSelectorHwnd_) SetFocus(captureSelectorHwnd_);
+  }
+
+  void CancelScreenshotTextEditing() {
+    if (!screenshotTextEditing_) return;
+    screenshotTextEditing_ = false;
+    screenshotTextBuffer_.clear();
+    feathercast::screenshot::EditorController::CancelGesture(screenshotEditor_);
+    DestroyScreenshotTextEdit(true);
+    RECT client{};
+    GetClientRect(captureSelectorHwnd_, &client);
+    const float clientScale = GetWindowScale(captureSelectorHwnd_);
+    const auto buttons = ScreenshotToolbarItems(
+        static_cast<float>(client.right) / clientScale,
+        static_cast<float>(client.bottom) / clientScale);
+    const auto textButton = std::find_if(
+        buttons.begin(), buttons.end(), [](const ScreenshotToolbarButton& button) {
+          return button.action == ScreenshotToolbarAction::Text;
+        });
+    if (textButton != buttons.end()) {
+      SetScreenshotFocusIndex(static_cast<int>(
+          std::distance(buttons.begin(), textButton)));
+    }
+    screenshotStatus_.clear();
+    InvalidateRect(captureSelectorHwnd_, nullptr, FALSE);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_, OBJID_CLIENT,
+                   CHILDID_SELF);
   }
 
   feathercast::screenshot::Point ScreenshotScreenPoint(POINT point) const {
@@ -4430,18 +4769,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   RectF ScreenshotLocalRect(feathercast::screenshot::Rect rect) const {
     const float scale = GetWindowScale(captureSelectorHwnd_);
-    return {static_cast<float>(rect.left - captureVirtualBounds_.left) / scale,
-            static_cast<float>(rect.top - captureVirtualBounds_.top) / scale,
-            static_cast<float>(rect.right - captureVirtualBounds_.left) / scale,
-            static_cast<float>(rect.bottom - captureVirtualBounds_.top) / scale};
+    const auto local = feathercast::screenshot::PixelToDip(
+        rect,
+        {captureVirtualBounds_.left, captureVirtualBounds_.top}, scale);
+    return {local.left, local.top, local.right, local.bottom};
   }
 
   D2D1_POINT_2F ScreenshotLocalPoint(
       feathercast::screenshot::Point point) const {
     const float scale = GetWindowScale(captureSelectorHwnd_);
-    return D2D1::Point2F(
-        static_cast<float>(point.x - captureVirtualBounds_.left) / scale,
-        static_cast<float>(point.y - captureVirtualBounds_.top) / scale);
+    const auto local = feathercast::screenshot::PixelToDip(
+        point, {captureVirtualBounds_.left, captureVirtualBounds_.top}, scale);
+    return D2D1::Point2F(local.x, local.y);
   }
 
   D2D1_COLOR_F ScreenshotD2DColor(
@@ -4522,24 +4861,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         break;
       case Tool::Blur:
       case Tool::Pixelate:
-        FillRound(rect, 4.0f,
-                  ScreenshotThemeColor(annotation.tool == Tool::Blur
-                                           ? theme_.surfaceHover
-                                           : theme_.iconTile,
-                                       0.38f));
         StrokeRound(rect, 4.0f, ScreenshotD2DColor(annotation.color, 0.9f),
                     stroke);
-        DrawTextBlock(annotation.tool == Tool::Blur ? L"Blur" : L"Pixelate",
-                      {rect.left + 8.0f, rect.top + 5.0f, rect.right - 8.0f,
-                       rect.top + 26.0f},
-                      subFormat_.Get(), ScreenshotD2DColor(annotation.color));
         break;
       case Tool::Text:
         if (!annotation.text.empty()) {
-          DrawTextBlock(annotation.text,
-                        {rect.left + 2.0f, rect.top + 2.0f, rect.right - 2.0f,
-                         rect.bottom - 2.0f},
-                        bodyFormat_.Get(), ScreenshotD2DColor(annotation.color));
+          const auto textBounds = AnnotationTextBounds(annotation);
+          const RectF textRect = ScreenshotLocalRect(textBounds);
+          DrawTextBlock(annotation.text, textRect,
+                        ScreenshotAnnotationTextFormat(annotation),
+                        ScreenshotD2DColor(annotation.color));
         } else {
           StrokeRound(rect, 4.0f, ScreenshotD2DColor(annotation.color, 0.9f),
                       stroke);
@@ -4564,6 +4895,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     preview.color = screenshotEditor_.color;
     preview.strokeWidth = screenshotEditor_.strokeWidth;
     preview.fontSize = screenshotEditor_.fontSize;
+    preview.fontFamily = screenshotEditor_.fontFamily;
     preview.points = screenshotEditor_.gesturePoints;
     if (preview.points.empty()) {
       preview.points.push_back(*screenshotEditor_.gestureStart);
@@ -4581,6 +4913,93 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     }
     return preview;
+  }
+
+  std::optional<feathercast::screenshot::Rect>
+  ScreenshotSelectionForPainting() const {
+    if (screenshotEditor_.selection) return screenshotEditor_.selection;
+    if (screenshotEditor_.gesturePoints.size() < 2) return std::nullopt;
+    const auto first = screenshotEditor_.gesturePoints.front();
+    const auto last = screenshotEditor_.gesturePoints.back();
+    return feathercast::screenshot::Normalize(
+        {first.x, first.y, last.x, last.y});
+  }
+
+  void InvalidateScreenshotPreviewCache() {
+    screenshotEffectPreviewBitmap_.Reset();
+    screenshotEffectPreviewBounds_ = {};
+    screenshotEffectPreviewSelection_.reset();
+    screenshotEffectPreviewRevision_ = 0;
+    ++screenshotAnnotationRevision_;
+  }
+
+  void UpdateScreenshotEffectPreview(
+      std::optional<feathercast::screenshot::Rect> selection) {
+    using namespace feathercast::screenshot;
+    if (!screenshotDraft_ || !screenshotDraft_->Valid() ||
+        !captureSelectorSurface_.dc || !selection || selection->Empty()) {
+      screenshotEffectPreviewBitmap_.Reset();
+      screenshotEffectPreviewSelection_.reset();
+      screenshotEffectPreviewRevision_ = screenshotAnnotationRevision_;
+      return;
+    }
+    if (screenshotEffectPreviewRevision_ == screenshotAnnotationRevision_ &&
+        screenshotEffectPreviewSelection_ == selection) {
+      return;
+    }
+    screenshotEffectPreviewBitmap_.Reset();
+    screenshotEffectPreviewSelection_ = selection;
+    screenshotEffectPreviewRevision_ = screenshotAnnotationRevision_;
+
+    std::vector<Annotation> effects;
+    for (const auto& annotation : screenshotEditor_.annotations) {
+      if (annotation.tool == Tool::Blur || annotation.tool == Tool::Pixelate) {
+        effects.push_back(annotation);
+      }
+    }
+    if (const auto gesture = ScreenshotGesturePreview(); gesture &&
+        (gesture->tool == Tool::Blur || gesture->tool == Tool::Pixelate)) {
+      effects.push_back(*gesture);
+    }
+    if (effects.empty()) return;
+
+    Rect region = Normalize(*selection);
+    bool hasEffectBounds = false;
+    Rect effectBounds{};
+    for (const auto& annotation : effects) {
+      Rect bounds = Normalize(annotation.bounds);
+      bounds.left = std::max(bounds.left, region.left);
+      bounds.top = std::max(bounds.top, region.top);
+      bounds.right = std::min(bounds.right, region.right);
+      bounds.bottom = std::min(bounds.bottom, region.bottom);
+      if (bounds.Empty()) continue;
+      if (!hasEffectBounds) {
+        effectBounds = bounds;
+        hasEffectBounds = true;
+      } else {
+        effectBounds.left = std::min(effectBounds.left, bounds.left);
+        effectBounds.top = std::min(effectBounds.top, bounds.top);
+        effectBounds.right = std::max(effectBounds.right, bounds.right);
+        effectBounds.bottom = std::max(effectBounds.bottom, bounds.bottom);
+      }
+    }
+    if (!hasEffectBounds || effectBounds.Width() < 2 || effectBounds.Height() < 2) {
+      return;
+    }
+    std::wstring error;
+    const auto rendered = Render(*screenshotDraft_, effectBounds, effects, &error);
+    if (!rendered || !rendered->Valid()) return;
+    const auto properties = D2D1::BitmapProperties(D2D1::PixelFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap> bitmap;
+    if (FAILED(captureSelectorSurface_.dc->CreateBitmap(
+            D2D1::SizeU(rendered->width, rendered->height),
+            rendered->pixels.data(), rendered->stride, properties,
+            bitmap.GetAddressOf()))) {
+      return;
+    }
+    screenshotEffectPreviewBounds_ = effectBounds;
+    screenshotEffectPreviewBitmap_ = std::move(bitmap);
   }
 
   void DrawScreenshotSelectionHandles(
@@ -4615,12 +5034,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     PAINTSTRUCT paint{};
     BeginPaint(captureSelectorHwnd_, &paint);
     BeginFrameMeasurement();
-    if (!EnsureRenderResources() ||
-        FAILED(CreateGlassSurface(captureSelectorSurface_,
-                                  captureSelectorHwnd_))) {
+    if (!EnsureRenderResources()) {
+      ScheduleRenderRecovery(L"screenshot-editor-resources", E_FAIL);
       EndPaint(captureSelectorHwnd_, &paint);
       return;
     }
+    const HRESULT surfaceResult =
+        CreateGlassSurface(captureSelectorSurface_, captureSelectorHwnd_);
+    if (FAILED(surfaceResult)) {
+      ScheduleRenderRecovery(L"screenshot-editor-surface", surfaceResult);
+      EndPaint(captureSelectorHwnd_, &paint);
+      return;
+    }
+    if (screenshotDraft_ && screenshotDraft_->Valid() &&
+        !PromoteScreenshotDraftBitmap()) {
+      ScheduleRenderRecovery(L"screenshot-editor-bitmap", E_FAIL);
+      EndPaint(captureSelectorHwnd_, &paint);
+      return;
+    }
+    UpdateScreenshotTextEditWindow();
     ID2D1DeviceContext* dc = captureSelectorSurface_.dc.Get();
     SetActiveTarget(dc);
     if (FAILED(EnsureBrushResources())) {
@@ -4629,6 +5061,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(captureSelectorHwnd_, &paint);
       return;
     }
+    const auto paintingSelection = ScreenshotSelectionForPainting();
+    UpdateScreenshotEffectPreview(paintingSelection);
     const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
       RECT client{};
       GetClientRect(captureSelectorHwnd_, &client);
@@ -4679,6 +5113,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                             ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                             : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         dc->PopAxisAlignedClip();
+        if (screenshotEffectPreviewBitmap_) {
+          dc->DrawBitmap(
+              screenshotEffectPreviewBitmap_.Get(),
+              ToD2D(ScreenshotLocalRect(screenshotEffectPreviewBounds_)),
+              1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
         const auto gesturePreview = ScreenshotGesturePreview();
         if (!screenshotEditor_.annotations.empty() || gesturePreview) {
           dc->PushAxisAlignedClip(ToD2D(selection),
@@ -4695,19 +5135,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (screenshotTextEditing_ && screenshotEditor_.gestureStart) {
         feathercast::screenshot::Annotation preview;
         preview.tool = feathercast::screenshot::Tool::Text;
-        preview.bounds = screenshotEditor_.gesturePoints.size() >= 2
-                             ? feathercast::screenshot::Normalize(
-                                   {screenshotEditor_.gesturePoints.front().x,
-                                    screenshotEditor_.gesturePoints.front().y,
-                                    screenshotEditor_.gesturePoints.back().x,
-                                    screenshotEditor_.gesturePoints.back().y})
-                             : feathercast::screenshot::Rect{
-                                   screenshotEditor_.gestureStart->x,
-                                   screenshotEditor_.gestureStart->y,
-                                   screenshotEditor_.gestureStart->x + 220,
-                                   screenshotEditor_.gestureStart->y + 48};
+        preview.bounds = ScreenshotTextAnnotationBounds();
         preview.text = screenshotTextBuffer_;
         preview.color = screenshotEditor_.color;
+        preview.fontSize = screenshotEditor_.fontSize;
+        preview.fontFamily = screenshotEditor_.fontFamily;
         DrawScreenshotAnnotationPreview(preview);
       }
 
@@ -4726,21 +5158,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             bodyFormat_.Get(), EmphasisTextColor());
       }
 
-      const auto buttons = ScreenshotToolbarItems(width);
-      const float barLeft = buttons.empty() ? 12.0f : buttons.front().rect.left - 12.0f;
-      const float barRight = buttons.empty()
-                                 ? width - 12.0f
-                                 : std::min(width - 12.0f,
-                                            barLeft + 1160.0f);
-      FillRound({barLeft, 6.0f, barRight, 94.0f}, 12.0f,
+      const auto toolbar = ScreenshotToolbarContract(width, height);
+      const auto buttons = ScreenshotToolbarItems(width, height);
+      const RectF toolbarBar{toolbar.bar.left, toolbar.bar.top,
+                             toolbar.bar.right, toolbar.bar.bottom};
+      FillRound(toolbarBar, 12.0f,
                 highContrast_ ? D2DColor(theme_.overlayBackground)
                               : D2D1::ColorF(0.05f, 0.06f, 0.08f, 0.94f));
-      StrokeRound({barLeft, 6.0f, barRight, 94.0f}, 12.0f,
-                  D2DColor(theme_.border), 1.0f);
-      const bool outputBusy = screenshotEditor_.phase ==
-                                  feathercast::screenshot::Phase::Saving ||
-                              screenshotEditor_.phase ==
-                                  feathercast::screenshot::Phase::Copying;
+      StrokeRound(toolbarBar, 12.0f, D2DColor(theme_.border), 1.0f);
       for (std::size_t index = 0; index < buttons.size(); ++index) {
         const auto& button = buttons[index];
         const auto action = button.action;
@@ -4752,16 +5177,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
              (IsScreenshotToolAction(action) &&
               action != ScreenshotToolbarAction::Select &&
               screenshotEditor_.tool == ScreenshotToolForAction(action)));
-        const bool disabled = outputBusy ||
-                              (action == ScreenshotToolbarAction::Undo &&
-                               screenshotEditor_.annotations.empty()) ||
-                              (action == ScreenshotToolbarAction::Redo &&
-                               screenshotEditor_.redo.empty()) ||
-                              ((action == ScreenshotToolbarAction::Save ||
-                                action == ScreenshotToolbarAction::Copy) &&
-                               (!currentSelection ||
-                                screenshotEditor_.phase !=
-                                    feathercast::screenshot::Phase::Editing));
+        const bool disabled = !ScreenshotToolbarActionAvailable(action);
         if (color) {
           const bool active = screenshotEditor_.color ==
                               ScreenshotColorForAction(action);
@@ -4780,7 +5196,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           continue;
         }
         const bool hovered = static_cast<int>(index) == screenshotEditor_.hoverIndex;
-        const bool focused = static_cast<int>(index) == screenshotEditor_.focusIndex;
+        const bool focused = !disabled &&
+                             GetFocus() == captureSelectorHwnd_ &&
+                             static_cast<int>(index) == screenshotEditor_.focusIndex;
         FillRound(button.rect, 7.0f,
                   disabled ? ScreenshotThemeColor(theme_.surface, 0.35f)
                            : (selected || hovered ? D2DColor(theme_.surfaceHover)
@@ -4802,9 +5220,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                                  feathercast::screenshot::Phase::Selecting
                                              ? L"Drag to select a region"
                                              : L"Drag to annotate  ·  Select to move or resize")
-                                      : screenshotStatus_;
-      DrawTextBlock(footer, {16.0f, std::max(108.0f, height - 34.0f),
-                             width - 16.0f, height - 10.0f},
+                                       : screenshotStatus_;
+      const RectF footerRect{toolbar.footer.left, toolbar.footer.top,
+                             toolbar.footer.right, toolbar.footer.bottom};
+      DrawTextBlock(footer, footerRect,
                     centerFormat_.Get(),
                     screenshotEditor_.phase ==
                             feathercast::screenshot::Phase::Editing
@@ -4850,15 +5269,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const auto selection =
           feathercast::ui::CaptureUiController::SelectionRect(captureUiState_);
       if (selection) {
-        RectF rect{
-            static_cast<float>(selection->left - captureVirtualBounds_.left) /
-                scale,
-            static_cast<float>(selection->top - captureVirtualBounds_.top) /
-                scale,
-            static_cast<float>(selection->right - captureVirtualBounds_.left) /
-                scale,
-            static_cast<float>(selection->bottom - captureVirtualBounds_.top) /
-                scale};
+        const auto rectDip = feathercast::screenshot::PixelToDip(
+            ScreenshotRect({selection->left, selection->top, selection->right,
+                            selection->bottom}),
+            {captureVirtualBounds_.left, captureVirtualBounds_.top}, scale);
+        RectF rect{rectDip.left, rectDip.top, rectDip.right, rectDip.bottom};
         dc->PushAxisAlignedClip(
             D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom),
             D2D1_ANTIALIAS_MODE_ALIASED);
@@ -4877,14 +5292,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
 
       if (captureUiState_.selectionEnd) {
-        const float x =
-            static_cast<float>(captureUiState_.selectionEnd->x -
-                               captureVirtualBounds_.left) /
-            scale;
-        const float y =
-            static_cast<float>(captureUiState_.selectionEnd->y -
-                               captureVirtualBounds_.top) /
-            scale;
+        const auto pointDip = feathercast::screenshot::PixelToDip(
+            feathercast::screenshot::Point{captureUiState_.selectionEnd->x,
+                                           captureUiState_.selectionEnd->y},
+            {captureVirtualBounds_.left, captureVirtualBounds_.top}, scale);
+        const float x = pointDip.x;
+        const float y = pointDip.y;
         auto crosshair = Brush(EmphasisTextColor(0.75f));
         dc->DrawLine(D2D1::Point2F(0, y), D2D1::Point2F(width, y),
                      crosshair.Get(), 1.0f);
@@ -5031,6 +5444,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     switch (msg) {
       case WM_NCDESTROY:
         CancelRenderRetry(hwnd);
+        if (screenshotTextEditHwnd_) {
+          screenshotTextEditing_ = false;
+          DestroyScreenshotTextEdit(false);
+        }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
       case WM_ERASEBKGND:
         return 1;
@@ -5043,9 +5460,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_PAINT:
         PaintScreenshotEditor();
         return 0;
+      case WM_SETFOCUS:
+        NormalizeScreenshotFocus();
+        NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT,
+                       AccessibleFocusedChild(hwnd));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_KILLFOCUS:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
       case WM_SIZE:
         ResizeGlassSurface(captureSelectorSurface_, hwnd, LOWORD(lParam),
                            HIWORD(lParam));
+        UpdateScreenshotTextEditWindow();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case WM_DPICHANGED:
@@ -5063,9 +5490,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           const Handle handle = EditorController::HitTestHandle(
               screenshotEditor_, {point.x, point.y});
           if (handle == Handle::Move) cursor = LoadCursorW(nullptr, IDC_SIZEALL);
-          else if (handle != Handle::None) {
+          else if (handle == Handle::TopLeft || handle == Handle::BottomRight)
             cursor = LoadCursorW(nullptr, IDC_SIZENWSE);
-          }
+          else if (handle == Handle::TopRight || handle == Handle::BottomLeft)
+            cursor = LoadCursorW(nullptr, IDC_SIZENESW);
+          else if (handle == Handle::Left || handle == Handle::Right)
+            cursor = LoadCursorW(nullptr, IDC_SIZEWE);
+          else if (handle == Handle::Top || handle == Handle::Bottom)
+            cursor = LoadCursorW(nullptr, IDC_SIZENS);
         }
         SetCursor(cursor);
         return TRUE;
@@ -5074,14 +5506,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         SetFocus(hwnd);
         const int toolbarIndex = HitTestScreenshotToolbar(x, y);
         if (toolbarIndex >= 0) {
-          screenshotEditor_.focusIndex = toolbarIndex;
+          SetScreenshotFocusIndex(toolbarIndex);
+          RECT client{};
+          GetClientRect(hwnd, &client);
           ApplyScreenshotToolbarAction(
-              ScreenshotToolbarItems(static_cast<float>(GetWindowWidth(hwnd)) /
-                                     scale)[static_cast<size_t>(toolbarIndex)]
+              ScreenshotToolbarItems(static_cast<float>(client.right) / scale,
+                                     static_cast<float>(client.bottom) / scale)
+                  [static_cast<size_t>(toolbarIndex)]
                   .action);
           return 0;
         }
-        if (screenshotTextEditing_) finishTextEditing();
+        if (screenshotTextEditing_) {
+          finishTextEditing();
+          return 0;
+        }
         if (screenshotEditor_.phase == Phase::Selecting) {
           EditorController::BeginSelection(screenshotEditor_,
                                             ScreenshotScreenPoint(screenPoint()));
@@ -5123,6 +5561,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           }
         }
         if (changed) {
+          InvalidateScreenshotPreviewCache();
           InvalidateRect(hwnd, nullptr, FALSE);
           NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
         }
@@ -5160,13 +5599,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                             : start.y - 48;
               }
               if (EditorController::UpdateAnnotation(screenshotEditor_, end)) {
-                screenshotTextBuffer_.clear();
-                screenshotTextEditing_ = true;
-                const auto buttons = ScreenshotToolbarItems(
-                    static_cast<float>(GetWindowWidth(hwnd)) / scale);
-                screenshotEditor_.focusIndex = static_cast<int>(buttons.size());
-                screenshotStatus_ =
-                    L"Type text  ·  Enter to place  ·  Esc to cancel";
+                if (!BeginScreenshotTextEditing()) {
+                  EditorController::CancelGesture(screenshotEditor_);
+                  screenshotStatus_ = L"The text editor could not start.";
+                } else {
+                  screenshotStatus_ =
+                      L"Type text  ·  Enter to place  ·  Esc to cancel";
+                }
               }
             } else if (!EditorController::CommitAnnotation(screenshotEditor_,
                                                             point)) {
@@ -5174,15 +5613,42 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             } else {
               screenshotStatus_.clear();
             }
+            InvalidateScreenshotPreviewCache();
           }
         }
         if (GetCapture() == hwnd) ReleaseCapture();
+        InvalidateScreenshotPreviewCache();
         InvalidateRect(hwnd, nullptr, FALSE);
         NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
         return 0;
       }
+      case WM_COMMAND: {
+        const HWND source = reinterpret_cast<HWND>(lParam);
+        if (source == screenshotTextEditHwnd_ &&
+            HIWORD(wParam) == EN_CHANGE) {
+          const int length = GetWindowTextLengthW(source);
+          std::wstring value(static_cast<size_t>(std::max(0, length)) + 1,
+                             L'\0');
+          const int copied = GetWindowTextW(
+              source, value.data(), static_cast<int>(value.size()));
+          value.resize(static_cast<size_t>(std::max(0, copied)));
+          screenshotTextBuffer_ = std::move(value);
+          InvalidateRect(hwnd, nullptr, FALSE);
+          RECT client{};
+          GetClientRect(hwnd, &client);
+          NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT,
+                         static_cast<LONG>(ScreenshotToolbarItems(
+                             static_cast<float>(client.right) / scale,
+                             static_cast<float>(client.bottom) / scale)
+                                                 .size() +
+                                             1));
+          return 0;
+        }
+        break;
+      }
       case WM_KEYDOWN: {
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (control && wParam == 'S') {
           FinalizeScreenshot(Destination::File);
           return 0;
@@ -5193,6 +5659,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         if (control && wParam == 'Z') {
           if (EditorController::Undo(screenshotEditor_)) {
+            InvalidateScreenshotPreviewCache();
+            NormalizeScreenshotFocus();
             InvalidateRect(hwnd, nullptr, FALSE);
             NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
           }
@@ -5200,6 +5668,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         if (control && wParam == 'Y') {
           if (EditorController::Redo(screenshotEditor_)) {
+            InvalidateScreenshotPreviewCache();
+            NormalizeScreenshotFocus();
             InvalidateRect(hwnd, nullptr, FALSE);
             NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
           }
@@ -5207,74 +5677,96 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         if (wParam == VK_ESCAPE) {
           if (screenshotTextEditing_) {
-            screenshotTextEditing_ = false;
-            screenshotTextBuffer_.clear();
-            EditorController::CancelGesture(screenshotEditor_);
-            const RECT client = [&] {
-              RECT value{};
-              GetClientRect(hwnd, &value);
-              return value;
-            }();
-            const auto buttons = ScreenshotToolbarItems(
-                static_cast<float>(client.right) / scale);
-            const auto textButton = std::find_if(
-                buttons.begin(), buttons.end(),
-                [](const ScreenshotToolbarButton& button) {
-                  return button.action == ScreenshotToolbarAction::Text;
-                });
-            if (textButton != buttons.end()) {
-              screenshotEditor_.focusIndex = static_cast<int>(
-                  std::distance(buttons.begin(), textButton));
-            }
-            screenshotStatus_.clear();
-            InvalidateRect(hwnd, nullptr, FALSE);
+            CancelScreenshotTextEditing();
           } else if (EditorController::CancelGesture(screenshotEditor_)) {
+            InvalidateScreenshotPreviewCache();
             InvalidateRect(hwnd, nullptr, FALSE);
           } else {
             CancelScreenshotEditor();
           }
           return 0;
         }
-        if (screenshotTextEditing_) {
-          if (wParam == VK_BACK && !screenshotTextBuffer_.empty()) {
-            screenshotTextBuffer_.pop_back();
+        if (screenshotTextEditing_) return 0;
+
+        if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP ||
+            wParam == VK_DOWN) {
+          const EditorKey key = wParam == VK_LEFT
+                                    ? EditorKey::Left
+                                    : wParam == VK_RIGHT
+                                          ? EditorKey::Right
+                                          : wParam == VK_UP ? EditorKey::Up
+                                                            : EditorKey::Down;
+          const auto result = EditorController::HandleKeyboard(
+              screenshotEditor_, key, shift, control);
+          if (result == KeyboardResult::Moved) {
+            InvalidateScreenshotPreviewCache();
             InvalidateRect(hwnd, nullptr, FALSE);
-          } else if (wParam == VK_RETURN) {
-            finishTextEditing();
+            NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
           }
           return 0;
         }
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const auto buttons = ScreenshotToolbarItems(
+            static_cast<float>(client.right) / scale,
+            static_cast<float>(client.bottom) / scale);
+        const float width = static_cast<float>(client.right) / scale;
+        const float height = static_cast<float>(client.bottom) / scale;
         if (wParam == VK_TAB) {
-          RECT client{};
-          GetClientRect(hwnd, &client);
-          const auto buttons = ScreenshotToolbarItems(
-              static_cast<float>(client.right) / scale);
-          if (!buttons.empty()) {
-            const bool reverse = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            const int count = static_cast<int>(buttons.size());
-            screenshotEditor_.focusIndex =
-                (screenshotEditor_.focusIndex + (reverse ? count - 1 : 1)) %
-                count;
-            InvalidateRect(hwnd, nullptr, FALSE);
+          const auto focusable = ScreenshotFocusableIndices(
+              width, height, screenshotTextEditing_);
+          if (!focusable.empty()) {
+            const bool reverse = shift;
+            const auto current = std::find(focusable.begin(), focusable.end(),
+                                           screenshotEditor_.focusIndex);
+            std::size_t next = 0;
+            if (current == focusable.end()) {
+              next = reverse ? focusable.size() - 1 : 0;
+            } else {
+              const auto offset = static_cast<std::size_t>(
+                  std::distance(focusable.begin(), current));
+              next = reverse
+                         ? (offset == 0 ? focusable.size() - 1 : offset - 1)
+                         : (offset + 1) % focusable.size();
+            }
+            SetScreenshotFocusIndex(focusable[next]);
+            SetFocus(hwnd);
           }
           return 0;
         }
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
-          RECT client{};
-          GetClientRect(hwnd, &client);
-          const auto buttons = ScreenshotToolbarItems(
-              static_cast<float>(client.right) / scale);
+          const int selectionIndex = static_cast<int>(buttons.size()) +
+                                     (screenshotTextEditing_ ? 1 : 0);
+          if (wParam == VK_RETURN &&
+              (screenshotEditor_.phase == Phase::Selecting ||
+               screenshotEditor_.focusIndex == selectionIndex)) {
+            const auto result = EditorController::HandleKeyboard(
+                screenshotEditor_, EditorKey::Enter);
+            if (result == KeyboardResult::Confirmed) {
+              NormalizeScreenshotFocus(true);
+              InvalidateScreenshotPreviewCache();
+              InvalidateRect(hwnd, nullptr, FALSE);
+              NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
+            }
+            return 0;
+          }
           if (screenshotEditor_.focusIndex >= 0 &&
-              screenshotEditor_.focusIndex < static_cast<int>(buttons.size())) {
+              screenshotEditor_.focusIndex < static_cast<int>(buttons.size()) &&
+              ScreenshotToolbarActionAvailable(
+                  buttons[static_cast<size_t>(screenshotEditor_.focusIndex)]
+                      .action)) {
             ApplyScreenshotToolbarAction(
-                buttons[static_cast<size_t>(screenshotEditor_.focusIndex)].action);
+                buttons[static_cast<size_t>(screenshotEditor_.focusIndex)]
+                    .action);
           }
           return 0;
         }
         return 0;
       }
       case WM_CHAR:
-        if (screenshotTextEditing_ && wParam >= 32 && wParam != 127) {
+        if (screenshotTextEditing_ && !screenshotTextEditHwnd_ &&
+            wParam >= 32 && wParam != 127) {
           screenshotTextBuffer_.push_back(static_cast<wchar_t>(wParam));
           InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -5368,7 +5860,35 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         return 0;
       case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) CancelCaptureSelection();
+        if (wParam == VK_ESCAPE) {
+          CancelCaptureSelection();
+          return 0;
+        }
+        if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP ||
+            wParam == VK_DOWN || wParam == VK_RETURN) {
+          using Key = feathercast::ui::CaptureKey;
+          const auto key = wParam == VK_LEFT
+                               ? Key::Left
+                               : wParam == VK_RIGHT
+                                     ? Key::Right
+                                     : wParam == VK_UP
+                                           ? Key::Up
+                                           : wParam == VK_DOWN
+                                                 ? Key::Down
+                                                 : Key::Enter;
+          const auto result =
+              feathercast::ui::CaptureUiController::HandleSelectionKey(
+                  captureUiState_, key,
+                  (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                  (GetKeyState(VK_CONTROL) & 0x8000) != 0);
+          if (result == feathercast::ui::CaptureKeyboardResult::Moved) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+            NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
+          } else if (result ==
+                     feathercast::ui::CaptureKeyboardResult::Confirmed) {
+            CompleteCaptureSelection();
+          }
+        }
         return 0;
       case WM_RBUTTONUP:
       case WM_CANCELMODE:
@@ -5636,6 +6156,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                           settingsBlurApplied_);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+      case WM_MOVING:
+      case WM_MOVE:
+        SyncSettingsSurfaceAfterNativeMove(hwnd);
+        break;
       case WM_WINDOWPOSCHANGED: {
         const LRESULT result = DefWindowProcW(hwnd, msg, wParam, lParam);
         SyncSettingsSurfaceAfterNativeMove(hwnd);
@@ -5963,6 +6487,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     float lastVisualOpacity = -1.0f;
     bool lastBlurDuringMotion = true;
     bool lastWindowTransitioning = false;
+    RECT lastHostRect{};
     bool blurClipActive = false;
     RECT blurClip{};
     int blurClipCorner = 0;
@@ -5980,6 +6505,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       lastVisualOpacity = -1.0f;
       lastBlurDuringMotion = true;
       lastWindowTransitioning = false;
+      lastHostRect = {};
       blurClipActive = false;
       blurClip = {};
       blurClipCorner = 0;
@@ -6051,6 +6577,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ClearIconBitmaps();
     previewBitmap_.Reset();
     screenshotDraftBitmap_.Reset();
+    screenshotEffectPreviewBitmap_.Reset();
+    screenshotEffectPreviewBounds_ = {};
+    screenshotEffectPreviewSelection_.reset();
+    screenshotEffectPreviewRevision_ = 0;
     brushCache_.clear();
     textLayoutCache_.clear();
   }
@@ -6311,6 +6841,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     surface.blurClipActive = false;
     surface.blurClip = {};
     surface.blurClipCorner = 0;
+    surface.lastHostRect = {};
   }
 
   // DWM blur is hosted by a separate, empty popup so its native bounds can
@@ -6392,14 +6923,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     const int blurWidth = clip.right - clip.left;
     const int blurHeight = clip.bottom - clip.top;
-    HRGN region = CreateRoundRectRgn(0, 0, blurWidth + 1, blurHeight + 1,
-                                     corner, corner);
-    if (!region) return;
-    SetWindowPos(blurHwnd, hwnd, clip.left, clip.top, blurWidth, blurHeight,
-                 SWP_NOACTIVATE);
-    if (!SetWindowRgn(blurHwnd, region, TRUE)) {
-      DeleteObject(region);
-      return;
+    const int oldBlurWidth = surface.blurClip.right - surface.blurClip.left;
+    const int oldBlurHeight = surface.blurClip.bottom - surface.blurClip.top;
+    const bool shapeChanged = !surface.blurClipActive ||
+                              blurWidth != oldBlurWidth ||
+                              blurHeight != oldBlurHeight ||
+                              corner != surface.blurClipCorner;
+    if (shapeChanged) {
+      HRGN region = CreateRoundRectRgn(0, 0, blurWidth + 1, blurHeight + 1,
+                                       corner, corner);
+      if (!region) return;
+      SetWindowPos(blurHwnd, hwnd, clip.left, clip.top, blurWidth, blurHeight,
+                   SWP_NOACTIVATE);
+      if (!SetWindowRgn(blurHwnd, region, TRUE)) {
+        DeleteObject(region);
+        return;
+      }
+    } else {
+      SetWindowPos(blurHwnd, hwnd, clip.left, clip.top, blurWidth, blurHeight,
+                   SWP_NOACTIVATE);
     }
     ShowWindow(blurHwnd, SW_SHOWNOACTIVATE);
     surface.blurClipActive = true;
@@ -6431,6 +6973,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         transform._22, transform._31, transform._32};
     const float appliedOpacity = static_cast<float>(
         std::clamp(opacity, 0.0, 1.0));
+
+    RECT host{};
+    GetWindowRect(hwnd, &host);
+    const bool hostChanged = !surface.visualStateValid ||
+                             surface.lastHostRect.left != host.left ||
+                             surface.lastHostRect.top != host.top ||
+                             surface.lastHostRect.right != host.right ||
+                             surface.lastHostRect.bottom != host.bottom;
+
     const bool transformChanged =
         !surface.visualStateValid ||
         std::abs(surface.lastVisualTransform._11 - compositionTransform._11) >
@@ -6456,9 +7007,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool transitionStateChanged =
         !surface.visualStateValid ||
         surface.lastWindowTransitioning != transitioning;
-    surface.visualStateChanged = transformChanged || opacityChanged ||
-                                  blurPolicyChanged || transitionStateChanged;
-    if (!surface.visualStateChanged) return S_OK;
+    const bool visualChanged = transformChanged || opacityChanged;
+    surface.visualStateChanged = visualChanged || blurPolicyChanged ||
+                                  transitionStateChanged;
+    if (!surface.visualStateChanged && !hostChanged) return S_OK;
 
     HRESULT result = S_OK;
     if (transformChanged) {
@@ -6469,7 +7021,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float radius = hwnd == settingsHwnd_ ? theme_.settingsRadius
                                                 : theme_.overlayRadius;
     if (transformChanged || opacityChanged || blurPolicyChanged ||
-        transitionStateChanged) {
+        transitionStateChanged || hostChanged) {
       UpdateSurfaceBlurWindow(surface, hwnd, transform, opacity, radius);
     }
 
@@ -6483,6 +7035,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     surface.lastBlurDuringMotion =
         performanceGovernor_.Policy().allowBlurDuringMotion;
     surface.lastWindowTransitioning = transitioning;
+    surface.lastHostRect = host;
     return S_OK;
   }
 
@@ -6558,9 +7111,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // reaches this function once per frame.
   void ResizeGlassSurface(GlassSurface& surface, HWND hwnd, UINT width, UINT height) {
     if (!surface.swapChain || !surface.dc) return;
-    if (IsWindowTransitioning(hwnd)) return;
+    if (hwnd == hwnd_ && overlayClosing_) return;
+    if (hwnd == settingsHwnd_ && settingsClosing_) return;
+    if (hwnd == volumeHwnd_ && volumeClosing_) return;
     width = std::max<UINT>(1, width);
     height = std::max<UINT>(1, height);
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    if (SUCCEEDED(surface.swapChain->GetDesc1(&desc))) {
+      if (desc.Width == width && desc.Height == height) return;
+    }
     surface.dc->SetTarget(nullptr);
     surface.bitmap.Reset();
     const HRESULT resizeResult = surface.swapChain->ResizeBuffers(
@@ -6599,6 +7158,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     centerFormat_.Reset();
     emojiFormat_.Reset();
     volumeValueFormat_.Reset();
+    screenshotAnnotationTextFormat_.Reset();
+    screenshotAnnotationTextFormatSize_ = 0.0f;
+    screenshotAnnotationTextFormatScale_ = 0.0f;
+    screenshotAnnotationTextFormatFamily_.clear();
     textLayoutCache_.clear();
   }
 
@@ -6723,7 +7286,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   };
 
   void CreateTextFormat(const TextStyle& style,
-                        ComPtr<IDWriteTextFormat>& out) {
+                        ComPtr<IDWriteTextFormat>& out,
+                        const std::wstring* familySpec = nullptr) {
+    const std::wstring& families =
+        familySpec && !familySpec->empty() ? *familySpec : theme_.fontFamily;
     const auto tryFamily = [&](const std::wstring& family) {
       if (family.empty()) return false;
       out.Reset();
@@ -6734,9 +7300,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     bool created = false;
     std::size_t start = 0;
-    while (start <= theme_.fontFamily.size()) {
-      const std::size_t comma = theme_.fontFamily.find(L',', start);
-      const std::wstring family = Trim(theme_.fontFamily.substr(
+    while (start <= families.size()) {
+      const std::size_t comma = families.find(L',', start);
+      const std::wstring family = Trim(families.substr(
           start, comma == std::wstring::npos ? std::wstring::npos : comma - start));
       if (tryFamily(family)) {
         created = true;
@@ -6764,6 +7330,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         out->SetTrimming(&trimming, ellipsis.Get());
       }
     }
+  }
+
+  IDWriteTextFormat* ScreenshotAnnotationTextFormat(
+      const feathercast::screenshot::Annotation& annotation) {
+    if (!dwriteFactory_) return bodyFormat_.Get();
+    const float scale = GetWindowScale(captureSelectorHwnd_);
+    const std::wstring family = annotation.fontFamily.empty()
+                                    ? theme_.fontFamily
+                                    : annotation.fontFamily;
+    const float size = std::max(12.0f,
+                                static_cast<float>(annotation.fontSize)) /
+                       std::max(0.01f, scale);
+    if (!screenshotAnnotationTextFormat_ ||
+        std::abs(screenshotAnnotationTextFormatSize_ - size) > 0.01f ||
+        std::abs(screenshotAnnotationTextFormatScale_ - scale) > 0.001f ||
+        screenshotAnnotationTextFormatFamily_ != family) {
+      CreateTextFormat({size, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                        std::max(14.0f, size * 1.25f)},
+                       screenshotAnnotationTextFormat_, &family);
+      if (screenshotAnnotationTextFormat_) {
+        screenshotAnnotationTextFormat_->SetWordWrapping(
+            DWRITE_WORD_WRAPPING_WRAP);
+        screenshotAnnotationTextFormat_->SetTextAlignment(
+            DWRITE_TEXT_ALIGNMENT_LEADING);
+        screenshotAnnotationTextFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+      }
+      screenshotAnnotationTextFormatSize_ = size;
+      screenshotAnnotationTextFormatScale_ = scale;
+      screenshotAnnotationTextFormatFamily_ = family;
+    }
+    return screenshotAnnotationTextFormat_.Get();
   }
 
   bool CreateTray() {
@@ -7698,24 +8296,35 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (!entry.appUserModelId.empty()) {
         candidateIdentities.push_back(L"aumid:" + Lower(entry.appUserModelId));
       }
-      if (!entry.targetPath.empty()) {
-        candidateIdentities.push_back(L"target:" + Lower(entry.targetPath));
+      if (!entry.targetPath.empty() && !IsHostExecutable(entry.targetPath) && entry.args.empty()) {
+        candidateIdentities.push_back(L"target:" + canonicalPathKey(entry.targetPath));
       }
       if (entry.isGame && !entry.path.empty()) {
         candidateIdentities.push_back(
             L"install:" + canonicalPathKey(entry.path));
       }
       if (!entry.isGame && !entry.launchTarget.empty()) {
-        candidateIdentities.push_back(L"launch:" + Lower(entry.launchTarget));
+        candidateIdentities.push_back(L"launch:" + canonicalPathKey(entry.launchTarget));
       }
-      candidateIdentities.push_back(L"id:" + Lower(entry.id));
+      candidateIdentities.push_back(L"id:" + canonicalPathKey(entry.id));
 
       std::optional<size_t> foundIndex;
       for (const auto& identity : candidateIdentities) {
         if (const auto found = identities.find(identity);
             found != identities.end()) {
-          foundIndex = found->second;
-          break;
+          if (feathercast::discovery::ShouldMergeApps(apps[found->second], entry)) {
+            foundIndex = found->second;
+            break;
+          }
+        }
+      }
+
+      if (!foundIndex) {
+        const std::wstring nameKey = L"name:" + NameKey(entry.name);
+        if (const auto found = identities.find(nameKey); found != identities.end()) {
+          if (feathercast::discovery::ShouldMergeApps(apps[found->second], entry)) {
+            foundIndex = found->second;
+          }
         }
       }
 
@@ -7735,51 +8344,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
 
       if (foundIndex) {
-        auto& existing = apps[*foundIndex];
-        if (entry.isGame && !existing.isGame) {
-          const std::wstring visibleName = existing.name;
-          const std::wstring localIcon = existing.iconKey;
-          const std::wstring localTarget = existing.targetPath;
-          const bool adminSupported = existing.adminSupported || entry.adminSupported;
-          const bool systemEssential = existing.systemEssential || entry.systemEssential;
-          entry.name = visibleName;
-          if (!localIcon.empty()) entry.iconKey = localIcon;
-          if (entry.targetPath.empty()) entry.targetPath = localTarget;
-          entry.adminSupported = adminSupported;
-          entry.systemEssential = systemEssential;
-          entry.keywords = UniqueKeywords({
-              feathercast::core::JoinKeywords(existing.keywords),
-              feathercast::core::JoinKeywords(entry.keywords),
-          });
-          existing = std::move(entry);
-          for (const auto& identity : candidateIdentities) {
-            identities.emplace(identity, *foundIndex);
-          }
-          return;
-        }
-        existing.adminSupported = existing.adminSupported || entry.adminSupported;
-        existing.systemEssential = existing.systemEssential || entry.systemEssential;
-        existing.isGame = existing.isGame || entry.isGame;
-        if (!entry.gameProvider.empty() &&
-            existing.gameProvider.find(entry.gameProvider) == std::wstring::npos) {
-          if (!existing.gameProvider.empty()) existing.gameProvider += L" + ";
-          existing.gameProvider += entry.gameProvider;
-        }
-        if (entry.isGame && !entry.path.empty()) existing.path = entry.path;
-        if (existing.iconKey.empty()) existing.iconKey = std::move(entry.iconKey);
-        if (existing.targetPath.empty()) existing.targetPath = std::move(entry.targetPath);
-        existing.keywords = UniqueKeywords({
-            feathercast::core::JoinKeywords(existing.keywords),
-            feathercast::core::JoinKeywords(entry.keywords),
-        });
+        feathercast::discovery::MergeAppEntries(apps[*foundIndex], std::move(entry));
         for (const auto& identity : candidateIdentities) {
           identities.emplace(identity, *foundIndex);
         }
+        identities.emplace(L"name:" + NameKey(apps[*foundIndex].name), *foundIndex);
         return;
       }
+      const size_t newIndex = apps.size();
       for (const auto& identity : candidateIdentities) {
-        identities.emplace(identity, apps.size());
+        identities.emplace(identity, newIndex);
       }
+      identities.emplace(L"name:" + NameKey(entry.name), newIndex);
       apps.push_back(std::move(entry));
     };
 
@@ -7809,14 +8385,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::vector<std::filesystem::path> StartMenuShortcutPaths(std::stop_token stopToken,
                                                             uint64_t generation) {
     std::vector<std::filesystem::path> dirs;
-    wchar_t programData[MAX_PATH]{};
-    wchar_t appData[MAX_PATH]{};
-    GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
-    GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
-    if (programData[0]) dirs.emplace_back(std::filesystem::path(programData) / L"Microsoft" / L"Windows" / L"Start Menu" / L"Programs");
-    if (appData[0]) dirs.emplace_back(std::filesystem::path(appData) / L"Microsoft" / L"Windows" / L"Start Menu" / L"Programs");
+    auto addDir = [&](const std::wstring& dirPath) {
+      if (!dirPath.empty()) {
+        std::filesystem::path p(dirPath);
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) {
+          dirs.push_back(std::move(p));
+        }
+      }
+    };
+
+    addDir(KnownFolderPath(FOLDERID_CommonPrograms));
+    addDir(KnownFolderPath(FOLDERID_Programs));
+    addDir(KnownFolderPath(FOLDERID_PublicDesktop));
+    addDir(KnownFolderPath(FOLDERID_Desktop));
+
+    if (dirs.empty()) {
+      wchar_t programData[MAX_PATH]{};
+      wchar_t appData[MAX_PATH]{};
+      wchar_t userProfile[MAX_PATH]{};
+      wchar_t publicProfile[MAX_PATH]{};
+      GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+      GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+      GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH);
+      GetEnvironmentVariableW(L"PUBLIC", publicProfile, MAX_PATH);
+      if (programData[0]) addDir(std::filesystem::path(programData) / L"Microsoft" / L"Windows" / L"Start Menu" / L"Programs");
+      if (appData[0]) addDir(std::filesystem::path(appData) / L"Microsoft" / L"Windows" / L"Start Menu" / L"Programs");
+      if (publicProfile[0]) addDir(std::filesystem::path(publicProfile) / L"Desktop");
+      if (userProfile[0]) addDir(std::filesystem::path(userProfile) / L"Desktop");
+    }
 
     std::vector<std::filesystem::path> out;
+    std::set<std::wstring> seen;
     for (const auto& dir : dirs) {
       if (DiscoveryCanceled(stopToken, generation)) break;
       std::error_code ec;
@@ -7824,7 +8424,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       size_t enumerated = 0;
       for (std::filesystem::recursive_directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec)) {
         if (ec) continue;
-        if (it->is_regular_file(ec) && Lower(it->path().extension().wstring()) == L".lnk") out.push_back(it->path());
+        if (it->is_regular_file(ec) && Lower(it->path().extension().wstring()) == L".lnk") {
+          std::wstring canonical = Lower(it->path().lexically_normal().wstring());
+          if (seen.insert(canonical).second) {
+            out.push_back(it->path());
+          }
+        }
         if ((++enumerated & 63u) == 0 && DiscoveryCanceled(stopToken, generation)) break;
       }
     }
@@ -7832,7 +8437,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::optional<AppEntry> ShortcutEntry(const std::filesystem::path& path) {
-    const std::wstring name = CleanName(path.stem().wstring());
+    const std::wstring baseName = CleanName(path.stem().wstring());
+    if (baseName.empty() || ShouldSkipName(baseName)) return std::nullopt;
+    const std::wstring name = DisambiguateShortcutName(baseName, path);
     if (name.empty() || ShouldSkipName(name)) return std::nullopt;
 
     ShortcutInfo shortcut;
@@ -7848,10 +8455,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     entry.targetPath = shortcut.target;
     entry.args = shortcut.args;
     entry.cwd = shortcut.cwd;
+    entry.appUserModelId = shortcut.appUserModelId;
     entry.iconKey = path.wstring();
     entry.adminSupported = true;
     entry.systemEssential = IsSystemEssentialName(name);
-    entry.keywords = KeywordsFor(name, shortcut.target, L"");
+    entry.keywords = KeywordsFor(name, shortcut.target, shortcut.appUserModelId);
     return entry;
   }
 
@@ -7891,6 +8499,31 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           if (!name.empty() && !appId.empty() && !ShouldSkipName(name)) {
             const bool terminal = Lower(name).find(L"terminal") != std::wstring::npos;
             const std::wstring terminalAlias = terminal ? FindWindowsAppAlias(L"wt.exe") : L"";
+            std::wstring targetPath = terminalAlias;
+            if (targetPath.empty() && item) {
+              PWSTR parsingPath = nullptr;
+              if (SUCCEEDED(item->GetString(PKEY_Link_TargetParsingPath, &parsingPath)) && parsingPath) {
+                targetPath = parsingPath;
+                CoTaskMemFree(parsingPath);
+              }
+            }
+            if (targetPath.empty() && item) {
+              PWSTR fsPath = nullptr;
+              if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &fsPath)) && fsPath) {
+                targetPath = fsPath;
+                CoTaskMemFree(fsPath);
+              }
+            }
+            if (targetPath.empty() && appId.size() > 39 && appId.front() == L'{' && appId[37] == L'}' && appId[38] == L'\\') {
+              const std::wstring guidStr = appId.substr(0, 38);
+              GUID folderId{};
+              if (SUCCEEDED(IIDFromString(guidStr.c_str(), &folderId))) {
+                const std::wstring baseFolder = KnownFolderPath(folderId);
+                if (!baseFolder.empty()) {
+                  targetPath = (std::filesystem::path(baseFolder) / appId.substr(39)).wstring();
+                }
+              }
+            }
 
             AppEntry entry;
             entry.id = L"start:" + appId;
@@ -7898,16 +8531,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             entry.appUserModelId = appId;
             entry.iconKey = L"appsFolder:" + appId;
             entry.systemEssential = IsSystemEssentialName(name);
-            entry.keywords = KeywordsFor(name, terminalAlias, appId);
+            entry.keywords = KeywordsFor(name, targetPath.empty() ? terminalAlias : targetPath, appId);
 
             entry.source = appId.find(L"!") != std::wstring::npos ? L"appx" : L"start";
             entry.launchType = LaunchType::AppsFolder;
             entry.launchTarget = appId;
-            // Keep the execution alias (e.g. wt.exe) so the app can still be
+            // Keep the execution alias (e.g. wt.exe) or resolved target so the app can still be
             // launched elevated; normal launches go through AppsFolder
             // activation, which reliably brings the window to the foreground
             // instead of occasionally opening an Explorer folder.
-            entry.targetPath = terminalAlias;
+            entry.targetPath = targetPath;
             entry.adminSupported = !entry.targetPath.empty();
             if (terminal) entry.systemEssential = true;
             out.push_back(std::move(entry));
@@ -9198,6 +9831,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     overlayClosing_ = false;
     overlaySurfaceScale_.Snap(1.0);
     overlayOpacity_.Snap(1.0);
+    RECT currentBounds{};
+    if (GetWindowRect(hwnd_, &currentBounds)) {
+      SnapWindowBounds(overlayBounds_, currentBounds);
+    }
     CancelPointerPress(hwnd_);
     KillTimer(hwnd_, 1);
     KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
@@ -9923,6 +10560,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     settingsClosing_ = false;
     settingsSurfaceScale_.Snap(1.0);
     settingsOpacity_.Snap(1.0);
+    RECT currentBounds{};
+    if (GetWindowRect(settingsHwnd_, &currentBounds)) {
+      SnapWindowBounds(settingsBounds_, currentBounds);
+    }
     CancelPointerPress(settingsHwnd_);
     const auto effects =
         feathercast::ui::SettingsController::Close(settingsState_);
@@ -10220,11 +10861,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   static int DipToPixels(float dip, float scale) {
-    return std::max(1, static_cast<int>(std::lround(dip * scale)));
+    return std::max(1, feathercast::screenshot::DipToPixel(dip, scale));
   }
 
   static float PixelsToDip(int pixels, float scale) {
-    return static_cast<float>(pixels) / std::max(0.01f, scale);
+    return feathercast::screenshot::PixelToDip(pixels, scale);
   }
 
   void HandleDpiChanged(HWND hwnd, LPARAM lParam, bool adoptSuggestedBounds) {
@@ -10242,6 +10883,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       ApplyWindowSize();
     } else if (hwnd == settingsHwnd_) {
       ResizeSettingsWindow(false);
+    }
+    if (hwnd == captureSelectorHwnd_) {
+      InvalidateScreenshotPreviewCache();
+      UpdateScreenshotTextEditWindow();
     }
     InvalidateRect(hwnd, nullptr, FALSE);
   }
@@ -10289,16 +10934,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   int CurrentHeight() const {
-    if (confirmation_) return settings_.compactMode ? 300 : WIN_HEIGHT;
-    if (!settings_.compactMode) return WIN_HEIGHT;
-    if (Trim(query_).empty() && !actionMode_ && browseView_ == BrowseView::None) return COMPACT_BASE_HEIGHT;
+    if (confirmation_) return 300;
+    const int baseHeight = settings_.compactMode ? COMPACT_BASE_HEIGHT
+                                                 : (COMPACT_BASE_HEIGHT + 40);
+    if (settings_.compactMode && Trim(query_).empty() && !actionMode_ &&
+        browseView_ == BrowseView::None) {
+      return COMPACT_BASE_HEIGHT;
+    }
     const MONITORINFO mi = OverlayMonitorInfo();
     HMONITOR monitor = overlayMonitor_;
     if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
     const float scale = std::max(1.0f, GetMonitorScale(monitor));
     const int maxHeight = static_cast<int>(
         (static_cast<float>(mi.rcWork.bottom - mi.rcWork.top) / scale) * 0.7f);
-    return std::clamp(COMPACT_BASE_HEIGHT + ResultsContentHeight(), COMPACT_BASE_HEIGHT, maxHeight);
+    return std::clamp(baseHeight + ResultsContentHeight(), baseHeight, maxHeight);
   }
 
   void ApplyWindowSize() {
@@ -11105,6 +11754,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(hwnd_, &ps);
       return;
     }
+    RECT clientRc{};
+    GetClientRect(hwnd_, &clientRc);
+    const UINT clientWidth = std::max<UINT>(1, clientRc.right - clientRc.left);
+    const UINT clientHeight = std::max<UINT>(1, clientRc.bottom - clientRc.top);
+    DXGI_SWAP_CHAIN_DESC1 swapDesc{};
+    if (overlaySurface_.swapChain &&
+        SUCCEEDED(overlaySurface_.swapChain->GetDesc1(&swapDesc))) {
+      if (swapDesc.Width != clientWidth || swapDesc.Height != clientHeight) {
+        ResizeGlassSurface(overlaySurface_, hwnd_, clientWidth, clientHeight);
+      }
+    }
     {
       ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
       SetActiveTarget(dc);
@@ -11168,6 +11828,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EndPaint(settingsHwnd_, &ps);
       return;
     }
+    RECT settingsRc{};
+    GetClientRect(settingsHwnd_, &settingsRc);
+    const UINT settingsWidth = std::max<UINT>(1, settingsRc.right - settingsRc.left);
+    const UINT settingsHeight = std::max<UINT>(1, settingsRc.bottom - settingsRc.top);
+    DXGI_SWAP_CHAIN_DESC1 settingsSwapDesc{};
+    if (settingsSurface_.swapChain &&
+        SUCCEEDED(settingsSurface_.swapChain->GetDesc1(&settingsSwapDesc))) {
+      if (settingsSwapDesc.Width != settingsWidth || settingsSwapDesc.Height != settingsHeight) {
+        ResizeGlassSurface(settingsSurface_, settingsHwnd_, settingsWidth, settingsHeight);
+      }
+    }
     {
       ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
       SetActiveTarget(dc);
@@ -11218,6 +11889,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       ScheduleRenderRecovery(L"volume-visual", visuals);
       EndPaint(volumeHwnd_, &paint);
       return;
+    }
+    RECT volumeRc{};
+    GetClientRect(volumeHwnd_, &volumeRc);
+    const UINT volumeWidth = std::max<UINT>(1, volumeRc.right - volumeRc.left);
+    const UINT volumeHeight = std::max<UINT>(1, volumeRc.bottom - volumeRc.top);
+    DXGI_SWAP_CHAIN_DESC1 volumeSwapDesc{};
+    if (volumeSurface_.swapChain &&
+        SUCCEEDED(volumeSurface_.swapChain->GetDesc1(&volumeSwapDesc))) {
+      if (volumeSwapDesc.Width != volumeWidth || volumeSwapDesc.Height != volumeHeight) {
+        ResizeGlassSurface(volumeSurface_, volumeHwnd_, volumeWidth, volumeHeight);
+      }
     }
     {
       ID2D1DeviceContext* dc = volumeSurface_.dc.Get();
@@ -14593,7 +15275,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           RECT rc{};
           GetClientRect(hwnd_, &rc);
           const float scale = GetWindowScale(hwnd_);
-          const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 36);
+          const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 40);
           int nextScroll = scroll_;
           if (rowTop - scroll_ < 0) {
             nextScroll = rowTop;
@@ -16170,7 +16852,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     const float scale = GetWindowScale(hwnd_);
-    const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 36);
+    const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 40);
     feathercast::ui::OverlayController::SetScroll(
         overlayState_, nextScroll,
         std::max(0, ResultsContentHeight() - visible));
@@ -17681,11 +18363,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::screenshot::EditorState screenshotEditor_;
   std::shared_ptr<const feathercast::screenshot::Draft> screenshotDraft_;
   ComPtr<ID2D1Bitmap> screenshotDraftBitmap_;
+  ComPtr<ID2D1Bitmap> screenshotEffectPreviewBitmap_;
+  feathercast::screenshot::Rect screenshotEffectPreviewBounds_;
+  std::optional<feathercast::screenshot::Rect>
+      screenshotEffectPreviewSelection_;
+  std::uint64_t screenshotAnnotationRevision_ = 1;
+  std::uint64_t screenshotEffectPreviewRevision_ = 0;
   feathercast::ui::CaptureShortcutTarget screenshotTarget_ =
       feathercast::ui::CaptureShortcutTarget::None;
   std::wstring screenshotStatus_;
   std::wstring screenshotTextBuffer_;
   bool screenshotTextEditing_ = false;
+  HWND screenshotTextEditHwnd_ = nullptr;
+  bool screenshotCaptureUiExcluded_ = false;
   feathercast::capture::PixelRect captureVirtualBounds_;
   feathercast::capture::PixelRect activeCaptureBounds_;
   feathercast::ui::OverlayState overlayState_;
@@ -17866,6 +18556,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   ComPtr<IDWriteTextFormat> centerFormat_;
   ComPtr<IDWriteTextFormat> emojiFormat_;
   ComPtr<IDWriteTextFormat> volumeValueFormat_;
+  ComPtr<IDWriteTextFormat> screenshotAnnotationTextFormat_;
+  float screenshotAnnotationTextFormatSize_ = 0.0f;
+  float screenshotAnnotationTextFormatScale_ = 0.0f;
+  std::wstring screenshotAnnotationTextFormatFamily_;
 };
 
 }  // namespace
