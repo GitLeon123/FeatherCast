@@ -64,6 +64,8 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
 
 int main() {
   using feathercast::ui::CapturePhase;
+  using feathercast::ui::CaptureKey;
+  using feathercast::ui::CaptureKeyboardResult;
   using feathercast::ui::CaptureShortcutTarget;
   using feathercast::ui::CaptureUiController;
   using feathercast::ui::CaptureUiState;
@@ -141,6 +143,80 @@ int main() {
   assert(CaptureUiController::Fail(capture));
   assert(CaptureUiController::Fail(capture));
   assert(capture.phase == CapturePhase::Idle);
+
+  {
+    using namespace feathercast::screenshot;
+    using ScreenshotRect = feathercast::screenshot::Rect;
+    for (const auto [width, height] : std::vector<std::pair<float, float>>{
+             {280.0f, 384.0f}, {683.0f, 384.0f}, {1366.0f, 768.0f}}) {
+      const auto layout = BuildToolbarLayout(width, height);
+      assert(layout.buttons.size() == 21);
+      assert(layout.rows > 0);
+      assert(layout.bar.left >= 0.0f && layout.bar.right <= width &&
+             layout.bar.top >= 0.0f && layout.bar.bottom <= height);
+      assert(layout.footer.left >= 0.0f && layout.footer.right <= width &&
+             layout.footer.top >= 0.0f && layout.footer.bottom <= height);
+      for (const auto& button : layout.buttons) {
+        assert(button.rect.left >= 0.0f && button.rect.right <= width);
+        assert(button.rect.top >= 0.0f && button.rect.bottom <= height);
+        assert(button.rect.right > button.rect.left);
+        assert(button.rect.bottom > button.rect.top);
+        assert(ToolbarContains(
+            button, {button.rect.left + 0.01f, button.rect.top + 0.01f}));
+        assert(!ToolbarContains(button, {button.rect.right, button.rect.bottom}));
+      }
+      std::vector<bool> enabled(layout.buttons.size(), false);
+      enabled[0] = true;
+      enabled[2] = true;
+      const auto focusOrder = ToolbarFocusableIndices(layout, enabled);
+      assert((focusOrder == std::vector<int>{0, 2}));
+    }
+
+    assert(PixelToDip(ScreenshotRect{-1920, -200, -1600, 200},
+                      {-1920, -200}, 2.0f) ==
+           (DipRect{0.0f, 0.0f, 160.0f, 200.0f}));
+    assert(DipToPixel(DipRect{0.0f, 0.0f, 160.0f, 200.0f},
+                      {-1920, -200}, 2.0f) ==
+           (ScreenshotRect{-1920, -200, -1600, 200}));
+
+    EditorState keyboardEditor;
+    assert(EditorController::Begin(keyboardEditor, {0, 0, 500, 400}));
+    assert(EditorController::HandleKeyboard(keyboardEditor, EditorKey::Right) ==
+           KeyboardResult::Moved);
+    const ScreenshotRect movedSelection = *keyboardEditor.selection;
+    assert(movedSelection.left == 91 && movedSelection.Width() == 320);
+    assert(EditorController::HandleKeyboard(keyboardEditor, EditorKey::Right,
+                                             true) == KeyboardResult::Moved);
+    assert(keyboardEditor.selection->Width() == movedSelection.Width() + 1);
+    assert(EditorController::HandleKeyboard(keyboardEditor, EditorKey::Down,
+                                             false, true) == KeyboardResult::Moved);
+    assert(keyboardEditor.selection->top == movedSelection.top + 10);
+    assert(EditorController::HandleKeyboard(keyboardEditor, EditorKey::Enter) ==
+           KeyboardResult::Confirmed);
+    assert(keyboardEditor.phase == Phase::Editing);
+    assert(AnnotationTextBounds(
+               Annotation{Tool::Text, {10, 20, 110, 60}, {}, L"Note", {}, 2,
+                           24, L"Segoe UI"}) ==
+           (ScreenshotRect{12, 22, 108, 58}));
+
+    CaptureUiState keyboardCapture;
+    assert(CaptureUiController::Begin(
+        keyboardCapture, CaptureShortcutTarget::ScreenshotRegion,
+        {0, 0, 500, 400}));
+    assert(CaptureUiController::HandleSelectionKey(
+               keyboardCapture, CaptureKey::Left) ==
+           CaptureKeyboardResult::Moved);
+    const auto captureSelection = CaptureUiController::SelectionRect(
+        keyboardCapture);
+    assert(captureSelection && captureSelection->Width() == 320);
+    assert(CaptureUiController::HandleSelectionKey(
+               keyboardCapture, CaptureKey::Down, true) ==
+           CaptureKeyboardResult::Moved);
+    assert(CaptureUiController::HandleSelectionKey(
+               keyboardCapture, CaptureKey::Enter) ==
+           CaptureKeyboardResult::Confirmed);
+    assert(keyboardCapture.phase == CapturePhase::StartingScreenshot);
+  }
 
   using feathercast::capture::CaptureOperation;
   using CaptureRect = feathercast::capture::PixelRect;

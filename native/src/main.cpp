@@ -5739,8 +5739,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           const int selectionIndex = static_cast<int>(buttons.size()) +
                                      (screenshotTextEditing_ ? 1 : 0);
           if (wParam == VK_RETURN &&
-              (screenshotEditor_.phase == Phase::Selecting ||
-               screenshotEditor_.focusIndex == selectionIndex)) {
+              screenshotEditor_.focusIndex == selectionIndex) {
             const auto result = EditorController::HandleKeyboard(
                 screenshotEditor_, EditorKey::Enter);
             if (result == KeyboardResult::Confirmed) {
