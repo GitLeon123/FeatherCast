@@ -9,18 +9,20 @@ $ErrorActionPreference = "Stop"
 $repository = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $repository $BuildDirectory
 $cpackConfig = Join-Path $build "CPackConfig.cmake"
+$packageDirectory = Join-Path $build "packages"
 if (-not (Test-Path $cpackConfig)) { throw "CPackConfig.cmake was not found." }
+New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
 
 Push-Location $repository
 try {
-  & cpack --config $cpackConfig -C $Configuration -G ZIP
+  & cpack --config $cpackConfig -C $Configuration -G ZIP -B $packageDirectory
   if ($LASTEXITCODE -ne 0) { throw "ZIP packaging failed." }
-  & cpack --config $cpackConfig -C $Configuration -G NSIS
+  & cpack --config $cpackConfig -C $Configuration -G NSIS -B $packageDirectory
   if ($LASTEXITCODE -ne 0) { throw "NSIS packaging failed." }
 
-  $zip = Get-ChildItem "FeatherCast-*-win64.zip" |
+  $zip = Get-ChildItem -LiteralPath $packageDirectory -Filter "FeatherCast-*-win64.zip" -File |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-  $installer = Get-ChildItem "FeatherCast-*-win64.exe" |
+  $installer = Get-ChildItem -LiteralPath $packageDirectory -Filter "FeatherCast-*-win64.exe" -File |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
   if (-not $zip -or -not $installer) { throw "Expected ZIP and NSIS packages." }
 

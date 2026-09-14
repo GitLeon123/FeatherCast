@@ -97,6 +97,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <list>
 #include <limits>
@@ -164,6 +165,7 @@ constexpr int HOTKEY_RECORD_FULLSCREEN = 0x4C47;
 constexpr int HOTKEY_RECORD_REGION = 0x4C48;
 constexpr UINT TIMER_CLOCK_DISPLAY = 3;
 constexpr UINT TIMER_VOLUME_REFRESH = 5;
+constexpr UINT TIMER_VOLUME_WRITE = 15;
 constexpr UINT TIMER_OVERLAY_ACTIVATE = 6;
 constexpr UINT TIMER_PREVIEW_LOAD = 7;
 constexpr UINT TIMER_FILE_SNAPSHOT = 8;
@@ -229,7 +231,7 @@ constexpr int MAX_OVERLAY_WIDTH = 980;
 constexpr int SETTINGS_WIDTH = 760;
 constexpr int SETTINGS_HEIGHT = 560;
 constexpr int VOLUME_WIDTH = 440;
-constexpr int VOLUME_HEIGHT = 170;
+constexpr int VOLUME_HEIGHT = 210;
 constexpr int MIN_RESULTS = 25;
 constexpr int MAX_RESULT_SETTING = 400;
 constexpr int MIN_CLIPBOARD_HISTORY_LIMIT = 1;
@@ -2103,6 +2105,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return RECT{origin.x + physical.left, origin.y + physical.top,
                   origin.x + physical.right, origin.y + physical.bottom};
     };
+    auto markOffscreen = [&](Item& item) {
+      if (item.screenRect.right <= origin.x ||
+          item.screenRect.left >= origin.x + client.right ||
+          item.screenRect.bottom <= origin.y ||
+          item.screenRect.top >= origin.y + client.bottom) {
+        item.state |= STATE_SYSTEM_OFFSCREEN;
+      }
+    };
 
     if (hwnd == captureSelectorHwnd_ && ScreenshotEditorActive()) {
       const float width = static_cast<float>(client.right) / scale;
@@ -2264,16 +2274,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (hwnd == volumeHwnd_) {
       const float width = static_cast<float>(client.right) / scale;
+      const bool parentFocused = GetFocus() == hwnd && volumeVisible_ &&
+                                 !volumeClosing_;
+      const std::wstring outputName =
+          volumeDeviceName_.empty() ? L"Default output" : volumeDeviceName_;
       Item slider;
       slider.name = L"Volume";
       slider.value = std::to_wstring(volumePercent_) + L"%";
       slider.description = volumeStatus_.empty()
-                               ? L"Use arrow keys to adjust the default output volume"
+                               ? L"Output: " + outputName +
+                                     L". Use arrow keys to adjust the volume"
                                : volumeStatus_;
       slider.role = ROLE_SYSTEM_SLIDER;
-      slider.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_FOCUSED;
+      slider.state = STATE_SYSTEM_FOCUSABLE;
+      if (parentFocused && volumeFocusIndex_ == 0) {
+        slider.state |= STATE_SYSTEM_FOCUSED;
+      }
       slider.screenRect = screenRect(VolumeTrackHitRect(width));
       items.push_back(std::move(slider));
+
+      Item mute;
+      mute.name = volumeMuted_ ? L"Unmute audio" : L"Mute audio";
+      mute.value = volumeMuted_ ? L"Muted" : L"Not muted";
+      mute.description = L"Toggle mute for the default audio output";
+      mute.defaultAction = mute.name;
+      mute.role = ROLE_SYSTEM_CHECKBUTTON;
+      mute.state = STATE_SYSTEM_FOCUSABLE;
+      if (volumeMuted_) mute.state |= STATE_SYSTEM_CHECKED;
+      if (parentFocused && volumeFocusIndex_ == 1) {
+        mute.state |= STATE_SYSTEM_FOCUSED;
+      }
+      mute.screenRect = screenRect(VolumeMuteHitRect());
+      items.push_back(std::move(mute));
       return items;
     }
 
@@ -2457,6 +2489,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         if (!enabled) setting.state = STATE_SYSTEM_UNAVAILABLE;
         setting.screenRect = screenRect(hit->rect);
+        markOffscreen(setting);
         items.push_back(std::move(setting));
         continue;
       }
@@ -2490,6 +2523,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         setting.state |= STATE_SYSTEM_FOCUSED;
       }
       setting.screenRect = screenRect(hit->rect);
+      markOffscreen(setting);
       items.push_back(std::move(setting));
     }
     if (settingsCategory_ == SettingsCategory::Shortcut) {
@@ -2509,6 +2543,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       note.screenRect = screenRect(
           {kSettSidebarWidth + kSettContentInset, noteTop,
            width - kSettContentInset, noteTop + 64.0f});
+      markOffscreen(note);
       items.push_back(std::move(note));
     }
     if (settingsCategory_ == SettingsCategory::Extensions) {
@@ -2531,6 +2566,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         status.screenRect = screenRect(
             {kSettSidebarWidth + kSettContentInset, y,
              width - kSettContentInset, y + kSettRow});
+        markOffscreen(status);
         items.push_back(std::move(status));
         y += kSettRow;
       }
@@ -2546,6 +2582,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       status.screenRect =
           screenRect({kSettSidebarWidth + kSettContentInset, kSettTop,
                       width - kSettContentInset, kSettTop + 40.0f});
+      markOffscreen(status);
       items.push_back(std::move(status));
     }
     return items;
@@ -2675,7 +2712,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (hwnd == recordingControlHwnd_) {
       return captureUiState_.controlFocus + 1;
     }
-    if (hwnd == volumeHwnd_) return 1;
+    if (hwnd == volumeHwnd_) {
+      return GetFocus() == hwnd && volumeVisible_ && !volumeClosing_
+                 ? volumeFocusIndex_ + 1
+                 : 0;
+    }
     if (hwnd == hwnd_) {
       if (confirmation_) return confirmationFocus_ + 1;
       return LauncherAccessibleFocusChild();
@@ -2764,7 +2805,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     if (hwnd == volumeHwnd_) {
-      if (child == 1) SetFocus(volumeHwnd_);
+      if (child == 1 || child == 2) {
+        SetFocus(volumeHwnd_);
+        SetVolumeFocusIndex(child - 1);
+      }
       return;
     }
     if (hwnd == hwnd_) {
@@ -2852,7 +2896,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     if (hwnd == volumeHwnd_) {
-      if (child == 1) SetFocus(volumeHwnd_);
+      if (child == 1) {
+        SetFocus(volumeHwnd_);
+        SetVolumeFocusIndex(0);
+      } else if (child == 2) {
+        SetFocus(volumeHwnd_);
+        SetVolumeFocusIndex(1);
+        ToggleVolumeMute();
+      }
       return;
     }
     if (hwnd == hwnd_) {
@@ -4355,7 +4406,71 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   feathercast::screenshot::ToolbarLayout ScreenshotToolbarContract(
       float width, float height) const {
-    return feathercast::screenshot::BuildToolbarLayout(width, height);
+    using feathercast::screenshot::BuildToolbarLayout;
+    using feathercast::screenshot::DipRect;
+
+    if (!captureSelectorHwnd_ || captureVirtualBounds_.Empty() ||
+        width <= 0.0f || height <= 0.0f) {
+      return BuildToolbarLayout(width, height);
+    }
+
+    const float scale = GetWindowScale(captureSelectorHwnd_);
+    const RECT captureBounds{captureVirtualBounds_.left,
+                             captureVirtualBounds_.top,
+                             captureVirtualBounds_.right,
+                             captureVirtualBounds_.bottom};
+    auto monitorBounds = [](HMONITOR monitor) -> std::optional<RECT> {
+      MONITORINFO info{sizeof(info)};
+      if (!monitor || !GetMonitorInfoW(monitor, &info)) return std::nullopt;
+      return info.rcMonitor;
+    };
+    const auto intersects = [](const RECT& first, const RECT& second) {
+      return first.left < second.right && first.right > second.left &&
+             first.top < second.bottom && first.bottom > second.top;
+    };
+
+    auto target = monitorBounds(
+        MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    if (!target || !intersects(*target, captureBounds)) {
+      const POINT center{
+          captureBounds.left + (captureBounds.right - captureBounds.left) / 2,
+          captureBounds.top + (captureBounds.bottom - captureBounds.top) / 2};
+      target = monitorBounds(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST));
+    }
+    if (!target) return BuildToolbarLayout(width, height);
+
+    const float hostLeft = std::clamp(
+        static_cast<float>(target->left - captureBounds.left) / scale, 0.0f,
+        width);
+    const float hostRight = std::clamp(
+        static_cast<float>(target->right - captureBounds.left) / scale, 0.0f,
+        width);
+    const float hostTop = std::clamp(
+        static_cast<float>(target->top - captureBounds.top) / scale, 0.0f,
+        height);
+    const float hostBottom = std::clamp(
+        static_cast<float>(target->bottom - captureBounds.top) / scale, 0.0f,
+        height);
+    const float hostWidth = hostRight - hostLeft;
+    const float hostHeight = hostBottom - hostTop;
+    if (hostWidth <= 0.0f || hostHeight <= 0.0f) {
+      return BuildToolbarLayout(width, height);
+    }
+
+    auto layout = BuildToolbarLayout(hostWidth, hostHeight);
+    const float dx = (hostLeft + hostRight - layout.bar.left - layout.bar.right) *
+                     0.5f;
+    const float dy = hostTop;
+    auto translate = [dx, dy](DipRect& rect) {
+      rect.left += dx;
+      rect.right += dx;
+      rect.top += dy;
+      rect.bottom += dy;
+    };
+    translate(layout.bar);
+    translate(layout.footer);
+    for (auto& button : layout.buttons) translate(button.rect);
+    return layout;
   }
 
   std::vector<ScreenshotToolbarButton> ScreenshotToolbarItems(
@@ -6070,6 +6185,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_TIMER:
         if (wParam == TIMER_VOLUME_REFRESH) {
           RefreshVolumeFromSystem();
+        } else if (wParam == TIMER_VOLUME_WRITE) {
+          FlushPendingVolumeWrite();
         } else if (wParam == TIMER_RENDER_RETRY) {
           CompleteRenderRetry(hwnd);
         }
@@ -6095,14 +6212,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         GetClientRect(hwnd, &client);
         const float width = static_cast<float>(client.right) / scale;
         if (PointInRect(VolumeTrackHitRect(width), x, y)) {
+          SetFocus(hwnd);
+          SetVolumeFocusIndex(0);
           volumeDragging_ = true;
           SetCapture(hwnd);
           SetVolumeFromTrack(x, width);
+        } else if (PointInRect(VolumeMuteHitRect(), x, y)) {
+          SetFocus(hwnd);
+          SetVolumeFocusIndex(1);
+          ToggleVolumeMute();
         }
         return 0;
       }
       case WM_MOUSEMOVE:
         if (!PointerInputAllowed(hwnd)) return 0;
+        {
+          const float scale = GetWindowScale(hwnd);
+          RECT client{};
+          GetClientRect(hwnd, &client);
+          const float width = static_cast<float>(client.right) / scale;
+          const float x = static_cast<float>(GET_X_LPARAM(lParam)) / scale;
+          const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / scale;
+          const int hover = PointInRect(VolumeTrackHitRect(width), x, y)
+                                ? 0
+                                : (PointInRect(VolumeMuteHitRect(), x, y) ? 1
+                                                                           : -1);
+          if (hover != volumeHoverIndex_) {
+            volumeHoverIndex_ = hover;
+            InvalidateRect(hwnd, nullptr, FALSE);
+          }
+          TRACKMOUSEEVENT trackMouse{sizeof(trackMouse), TME_LEAVE, hwnd, 0};
+          TrackMouseEvent(&trackMouse);
+        }
         if (volumeDragging_ && GetCapture() == hwnd) {
           const float scale = GetWindowScale(hwnd);
           RECT client{};
@@ -6112,6 +6253,31 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               static_cast<float>(client.right) / scale);
         }
         return 0;
+      case WM_MOUSELEAVE:
+        if (volumeHoverIndex_ != -1) {
+          volumeHoverIndex_ = -1;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      case WM_MOUSEWHEEL:
+        if (!PointerInputAllowed(hwnd)) return 0;
+        if (volumeFocusIndex_ == 0 || volumeHoverIndex_ == 0) {
+          const int wheelDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+          if (wheelDelta != 0) {
+            ApplyVolumePercent(feathercast::audio::AdjustPercent(
+                volumePercent_, wheelDelta > 0 ? 1 : -1));
+          }
+        }
+        return 0;
+      case WM_SETCURSOR:
+        if (volumeHoverIndex_ == 0) {
+          SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        } else if (volumeHoverIndex_ == 1) {
+          SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        } else {
+          SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        }
+        return TRUE;
       case WM_LBUTTONUP:
         if (volumeDragging_) {
           const float scale = GetWindowScale(hwnd);
@@ -6121,12 +6287,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               static_cast<float>(GET_X_LPARAM(lParam)) / scale,
               static_cast<float>(client.right) / scale);
           volumeDragging_ = false;
+          FlushPendingVolumeWrite();
           if (GetCapture() == hwnd) ReleaseCapture();
         }
         return 0;
       case WM_CANCELMODE:
       case WM_CAPTURECHANGED:
         volumeDragging_ = false;
+        FlushPendingVolumeWrite();
         return 0;
       case WM_CLOSE:
         HideVolumeControl(true);
@@ -7202,6 +7370,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       theme_.success = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
       theme_.recording = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
       theme_.accentFallback = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
+    } else {
+      theme_.textDim = feathercast::theme::EnsureContrast(
+          theme_.textDim, theme_.settingsBackground);
+      theme_.textDim = feathercast::theme::EnsureContrast(
+          theme_.textDim, theme_.surface);
     }
     // Preference changes invalidate text formats, but healthy composition
     // surfaces survive; DPI changes and device failures recreate them.
@@ -9119,7 +9292,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       previousResultKeys.push_back(item.Key());
       previousResultNames.push_back(item.Name());
     }
-    const bool preserveSelection = query_ == displayedQuery_;
+    const bool preserveSelection =
+        feathercast::ui::OverlayController::CanRestoreSelection(overlayState_) &&
+        query_ == displayedQuery_;
     const std::wstring selectedKey =
         preserveSelection && selected_ >= 0 &&
                 selected_ < static_cast<int>(flatItems_.size())
@@ -9157,6 +9332,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     renderedActionMode_ = actionMode_;
     renderedDataRevision_ = dataRevision_.load(std::memory_order_acquire);
     hasRenderedResults_ = true;
+    bool restoredSelection = false;
     if (pendingNavigationRestore_) {
       const auto& restore = *pendingNavigationRestore_;
       const auto match = std::find_if(
@@ -9169,6 +9345,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               : restore.selected,
           restore.scroll);
       pendingNavigationRestore_.reset();
+      restoredSelection = true;
     } else if (!selectedKey.empty()) {
       const auto match = std::find_if(
           flatItems_.begin(), flatItems_.end(), [&](const DisplayItem& item) {
@@ -9179,9 +9356,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             overlayState_,
             static_cast<int>(std::distance(flatItems_.begin(), match)),
             static_cast<int>(flatItems_.size()), false);
+        restoredSelection = true;
       }
     }
+    if (!restoredSelection && !flatItems_.empty()) {
+      feathercast::ui::OverlayController::Select(
+          overlayState_, 0, static_cast<int>(flatItems_.size()), false);
+    }
     displayedQuery_ = query_;
+    feathercast::ui::OverlayController::ArmSelectionRestoration(overlayState_);
     if (!actionMode_ && browseView_ == BrowseView::None) {
       const bool hasProductivityResult =
           std::any_of(flatItems_.begin(), flatItems_.end(),
@@ -9714,6 +9897,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const auto effects = feathercast::ui::OverlayController::ResetForShow(
         overlayState_, view, resumedQuery.value_or(L""),
         resumedQuery.has_value());
+    const bool canReuseRenderedResults =
+        hasRenderedResults_ && renderedQuery_ == query_ &&
+        renderedView_ == view && renderedBrowseView_ == browseView_ &&
+        renderedActionMode_ == actionMode_ &&
+        renderedDataRevision_ == dataRevision_.load(std::memory_order_acquire);
     const std::uint64_t generation =
         overlayFocusSession_.Begin(GetTickCount64());
     overlayRestoreCandidate_.reset();
@@ -9729,21 +9917,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                          : GetForegroundWindow();
     overlayMonitor_ = ResolveOverlayMonitor(foreground);
     visible_ = true;
-    UpdateBackgroundState();
-    SyncSelectionAnimationToTarget();
-    ExecuteOverlayEffects(effects);
-    const bool canReuseRenderedResults =
-        hasRenderedResults_ && renderedQuery_ == query_ &&
-        renderedView_ == view_ && renderedBrowseView_ == browseView_ &&
-        renderedActionMode_ == actionMode_ &&
-        renderedDataRevision_ == dataRevision_.load(std::memory_order_acquire);
     if (!canReuseRenderedResults) {
+      if (previewOpen_) ClosePreview();
       sections_.clear();
       flatItems_.clear();
       hits_.clear();
+      resultRowMotion_.clear();
+      resultHeaderMotion_.clear();
+      resultRenderCache_.clear();
+      markdownCache_.clear();
+      visibleIconKeys_.clear();
+      hasRenderedResults_ = false;
     } else {
       QueueVisibleResultIcons();
     }
+    UpdateBackgroundState();
+    ExecuteOverlayEffects(effects);
+    // The result model must be current before the selection pill is snapped.
+    // Otherwise a fresh session can briefly target a row from the last query.
+    SyncSelectionAnimationToTarget();
     PositionWindow();
     // Reassert the transparent window treatment each reveal.
     ApplySurfaceGlass(hwnd_, overlayBlurHwnd_, overlayBlurApplied_);
@@ -9916,10 +10108,39 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             track.bottom + 16.0f};
   }
 
+  static RectF VolumeMuteRect() {
+    return {24.0f, 112.0f, 128.0f, 148.0f};
+  }
+
+  static RectF VolumeMuteHitRect() {
+    const RectF button = VolumeMuteRect();
+    return {button.left - 4.0f, button.top - 4.0f, button.right + 4.0f,
+            button.bottom + 4.0f};
+  }
+
+  void SetVolumeFocusIndex(int index) {
+    const int next = std::clamp(index, 0, 1);
+    if (volumeFocusIndex_ == next) return;
+    volumeFocusIndex_ = next;
+    if (volumeHwnd_) {
+      InvalidateRect(volumeHwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_FOCUS, volumeHwnd_, OBJID_CLIENT,
+                     volumeFocusIndex_ + 1);
+    }
+  }
+
   void NotifyVolumeValueChanged() {
     if (!volumeHwnd_) return;
     InvalidateRect(volumeHwnd_, nullptr, FALSE);
     NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, volumeHwnd_, OBJID_CLIENT, 1);
+  }
+
+  void NotifyVolumeMuteChanged() {
+    if (!volumeHwnd_) return;
+    InvalidateRect(volumeHwnd_, nullptr, FALSE);
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, volumeHwnd_, OBJID_CLIENT, 2);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, volumeHwnd_, OBJID_CLIENT, 2);
+    NotifyWinEvent(EVENT_OBJECT_STATECHANGE, volumeHwnd_, OBJID_CLIENT, 2);
   }
 
   void RetargetVolumeVisual(bool animate) {
@@ -9932,26 +10153,55 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void SetVolumeStatus(std::wstring status) {
     if (volumeStatus_ == status) return;
     volumeStatus_ = std::move(status);
-    if (volumeHwnd_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
+    if (volumeHwnd_) {
+      InvalidateRect(volumeHwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, volumeHwnd_, OBJID_CLIENT, 1);
+    }
   }
 
   void RefreshVolumeFromSystem() {
     if (!volumeVisible_ || volumeDragging_) return;
-    const auto current = feathercast::audio::ReadDefaultOutputVolumePercent();
+    const auto current = feathercast::audio::ReadDefaultOutputState();
     if (!current) {
       SetVolumeStatus(L"Could not read the default output volume.");
       return;
     }
     SetVolumeStatus({});
-    if (*current == volumePercent_) return;
-    volumePercent_ = *current;
-    RetargetVolumeVisual(true);
-    NotifyVolumeValueChanged();
+    const bool percentChanged = current->percent != volumePercent_;
+    const bool muteChanged = current->muted != volumeMuted_;
+    const bool deviceChanged = current->deviceName != volumeDeviceName_;
+    volumeDeviceName_ = current->deviceName;
+    if (percentChanged) {
+      volumePercent_ = current->percent;
+      RetargetVolumeVisual(true);
+      NotifyVolumeValueChanged();
+    } else if (deviceChanged) {
+      NotifyVolumeValueChanged();
+    }
+    if (muteChanged) {
+      volumeMuted_ = current->muted;
+      NotifyVolumeMuteChanged();
+    }
   }
 
   bool ApplyVolumePercent(int percent) {
     const int next = feathercast::audio::ClampPercent(percent);
-    if (next == volumePercent_) return true;
+    if (next == volumePercent_) {
+      SetVolumeStatus({});
+      return true;
+    }
+    if (volumeDragging_) {
+      const bool wasPending = volumePendingPercent_.has_value();
+      volumePendingPercent_ = next;
+      volumePercent_ = next;
+      RetargetVolumeVisual(false);
+      SetVolumeStatus({});
+      NotifyVolumeValueChanged();
+      if (!wasPending && volumeHwnd_) {
+        SetTimer(volumeHwnd_, TIMER_VOLUME_WRITE, 16, nullptr);
+      }
+      return true;
+    }
     if (!feathercast::audio::SetDefaultOutputVolumePercent(next)) {
       SetVolumeStatus(L"Could not change the default output volume.");
       return false;
@@ -9960,6 +10210,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RetargetVolumeVisual(!volumeDragging_);
     SetVolumeStatus({});
     NotifyVolumeValueChanged();
+    return true;
+  }
+
+  void FlushPendingVolumeWrite() {
+    KillTimer(volumeHwnd_, TIMER_VOLUME_WRITE);
+    if (!volumePendingPercent_) return;
+    const int pending = *volumePendingPercent_;
+    volumePendingPercent_.reset();
+    if (!feathercast::audio::SetDefaultOutputVolumePercent(pending)) {
+      SetVolumeStatus(L"Could not change the default output volume.");
+      return;
+    }
+    SetVolumeStatus({});
+  }
+
+  bool ToggleVolumeMute() {
+    const auto current = feathercast::audio::ReadDefaultOutputState();
+    if (!current ||
+        !feathercast::audio::SetDefaultOutputMute(!current->muted)) {
+      SetVolumeStatus(L"Could not change the mute state.");
+      return false;
+    }
+    volumeMuted_ = !current->muted;
+    volumeDeviceName_ = current->deviceName;
+    SetVolumeStatus({});
+    NotifyVolumeMuteChanged();
     return true;
   }
 
@@ -9986,28 +10262,44 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case VK_ESCAPE:
         HideVolumeControl(true);
         return;
+      case VK_TAB:
+        SetVolumeFocusIndex(volumeFocusIndex_ == 0 ? 1 : 0);
+        return;
+      case 'M':
+        ToggleVolumeMute();
+        return;
+      case VK_RETURN:
+      case VK_SPACE:
+        if (volumeFocusIndex_ == 1) ToggleVolumeMute();
+        return;
       case VK_LEFT:
       case VK_DOWN:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(
             feathercast::audio::AdjustPercent(volumePercent_, -1));
         return;
       case VK_RIGHT:
       case VK_UP:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(
             feathercast::audio::AdjustPercent(volumePercent_, 1));
         return;
       case VK_NEXT:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(
             feathercast::audio::AdjustPercent(volumePercent_, -10));
         return;
       case VK_PRIOR:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(
             feathercast::audio::AdjustPercent(volumePercent_, 10));
         return;
       case VK_HOME:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(0);
         return;
       case VK_END:
+        if (volumeFocusIndex_ != 0) return;
         ApplyVolumePercent(100);
         return;
       default:
@@ -10033,7 +10325,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ShowVolumeControl() {
     feathercast::audio::SetDefaultOutputEndpointCacheEnabled(true);
-    const auto current = feathercast::audio::ReadDefaultOutputVolumePercent();
+    const auto current = feathercast::audio::ReadDefaultOutputState();
     if (!current) {
       feathercast::audio::SetDefaultOutputEndpointCacheEnabled(false);
       SetOverlayStatus(StatusSeverity::Error,
@@ -10048,8 +10340,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     HideOverlay(OverlayCloseReason::Transition);
     EnterInteractiveScheduling();
 
-    volumePercent_ = *current;
+    volumePercent_ = current->percent;
+    volumeMuted_ = current->muted;
+    volumeDeviceName_ = current->deviceName;
     volumeStatus_.clear();
+    volumePendingPercent_.reset();
+    volumeFocusIndex_ = 0;
+    volumeHoverIndex_ = -1;
     volumeMonitor_ = monitor;
     volumeVisible_ = true;
     volumeClosing_ = false;
@@ -10076,7 +10373,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     SetWindowPos(volumeHwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (!FocusWindow(volumeHwnd_)) {
-      volumeStatus_ = L"Volume control could not receive focus.";
+      SetVolumeStatus(L"Volume control could not receive focus.");
     }
     SetActiveWindow(volumeHwnd_);
     SetFocus(volumeHwnd_);
@@ -10093,8 +10390,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     pendingVolumeRestore_ = nullptr;
     volumeRestoreWindow_ = nullptr;
     volumeVisible_ = false;
-    feathercast::audio::SetDefaultOutputEndpointCacheEnabled(false);
     volumeDragging_ = false;
+    FlushPendingVolumeWrite();
+    feathercast::audio::SetDefaultOutputEndpointCacheEnabled(false);
     KillTimer(volumeHwnd_, TIMER_VOLUME_REFRESH);
     if (GetCapture() == volumeHwnd_) ReleaseCapture();
     ShowWindow(volumeHwnd_, SW_HIDE);
@@ -10102,6 +10400,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ClearSurfaceBlurClip(volumeSurface_, volumeHwnd_);
     volumeMonitor_ = nullptr;
     volumeStatus_.clear();
+    volumeDeviceName_.clear();
+    volumeMuted_ = false;
+    volumePendingPercent_.reset();
+    volumeFocusIndex_ = 0;
+    volumeHoverIndex_ = -1;
     UpdateBackgroundState();
     if (restoreTarget && !FocusWindow(restoreTarget)) {
       ShowTrayNotification(L"FeatherCast",
@@ -10500,7 +10803,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                      : hwnd_;
     feathercast::library_ui::ShowLibraryManager(
         owner, LibraryManagerData(), std::move(callbacks), initialKind,
-        std::move(initialAppId));
+        std::move(initialAppId), theme_, highContrast_);
     InvalidateRect(settingsHwnd_, nullptr, FALSE);
   }
 
@@ -10530,8 +10833,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // Reassert the transparent window treatment now that the window is sized.
     ApplySurfaceGlass(settingsHwnd_, settingsBlurHwnd_, settingsBlurApplied_);
     settingsCategoryTop_.Snap(
-        kSettTop + static_cast<double>(SettingsCategoryIndex(settingsCategory_)) *
-                       kSettCategoryRow);
+        SettingsCategoryTop(static_cast<float>(clamped) / scale,
+                            settingsCategory_));
     settingsVisualScroll_.Snap(settingsScroll_);
     const bool surfaceReady =
         PrewarmGlassSurface(settingsHwnd_, settingsSurface_);
@@ -11735,7 +12038,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   D2D1_COLOR_F EmphasisTextColor(float alpha = 1.0f) const {
-    if (!highContrast_) return D2D1::ColorF(1, 1, 1, alpha);
+    if (!highContrast_) {
+      const auto accent = ThemeColorFromSystem(ActiveAccent());
+      const feathercast::theme::Color white{1.0f, 1.0f, 1.0f, 1.0f};
+      const feathercast::theme::Color black{0.0f, 0.0f, 0.0f, 1.0f};
+      const auto foreground = feathercast::theme::ContrastRatio(white, accent) >=
+                                      feathercast::theme::ContrastRatio(black, accent)
+                                  ? white
+                                  : black;
+      return D2D1::ColorF(foreground.r, foreground.g, foreground.b, alpha);
+    }
     auto color = D2DColor(ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHTTEXT)));
     color.a = alpha;
     return color;
@@ -11932,6 +12244,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
         DrawTextBlock(L"Volume Control", {24.0f, 18.0f, width - 150.0f, 46.0f},
                       titleFormat_.Get(), D2DColor(theme_.textPrimary));
+        const std::wstring outputName =
+            volumeDeviceName_.empty() ? L"Default output" : volumeDeviceName_;
+        DrawTextBlock(L"Output: " + outputName,
+                      {24.0f, 48.0f, width - 150.0f, 70.0f},
+                      bodyFormat_.Get(), D2DColor(theme_.textMuted));
         const double visualPercent =
             std::clamp(volumeVisualPercent_.Value(), 0.0, 100.0);
         DrawTextBlock(std::to_wstring(static_cast<int>(std::lround(visualPercent))) + L"%",
@@ -11957,10 +12274,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                           9.0f, 9.0f),
             knobBorder.Get(), 1.0f);
 
+        if (GetFocus() == volumeHwnd_ && volumeFocusIndex_ == 0) {
+          DrawFocusFrame(VolumeTrackHitRect(width), 8.0f);
+        }
+
+        const RectF muteRect = VolumeMuteRect();
+        FillRound(muteRect, theme_.controlRadius,
+                  volumeHoverIndex_ == 1 ? D2DColor(theme_.surfaceHover)
+                                         : D2DColor(theme_.surface));
+        StrokeRound(muteRect, theme_.controlRadius,
+                    GetFocus() == volumeHwnd_ && volumeFocusIndex_ == 1
+                        ? D2DColor(ActiveAccent())
+                        : D2DColor(theme_.border),
+                    GetFocus() == volumeHwnd_ && volumeFocusIndex_ == 1
+                        ? 2.0f
+                        : 1.0f);
+        DrawCenteredButtonText(volumeMuted_ ? L"Unmute" : L"Mute", muteRect,
+                               D2DColor(theme_.textPrimary));
+
         const bool error = !volumeStatus_.empty();
         DrawTextBlock(error ? volumeStatus_
-                            : L"Arrow keys 1%  |  Page Up/Down 10%  |  Home/End",
-                      {24.0f, 122.0f, width - 24.0f, height - 18.0f},
+                            : L"Arrows 1%  |  PgUp/Dn 10%  |  M mute  |  Esc close",
+                      {24.0f, 170.0f, width - 24.0f, height - 18.0f},
                       bodyFormat_.Get(),
                        error ? D2DColor(theme_.danger)
                              : D2DColor(theme_.textMuted));
@@ -13627,22 +13962,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   static constexpr float kSettStatus = 52.0f;
   static constexpr float kSettHelpHeight = 32.0f;
 
-  static constexpr std::array<SettingsCategory, 8> kSettingsCategories = {
-    SettingsCategory::Shortcut,
-    SettingsCategory::General,
-    SettingsCategory::Results,
-    SettingsCategory::Library,
-    SettingsCategory::Privacy,
-    SettingsCategory::Extensions,
-    SettingsCategory::Appearance,
-    SettingsCategory::Maintenance,
-  };
+  static const auto& SettingsCategories() {
+    return feathercast::settings_catalog::Categories();
+  }
 
   static int SettingsCategoryIndex(SettingsCategory category) {
-    const auto it = std::find(kSettingsCategories.begin(), kSettingsCategories.end(), category);
-    return it == kSettingsCategories.end()
+    const auto& categories = SettingsCategories();
+    const auto it = std::find_if(
+        categories.begin(), categories.end(),
+        [&](const auto& descriptor) { return descriptor.category == category; });
+    return it == categories.end()
                ? 0
-               : static_cast<int>(std::distance(kSettingsCategories.begin(), it));
+               : static_cast<int>(std::distance(categories.begin(), it));
+  }
+
+  static SettingsCategory SettingsCategoryAt(size_t index) {
+    const auto& categories = SettingsCategories();
+    if (categories.empty()) return SettingsCategory::General;
+    return categories[std::min(index, categories.size() - 1)].category;
+  }
+
+  static float SettingsCategoryRowHeight(float height) {
+    const auto count = SettingsCategories().size();
+    if (count == 0) return kSettCategoryRow;
+    const float available =
+        std::max(0.0f, height - kSettTop - kSettHelpHeight);
+    return std::clamp(available / static_cast<float>(count), 24.0f,
+                      kSettCategoryRow);
+  }
+
+  static float SettingsCategoryTop(float height, SettingsCategory category) {
+    return kSettTop + static_cast<float>(SettingsCategoryIndex(category)) *
+                          SettingsCategoryRowHeight(height);
   }
 
   static int SettingsCategoryFocusIndex(SettingsCategory category) {
@@ -13651,18 +14002,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   static RectF SettingsFilterRect(float width) {
     return {std::max(250.0f, width - 330.0f), 10.0f, width - 60.0f, 46.0f};
-  }
-
-  static const wchar_t* SettingsCategoryLabel(SettingsCategory category) {
-    const auto* descriptor =
-        feathercast::settings_catalog::FindCategory(category);
-    return descriptor ? descriptor->label.data() : L"Settings";
-  }
-
-  static HitType SettingsCategoryHit(SettingsCategory category) {
-    const auto* descriptor =
-        feathercast::settings_catalog::FindCategory(category);
-    return descriptor ? descriptor->hit : HitType::SettingsGeneralCategory;
   }
 
   static std::optional<SettingsCategory> SettingsCategoryForHit(HitType type) {
@@ -13713,6 +14052,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool SettingsControlEnabled(HitType type) const {
     const auto* descriptor = feathercast::settings_catalog::Find(type);
     if (!descriptor) return true;
+    if (settingsPersistenceBlocked_) return false;
     return feathercast::settings_catalog::Enabled(
         *descriptor, SettingsCatalogContext());
   }
@@ -13748,32 +14088,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   int SettingsPageContentHeight() const {
     float h = kSettTop + SettingsStatusOffset();
+    const float contentWidth = SettingsContentWidth();
     switch (settingsCategory_) {
       case SettingsCategory::Shortcut:
         h += kSettSection + kSettShortcut;
+        if (contentWidth < 360.0f) {
+          h += kSettMaint +
+               4.0f * (54.0f + SettingsActionGroupHeight(contentWidth, 2) -
+                        66.0f);
+        }
         break;
       case SettingsCategory::General:
         h += kSettSection + 4 * kSettRow;
+        if (contentWidth < 360.0f) h += 40.0f;
         break;
       case SettingsCategory::Results:
         h += kSettSection + 5 * kSettRow;
         break;
       case SettingsCategory::Library:
         h += kSettSection + 3 * kSettRow;
+        if (contentWidth < 360.0f) {
+          h += 3.0f * kSettMaint;
+        }
         break;
       case SettingsCategory::Privacy:
-        h += kSettSection + 9 * kSettRow + 3 * kSettMaint;
+        h += kSettSection + 9 * kSettRow;
+        if (contentWidth < 360.0f) {
+          h += 2.0f * SettingsActionGroupHeight(contentWidth, 2) +
+               SettingsActionGroupHeight(contentWidth, 3) + kSettMaint +
+               SettingsActionGroupHeight(contentWidth, 3);
+        } else {
+          h += SettingsActionGroupHeight(contentWidth, 3) + kSettMaint +
+               SettingsActionGroupHeight(contentWidth, 3);
+        }
         break;
       case SettingsCategory::Extensions:
         h += kSettSection + kSettRow +
              static_cast<float>(extensions_.Health().size()) * kSettRow +
-             kSettMaint;
+             SettingsActionGroupHeight(contentWidth, 2);
         break;
       case SettingsCategory::Appearance:
         h += kSettSection + kSettRow + (settings_.syncAccentColor ? 0.0f : 48.0f);
         break;
       case SettingsCategory::Maintenance:
-        h += kSettSection + kSettMaint;
+        h += kSettSection + SettingsActionGroupHeight(contentWidth, 3);
         break;
     }
     h += kSettBottom;
@@ -13788,17 +14146,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::vector<HitType> SettingsFocusOrder() const {
-    std::vector<HitType> order = {
-      HitType::SettingsFilter,
-      HitType::SettingsShortcutCategory,
-      HitType::SettingsGeneralCategory,
-      HitType::SettingsResultsCategory,
-      HitType::SettingsLibraryCategory,
-      HitType::SettingsPrivacyCategory,
-      HitType::SettingsExtensionsCategory,
-      HitType::SettingsAppearanceCategory,
-      HitType::SettingsMaintenanceCategory,
-    };
+    std::vector<HitType> order = {HitType::SettingsFilter};
+    for (const auto& category : SettingsCategories()) {
+      order.push_back(category.hit);
+    }
     auto controls = feathercast::settings_catalog::FocusOrder(
         settingsCategory_, SettingsCatalogContext());
     order.insert(order.end(), controls.begin(), controls.end());
@@ -13856,6 +14207,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void DrawSettingRowLabel(float y, float rowH, const std::wstring& label,
                            const std::wstring& desc, float left, float labelRight,
                            bool enabled = true) {
+    labelRight = std::max(left + 1.0f, labelRight);
     DrawTextBlock(label, {left, y + rowH / 2 - 20, labelRight, y + rowH / 2},
                   labelFormat_.Get(),
                   enabled ? SettWhite() : D2DColor(theme_.textDim));
@@ -13920,8 +14272,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     hits_.push_back({{left - 8.0f, y, right, y + rowH}, type, -1, enabled});
   }
 
-  static RectF AnimationSliderHitRect(float y, float rowH, float right) {
-    return {right - 232.0f, y + 4.0f, right, y + rowH - 4.0f};
+  static RectF AnimationSliderHitRect(float y, float rowH, float left,
+                                      float right) {
+    return {std::max(left, right - 232.0f), y + 4.0f, right,
+            y + rowH - 4.0f};
   }
 
   static RectF AnimationSliderTrackRect(const RectF& hit) {
@@ -13929,8 +14283,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             hit.top + 22.0f};
   }
 
-  void DrawAnimationSlider(float y, float rowH, float right) {
-    const RectF hit = AnimationSliderHitRect(y, rowH, right);
+  void DrawAnimationSlider(float y, float rowH, float left, float right) {
+    const RectF hit = AnimationSliderHitRect(y, rowH, left, right);
     const RectF track = AnimationSliderTrackRect(hit);
     const COLORREF accent = ActiveAccent();
     const int selected = static_cast<int>(settings_.animationLevel);
@@ -13984,25 +14338,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RectF minus{plus.left - 8 - 36, cy - 17, plus.left - 8, cy + 17};
     DrawSettingsButton(minus, L"-", down, enabled);
     DrawSettingsButton(plus, L"+", up, enabled);
-    DrawTextBlock(value, {minus.left - 96, cy - 11, minus.left - 12, cy + 11},
+    const float valueLeft =
+        std::max(kSettSidebarWidth + kSettContentInset, minus.left - 96.0f);
+    DrawTextBlock(value, {valueLeft, cy - 11, minus.left - 12, cy + 11},
                   footerRightFormat_.Get(),
                   enabled ? SettWhite() : D2DColor(theme_.textDim));
   }
 
   void DrawSettingsSidebar(float height) {
     const COLORREF accent = ActiveAccent();
-    for (size_t i = 0; i < kSettingsCategories.size(); ++i) {
-      const SettingsCategory category = kSettingsCategories[i];
-      const HitType type = SettingsCategoryHit(category);
-      const float top = kSettTop + static_cast<float>(i) * kSettCategoryRow;
-      const RectF rect{12.0f, top, kSettSidebarWidth - 12.0f, top + 38.0f};
+    const float categoryRow = SettingsCategoryRowHeight(height);
+    const float categoryHeight = std::max(20.0f, categoryRow - 6.0f);
+    const auto& categories = SettingsCategories();
+    for (size_t i = 0; i < categories.size(); ++i) {
+      const auto& descriptor = categories[i];
+      const SettingsCategory category = descriptor.category;
+      const HitType type = descriptor.hit;
+      const float top = kSettTop + static_cast<float>(i) * categoryRow;
+      const RectF rect{12.0f, top, kSettSidebarWidth - 12.0f,
+                       top + categoryHeight};
       const bool selected = category == settingsCategory_;
       const bool hover = SettHover(type);
       if (selected) {
         const float selectedTop =
             static_cast<float>(settingsCategoryTop_.Value());
         const RectF animatedRect{rect.left, selectedTop, rect.right,
-                                 selectedTop + 38.0f};
+                                 selectedTop + categoryHeight};
         FillRound(animatedRect, theme_.controlRadius,
                   Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.22f));
       } else if (hover) {
@@ -14010,19 +14371,75 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       if (SettFocused(type)) DrawFocusFrame(rect, theme_.controlRadius);
       DrawVerticallyCenteredTextBlock(
-          SettingsCategoryLabel(category),
-          {24.0f, top, rect.right - 12.0f, top + 38.0f},
+          descriptor.label.data(),
+          {24.0f, top, rect.right - 12.0f, top + categoryHeight},
           bodyFormat_.Get(), selected ? SettWhite() : SettGray());
       hits_.push_back({rect, type});
     }
 
-    if (height > kSettTop + kSettingsCategories.size() * kSettCategoryRow + 12.0f) {
+    if (height > kSettTop + categories.size() * categoryRow + 12.0f) {
       auto divider = Brush(D2DColor(theme_.divider));
       activeRT_->DrawLine(
           D2D1::Point2F(kSettSidebarWidth, 68.0f),
           D2D1::Point2F(kSettSidebarWidth, height - 12.0f),
           divider.Get(), 1.0f);
     }
+  }
+
+  struct SettingsActionButton {
+    std::wstring text;
+    HitType type = HitType::CloseSettings;
+    bool enabled = true;
+  };
+
+  static size_t SettingsActionColumns(float contentWidth, size_t count) {
+    if (count <= 1) return 1;
+    if (contentWidth < 360.0f) return 1;
+    if (contentWidth < 520.0f) return std::min<size_t>(2, count);
+    return std::min<size_t>(3, count);
+  }
+
+  static float SettingsActionGroupHeight(float contentWidth, size_t count) {
+    const size_t columns = SettingsActionColumns(contentWidth, count);
+    const size_t rows = (count + columns - 1) / columns;
+    return static_cast<float>(rows) * kSettMaint;
+  }
+
+  float SettingsContentWidth() const {
+    if (!settingsHwnd_) {
+      return static_cast<float>(SETTINGS_WIDTH) - kSettSidebarWidth -
+             2.0f * kSettContentInset;
+    }
+    RECT client{};
+    GetClientRect(settingsHwnd_, &client);
+    return static_cast<float>(client.right) / GetWindowScale(settingsHwnd_) -
+           kSettSidebarWidth - 2.0f * kSettContentInset;
+  }
+
+  float DrawSettingsActionGroup(
+      float y, float left, float right,
+      std::initializer_list<SettingsActionButton> buttons) {
+    if (buttons.size() == 0) return y;
+    const float contentWidth = right - left;
+    const size_t columns = SettingsActionColumns(contentWidth, buttons.size());
+    const float gap = 12.0f;
+    const float buttonWidth =
+        (contentWidth - gap * static_cast<float>(columns - 1)) /
+        static_cast<float>(columns);
+    size_t index = 0;
+    for (const auto& button : buttons) {
+      const size_t row = index / columns;
+      const size_t column = index % columns;
+      const float top = y + static_cast<float>(row) * kSettMaint +
+                        (kSettMaint - 38.0f) / 2.0f;
+      const float buttonLeft =
+          left + static_cast<float>(column) * (buttonWidth + gap);
+      DrawSettingsButton(
+          {buttonLeft, top, buttonLeft + buttonWidth, top + 38.0f},
+          button.text, button.type, button.enabled);
+      ++index;
+    }
+    return y + SettingsActionGroupHeight(contentWidth, buttons.size());
   }
 
   void DrawSettings() {
@@ -14032,6 +14449,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float width = static_cast<float>(rc.right - rc.left) / scale;
     const float height = static_cast<float>(rc.bottom - rc.top) / scale;
     const COLORREF accent = ActiveAccent();
+    const float categoryTop = SettingsCategoryTop(height, settingsCategory_);
+    if (std::abs(settingsCategoryTop_.Target() - categoryTop) > 0.5) {
+      settingsCategoryTop_.Snap(categoryTop);
+    }
 
     DrawObsidianBackground(width, height, theme_.settingsRadius, ObsidianBackgroundKind::Settings);
 
@@ -14141,6 +14562,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     switch (settingsCategory_) {
       case SettingsCategory::Shortcut: {
         y = DrawSettingsSection(y, L"GLOBAL SHORTCUT", contentLeft, contentRight);
+        const bool compactActions = contentWidth < 360.0f;
         const std::wstring current =
             settings_.shortcut.empty() || settings_.shortcut == L"none"
                 ? L"None"
@@ -14152,7 +14574,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       {contentLeft, y + 33, contentRight, y + 51},
                       bodyFormat_.Get(), SettGray());
         const float btnTop = y + 56;
-        RectF record{contentLeft, btnTop, contentRight - 106, btnTop + 38};
+        RectF record{contentLeft, btnTop,
+                     compactActions ? contentRight : contentRight - 106,
+                     btnTop + 38};
         const bool recHover = SettHover(HitType::RecordShortcut);
         FillRound(
             record, theme_.controlRadius,
@@ -14173,8 +14597,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                                     : L"Record new shortcut");
         DrawCenteredButtonText(recordText, record,
                                recording_ ? D2DColor(accent) : SettWhite());
+        const RectF secondaryButton =
+            compactActions
+                ? RectF{contentLeft, btnTop + kSettMaint, contentRight,
+                        btnTop + kSettMaint + 38}
+                : RectF{contentRight - 94, btnTop, contentRight, btnTop + 38};
         if (!pendingShortcut_.empty()) {
-          RectF save{contentRight - 94, btnTop, contentRight, btnTop + 38};
+          RectF save = secondaryButton;
           FillRound(save, theme_.controlRadius, D2DColor(accent));
           if (SettFocused(HitType::SaveShortcut)) {
             DrawFocusFrame(save, theme_.controlRadius);
@@ -14182,11 +14611,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           hits_.push_back({save, HitType::SaveShortcut});
           DrawCenteredButtonText(L"Save", save, EmphasisTextColor());
         } else {
-          RectF clearBtn{contentRight - 94, btnTop, contentRight, btnTop + 38};
-          DrawSettingsButton(clearBtn, L"Clear", HitType::ClearShortcut,
+          DrawSettingsButton(secondaryButton, L"Clear", HitType::ClearShortcut,
                              SettingsControlEnabled(HitType::ClearShortcut));
         }
-        y += 108.0f;
+        y += 108.0f + (compactActions ? kSettMaint : 0.0f);
         y = DrawSettingsSection(y, L"CAPTURE SHORTCUTS", contentLeft,
                                 contentRight);
         struct CaptureShortcutRow {
@@ -14212,28 +14640,40 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           const auto& row = captureRows[index];
           const bool assigned =
               !row.value->empty() && *row.value != L"none";
-          DrawTextBlock(row.label,
-                        {contentLeft, y + 6.0f, contentRight - 204.0f,
-                         y + 27.0f},
-                        labelFormat_.Get(), SettWhite());
-          DrawTextBlock(assigned ? *row.value : L"None",
-                        {contentLeft, y + 29.0f, contentRight - 204.0f,
-                         y + 49.0f},
-                        bodyFormat_.Get(), SettGray());
-          const RectF recordButton{contentRight - 196.0f, y + 8.0f,
-                                   contentRight - 76.0f, y + 46.0f};
-          const RectF clearButton{contentRight - 68.0f, y + 8.0f,
-                                  contentRight, y + 46.0f};
           const bool isRecording =
               recording_ &&
               recordingCaptureShortcut_ == static_cast<int>(index);
-          DrawSettingsButton(recordButton,
-                             isRecording
-                                 ? L"Press a key..."
-                                 : (assigned ? L"Change" : L"Record"),
-                             row.record);
-          DrawSettingsButton(clearButton, L"Clear", row.clear, assigned);
-          y += 66.0f;
+          const std::wstring recordLabel =
+              isRecording ? L"Press a key..."
+                          : (assigned ? L"Change" : L"Record");
+          if (compactActions) {
+            DrawTextBlock(row.label,
+                          {contentLeft, y + 6.0f, contentRight, y + 27.0f},
+                          labelFormat_.Get(), SettWhite());
+            DrawTextBlock(assigned ? *row.value : L"None",
+                          {contentLeft, y + 29.0f, contentRight, y + 49.0f},
+                          bodyFormat_.Get(), SettGray());
+            y += 54.0f;
+            y = DrawSettingsActionGroup(
+                y, contentLeft, contentRight,
+                {{recordLabel, row.record}, {L"Clear", row.clear, assigned}});
+          } else {
+            DrawTextBlock(row.label,
+                          {contentLeft, y + 6.0f, contentRight - 204.0f,
+                           y + 27.0f},
+                          labelFormat_.Get(), SettWhite());
+            DrawTextBlock(assigned ? *row.value : L"None",
+                          {contentLeft, y + 29.0f, contentRight - 204.0f,
+                           y + 49.0f},
+                          bodyFormat_.Get(), SettGray());
+            const RectF recordButton{contentRight - 196.0f, y + 8.0f,
+                                     contentRight - 76.0f, y + 46.0f};
+            const RectF clearButton{contentRight - 68.0f, y + 8.0f,
+                                    contentRight, y + 46.0f};
+            DrawSettingsButton(recordButton, recordLabel, row.record);
+            DrawSettingsButton(clearButton, L"Clear", row.clear, assigned);
+            y += 66.0f;
+          }
         }
         DrawTextBlock(L"Windows setting: If Print Screen opens Snipping Tool,",
                       {contentLeft, y + 6.0f, contentRight, y + 23.0f},
@@ -14263,9 +14703,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawSwitch(y, kSettRow, settings_.compactMode,
                    HitType::CompactToggle, contentLeft, contentRight);
         y += kSettRow;
-        DrawCatalogSettingRowLabel(y, kSettRow, HitType::AnimationLevel,
-                                   contentLeft, contentRight - 252);
-        DrawAnimationSlider(y, kSettRow, contentRight);
+        if (contentWidth < 360.0f) {
+          DrawCatalogSettingRowLabel(y, 40.0f, HitType::AnimationLevel,
+                                     contentLeft, contentRight);
+          DrawAnimationSlider(y + 40.0f, kSettRow, contentLeft,
+                              contentRight);
+          y += 40.0f + kSettRow;
+        } else {
+          DrawCatalogSettingRowLabel(y, kSettRow, HitType::AnimationLevel,
+                                     contentLeft, contentRight - 252);
+          DrawAnimationSlider(y, kSettRow, contentLeft, contentRight);
+          y += kSettRow;
+        }
         break;
 
       case SettingsCategory::Results:
@@ -14304,6 +14753,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
       case SettingsCategory::Library: {
         y = DrawSettingsSection(y, L"LIBRARY", contentLeft, contentRight);
+        const bool compactActions = contentWidth < 360.0f;
         std::size_t snippetCount = 0;
         {
           std::lock_guard lock(dataMutex_);
@@ -14311,42 +14761,65 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::ManageSnippets, contentLeft,
-            contentRight - 150.0f, true,
+            compactActions ? contentRight : contentRight - 150.0f, true,
             std::to_wstring(snippetCount) +
                 (snippetCount == 1 ? L" reusable text item." :
                                      L" reusable text items."));
-        DrawSettingsButton(
-            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
-            L"Manage", HitType::ManageSnippets);
-        y += kSettRow;
+        if (compactActions) {
+          y += kSettRow;
+          y = DrawSettingsActionGroup(
+              y, contentLeft, contentRight,
+              {{L"Manage", HitType::ManageSnippets}});
+        } else {
+          DrawSettingsButton(
+              {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+              L"Manage", HitType::ManageSnippets);
+          y += kSettRow;
+        }
         const std::size_t quicklinkCount = settings_.quicklinks.size();
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::ManageQuicklinks, contentLeft,
-            contentRight - 150.0f, true,
+            compactActions ? contentRight : contentRight - 150.0f, true,
             std::to_wstring(quicklinkCount) +
                 (quicklinkCount == 1 ? L" URL, file, or folder shortcut." :
                                        L" URL, file, or folder shortcuts."));
-        DrawSettingsButton(
-            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
-            L"Manage", HitType::ManageQuicklinks);
-        y += kSettRow;
+        if (compactActions) {
+          y += kSettRow;
+          y = DrawSettingsActionGroup(
+              y, contentLeft, contentRight,
+              {{L"Manage", HitType::ManageQuicklinks}});
+        } else {
+          DrawSettingsButton(
+              {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+              L"Manage", HitType::ManageQuicklinks);
+          y += kSettRow;
+        }
         const std::size_t commandAliasCount = settings_.commandAliases.size();
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::ManageCommandAliases, contentLeft,
-            contentRight - 150.0f, true,
+            compactActions ? contentRight : contentRight - 150.0f, true,
             commandAliasCount == 0
                 ? L"No command aliases configured."
                 : (std::to_wstring(commandAliasCount) +
                    (commandAliasCount == 1 ? L" command alias configured." :
                                              L" command aliases configured.")));
-        DrawSettingsButton(
-            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
-            L"Manage", HitType::ManageCommandAliases);
+        if (compactActions) {
+          y += kSettRow;
+          y = DrawSettingsActionGroup(
+              y, contentLeft, contentRight,
+              {{L"Manage", HitType::ManageCommandAliases}});
+        } else {
+          DrawSettingsButton(
+              {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+              L"Manage", HitType::ManageCommandAliases);
+          y += kSettRow;
+        }
         break;
       }
 
       case SettingsCategory::Privacy: {
         y = DrawSettingsSection(y, L"PRIVACY", contentLeft, contentRight);
+        const bool compactActions = contentWidth < 360.0f;
         DrawCatalogSettingRowLabel(y, kSettRow,
                                    HitType::ClipboardHistoryToggle,
                                    contentLeft, contentRight - 66);
@@ -14375,19 +14848,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const std::size_t excludedAppCount = settings_.clipboardExcludedApps.size();
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::AddClipboardExcludedApp, contentLeft,
-            contentRight - 260, clipboardControls,
+            compactActions ? contentRight : contentRight - 260,
+            clipboardControls,
             excludedAppCount == 0
                 ? L"No apps excluded."
                 : (std::to_wstring(excludedAppCount) +
                    (excludedAppCount == 1 ? L" app excluded." : L" apps excluded.")));
-        DrawSettingsButton(
-            {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f, y + 48.0f},
-            L"Exclude App...", HitType::AddClipboardExcludedApp, clipboardControls);
-        DrawSettingsButton(
-            {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
-            L"Remove...", HitType::RemoveClipboardExcludedApp,
-            clipboardControls && excludedAppCount > 0);
-        y += kSettRow;
+        if (compactActions) {
+          y += kSettRow;
+          y = DrawSettingsActionGroup(
+              y, contentLeft, contentRight,
+              {{L"Exclude App...", HitType::AddClipboardExcludedApp,
+                clipboardControls},
+               {L"Remove...", HitType::RemoveClipboardExcludedApp,
+                clipboardControls && excludedAppCount > 0}});
+        } else {
+          DrawSettingsButton(
+              {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f,
+               y + 48.0f},
+              L"Exclude App...", HitType::AddClipboardExcludedApp,
+              clipboardControls);
+          DrawSettingsButton(
+              {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
+              L"Remove...", HitType::RemoveClipboardExcludedApp,
+              clipboardControls && excludedAppCount > 0);
+          y += kSettRow;
+        }
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::FileIndexToggle, contentLeft,
             contentRight - 66, true,
@@ -14421,70 +14907,67 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const std::size_t patternCount = settings_.fileIndexExcludePatterns.size();
         DrawCatalogSettingRowLabel(
             y, kSettRow, HitType::AddFileIndexPattern, contentLeft,
-            contentRight - 260, fileIndexControls,
+            compactActions ? contentRight : contentRight - 260,
+            fileIndexControls,
             patternCount == 0
                 ? L"No exclusion patterns configured."
                 : (std::to_wstring(patternCount) +
                    (patternCount == 1 ? L" exclusion pattern configured." : L" exclusion patterns configured.")));
-        DrawSettingsButton(
-            {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f, y + 48.0f},
-            L"Add Pattern...", HitType::AddFileIndexPattern, fileIndexControls);
-        DrawSettingsButton(
-            {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
-            L"Remove...", HitType::RemoveFileIndexPattern,
-            fileIndexControls && patternCount > 0);
-        y += kSettRow;
+        if (compactActions) {
+          y += kSettRow;
+          y = DrawSettingsActionGroup(
+              y, contentLeft, contentRight,
+              {{L"Add Pattern...", HitType::AddFileIndexPattern,
+                fileIndexControls},
+               {L"Remove...", HitType::RemoveFileIndexPattern,
+                fileIndexControls && patternCount > 0}});
+        } else {
+          DrawSettingsButton(
+              {contentRight - 250.0f, y + 12.0f, contentRight - 130.0f,
+               y + 48.0f},
+              L"Add Pattern...", HitType::AddFileIndexPattern,
+              fileIndexControls);
+          DrawSettingsButton(
+              {contentRight - 120.0f, y + 12.0f, contentRight, y + 48.0f},
+              L"Remove...", HitType::RemoveFileIndexPattern,
+              fileIndexControls && patternCount > 0);
+          y += kSettRow;
+        }
         DrawCatalogSettingRowLabel(y, kSettRow, HitType::DiagnosticsToggle,
                                    contentLeft, contentRight - 66);
         DrawSwitch(y, kSettRow, settings_.diagnosticsEnabled,
                    HitType::DiagnosticsToggle, contentLeft, contentRight);
         y += kSettRow;
 
-        const float threeRootButtonWidth = (contentWidth - 24.0f) / 3.0f;
-        float btnTop = y + (kSettMaint - 38) / 2.0f;
-        DrawSettingsButton(
-            {contentLeft, btnTop, contentLeft + threeRootButtonWidth,
-             btnTop + 38},
-            L"Add Indexed Folder", HitType::AddFileRoot, fileIndexControls);
-        DrawSettingsButton(
-            {contentLeft + threeRootButtonWidth + 12, btnTop,
-             contentLeft + 2 * threeRootButtonWidth + 12, btnTop + 38},
-            L"Remove Folder...", HitType::RemoveFileRoot,
-            SettingsControlEnabled(HitType::RemoveFileRoot));
-        DrawSettingsButton(
-            {contentRight - threeRootButtonWidth, btnTop, contentRight,
-             btnTop + 38},
-            L"Use Default Folders", HitType::ClearFileRoots,
-            fileIndexControls);
-        y += kSettMaint;
+        y = DrawSettingsActionGroup(
+            y, contentLeft, contentRight,
+            {{L"Add Indexed Folder", HitType::AddFileRoot, fileIndexControls},
+             {L"Remove Folder...", HitType::RemoveFileRoot,
+              SettingsControlEnabled(HitType::RemoveFileRoot)},
+             {L"Use Default Folders", HitType::ClearFileRoots,
+              fileIndexControls}});
 
-        btnTop = y + (kSettMaint - 38) / 2.0f;
+        const float btnTop = y + (kSettMaint - 38) / 2.0f;
         DrawSettingsButton(
             {contentLeft, btnTop, contentRight, btnTop + 38},
             L"Rebuild File Index", HitType::RebuildFileIndex,
             fileIndexControls);
         y += kSettMaint;
 
-        const float threeButtonWidth = (contentWidth - 24.0f) / 3.0f;
-        btnTop = y + (kSettMaint - 38) / 2.0f;
-        DrawSettingsButton(
-            {contentLeft, btnTop, contentLeft + threeButtonWidth, btnTop + 38},
-            pendingStorageOperation_ == StorageOperationKind::ClearClipboard
-                ? L"Deleting..."
-                : L"Delete Clipboard Data",
-            HitType::ClearClipboardData,
-            SettingsControlEnabled(HitType::ClearClipboardData));
-        DrawSettingsButton(
-            {contentLeft + threeButtonWidth + 12, btnTop,
-             contentLeft + 2 * threeButtonWidth + 12, btnTop + 38},
-            pendingStorageOperation_ == StorageOperationKind::ClearFileIndex
-                ? L"Deleting..."
-                : L"Delete File Index",
-            HitType::ClearFileIndexData,
-            SettingsControlEnabled(HitType::ClearFileIndexData));
-        DrawSettingsButton(
-            {contentRight - threeButtonWidth, btnTop, contentRight, btnTop + 38},
-            L"Open Local Data", HitType::OpenLocalDataFolder);
+        y = DrawSettingsActionGroup(
+            y, contentLeft, contentRight,
+            {{pendingStorageOperation_ == StorageOperationKind::ClearClipboard
+                  ? L"Deleting..."
+                  : L"Delete Clipboard Data",
+              HitType::ClearClipboardData,
+              SettingsControlEnabled(HitType::ClearClipboardData)},
+             {pendingStorageOperation_ == StorageOperationKind::ClearFileIndex
+                  ? L"Deleting..."
+                  : L"Delete File Index",
+              HitType::ClearFileIndexData,
+              SettingsControlEnabled(HitType::ClearFileIndexData)},
+             {L"Open Local Data", HitType::OpenLocalDataFolder,
+              SettingsControlEnabled(HitType::OpenLocalDataFolder)}});
         break;
       }
 
@@ -14514,16 +14997,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                               contentRight);
           y += kSettRow;
         }
-        const float btnW = (contentWidth - 12.0f) / 2.0f;
-        const float btnTop = y + (kSettMaint - 38) / 2.0f;
-        DrawSettingsButton(
-            {contentLeft, btnTop, contentLeft + btnW, btnTop + 38},
-            extensionReloadPending_ ? L"Reloading..." : L"Reload Extensions",
-            HitType::ReloadExtensions,
-            SettingsControlEnabled(HitType::ReloadExtensions));
-        DrawSettingsButton(
-            {contentLeft + btnW + 12, btnTop, contentRight, btnTop + 38},
-            L"Open Plugins Folder", HitType::OpenPluginsFolder);
+        y = DrawSettingsActionGroup(
+            y, contentLeft, contentRight,
+            {{extensionReloadPending_ ? L"Reloading..." : L"Reload Extensions",
+              HitType::ReloadExtensions,
+              SettingsControlEnabled(HitType::ReloadExtensions)},
+             {L"Open Plugins Folder", HitType::OpenPluginsFolder,
+              SettingsControlEnabled(HitType::OpenPluginsFolder)}});
         break;
       }
 
@@ -14539,7 +15019,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                    HitType::AccentToggle, contentLeft, contentRight);
         y += kSettRow;
         if (!settings_.syncAccentColor) {
-          RectF colorBox{contentLeft, y, contentLeft + 196, y + 36};
+          const float colorBoxWidth = std::min(196.0f, contentWidth);
+          RectF colorBox{contentLeft, y, contentLeft + colorBoxWidth, y + 36};
           const bool colorHover = SettHover(HitType::AccentColor);
           const bool colorFocused = SettFocused(HitType::AccentColor);
           FillRound(colorBox, theme_.controlRadius, D2DColor(theme_.surface));
@@ -14553,7 +15034,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           FillRound({contentLeft + 12, y + 9, contentLeft + 36, y + 27}, 5,
                     D2DColor(ColorRefFromHex(settings_.customAccentColor)));
           DrawTextBlock(L"Pick color  " + settings_.customAccentColor,
-                        {contentLeft + 48, y + 9, contentLeft + 188, y + 29},
+                        {contentLeft + 48, y + 9, colorBox.right - 8,
+                         y + 29},
                         bodyFormat_.Get(), SettWhite());
           hits_.push_back({colorBox, HitType::AccentColor});
         }
@@ -14561,18 +15043,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
       case SettingsCategory::Maintenance: {
         y = DrawSettingsSection(y, L"MAINTENANCE", contentLeft, contentRight);
-        const float btnW = (contentWidth - 24.0f) / 3.0f;
-        const float btnTop = y + (kSettMaint - 38) / 2.0f;
-        DrawSettingsButton(
-            {contentLeft, btnTop, contentLeft + btnW, btnTop + 38},
-            L"Clear Recents", HitType::ClearRecents);
-        DrawSettingsButton(
-            {contentLeft + btnW + 12, btnTop,
-             contentLeft + 2 * btnW + 12, btnTop + 38},
-            L"Clear Icon Cache", HitType::ClearIconCache);
-        DrawSettingsButton(
-            {contentRight - btnW, btnTop, contentRight, btnTop + 38},
-            L"Check Updates", HitType::CheckUpdates);
+        y = DrawSettingsActionGroup(
+            y, contentLeft, contentRight,
+            {{L"Clear Recents", HitType::ClearRecents,
+              SettingsControlEnabled(HitType::ClearRecents)},
+             {L"Clear Icon Cache", HitType::ClearIconCache,
+              SettingsControlEnabled(HitType::ClearIconCache)},
+             {L"Check Updates", HitType::CheckUpdates,
+              SettingsControlEnabled(HitType::CheckUpdates)}});
         break;
       }
     }
@@ -15415,9 +15893,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (changed) {
       settingsPageProgress_.Snap(1.0);
+      float settingsHeight = static_cast<float>(SETTINGS_HEIGHT);
+      if (settingsHwnd_) {
+        RECT client{};
+        GetClientRect(settingsHwnd_, &client);
+        settingsHeight = static_cast<float>(client.bottom) /
+                         GetWindowScale(settingsHwnd_);
+      }
       settingsCategoryTop_.Snap(
-          kSettTop + static_cast<double>(SettingsCategoryIndex(category)) *
-                         kSettCategoryRow);
+          SettingsCategoryTop(settingsHeight, category));
       RetargetSettingsScroll(false);
       ResizeSettingsWindow(false);
     }
@@ -16023,9 +16507,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (focusedCategory && (vk == VK_UP || vk == VK_DOWN)) {
       const int direction = vk == VK_UP ? -1 : 1;
       const int current = SettingsCategoryIndex(*focusedCategory);
-      const int count = static_cast<int>(kSettingsCategories.size());
+      const int count = static_cast<int>(SettingsCategories().size());
       const int next = (current + direction + count) % count;
-      SelectSettingsCategory(kSettingsCategories[static_cast<size_t>(next)]);
+      SelectSettingsCategory(SettingsCategoryAt(static_cast<size_t>(next)));
       return;
     }
     if (focusedType == HitType::AnimationLevel) {
@@ -16057,9 +16541,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     if (vk == VK_RIGHT && focusedCategory &&
-        order.size() > kSettingsCategories.size() + 2) {
+        order.size() > SettingsCategories().size() + 2) {
       feathercast::ui::SettingsController::SetFocus(
-          settingsState_, static_cast<int>(kSettingsCategories.size()) + 1,
+          settingsState_, static_cast<int>(SettingsCategories().size()) + 1,
           static_cast<int>(order.size()));
       EnsureSettingsFocusVisible();
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
@@ -16146,7 +16630,61 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     std::wstring result;
     bool ok = false;
     HFONT font = nullptr;
+    HWND label = nullptr;
+    HWND edit = nullptr;
+    HWND okButton = nullptr;
+    HWND cancelButton = nullptr;
   };
+
+  static UINT PromptDpi(HWND hwnd) {
+    using GetDpiForWindowProc = UINT(WINAPI*)(HWND);
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+      if (auto proc = reinterpret_cast<GetDpiForWindowProc>(
+              GetProcAddress(user32, "GetDpiForWindow"))) {
+        if (const UINT dpi = proc(hwnd); dpi > 0) return dpi;
+      }
+    }
+    return 96;
+  }
+
+  static int PromptDip(HWND hwnd, float dip) {
+    return std::max(1, static_cast<int>(std::lround(
+                           dip * static_cast<float>(PromptDpi(hwnd)) / 96.0f)));
+  }
+
+  static void LayoutPromptDialog(HWND hwnd, PromptDialogData& data) {
+    RECT client{};
+    if (!GetClientRect(hwnd, &client)) return;
+    const int margin = PromptDip(hwnd, 16.0f);
+    const int gap = PromptDip(hwnd, 8.0f);
+    const int labelHeight = PromptDip(hwnd, 36.0f);
+    const int editHeight = PromptDip(hwnd, 24.0f);
+    const int buttonHeight = PromptDip(hwnd, 28.0f);
+    const int buttonWidth = PromptDip(hwnd, 90.0f);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+    const int contentWidth = std::max(1, width - 2 * margin);
+    if (data.label) {
+      MoveWindow(data.label, margin, margin, contentWidth, labelHeight, TRUE);
+    }
+    if (data.edit) {
+      MoveWindow(data.edit, margin, margin + labelHeight + gap, contentWidth,
+                 editHeight, TRUE);
+    }
+    const int buttonsTop = std::max(
+        margin + labelHeight + gap + editHeight + gap,
+        height - margin - buttonHeight);
+    const int buttonsWidth = buttonWidth * 2 + gap;
+    const int buttonsLeft = std::max(margin, width - margin - buttonsWidth);
+    if (data.okButton) {
+      MoveWindow(data.okButton, buttonsLeft, buttonsTop, buttonWidth,
+                 buttonHeight, TRUE);
+    }
+    if (data.cancelButton) {
+      MoveWindow(data.cancelButton, buttonsLeft + buttonWidth + gap,
+                 buttonsTop, buttonWidth, buttonHeight, TRUE);
+    }
+  }
 
   static LRESULT CALLBACK PromptDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* data = reinterpret_cast<PromptDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -16159,36 +16697,62 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
         data->font = CreateFontIndirectW(&metrics.lfMessageFont);
 
-        HWND lbl = CreateWindowExW(0, L"STATIC", data->prompt,
-                                   WS_CHILD | WS_VISIBLE, 16, 16, 380, 40,
-                                   hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-        if (data->font) SendMessageW(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+        data->label = CreateWindowExW(
+            0, L"STATIC", data->prompt, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+            hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (data->font)
+          SendMessageW(data->label, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(data->font), TRUE);
 
-        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", data->initialText.c_str(),
-                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                    16, 60, 380, 24, hwnd, reinterpret_cast<HMENU>(101),
-                                    GetModuleHandleW(nullptr), nullptr);
-        if (data->font) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
-        SendMessageW(edit, EM_SETSEL, 0, -1);
-        SetFocus(edit);
+        data->edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", data->initialText.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0,
+            hwnd, reinterpret_cast<HMENU>(101), GetModuleHandleW(nullptr),
+            nullptr);
+        if (data->font)
+          SendMessageW(data->edit, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(data->font), TRUE);
 
-        HWND btnOk = CreateWindowExW(0, L"BUTTON", L"OK",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                     210, 96, 90, 28, hwnd, reinterpret_cast<HMENU>(IDOK),
-                                     GetModuleHandleW(nullptr), nullptr);
-        if (data->font) SendMessageW(btnOk, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+        data->okButton = CreateWindowExW(
+            0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 0,
+            0, hwnd, reinterpret_cast<HMENU>(IDOK), GetModuleHandleW(nullptr),
+            nullptr);
+        if (data->font)
+          SendMessageW(data->okButton, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(data->font), TRUE);
 
-        HWND btnCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                         306, 96, 90, 28, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
-                                         GetModuleHandleW(nullptr), nullptr);
-        if (data->font) SendMessageW(btnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(data->font), TRUE);
+        data->cancelButton = CreateWindowExW(
+            0, L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
+            hwnd, reinterpret_cast<HMENU>(IDCANCEL), GetModuleHandleW(nullptr),
+            nullptr);
+        if (data->font)
+          SendMessageW(data->cancelButton, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(data->font), TRUE);
+        LayoutPromptDialog(hwnd, *data);
+        SendMessageW(data->edit, EM_SETSEL, 0, -1);
+        SetFocus(data->edit);
+        return 0;
+      }
+      case WM_SIZE:
+        if (data) LayoutPromptDialog(hwnd, *data);
+        return 0;
+      case WM_DPICHANGED: {
+        const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        if (suggested) {
+          SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                       suggested->right - suggested->left,
+                       suggested->bottom - suggested->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (data) LayoutPromptDialog(hwnd, *data);
         return 0;
       }
       case WM_COMMAND: {
         const int id = LOWORD(wParam);
         if (id == IDOK) {
-          HWND edit = GetDlgItem(hwnd, 101);
+          HWND edit = data ? data->edit : GetDlgItem(hwnd, 101);
           int len = GetWindowTextLengthW(edit);
           std::wstring text(len + 1, L'\0');
           int copied = GetWindowTextW(edit, text.data(), len + 1);
@@ -16238,7 +16802,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
                                L"FeatherCastPromptDialog", title,
                                WS_CAPTION | WS_SYSMENU | WS_POPUP,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 428, 170,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
+                               DipToPixels(428.0f, owner ? GetWindowScale(owner)
+                                                        : 1.0f),
+                               DipToPixels(170.0f, owner ? GetWindowScale(owner)
+                                                        : 1.0f),
                                owner, nullptr, GetModuleHandleW(nullptr), &data);
     if (!dlg) return std::nullopt;
 
@@ -18314,6 +18882,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool volumeVisible_ = false;
   bool volumeDragging_ = false;
   int volumePercent_ = 0;
+  bool volumeMuted_ = false;
+  std::optional<int> volumePendingPercent_;
+  int volumeFocusIndex_ = 0;
+  int volumeHoverIndex_ = -1;
+  std::wstring volumeDeviceName_;
   std::wstring volumeStatus_;
   HMONITOR volumeMonitor_ = nullptr;
   bool highContrast_ = false;

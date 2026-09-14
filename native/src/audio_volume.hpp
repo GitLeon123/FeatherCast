@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <string>
 
 namespace feathercast::audio {
 
@@ -20,9 +21,17 @@ inline int PercentFromTrack(float x, float left, float right) {
   return ClampPercent(static_cast<int>(std::lround(position * 100.0f)));
 }
 
+struct DefaultOutputState {
+  int percent = 0;
+  bool muted = false;
+  std::wstring deviceName;
+};
+
+std::optional<DefaultOutputState> ReadDefaultOutputState();
 std::optional<int> ReadDefaultOutputVolumePercent();
 bool SetDefaultOutputVolumePercent(int percent);
 bool StepDefaultOutputVolume(bool increase);
+bool SetDefaultOutputMute(bool muted);
 bool ToggleDefaultOutputMute();
 // Keep the endpoint alive while the compact volume surface is open so repeated
 // key repeats do not recreate the MMDevice enumerator for every tick.

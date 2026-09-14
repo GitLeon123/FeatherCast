@@ -3,6 +3,7 @@
 #include "command_catalog.hpp"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <initguid.h>
 #include <oleacc.h>
 
@@ -34,6 +35,43 @@ enum ControlId : int {
 
 constexpr UINT kBaseDpi = 96;
 constexpr int kWorkAreaInset = 24;
+
+COLORREF ColorRefFromTheme(const theme::Color& color) {
+  const auto channel = [](float value) {
+    return static_cast<BYTE>(std::clamp(value, 0.0f, 1.0f) * 255.0f +
+                             0.5f);
+  };
+  return RGB(channel(color.r), channel(color.g), channel(color.b));
+}
+
+void ApplyLibraryChrome(HWND window, const theme::Theme& theme,
+                        bool highContrast) {
+  if (!window) return;
+  constexpr DWORD kUseImmersiveDarkMode = 20;
+  constexpr DWORD kWindowCornerPreference = 33;
+  constexpr DWORD kBorderColor = 34;
+  constexpr DWORD kCaptionColor = 35;
+  constexpr DWORD kTextColor = 36;
+  const BOOL darkMode = highContrast ? FALSE : TRUE;
+  DwmSetWindowAttribute(window, kUseImmersiveDarkMode, &darkMode,
+                        sizeof(darkMode));
+  const DWORD corners = 2;
+  DwmSetWindowAttribute(window, kWindowCornerPreference, &corners,
+                        sizeof(corners));
+  const COLORREF background =
+      highContrast ? GetSysColor(COLOR_WINDOW)
+                   : ColorRefFromTheme(theme.overlayBackground);
+  const COLORREF border = highContrast
+                              ? GetSysColor(COLOR_WINDOWTEXT)
+                              : ColorRefFromTheme(theme.border);
+  const COLORREF text = highContrast
+                            ? GetSysColor(COLOR_WINDOWTEXT)
+                            : ColorRefFromTheme(theme.textPrimary);
+  DwmSetWindowAttribute(window, kBorderColor, &border, sizeof(border));
+  DwmSetWindowAttribute(window, kCaptionColor, &background,
+                        sizeof(background));
+  DwmSetWindowAttribute(window, kTextColor, &text, sizeof(text));
+}
 
 int ScaleForDpi(int logicalPixels, UINT dpi) {
   return MulDiv(logicalPixels, static_cast<int>(std::max<UINT>(kBaseDpi, dpi)),
@@ -128,7 +166,7 @@ SIZE FitWindowSize(HWND reference, int logicalWidth, int logicalHeight) {
       std::min(std::max(1, ScaleForDpi(logicalHeight, dpi)), maxHeight)};
 }
 
-HFONT CreateDialogFont(HWND window) {
+HFONT CreateDialogFont(HWND window, const theme::Theme& theme) {
   NONCLIENTMETRICSW metrics{sizeof(metrics)};
   if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
                              &metrics, 0)) {
@@ -139,6 +177,10 @@ HFONT CreateDialogFont(HWND window) {
   const UINT targetDpi = std::max(kBaseDpi, DpiForWindow(window));
   font.lfHeight = MulDiv(font.lfHeight, static_cast<int>(targetDpi),
                          static_cast<int>(std::max(kBaseDpi, systemDpi)));
+  if (!theme.fontFamily.empty()) {
+    wcsncpy_s(font.lfFaceName, LF_FACESIZE, theme.fontFamily.c_str(),
+              _TRUNCATE);
+  }
   return CreateFontIndirectW(&font);
 }
 
@@ -205,7 +247,8 @@ class EditorWindow {
                const std::vector<library::AppChoice>& availableApps,
                const std::vector<library::WebSearch>& searches,
                std::optional<std::size_t> editingIndex,
-               std::wstring preferredAppId = {})
+               std::wstring preferredAppId = {},
+               theme::Theme theme = {}, bool highContrast = false)
       : owner_(owner),
         kind_(kind),
         snippets_(snippets),
@@ -215,7 +258,9 @@ class EditorWindow {
         availableApps_(availableApps),
         searches_(searches),
         editingIndex_(editingIndex),
-        preferredAppId_(std::move(preferredAppId)) {
+        preferredAppId_(std::move(preferredAppId)),
+        theme_(std::move(theme)),
+        highContrast_(highContrast) {
     if (editingIndex_) {
       if (kind_ == library::ItemKind::Snippet) {
         snippet_ = snippets_.at(*editingIndex_);
@@ -236,6 +281,8 @@ class EditorWindow {
 
   ~EditorWindow() {
     if (font_) DeleteObject(font_);
+    if (backgroundBrush_) DeleteObject(backgroundBrush_);
+    if (surfaceBrush_) DeleteObject(surfaceBrush_);
   }
 
   bool Run() {
@@ -260,6 +307,7 @@ class EditorWindow {
         windowSize.cx, windowSize.cy, owner_, nullptr, GetModuleHandleW(nullptr),
         this);
     if (!hwnd_) return false;
+    ApplyLibraryChrome(hwnd_, theme_, highContrast_);
     CenterOwnedWindow(hwnd_, owner_);
     EnableWindow(owner_, FALSE);
     ShowWindow(hwnd_, SW_SHOW);
@@ -299,7 +347,7 @@ class EditorWindow {
       wc.lpfnWndProc = &EditorWindow::WindowProc;
       wc.hInstance = GetModuleHandleW(nullptr);
       wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-      wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+      wc.hbrBackground = nullptr;
       wc.lpszClassName = kEditorClass;
       return RegisterClassExW(&wc) != 0 ||
              GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
@@ -334,15 +382,65 @@ class EditorWindow {
   }
 
   void RefreshFont() {
-    HFONT next = CreateDialogFont(hwnd_);
+    HFONT next = CreateDialogFont(hwnd_, theme_);
     if (!next) return;
     const HFONT previous = font_;
     font_ = next;
     for (HWND control : {nameLabel_, name_, keywordLabel_, keyword_, valueLabel_,
-                         value_, save_, cancel_}) {
+                         value_, save_, cancel_, status_}) {
       UseDefaultFont(control, font_);
     }
     if (previous) DeleteObject(previous);
+  }
+
+  void RefreshBrushes() {
+    if (backgroundBrush_) DeleteObject(backgroundBrush_);
+    if (surfaceBrush_) DeleteObject(surfaceBrush_);
+    const COLORREF background =
+        highContrast_ ? GetSysColor(COLOR_WINDOW)
+                      : ColorRefFromTheme(theme_.overlayBackground);
+    const COLORREF surface =
+        highContrast_ ? GetSysColor(COLOR_BTNFACE)
+                      : ColorRefFromTheme(theme_.surface);
+    backgroundBrush_ = CreateSolidBrush(background);
+    surfaceBrush_ = CreateSolidBrush(surface);
+  }
+
+  void SetStatus(std::wstring text, bool error) {
+    statusError_ = error;
+    SetWindowTextW(status_, text.c_str());
+    InvalidateRect(status_, nullptr, TRUE);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, IdStatus);
+  }
+
+  LRESULT ColorControl(UINT message, WPARAM wParam, LPARAM lParam) const {
+    HDC dc = reinterpret_cast<HDC>(wParam);
+    const HWND control = reinterpret_cast<HWND>(lParam);
+    const bool staticControl = message == WM_CTLCOLORSTATIC;
+    const bool statusControl = control == status_;
+    const COLORREF text = statusControl && statusError_
+                              ? (highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
+                                               : ColorRefFromTheme(theme_.danger))
+                              : (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                                               : ColorRefFromTheme(theme_.textPrimary));
+    SetTextColor(dc, text);
+    SetBkColor(dc, staticControl
+                         ? (highContrast_ ? GetSysColor(COLOR_WINDOW)
+                                          : ColorRefFromTheme(theme_.overlayBackground))
+                         : (highContrast_ ? GetSysColor(COLOR_BTNFACE)
+                                          : ColorRefFromTheme(theme_.surface)));
+    SetBkMode(dc, staticControl ? TRANSPARENT : OPAQUE);
+    return reinterpret_cast<LRESULT>(staticControl ? backgroundBrush_
+                                                    : surfaceBrush_);
+  }
+
+  void PaintBackground() {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(hwnd_, &paint);
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    FillRect(dc, &client, backgroundBrush_);
+    EndPaint(hwnd_, &paint);
   }
 
   void LayoutCurrentClient() const {
@@ -385,6 +483,8 @@ class EditorWindow {
     save_ = AddControl(WC_BUTTONW, L"Save",
                        WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
     cancel_ = AddControl(WC_BUTTONW, L"Cancel", WS_TABSTOP, IDCANCEL);
+    status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
+    SetAccessibleName(status_, L"Validation status");
     const wchar_t* accessibleName = appAlias
         ? L"App"
         : (commandAlias
@@ -480,6 +580,7 @@ class EditorWindow {
     const int labelHeight = px(20);
     const int editHeight = px(27);
     const int gap = px(12);
+    const int statusHeight = px(24);
     const int contentWidth = std::max(1, width - 2 * margin);
     int y = margin;
     if (kind_ != library::ItemKind::WebSearch) {
@@ -502,6 +603,8 @@ class EditorWindow {
       const int buttonWidth = px(90);
       const int buttonHeight = px(30);
       const int buttonsTop = std::max(y, height - margin - buttonHeight);
+      const int statusTop = std::max(y, buttonsTop - gap - statusHeight);
+      MoveWindow(status_, margin, statusTop, contentWidth, statusHeight, TRUE);
       MoveWindow(cancel_, std::max(margin, width - margin - buttonWidth),
                  buttonsTop, buttonWidth, buttonHeight, TRUE);
       MoveWindow(save_, std::max(margin, width - margin - buttonWidth - gap -
@@ -515,8 +618,11 @@ class EditorWindow {
     const int buttonHeight = px(30);
     const int buttonsTop = std::max(y + editHeight,
                                    height - margin - buttonHeight);
+    const int statusTop = std::max(y + editHeight,
+                                   buttonsTop - gap - statusHeight);
     MoveWindow(value_, margin, y, contentWidth,
-               std::max(editHeight, buttonsTop - y - gap), TRUE);
+               std::max(editHeight, statusTop - y - gap), TRUE);
+    MoveWindow(status_, margin, statusTop, contentWidth, statusHeight, TRUE);
     MoveWindow(cancel_, std::max(margin, width - margin - buttonWidth),
                buttonsTop, buttonWidth, buttonHeight, TRUE);
     MoveWindow(save_, std::max(margin, width - margin - buttonWidth - gap -
@@ -531,8 +637,8 @@ class EditorWindow {
       snippet_.text = ControlText(value_);
       if (const auto error = library::ValidateSnippet(
               snippet_, snippets_, editingIndex_)) {
-        MessageBoxW(hwnd_, error->c_str(), L"Invalid Snippet",
-                    MB_OK | MB_ICONWARNING);
+        SetStatus(*error, true);
+        SetFocus(name_);
         return;
       }
     } else if (kind_ == library::ItemKind::Quicklink) {
@@ -541,8 +647,8 @@ class EditorWindow {
       quicklink_.target = snippets::Trim(ControlText(value_));
       if (const auto error = library::ValidateQuicklink(
               quicklink_, quicklinks_, editingIndex_)) {
-        MessageBoxW(hwnd_, error->c_str(), L"Invalid Quicklink",
-                    MB_OK | MB_ICONWARNING);
+        SetStatus(*error, true);
+        SetFocus(name_);
         return;
       }
     } else if (kind_ == library::ItemKind::AppAlias) {
@@ -558,8 +664,8 @@ class EditorWindow {
       alias_.alias = snippets::Trim(ControlText(keyword_));
       if (const auto error = library::ValidateAppAlias(
               alias_, aliases_, editingIndex_)) {
-        MessageBoxW(hwnd_, error->c_str(), L"Invalid App Alias",
-                    MB_OK | MB_ICONWARNING);
+        SetStatus(*error, true);
+        SetFocus(keyword_);
         return;
       }
     } else if (kind_ == library::ItemKind::CommandAlias) {
@@ -577,8 +683,8 @@ class EditorWindow {
       if (const auto error = library::ValidateCommandAlias(
               commandAlias_, commandAliases_, aliases_, snippets_,
               quicklinks_, editingIndex_)) {
-        MessageBoxW(hwnd_, error->c_str(), L"Invalid Command Alias",
-                    MB_OK | MB_ICONWARNING);
+        SetStatus(*error, true);
+        SetFocus(keyword_);
         return;
       }
     } else {
@@ -586,8 +692,8 @@ class EditorWindow {
       webSearch_.urlTemplate = snippets::Trim(ControlText(value_));
       if (const auto error = library::ValidateWebSearch(
               webSearch_, searches_, editingIndex_)) {
-        MessageBoxW(hwnd_, error->c_str(), L"Invalid Web Search",
-                    MB_OK | MB_ICONWARNING);
+        SetStatus(*error, true);
+        SetFocus(keyword_);
         return;
       }
     }
@@ -598,9 +704,20 @@ class EditorWindow {
   LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
       case WM_CREATE:
+        RefreshBrushes();
         CreateControls();
         RefreshFont();
         return 0;
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_PAINT:
+        PaintBackground();
+        return 0;
+      case WM_CTLCOLORSTATIC:
+      case WM_CTLCOLOREDIT:
+      case WM_CTLCOLORLISTBOX:
+      case WM_CTLCOLORBTN:
+        return ColorControl(message, wParam, lParam);
       case WM_SIZE:
         Layout(LOWORD(lParam), HIWORD(lParam));
         return 0;
@@ -612,7 +729,9 @@ class EditorWindow {
                        suggested->bottom - suggested->top,
                        SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        ApplyLibraryChrome(hwnd_, theme_, highContrast_);
         RefreshFont();
+        RefreshBrushes();
         LayoutCurrentClient();
         InvalidateRect(hwnd_, nullptr, TRUE);
         return 0;
@@ -652,6 +771,8 @@ class EditorWindow {
   library::CommandAlias commandAlias_;
   library::WebSearch webSearch_;
   std::wstring preferredAppId_;
+  theme::Theme theme_;
+  bool highContrast_ = false;
   bool accepted_ = false;
   HWND nameLabel_ = nullptr;
   HWND name_ = nullptr;
@@ -661,20 +782,30 @@ class EditorWindow {
   HWND value_ = nullptr;
   HWND save_ = nullptr;
   HWND cancel_ = nullptr;
+  HWND status_ = nullptr;
+  bool statusError_ = false;
+  HBRUSH backgroundBrush_ = nullptr;
+  HBRUSH surfaceBrush_ = nullptr;
 };
 
 class ManagerWindow {
  public:
   ManagerWindow(HWND owner, ManagerData data, ManagerCallbacks callbacks,
-                library::ItemKind initialKind, std::wstring initialAppId)
+                library::ItemKind initialKind, std::wstring initialAppId,
+                theme::Theme theme, bool highContrast)
       : owner_(owner),
         data_(std::move(data)),
         callbacks_(std::move(callbacks)),
         kind_(initialKind),
-        initialAppId_(std::move(initialAppId)) {}
+        initialAppId_(std::move(initialAppId)),
+        theme_(std::move(theme)),
+        highContrast_(highContrast) {}
 
   ~ManagerWindow() {
     if (font_) DeleteObject(font_);
+    if (backgroundBrush_) DeleteObject(backgroundBrush_);
+    if (surfaceBrush_) DeleteObject(surfaceBrush_);
+    if (selectedBrush_) DeleteObject(selectedBrush_);
   }
 
   void Run() {
@@ -690,6 +821,7 @@ class ManagerWindow {
         CW_USEDEFAULT, CW_USEDEFAULT, windowSize.cx, windowSize.cy, owner_,
         nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return;
+    ApplyLibraryChrome(hwnd_, theme_, highContrast_);
     CenterOwnedWindow(hwnd_, owner_);
     EnableWindow(owner_, FALSE);
     ShowWindow(hwnd_, SW_SHOW);
@@ -716,7 +848,7 @@ class ManagerWindow {
       wc.lpfnWndProc = &ManagerWindow::WindowProc;
       wc.hInstance = GetModuleHandleW(nullptr);
       wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-      wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+      wc.hbrBackground = nullptr;
       wc.lpszClassName = kManagerClass;
       return RegisterClassExW(&wc) != 0 ||
              GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
@@ -751,7 +883,7 @@ class ManagerWindow {
   }
 
   void RefreshFont() {
-    HFONT next = CreateDialogFont(hwnd_);
+    HFONT next = CreateDialogFont(hwnd_, theme_);
     if (!next) return;
     const HFONT previous = font_;
     font_ = next;
@@ -760,6 +892,70 @@ class ManagerWindow {
       UseDefaultFont(control, font_);
     }
     if (previous) DeleteObject(previous);
+  }
+
+  void RefreshBrushes() {
+    if (backgroundBrush_) DeleteObject(backgroundBrush_);
+    if (surfaceBrush_) DeleteObject(surfaceBrush_);
+    if (selectedBrush_) DeleteObject(selectedBrush_);
+    const COLORREF background =
+        highContrast_ ? GetSysColor(COLOR_WINDOW)
+                      : ColorRefFromTheme(theme_.overlayBackground);
+    const COLORREF surface =
+        highContrast_ ? GetSysColor(COLOR_BTNFACE)
+                      : ColorRefFromTheme(theme_.surface);
+    const COLORREF selected =
+        highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
+                      : ColorRefFromTheme(theme_.selectedBase);
+    backgroundBrush_ = CreateSolidBrush(background);
+    surfaceBrush_ = CreateSolidBrush(surface);
+    selectedBrush_ = CreateSolidBrush(selected);
+    if (list_) {
+      ListView_SetBkColor(list_, surface);
+      ListView_SetTextBkColor(list_, surface);
+      ListView_SetTextColor(
+          list_, highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                               : ColorRefFromTheme(theme_.textPrimary));
+      ListView_SetOutlineColor(list_, selected);
+    }
+  }
+
+  void SetStatus(std::wstring text, bool error) {
+    operationStatus_ = std::move(text);
+    operationStatusError_ = error;
+    if (status_) SetWindowTextW(status_, operationStatus_.c_str());
+    if (status_) InvalidateRect(status_, nullptr, TRUE);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, IdStatus);
+  }
+
+  LRESULT ColorControl(UINT message, WPARAM wParam, LPARAM lParam) const {
+    HDC dc = reinterpret_cast<HDC>(wParam);
+    const HWND control = reinterpret_cast<HWND>(lParam);
+    const bool staticControl = message == WM_CTLCOLORSTATIC;
+    const bool statusControl = control == status_;
+    const COLORREF text = statusControl && operationStatusError_
+                              ? (highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
+                                               : ColorRefFromTheme(theme_.danger))
+                              : (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                                               : ColorRefFromTheme(theme_.textPrimary));
+    SetTextColor(dc, text);
+    SetBkColor(dc, staticControl
+                         ? (highContrast_ ? GetSysColor(COLOR_WINDOW)
+                                          : ColorRefFromTheme(theme_.overlayBackground))
+                         : (highContrast_ ? GetSysColor(COLOR_BTNFACE)
+                                          : ColorRefFromTheme(theme_.surface)));
+    SetBkMode(dc, staticControl ? TRANSPARENT : OPAQUE);
+    return reinterpret_cast<LRESULT>(staticControl ? backgroundBrush_
+                                                    : surfaceBrush_);
+  }
+
+  void PaintBackground() {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(hwnd_, &paint);
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    FillRect(dc, &client, backgroundBrush_);
+    EndPaint(hwnd_, &paint);
   }
 
   void LayoutCurrentClient() const {
@@ -789,6 +985,7 @@ class ManagerWindow {
     SetAccessibleName(list_, L"Library items");
     ListView_SetExtendedListViewStyle(
         list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    RefreshBrushes();
     LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH};
     column.pszText = const_cast<wchar_t*>(L"Name");
     const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
@@ -1005,20 +1202,26 @@ class ManagerWindow {
     const bool integrationMissing =
         kind_ == library::ItemKind::CommandAlias &&
         !callbacks_.saveCommandAliases;
-    SetWindowTextW(status_,
-                   integrationMissing
-                       ? L"Command alias persistence is not connected."
-                       : message.empty()
-                       ? (Writable() ? L"Changes are saved immediately."
-                                     : L"Editing is unavailable.")
-                       : message.c_str());
+    if (operationStatus_.empty()) {
+      operationStatus_ =
+          integrationMissing
+              ? L"Command alias persistence is not connected."
+              : message.empty()
+                    ? (Writable() ? L"Changes are saved immediately."
+                                  : L"Editing is unavailable.")
+                    : message;
+      operationStatusError_ = !integrationMissing && !message.empty() &&
+                              !Writable();
+    }
+    SetWindowTextW(status_, operationStatus_.c_str());
   }
 
   void ShowResult(const library::OperationResult& result) {
-    if (!result.succeeded) {
-      MessageBoxW(hwnd_, result.message.c_str(), L"FeatherCast Library",
-                  MB_OK | MB_ICONWARNING);
-    }
+    SetStatus(result.succeeded
+                  ? L"Changes saved."
+                  : (result.message.empty() ? L"Could not save changes."
+                                             : result.message),
+              !result.succeeded);
   }
 
   void AddItem() {
@@ -1026,7 +1229,8 @@ class ManagerWindow {
     EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
                         data_.appAliases, data_.commandAliases,
                         data_.availableApps,
-                        data_.webSearches, std::nullopt, initialAppId_);
+                        data_.webSearches, std::nullopt, initialAppId_, theme_,
+                        highContrast_);
     if (!editor.Run()) return;
     if (kind_ == library::ItemKind::Snippet) {
       auto candidate = data_.snippets;
@@ -1073,7 +1277,7 @@ class ManagerWindow {
     EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
                         data_.appAliases, data_.commandAliases,
                         data_.availableApps,
-                        data_.webSearches, selected);
+                        data_.webSearches, selected, {}, theme_, highContrast_);
     if (!editor.Run()) return;
     if (kind_ == library::ItemKind::Snippet) {
       auto candidate = data_.snippets;
@@ -1165,8 +1369,19 @@ class ManagerWindow {
   LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
       case WM_CREATE:
+        RefreshBrushes();
         CreateControls();
         return 0;
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_PAINT:
+        PaintBackground();
+        return 0;
+      case WM_CTLCOLORSTATIC:
+      case WM_CTLCOLOREDIT:
+      case WM_CTLCOLORLISTBOX:
+      case WM_CTLCOLORBTN:
+        return ColorControl(message, wParam, lParam);
       case WM_SIZE:
         Layout(LOWORD(lParam), HIWORD(lParam));
         return 0;
@@ -1193,16 +1408,37 @@ class ManagerWindow {
                        suggested->bottom - suggested->top,
                        SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        ApplyLibraryChrome(hwnd_, theme_, highContrast_);
         RefreshFont();
+        RefreshBrushes();
         LayoutCurrentClient();
         InvalidateRect(hwnd_, nullptr, TRUE);
         return 0;
       }
       case WM_NOTIFY: {
         const auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header->idFrom == IdList && header->code == NM_CUSTOMDRAW) {
+          auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+          if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) {
+            return CDRF_NOTIFYITEMDRAW;
+          }
+          if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+            const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+            draw->clrText = highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                                          : ColorRefFromTheme(theme_.textPrimary);
+            draw->clrTextBk = selected
+                                  ? (highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
+                                                   : ColorRefFromTheme(theme_.selectedBase))
+                                  : (highContrast_ ? GetSysColor(COLOR_BTNFACE)
+                                                   : ColorRefFromTheme(theme_.surface));
+            return CDRF_NEWFONT;
+          }
+        }
         if (header->idFrom == IdTabs && header->code == TCN_SELCHANGE) {
           kind_ = static_cast<library::ItemKind>(TabCtrl_GetCurSel(tabs_));
           initialAppId_.clear();
+          operationStatus_.clear();
+          operationStatusError_ = false;
           Refresh();
           return 0;
         }
@@ -1224,6 +1460,8 @@ class ManagerWindow {
           case IdDelete: DeleteItem(); return 0;
           case IdReload:
             if (callbacks_.reload) data_ = callbacks_.reload();
+            operationStatus_.clear();
+            operationStatusError_ = false;
             Refresh();
             return 0;
           case IdOpenFile:
@@ -1256,6 +1494,10 @@ class ManagerWindow {
   ManagerCallbacks callbacks_;
   library::ItemKind kind_ = library::ItemKind::Snippet;
   std::wstring initialAppId_;
+  theme::Theme theme_;
+  bool highContrast_ = false;
+  std::wstring operationStatus_;
+  bool operationStatusError_ = false;
   HWND tabs_ = nullptr;
   HWND list_ = nullptr;
   HWND add_ = nullptr;
@@ -1265,6 +1507,9 @@ class ManagerWindow {
   HWND openFile_ = nullptr;
   HWND close_ = nullptr;
   HWND status_ = nullptr;
+  HBRUSH backgroundBrush_ = nullptr;
+  HBRUSH surfaceBrush_ = nullptr;
+  HBRUSH selectedBrush_ = nullptr;
 };
 
 }  // namespace
@@ -1272,9 +1517,11 @@ class ManagerWindow {
 void ShowLibraryManager(HWND owner, ManagerData data,
                         ManagerCallbacks callbacks,
                         library::ItemKind initialKind,
-                        std::wstring initialAppId) {
+                        std::wstring initialAppId, theme::Theme theme,
+                        bool highContrast) {
   ManagerWindow(owner, std::move(data), std::move(callbacks), initialKind,
-                std::move(initialAppId)).Run();
+                std::move(initialAppId), std::move(theme), highContrast)
+      .Run();
 }
 
 }  // namespace feathercast::library_ui

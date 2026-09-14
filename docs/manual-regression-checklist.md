@@ -43,6 +43,13 @@ and then with pointer input.
   acronym, name boundary, field prefix, typo, then general fuzzy/path matches.
   Pinning and usage reorder items only inside the same tier.
 - Rapid query edits never display results from an older query.
+- Every fresh overlay opening selects the first result from the current
+  generation, even after a previous session selected another item or the warm
+  result snapshot is reused; no selection pill or preview briefly jumps from
+  stale rows.
+- Same-query refreshes during one session preserve the selected item when it
+  still exists, while query edits and action/browse transitions start at the
+  current first result.
 - `Ctrl+Z` and `Ctrl+Y` restore query text, caret, and selection for the most
   recent 32 user edits; a new edit after Undo clears Redo.
 - Results dim while a generation is pending; navigation pressed during that
@@ -107,6 +114,9 @@ and then with pointer input.
 - Settings > Library lists snippets and quicklinks and opens the native manager
   on the requested tab. Add, edit, cancel, delete confirmation, reload, and
   Open File work with keyboard, pointer, IME, Narrator, and multiline text.
+- Library validation and save/reload failures remain in the manager/editor
+  status area without interrupting the workflow; destructive deletion still
+  asks for confirmation.
 - Duplicate keywords are marked and cannot be introduced by a new edit.
   Invalid or externally changed snippets.json is never overwritten.
 - Extensions lists each plugin's version and Available, Degraded, or
@@ -178,6 +188,8 @@ and then with pointer input.
 - At 60 Hz, 120 Hz, and 144 Hz, overlay/settings/volume openings, result
   transitions, the selection pill, settings pages and switches, confirmations,
   and volume changes remain paced to the display without visible snapping.
+- Repeated cold and warm search openings show no random selection, stale pill,
+  stale preview, or one-frame result transition pop.
 - Wheel and precision-trackpad deltas scroll both results and settings smoothly;
   repeated input retargets from the currently rendered position.
 - Compact and confirmation height changes, settings resizing, and opening
@@ -186,6 +198,21 @@ and then with pointer input.
   snaps every active transition to its final state.
 - Monitor changes preserve healthy composition surfaces; DPI changes and
   graphics device loss recreate resources without stale hit regions or crashes.
+
+## Volume Control
+
+- `volume`, `increase volume`, `decrease volume`, `adjust output`, `mute`, and
+  `unmute` return the expected commands.
+- Opening Volume Control shows the current default output name, volume
+  percentage, and mute state; changing the Windows default output while it is
+  open updates all three.
+- Arrow keys change by 1%, Page Up/Down by 10%, Home/End jump to limits, the
+  mouse wheel changes by 1%, and dragging writes the final position on release.
+- Tab moves between the slider and Mute/Unmute; Enter, Space, mouse click, and
+  `M` toggle mute; Escape closes and restores the previous window.
+- Narrator or another MSAA client exposes separate Volume and Mute/Unmute
+  children, reports the focused child and checked mute state, and announces
+  volume/error changes.
 
 ## File Preview
 

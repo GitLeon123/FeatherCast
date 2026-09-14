@@ -45,7 +45,7 @@ build/                     # Generated icon assets used by native resources
 cmake -S . -B build-native -G "Visual Studio 18 2026" -A x64
 cmake --build build-native --config Release
 ctest --test-dir build-native -C Release
-cpack --config build-native/CPackConfig.cmake -C Release
+cpack --config build-native/CPackConfig.cmake -C Release -B build-native/packages
 ```
 
 ## Conventions

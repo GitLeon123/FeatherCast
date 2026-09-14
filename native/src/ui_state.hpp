@@ -63,6 +63,7 @@ struct OverlayState {
   std::optional<std::size_t> selectionAnchor;
   int selected = 0;
   int scroll = 0;
+  bool selectionRestorationAllowed = false;
   bool actionMode = false;
   app::DisplayItem actionTarget;
   app::BrowseView browseView = app::BrowseView::None;
@@ -444,6 +445,7 @@ class OverlayController {
             : std::nullopt;
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     state.actionMode = false;
     state.actionTarget = {};
     state.browseView = app::BrowseView::None;
@@ -465,6 +467,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     state.status.reset();
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
@@ -486,7 +489,16 @@ class OverlayController {
   static UiEffects ResetResultPosition(OverlayState& state) {
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     return Effect(UiEffect::Invalidate);
+  }
+
+  static void ArmSelectionRestoration(OverlayState& state) {
+    state.selectionRestorationAllowed = true;
+  }
+
+  static bool CanRestoreSelection(const OverlayState& state) {
+    return state.selectionRestorationAllowed;
   }
 
   static UiEffects RestoreResultPosition(OverlayState& state, int selected,
@@ -588,6 +600,7 @@ class OverlayController {
     state.imeComposition.clear();
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     state.status.reset();
   }
 
@@ -597,6 +610,7 @@ class OverlayController {
     state.query.erase(range.first, range.second - range.first);
     state.caret = range.first;
     state.selectionAnchor.reset();
+    state.selectionRestorationAllowed = false;
   }
 
  public:
@@ -617,6 +631,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     state.status.reset();
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
@@ -701,6 +716,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.selectionRestorationAllowed = false;
     state.status.reset();
   }
 };
