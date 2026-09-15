@@ -326,13 +326,20 @@ inline ToolbarLayout BuildToolbarLayout(float width, float height) {
           height, button.rect.top + actualRowHeight);
     }
   }
-  result.bar = {std::min(width, left), std::min(height, 6.0f),
-                std::min(width, right), std::max(std::min(height, 6.0f),
-                                                 barBottom)};
+  float contentRight = innerLeft;
+  for (const auto& button : result.buttons) {
+    contentRight = std::max(contentRight, button.rect.right);
+  }
+  const float barRight =
+      std::min(width, std::max(left, contentRight + inset));
+  result.bar = {std::min(width, left), std::min(height, 6.0f), barRight,
+                std::max(std::min(height, 6.0f), barBottom)};
   const float footerTop = std::min(
       height, std::max(result.bar.bottom + 8.0f, height - 34.0f));
-  result.footer = {std::min(width, 16.0f), footerTop,
-                   std::max(std::min(width, 16.0f), width - 16.0f),
+  const float footerLeft = std::min(width, result.bar.left + inset);
+  const float footerRight =
+      std::max(footerLeft, result.bar.right - inset);
+  result.footer = {footerLeft, footerTop, footerRight,
                    std::min(height, std::max(footerTop, height - 10.0f))};
   return result;
 }

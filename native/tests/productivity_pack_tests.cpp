@@ -423,6 +423,12 @@ int main() {
 
     // 1. Responsive toolbar layout at wide, narrow, and synthetic DIP widths.
     {
+      const auto extraWide = BuildToolbarLayout(1920.0f, 800.0f);
+      assert(extraWide.rows == 1);
+      assert(extraWide.bar.right < 1920.0f);
+      assert(extraWide.footer.left >= extraWide.bar.left);
+      assert(extraWide.footer.right <= extraWide.bar.right);
+
       const auto wide = BuildToolbarLayout(1200.0f, 800.0f);
       assert(!wide.buttons.empty());
       assert(wide.bar.Width() > 0.0f && wide.bar.Height() > 0.0f);
@@ -1057,11 +1063,20 @@ int main() {
   feathercast::core::SearchItem volumeControlSearchItem;
   volumeControlSearchItem.id = L"cmd:volume-control";
   volumeControlSearchItem.name = volumeControlCommand.commandName;
-  volumeControlSearchItem.keywords = {L"volume", L"audio", L"speaker"};
+  volumeControlSearchItem.keywords = {L"adjust", L"output", L"volume",
+                                      L"audio", L"speaker"};
   volumeControlSearchItem.source = L"command";
   volumeControlSearchItem.kind = L"command";
   snapshot->searchItems.push_back(
       feathercast::core::PrepareSearchItem(volumeControlSearchItem));
+
+  feathercast::app::DisplayItem muteCommand;
+  muteCommand.isCommand = true;
+  muteCommand.command = feathercast::app::CommandKind::MuteAudio;
+  muteCommand.commandName = L"Mute Audio";
+  snapshot->pool.push_back(muteCommand);
+  snapshot->searchItems.push_back(feathercast::core::PrepareSearchItem(
+      feathercast::commands::BuildSearchItem(muteCommand, {})));
 
   snapshot->pool.push_back(utility);
   feathercast::core::SearchItem utilitySearchItem;
@@ -1291,6 +1306,13 @@ int main() {
   assert(commandResults.flatItems.front().command ==
          feathercast::app::CommandKind::VolumeUp);
 
+  request.query = L"increase volume";
+  const auto increaseResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  assert(!increaseResults.flatItems.empty());
+  assert(increaseResults.flatItems.front().command ==
+         feathercast::app::CommandKind::VolumeUp);
+
   request.query = L"volume control";
   const auto volumeControlResults =
       feathercast::search_pipeline::ComputeResults(request);
@@ -1298,6 +1320,20 @@ int main() {
   assert(volumeControlResults.flatItems.front().isCommand);
   assert(volumeControlResults.flatItems.front().command ==
          feathercast::app::CommandKind::VolumeControl);
+
+  request.query = L"adjust output";
+  const auto adjustResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  assert(!adjustResults.flatItems.empty());
+  assert(adjustResults.flatItems.front().command ==
+         feathercast::app::CommandKind::VolumeControl);
+
+  request.query = L"unmute";
+  const auto unmuteResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  assert(!unmuteResults.flatItems.empty());
+  assert(unmuteResults.flatItems.front().command ==
+         feathercast::app::CommandKind::MuteAudio);
 
   request.query = L"louder now";
   const auto rootAliasResults =

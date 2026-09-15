@@ -950,6 +950,7 @@ int main() {
     original.recentItems = {L"quicklink:docs"};
     original.usageStats[L"app:one"] = {42, 1750000000};
     original.compactMode = true;
+    original.autoFitResultHeight = false;
     original.animationLevel = fs::AnimationLevel::Reduced;
     original.customAccentColor = L"#ff0000";
     original.lastUpdateAttempt = 1234567890000;
@@ -983,6 +984,7 @@ int main() {
     assert(copy.usageStats.at(L"app:one").launches == 42);
     assert(copy.usageStats.at(L"app:one").lastUsed == 1750000000);
     assert(copy.compactMode == original.compactMode);
+    assert(copy.autoFitResultHeight == original.autoFitResultHeight);
     assert(copy.animationLevel == original.animationLevel);
     assert(copy.customAccentColor == original.customAccentColor);
     assert(copy.lastUpdateAttempt == original.lastUpdateAttempt);
@@ -1099,6 +1101,7 @@ int main() {
     // Malformed/edge inputs fall back to defaults without crashing.
     assert(fs::ParseSettings("").shortcut == L"Alt+Space");
     assert(fs::ParseSettings("{}").maxResults == 200);
+    assert(fs::ParseSettings("{}").autoFitResultHeight);
     assert(!fs::ParseSettings("{}").clipboardHistoryEnabled);
     assert(!fs::ParseSettings("{}").fileIndexEnabled);
     assert(fs::ParseSettings(R"({"shortcut": "Alt)").shortcut == L"Alt+Space");

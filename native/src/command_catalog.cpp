@@ -209,7 +209,8 @@ const std::vector<CommandDescriptor>& Catalog() {
                               L"Your computer will go to sleep immediately.",
                               L"Sleep"}},
       {L"mute-audio", app::CommandKind::MuteAudio, L"Mute Audio",
-       L"Toggle system audio mute", {L"mute", L"sound", L"volume", L"audio"}},
+       L"Toggle system audio mute",
+       {L"mute", L"unmute", L"toggle", L"sound", L"volume", L"audio"}},
       {L"shut-down", app::CommandKind::ShutDown, L"Shut Down PC",
        L"Power off this computer", {L"shutdown", L"power off", L"turn off"},
        ConfirmationDescriptor{L"Shut down this PC?",
@@ -228,13 +229,14 @@ const std::vector<CommandDescriptor>& Catalog() {
                               L"Empty Recycle Bin"}},
       {L"volume-control", app::CommandKind::VolumeControl, L"Volume Control",
        L"Adjust the default audio output volume",
-       {L"audio", L"sound", L"speaker", L"volume", L"level"}},
+       {L"adjust", L"set", L"output", L"default", L"audio", L"sound",
+        L"speaker", L"volume", L"level"}},
       {L"volume-up", app::CommandKind::VolumeUp, L"Volume Up",
        L"Increase the default audio output volume",
-       {L"audio", L"sound", L"speaker", L"louder"}},
+       {L"increase", L"raise", L"audio", L"sound", L"speaker", L"louder"}},
       {L"volume-down", app::CommandKind::VolumeDown, L"Volume Down",
        L"Decrease the default audio output volume",
-       {L"audio", L"sound", L"speaker", L"quieter"}},
+       {L"decrease", L"lower", L"audio", L"sound", L"speaker", L"quieter"}},
       {L"media-play-pause", app::CommandKind::MediaPlayPause,
        L"Play or Pause Media", L"Toggle playback in the active media session",
        {L"media", L"music", L"play", L"pause"}},
@@ -316,6 +318,7 @@ core::SearchItem BuildSearchItem(
   item.source = L"command";
   item.name = command.commandName;
   item.keywords = descriptor->keywords;
+  item.keywords.push_back(descriptor->detail);
   item.keywords.push_back(descriptor->stableId);
   item.systemEssential = true;
   if (const auto alias = aliases.find(descriptor->stableId);

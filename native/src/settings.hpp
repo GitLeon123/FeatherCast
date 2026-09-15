@@ -129,6 +129,7 @@ struct Settings {
   };
   std::map<std::wstring, UsageStat> usageStats;
   bool compactMode = false;
+  bool autoFitResultHeight = true;
   AnimationLevel animationLevel = AnimationLevel::Full;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
@@ -375,6 +376,7 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
     }
   }
   ReadBool(*root, "compactMode", settings.compactMode);
+  ReadBool(*root, "autoFitResultHeight", settings.autoFitResultHeight);
   bool legacyAnimationsEnabled = true;
   ReadBool(*root, "animationsEnabled", legacyAnimationsEnabled);
   settings.animationLevel = legacyAnimationsEnabled ? AnimationLevel::Full
@@ -535,6 +537,8 @@ inline std::string SerializeSettings(const Settings& settings) {
   }
   out << "},\n";
   out << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
+  out << "  \"autoFitResultHeight\": "
+      << (settings.autoFitResultHeight ? "true" : "false") << ",\n";
   out << "  \"animationLevel\": \"" << AnimationLevelKey(settings.animationLevel)
       << "\",\n";
   out << "  \"animationsEnabled\": "

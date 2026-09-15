@@ -4,6 +4,7 @@
 #include "filesystem_semantics.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -22,9 +23,9 @@ struct Color {
 
 struct Theme {
   std::wstring fontFamily = L"Segoe UI Variable Text";
-  // Obsidian dark panel at ~85 % opacity over real DirectComposition transparency.
-  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.85f};
-  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.85f};
+  // Obsidian dark panel at ~92 % opacity over real DirectComposition transparency.
+  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.92f};
+  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.92f};
   Color border{1.0f, 1.0f, 1.0f, 0.08f};
   Color divider{1.0f, 1.0f, 1.0f, 0.08f};
   // surface: #18181B – modern Tailwind Zinc-900 slate grey.
@@ -36,7 +37,7 @@ struct Theme {
   Color iconTile{0.23f, 0.23f, 0.28f, 1.0f};
   Color textPrimary{0.95f, 0.95f, 0.96f, 1.0f};
   Color textMuted{0.60f, 0.60f, 0.64f, 1.0f};
-  Color textDim{0.45f, 0.45f, 0.50f, 1.0f};
+  Color textDim{0.53f, 0.53f, 0.58f, 1.0f};
   Color sectionText{0.62f, 0.64f, 0.74f, 1.0f};
   Color danger{1.0f, 0.36f, 0.36f, 1.0f};
   Color success{0.30f, 0.78f, 0.48f, 1.0f};
@@ -48,6 +49,51 @@ struct Theme {
   float rowRadius = 6.0f;
   float controlRadius = 8.0f;
 };
+
+inline float SrgbToLinear(float channel) {
+  channel = std::clamp(channel, 0.0f, 1.0f);
+  return channel <= 0.04045f
+             ? channel / 12.92f
+             : std::pow((channel + 0.055f) / 1.055f, 2.4f);
+}
+
+inline float RelativeLuminance(const Color& color) {
+  return 0.2126f * SrgbToLinear(color.r) +
+         0.7152f * SrgbToLinear(color.g) +
+         0.0722f * SrgbToLinear(color.b);
+}
+
+inline float ContrastRatio(const Color& first, const Color& second) {
+  const float firstLuminance = RelativeLuminance(first);
+  const float secondLuminance = RelativeLuminance(second);
+  const float lighter = std::max(firstLuminance, secondLuminance);
+  const float darker = std::min(firstLuminance, secondLuminance);
+  return (lighter + 0.05f) / (darker + 0.05f);
+}
+
+// Preserve a theme's hue as far as possible, but never let secondary text fall
+// below the requested contrast against the panel it is rendered on.
+inline Color EnsureContrast(Color foreground, const Color& background,
+                            float minimumRatio = 4.5f) {
+  foreground.a = 1.0f;
+  if (ContrastRatio(foreground, background) >= minimumRatio) return foreground;
+
+  const bool moveTowardWhite = RelativeLuminance(foreground) >
+                                RelativeLuminance(background);
+  const Color endpoint = moveTowardWhite
+                             ? Color{1.0f, 1.0f, 1.0f, 1.0f}
+                             : Color{0.0f, 0.0f, 0.0f, 1.0f};
+  Color candidate = foreground;
+  for (int iteration = 0; iteration < 12; ++iteration) {
+    const float amount =
+        0.5f + 0.5f * static_cast<float>(iteration) / 11.0f;
+    candidate.r = foreground.r + (endpoint.r - foreground.r) * amount;
+    candidate.g = foreground.g + (endpoint.g - foreground.g) * amount;
+    candidate.b = foreground.b + (endpoint.b - foreground.b) * amount;
+    if (ContrastRatio(candidate, background) >= minimumRatio) return candidate;
+  }
+  return endpoint;
+}
 
 inline int HexNibble(wchar_t ch) {
   if (ch >= L'0' && ch <= L'9') return ch - L'0';
@@ -149,8 +195,8 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
   file <<
       "{\n"
       "  \"fontFamily\": \"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI\",\n"
-      "  \"overlayBackground\": \"#101012D9\",\n"
-      "  \"settingsBackground\": \"#101012D9\",\n"
+      "  \"overlayBackground\": \"#101012EB\",\n"
+      "  \"settingsBackground\": \"#101012EB\",\n"
       "  \"border\": \"#FFFFFF14\",\n"
       "  \"divider\": \"#FFFFFF14\",\n"
       "  \"surface\": \"#18181B\",\n"
@@ -159,7 +205,7 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
       "  \"iconTile\": \"#3B3B47\",\n"
       "  \"textPrimary\": \"#F2F2F5\",\n"
       "  \"textMuted\": \"#9999A3\",\n"
-      "  \"textDim\": \"#737380\",\n"
+      "  \"textDim\": \"#878793\",\n"
       "  \"sectionText\": \"#9EA3BD\",\n"
       "  \"danger\": \"#FF5C5C\",\n"
       "  \"success\": \"#4DC77A\",\n"

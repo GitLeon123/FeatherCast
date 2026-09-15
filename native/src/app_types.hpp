@@ -76,6 +76,7 @@ enum class HitType {
   RecordRegionShortcut,
   ClearRegionShortcut,
   CompactToggle,
+  AutoFitResultHeightToggle,
   AnimationLevel,
   AccentToggle,
   AccentColor,

@@ -1,6 +1,7 @@
 #include "interaction_state.hpp"
 #include "motion.hpp"
 #include "test_framework.hpp"
+#include "ui_state.hpp"
 
 #include <string>
 
@@ -87,6 +88,18 @@ int main() {
     state.Invalidate();
     assert(state.Pending());
     assert(!state.CanActivate());
+  }
+
+  {
+    feathercast::ui::OverlayState overlay;
+    feathercast::ui::OverlayController::ArmSelectionRestoration(overlay);
+    assert(feathercast::ui::OverlayController::CanRestoreSelection(overlay));
+    feathercast::ui::OverlayController::ResetForShow(
+        overlay, feathercast::app::View::Search);
+    assert(!feathercast::ui::OverlayController::CanRestoreSelection(overlay));
+    feathercast::ui::OverlayController::ArmSelectionRestoration(overlay);
+    feathercast::ui::OverlayController::SetQuery(overlay, L"terminal");
+    assert(!feathercast::ui::OverlayController::CanRestoreSelection(overlay));
   }
 
   {

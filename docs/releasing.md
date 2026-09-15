@@ -22,7 +22,7 @@ Run from a Visual Studio developer PowerShell:
 cmake --preset windows-x64
 cmake --build --preset release
 ctest --preset release
-cpack --config build-native/CPackConfig.cmake -C Release
+cpack --config build-native/CPackConfig.cmake -C Release -B build-native/packages
 # Full ZIP/NSIS package smoke (including Start menu and uninstall artifacts)
 scripts\package-smoke.ps1 -BuildDirectory build-native -Configuration Release
 ```

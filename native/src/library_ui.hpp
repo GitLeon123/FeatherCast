@@ -1,6 +1,7 @@
 #pragma once
 
 #include "library.hpp"
+#include "theme.hpp"
 
 #include <windows.h>
 
@@ -43,6 +44,8 @@ struct ManagerCallbacks {
 void ShowLibraryManager(HWND owner, ManagerData data,
                         ManagerCallbacks callbacks,
                         library::ItemKind initialKind,
-                        std::wstring initialAppId = {});
+                        std::wstring initialAppId = {},
+                        theme::Theme theme = {},
+                        bool highContrast = false);
 
 }  // namespace feathercast::library_ui

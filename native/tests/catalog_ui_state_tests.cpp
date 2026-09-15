@@ -4,6 +4,7 @@
 #include "settings_catalog.hpp"
 #include "result_icons.hpp"
 #include "test_framework.hpp"
+#include "theme.hpp"
 #include "ui_state.hpp"
 #include "ui_renderer.hpp"
 #include "window_activation.hpp"
@@ -27,6 +28,22 @@ int main() {
   assert(feathercast::commands::ValidateCatalog(&error));
   assert(feathercast::capabilities::ValidateCatalog(&error));
   assert(feathercast::settings_catalog::ValidateCatalog(&error));
+  const feathercast::theme::Theme defaultTheme;
+  assert(feathercast::theme::ContrastRatio(defaultTheme.textDim,
+                                           defaultTheme.settingsBackground) >=
+         4.5f);
+  const auto readableOnDark = feathercast::theme::EnsureContrast(
+      feathercast::theme::Color{0.20f, 0.20f, 0.22f, 1.0f},
+      defaultTheme.settingsBackground);
+  assert(feathercast::theme::ContrastRatio(readableOnDark,
+                                           defaultTheme.settingsBackground) >=
+         4.5f);
+  const auto readableOnLight = feathercast::theme::EnsureContrast(
+      feathercast::theme::Color{0.80f, 0.80f, 0.82f, 1.0f},
+      feathercast::theme::Color{0.95f, 0.95f, 0.95f, 1.0f});
+  assert(feathercast::theme::ContrastRatio(
+             readableOnLight, feathercast::theme::Color{0.95f, 0.95f, 0.95f,
+                                                        1.0f}) >= 4.5f);
   const auto commands = feathercast::commands::BuildCommandItems();
   assert(!commands.empty());
   assert(std::all_of(commands.begin(), commands.end(),
@@ -335,7 +352,16 @@ int main() {
          feathercast::settings_catalog::Role(*compactDescriptor) ==
              feathercast::settings_catalog::AccessibleRole::CheckButton);
   assert(feathercast::settings_catalog::AccessibleValue(
-             feathercast::app::HitType::CompactToggle, settingValues) == L"On");
+              feathercast::app::HitType::CompactToggle, settingValues) == L"On");
+  const auto* autoFitDescriptor = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::AutoFitResultHeightToggle);
+  assert(autoFitDescriptor &&
+         feathercast::settings_catalog::Role(*autoFitDescriptor) ==
+             feathercast::settings_catalog::AccessibleRole::CheckButton);
+  settingValues.autoFitResultHeight = false;
+  assert(feathercast::settings_catalog::AccessibleValue(
+             feathercast::app::HitType::AutoFitResultHeightToggle,
+             settingValues) == L"Off");
   assert(feathercast::settings_catalog::AccessibleValue(
              feathercast::app::HitType::OverlayWidthDown, settingValues) ==
          L"720 DIP");
@@ -371,6 +397,7 @@ int main() {
          feathercast::app::SettingsCategory::Library);
 
   feathercast::ui::OverlayState overlay;
+  overlay.selectionRestorationAllowed = true;
   overlay.status = feathercast::app::StatusMessage{
       feathercast::app::StatusSeverity::Error, L"Previous error"};
   const auto resetEffects = feathercast::ui::OverlayController::ResetForShow(
@@ -378,6 +405,11 @@ int main() {
   assert((resetEffects & feathercast::ui::Effect(
                              feathercast::ui::UiEffect::RequestSearch)) != 0);
   assert(!overlay.status);
+  assert(!feathercast::ui::OverlayController::CanRestoreSelection(overlay));
+  feathercast::ui::OverlayController::ArmSelectionRestoration(overlay);
+  assert(feathercast::ui::OverlayController::CanRestoreSelection(overlay));
+  feathercast::ui::OverlayController::SetQuery(overlay, L"terminal");
+  assert(!feathercast::ui::OverlayController::CanRestoreSelection(overlay));
 
   feathercast::ui::OverlayState resumed;
   feathercast::ui::OverlayController::ResetForShow(
