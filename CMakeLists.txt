@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.9.6 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.10.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -115,6 +115,7 @@ add_executable(FeatherCast WIN32
   native/src/main.cpp
   native/src/audio_volume.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/native/FeatherCast.rc
+  ${FEATHERCAST_MANIFEST}
 )
 
 add_executable(FeatherCastPluginHost
@@ -170,8 +171,6 @@ if(MSVC)
   target_compile_options(FeatherCast PRIVATE /bigobj "$<$<CONFIG:Release>:/Zi>")
   target_compile_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/Zi>")
   target_link_options(FeatherCast PRIVATE
-    "/MANIFEST:EMBED"
-    "/MANIFESTINPUT:${FEATHERCAST_MANIFEST}"
     "$<$<CONFIG:Release>:/DEBUG:FULL>"
   )
   target_link_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
@@ -434,6 +433,13 @@ set_tests_properties(
   FeatherCastSearchFilesTests
   FeatherCastSilentLifecycleTests
   PROPERTIES TIMEOUT 120
+)
+set_tests_properties(
+  FeatherCastCoreTests
+  FeatherCastProductivityBehaviorTests
+  FeatherCastStorageTrustTests
+  FeatherCastPersistenceServiceTests
+  PROPERTIES ENVIRONMENT "FEATHERCAST_TEST_DPAPI_FALLBACK=1"
 )
 
 install(TARGETS FeatherCast FeatherCastPluginHost RUNTIME DESTINATION bin)

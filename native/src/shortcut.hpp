@@ -34,6 +34,9 @@ struct HookResult {
   bool toggle = false;
   bool suppressWinStart = false;
   bool deferToggleUntilWinRelease = false;
+  bool replayKey = false;
+  bool replayWinKeyDown = false;
+  UINT replayWinVk = 0;
 };
 
 struct HotKeySpec {
@@ -366,18 +369,22 @@ inline HotKeySpec ToHotKeySpec(const ShortcutSpec& shortcut) {
   HotKeySpec hotKey;
   if (!shortcut.valid || shortcut.singleModifier || shortcut.vk == 0) return hotKey;
 
+  // Windows-key shortcuts (e.g. Win+Space, Win+Shift+S) are reserved by the OS
+  // and fail or conflict with RegisterHotKey. Low-level keyboard hook
+  // (WH_KEYBOARD_LL) receives these events reliably before Explorer/Start.
+  if (shortcut.win) return hotKey;
+
   // RegisterHotKey cannot reliably reserve the physical Print Screen key on
   // Windows. Keep it on the low-level hook, which also lets capture settings
   // use the bare key instead of forcing a fake modifier.
   if (shortcut.vk == VK_SNAPSHOT && !shortcut.ctrl && !shortcut.alt &&
-      !shortcut.shift && !shortcut.win) {
+      !shortcut.shift) {
     return hotKey;
   }
 
   if (shortcut.ctrl) hotKey.modifiers |= MOD_CONTROL;
   if (shortcut.alt) hotKey.modifiers |= MOD_ALT;
   if (shortcut.shift) hotKey.modifiers |= MOD_SHIFT;
-  if (shortcut.win) hotKey.modifiers |= MOD_WIN;
   hotKey.modifiers |= 0x4000;  // MOD_NOREPEAT, kept literal for older SDKs.
   hotKey.vk = shortcut.vk;
   hotKey.supported = hotKey.modifiers != 0;
@@ -391,7 +398,7 @@ inline bool IsExclusiveWinShortcut(const ShortcutSpec& shortcut) {
 
 inline bool ShouldHandleInLowLevelHook(const ShortcutSpec& shortcut, bool registeredHotKeyActive) {
   if (!shortcut.valid) return false;
-  if (shortcut.singleModifier) return true;
+  if (shortcut.singleModifier || shortcut.win) return true;
   return !registeredHotKeyActive;
 }
 
@@ -408,19 +415,54 @@ class ShortcutRuntime {
         if (matches) {
           const bool firstPress = !singleModifierDown_;
           singleModifierDown_ = true;
-          if (firstPress) singleModifierChord_ = false;
-          return {};
+          if (firstPress) {
+            singleModifierChord_ = false;
+            singleModifierPhysicalVk_ = vk;
+          }
+          HookResult result;
+          // Consume the original Windows key until we know whether this is a
+          // bare shortcut or a native Win+key chord. This prevents the shell
+          // from opening Start before the bare shortcut is dispatched.
+          result.consume = shortcut.singleModifierVk == VK_LWIN;
+          return result;
         }
-        if (singleModifierDown_) singleModifierChord_ = true;
-      } else if (up && matches) {
+        if (singleModifierDown_) {
+          const bool firstChordKey = !singleModifierChord_;
+          singleModifierChord_ = true;
+          if (shortcut.singleModifierVk == VK_LWIN) {
+            HookResult result;
+            result.consume = true;
+            result.replayKey = true;
+            if (firstChordKey) {
+              result.replayWinKeyDown = true;
+              result.replayWinVk = singleModifierPhysicalVk_;
+            }
+            return result;
+          }
+        }
+      } else if (up) {
         HookResult result;
-        if (singleModifierDown_ && !singleModifierChord_) {
-          result.toggle = true;
-          result.suppressWinStart = shortcut.singleModifierVk == VK_LWIN;
-          result.deferToggleUntilWinRelease = result.suppressWinStart;
+        if (matches) {
+          if (singleModifierDown_ && !singleModifierChord_) {
+            result.toggle = true;
+            result.deferToggleUntilWinRelease =
+                shortcut.singleModifierVk == VK_LWIN;
+            result.consume = shortcut.singleModifierVk == VK_LWIN;
+          } else if (singleModifierDown_ && singleModifierChord_ &&
+                     shortcut.singleModifierVk == VK_LWIN) {
+            result.consume = true;
+            result.replayKey = true;
+          }
+          singleModifierDown_ = false;
+          singleModifierChord_ = false;
+          singleModifierPhysicalVk_ = 0;
+          return result;
         }
-        singleModifierDown_ = false;
-        singleModifierChord_ = false;
+        if (singleModifierDown_ && singleModifierChord_ &&
+            shortcut.singleModifierVk == VK_LWIN) {
+          result.consume = true;
+          result.replayKey = true;
+        }
         return result;
       }
       return {};
@@ -453,6 +495,7 @@ class ShortcutRuntime {
  private:
   bool singleModifierDown_ = false;
   bool singleModifierChord_ = false;
+  UINT singleModifierPhysicalVk_ = 0;
   bool targetKeyDown_ = false;
   bool shortcutActive_ = false;
 };

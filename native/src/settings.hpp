@@ -23,6 +23,23 @@
 namespace feathercast::settings {
 
 inline constexpr int kCurrentSettingsSchemaVersion = 3;
+inline constexpr int kMinimumTextSizePercent = 90;
+inline constexpr int kMaximumTextSizePercent = 120;
+inline constexpr int kTextSizeStepPercent = 10;
+
+inline constexpr int ClampTextSizePercent(int value) {
+  return std::clamp(value, kMinimumTextSizePercent,
+                    kMaximumTextSizePercent);
+}
+
+inline constexpr int StepTextSizePercent(int value, int direction) {
+  return ClampTextSizePercent(
+      value + direction * kTextSizeStepPercent);
+}
+
+inline std::wstring TextSizePercentLabel(int value) {
+  return std::to_wstring(ClampTextSizePercent(value)) + L"%";
+}
 
 enum class AnimationLevel {
   Off,
@@ -133,6 +150,10 @@ struct Settings {
   AnimationLevel animationLevel = AnimationLevel::Full;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
+  // DirectWrite sizes are deliberately explicit, so expose a supported
+  // FeatherCast preference instead of relying on Windows text-size settings
+  // that do not consistently reach a custom Direct2D surface.
+  int textSizePercent = 100;
   bool startOnStartup = false;
   bool updateChecksEnabled = true;
   long long lastUpdateAttempt = 0;
@@ -389,6 +410,8 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   }
   ReadBool(*root, "syncAccentColor", settings.syncAccentColor);
   ReadString(*root, "customAccentColor", settings.customAccentColor);
+  ReadInt(*root, "textSizePercent", settings.textSizePercent);
+  settings.textSizePercent = ClampTextSizePercent(settings.textSizePercent);
   ReadBool(*root, "startOnStartup", settings.startOnStartup);
   ReadBool(*root, "updateChecksEnabled", settings.updateChecksEnabled);
   ReadLongLong(*root, "lastUpdateAttempt", settings.lastUpdateAttempt);
@@ -546,6 +569,8 @@ inline std::string SerializeSettings(const Settings& settings) {
       << ",\n";
   out << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
   out << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
+  out << "  \"textSizePercent\": " << ClampTextSizePercent(settings.textSizePercent)
+      << ",\n";
   out << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << ",\n";
   out << "  \"updateChecksEnabled\": " << (settings.updateChecksEnabled ? "true" : "false") << ",\n";
   out << "  \"lastUpdateAttempt\": " << settings.lastUpdateAttempt << ",\n";

@@ -467,11 +467,53 @@ void VerifyScreenshotEditorAccessibility() {
   accessible->Release();
 }
 
+void VerifyUnavailableFocusIsNeverReported() {
+  Item enabled;
+  enabled.name = L"Enabled control";
+  enabled.defaultAction = L"Activate";
+  enabled.role = ROLE_SYSTEM_PUSHBUTTON;
+  enabled.state = STATE_SYSTEM_FOCUSABLE;
+  enabled.screenRect = RECT{10, 10, 100, 42};
+
+  Item unavailable;
+  unavailable.name = L"Unavailable control";
+  unavailable.defaultAction = L"Activate";
+  unavailable.role = ROLE_SYSTEM_PUSHBUTTON;
+  unavailable.state = STATE_SYSTEM_UNAVAILABLE;
+  unavailable.screenRect = RECT{110, 10, 220, 42};
+
+  TestModel model;
+  model.items = {enabled, unavailable};
+  model.focusedChild = 2;
+  auto* accessible = new feathercast::accessibility::Window(&model, nullptr);
+
+  VARIANT focus;
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == CHILDID_SELF);
+  assert(accessible->get_accSelection(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == CHILDID_SELF);
+
+  VARIANT disabledState;
+  assert(accessible->get_accState(Child(2), &disabledState) == S_OK);
+  assert((disabledState.lVal & STATE_SYSTEM_UNAVAILABLE) != 0);
+  assert((disabledState.lVal & STATE_SYSTEM_FOCUSABLE) == 0);
+  assert(accessible->accSelect(SELFLAG_TAKEFOCUS, Child(2)) ==
+         E_ACCESSDENIED);
+  assert(accessible->accDoDefaultAction(Child(2)) == E_ACCESSDENIED);
+
+  model.focusedChild = 1;
+  assert(accessible->get_accFocus(&focus) == S_OK);
+  assert(focus.vt == VT_I4 && focus.lVal == 1);
+
+  accessible->Release();
+}
+
 }  // namespace
 
 int main() {
   VerifyLiveStatusProjection();
   VerifyAccessibleModelTransport();
   VerifyScreenshotEditorAccessibility();
+  VerifyUnavailableFocusIsNeverReported();
   return 0;
 }

@@ -115,9 +115,15 @@ int main() {
   assert(CaptureUiController::Begin(
       capture, CaptureShortcutTarget::RecordFullscreen));
   assert(capture.phase == CapturePhase::StartingRecording);
+  assert(!CaptureUiController::RecordingControlsEnabled(capture));
   assert(!CaptureUiController::Pause(capture));
   assert(CaptureUiController::RecordingStarted(capture));
   assert(CaptureUiController::RecordingStarted(capture));
+  assert(CaptureUiController::RecordingControlsEnabled(capture));
+  assert(CaptureUiController::NextControlFocus(0) == 1);
+  assert(CaptureUiController::NextControlFocus(1) == 0);
+  assert(CaptureUiController::NextControlFocus(0, true) == 1);
+  assert(CaptureUiController::NextControlFocus(1, true) == 0);
   assert(CaptureUiController::AddElapsed(capture, 1000));
   assert(CaptureUiController::Pause(capture));
   assert(CaptureUiController::Pause(capture));
@@ -132,6 +138,7 @@ int main() {
   assert(CaptureUiController::Stop(capture));
   assert(CaptureUiController::Stop(capture));
   assert(capture.phase == CapturePhase::Stopping);
+  assert(!CaptureUiController::RecordingControlsEnabled(capture));
   assert(!CaptureUiController::Resume(capture));
   assert(CaptureUiController::Complete(capture));
   assert(capture.phase == CapturePhase::Idle &&
@@ -905,8 +912,17 @@ int main() {
   appItem.app.id = L"app:test";
   appItem.app.name = L"Test App";
   appItem.app.source = L"start-menu";
+  appItem.app.adminSupported = true;
   const auto appActions = feathercast::commands::BuildActions(
       appItem, feathercast::app::Settings{});
+  assert(HasAction(appActions, feathercast::app::ActionKind::RunAsAdmin));
+  const auto runAsAdmin = std::find_if(
+      appActions.begin(), appActions.end(), [](const auto& item) {
+        return item.action == feathercast::app::ActionKind::RunAsAdmin;
+      });
+  assert(runAsAdmin != appActions.end());
+  assert(runAsAdmin->commandDetail.find(L"Ctrl+Shift+Enter") !=
+         std::wstring::npos);
   assert(HasAction(appActions,
                    feathercast::app::ActionKind::EditAppAlias));
 

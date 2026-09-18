@@ -7,6 +7,7 @@
 #include "emoji.hpp"
 #include "extension_protocol.hpp"
 #include "json.hpp"
+#include "layout_contract.hpp"
 #include "run_command.hpp"
 #include "settings.hpp"
 #include "shortcut.hpp"
@@ -543,6 +544,97 @@ int main() {
     assert(color);
     assert(std::fabs(color->g - (0xCD / 255.0f)) < 0.001);
     assert(!feathercast::theme::ParseHexColor(L"#NOPE"));
+
+    const auto normalized = feathercast::theme::NormalizeTheme(
+        feathercast::theme::Theme{});
+    for (const auto& surface : feathercast::theme::ThemeTextSurfaces(normalized)) {
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalized.textPrimary, surface) >= 4.5f);
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalized.textMuted, surface) >= 4.5f);
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalized.textDim, surface) >= 4.5f);
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalized.sectionText, surface) >= 4.5f);
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalized.accentFallback, surface) >= 3.0f);
+    }
+    const feathercast::theme::Color transparentText{1.0f, 1.0f, 1.0f, 0.2f};
+    const feathercast::theme::Color translucentSurface{0.0f, 0.0f, 0.0f,
+                                                       0.5f};
+    assert(feathercast::theme::CompositedContrastRatio(
+               transparentText, translucentSurface) <
+           feathercast::theme::ContrastRatio(transparentText,
+                                              translucentSurface));
+
+    feathercast::theme::Theme lowContrast;
+    // Keep the custom surface family coherent so the shared text token can
+    // satisfy the body-text floor on every actual surface. A theme that asks
+    // one token to be readable on both dark and mid-grey surfaces has no
+    // single 4.5:1 solution; per-surface text roles would be required there.
+    lowContrast.overlayBackground = {0.05f, 0.05f, 0.06f, 0.35f};
+    lowContrast.settingsBackground = lowContrast.overlayBackground;
+    lowContrast.surface = {0.05f, 0.05f, 0.06f, 1.0f};
+    lowContrast.surfaceHover = {0.05f, 0.05f, 0.06f, 0.2f};
+    lowContrast.selectedBase = lowContrast.surface;
+    lowContrast.iconTile = lowContrast.surface;
+    lowContrast.textPrimary = {0.5f, 0.5f, 0.5f, 0.1f};
+    lowContrast.textMuted = lowContrast.textPrimary;
+    lowContrast.textDim = lowContrast.textPrimary;
+    lowContrast.sectionText = lowContrast.textPrimary;
+    lowContrast.danger = lowContrast.textPrimary;
+    lowContrast.success = lowContrast.textPrimary;
+    lowContrast.recording = lowContrast.textPrimary;
+    lowContrast.accentFallback = lowContrast.textPrimary;
+    const auto normalizedLow =
+        feathercast::theme::NormalizeTheme(lowContrast);
+    for (const auto& surface :
+         feathercast::theme::ThemeTextSurfaces(normalizedLow)) {
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalizedLow.textPrimary, surface) >= 4.5f);
+      assert(feathercast::theme::CompositedContrastRatio(
+                 normalizedLow.accentFallback, surface) >= 3.0f);
+    }
+
+    const auto customAccent = feathercast::theme::NormalizeAccent(
+        {0.01f, 0.02f, 0.03f, 0.18f}, normalized);
+    for (const auto& surface :
+         feathercast::theme::ThemeTextSurfaces(normalized)) {
+      assert(feathercast::theme::CompositedContrastRatio(customAccent,
+                                                         surface) >= 3.0f);
+    }
+
+    const feathercast::theme::Color window{0.1f, 0.2f, 0.3f, 1.0f};
+    const feathercast::theme::Color button{0.4f, 0.5f, 0.6f, 1.0f};
+    const feathercast::theme::Color highlight{0.7f, 0.1f, 0.2f, 1.0f};
+    const feathercast::theme::Color windowText{0.9f, 0.8f, 0.7f, 1.0f};
+    const auto highContrast = feathercast::theme::HighContrastTheme(
+        feathercast::theme::Theme{}, window, button, highlight, windowText);
+    assert(highContrast.overlayBackground.r == window.r);
+    assert(highContrast.surface.r == button.r);
+    assert(highContrast.surfaceHover.r == highlight.r);
+    assert(highContrast.textMuted.r == windowText.r);
+    assert(highContrast.danger.r == highlight.r);
+  }
+
+  {
+    const auto recording = feathercast::layout::RecordingControls();
+    assert(recording.pause.left == 184.0f);
+    assert(recording.pause.right == 264.0f);
+    assert(recording.stop.left == 272.0f);
+    assert(recording.stop.right == 348.0f);
+    assert(feathercast::layout::Contains(recording.pause, 200.0f, 20.0f));
+    assert(!feathercast::layout::Contains(recording.pause, 264.0f, 20.0f));
+    assert(!feathercast::layout::ContainsRounded(recording.panel, 0.0f, 0.0f,
+                                                  10.0f));
+    assert(feathercast::layout::ContainsRounded(recording.panel, 180.0f, 32.0f,
+                                                10.0f));
+    const auto volume = feathercast::layout::VolumeControl(440.0f);
+    assert(volume.track.left == 28.0f && volume.track.right == 412.0f);
+    assert(feathercast::layout::Contains(volume.trackHit, 24.0f, 66.0f));
+    const auto filter = feathercast::layout::SettingsFilter(760.0f);
+    assert(filter.left < filter.right);
+    assert(feathercast::layout::DipToPixelsRounded(10.0f, 1.5f) == 15);
   }
 
   {
@@ -953,6 +1045,7 @@ int main() {
     original.autoFitResultHeight = false;
     original.animationLevel = fs::AnimationLevel::Reduced;
     original.customAccentColor = L"#ff0000";
+    original.textSizePercent = 120;
     original.lastUpdateAttempt = 1234567890000;
     original.lastUpdateCheck = 1234567890123;
     original.dismissedUpdateVersion = L"1.2.3";
@@ -987,6 +1080,7 @@ int main() {
     assert(copy.autoFitResultHeight == original.autoFitResultHeight);
     assert(copy.animationLevel == original.animationLevel);
     assert(copy.customAccentColor == original.customAccentColor);
+    assert(copy.textSizePercent == original.textSizePercent);
     assert(copy.lastUpdateAttempt == original.lastUpdateAttempt);
     assert(copy.lastUpdateCheck == original.lastUpdateCheck);
     assert(copy.dismissedUpdateVersion == original.dismissedUpdateVersion);
@@ -1265,6 +1359,10 @@ int main() {
     assert(fd::IsHostExecutable(L"C:\\Windows\\SysWOW64\\msiexec.exe"));
     assert(!fd::IsHostExecutable(L"C:\\Program Files\\Discord\\Discord.exe"));
     assert(!fd::IsHostExecutable(L"C:\\Program Files\\Unity\\Editor\\Unity.exe"));
+    assert(fd::SupportsAdminLaunchTarget(L"C:\\Program Files\\Demo\\Demo.exe"));
+    assert(fd::SupportsAdminLaunchTarget(L"C:\\ProgramData\\Demo\\Demo.lnk"));
+    assert(!fd::SupportsAdminLaunchTarget(L"C:\\Users\\User\\Desktop\\notes.txt"));
+    assert(!fd::SupportsAdminLaunchTarget(L"https://example.com/demo.exe"));
 
     // Host executables with different names must NOT merge
     feathercast::app::AppEntry cmdApp1;
@@ -1309,12 +1407,15 @@ int main() {
     assert((controlAltKHotKey.modifiers & MOD_ALT) != 0);
 
     assert(!ToHotKeySpec(ParseShortcut(L"Super")).supported);
+    assert(!ToHotKeySpec(ParseShortcut(L"Super+Space")).supported);
     assert(!ToHotKeySpec(ParseShortcut(L"none")).supported);
 
     assert(!ShouldHandleInLowLevelHook(ParseShortcut(L"Alt+Space"), true));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Alt+Space"), false));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super"), false));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super"), true));
+    assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super+Space"), true));
+    assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super+Space"), false));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Alt"), true));
     assert(!ShouldHandleInLowLevelHook(ParseShortcut(L"none"), false));
   }
@@ -1386,54 +1487,80 @@ int main() {
   {
     const auto super = ParseShortcut(L"Super");
     ShortcutRuntime runtime;
-    AssertPassOnly(runtime.Handle(
-        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    const auto firstDown = runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true));
+    assert(firstDown.consume);
+    assert(!firstDown.toggle);
+    assert(!firstDown.suppressWinStart);
+    assert(!firstDown.deferToggleUntilWinRelease);
+    assert(!firstDown.replayKey);
 
     const auto repeat = runtime.Handle(
         super, VK_LWIN, true, false, Mods(false, false, false, true));
-    AssertPassOnly(repeat);
+    assert(repeat.consume);
+    assert(!repeat.toggle);
+    assert(!repeat.replayKey);
 
     const auto release = runtime.Handle(super, VK_LWIN, false, true, Mods());
-    assert(!release.consume);
+    assert(release.consume);
     assert(release.toggle);
-    assert(release.suppressWinStart);
+    assert(!release.suppressWinStart);
     assert(release.deferToggleUntilWinRelease);
-    AssertPassOnly(runtime.Handle(super, VK_LWIN, false, true, Mods()));
+    const auto strayRelease = runtime.Handle(super, VK_LWIN, false, true, Mods());
+    AssertPassOnly(strayRelease);
 
-    AssertPassOnly(runtime.Handle(
-        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    const auto reopenDown = runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true));
+    assert(reopenDown.consume);
+    assert(!reopenDown.toggle);
+    assert(!reopenDown.suppressWinStart);
+    assert(!reopenDown.deferToggleUntilWinRelease);
     const auto reopenRelease = runtime.Handle(super, VK_LWIN, false, true, Mods());
-    assert(!reopenRelease.consume);
+    assert(reopenRelease.consume);
     assert(reopenRelease.toggle);
-    assert(reopenRelease.suppressWinStart);
+    assert(!reopenRelease.suppressWinStart);
     assert(reopenRelease.deferToggleUntilWinRelease);
   }
 
   {
     const auto super = ParseShortcut(L"Super");
     ShortcutRuntime runtime;
-    AssertPassOnly(runtime.Handle(super, VK_RWIN, true, false,
-                                  Mods(false, false, false, true)));
+    const auto firstDown = runtime.Handle(
+        super, VK_RWIN, true, false, Mods(false, false, false, true));
+    assert(firstDown.consume);
+    assert(!firstDown.toggle);
+    assert(!firstDown.suppressWinStart);
+    assert(!firstDown.deferToggleUntilWinRelease);
     const auto release = runtime.Handle(super, VK_RWIN, false, true, Mods());
-    assert(!release.consume);
+    assert(release.consume);
     assert(release.toggle);
-    assert(release.suppressWinStart);
+    assert(!release.suppressWinStart);
     assert(release.deferToggleUntilWinRelease);
   }
 
   {
     const auto super = ParseShortcut(L"Super");
     ShortcutRuntime runtime;
-    AssertPassOnly(runtime.Handle(
-        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    const auto winDown = runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true));
+    assert(winDown.consume);
+    assert(!winDown.toggle);
+    assert(!winDown.suppressWinStart);
     const auto chordDown = runtime.Handle(
         super, VK_LEFT, true, false, Mods(false, false, false, true));
-    AssertPassOnly(chordDown);
+    assert(chordDown.consume);
+    assert(chordDown.replayKey);
+    assert(chordDown.replayWinKeyDown);
+    assert(chordDown.replayWinVk == VK_LWIN);
     const auto chordUp = runtime.Handle(
         super, VK_LEFT, false, true, Mods(false, false, false, true));
-    AssertPassOnly(chordUp);
+    assert(chordUp.consume);
+    assert(chordUp.replayKey);
+    assert(!chordUp.replayWinKeyDown);
     const auto winUp = runtime.Handle(super, VK_LWIN, false, true, Mods());
-    AssertPassOnly(winUp);
+    assert(winUp.consume);
+    assert(winUp.replayKey);
+    assert(!winUp.toggle);
   }
 
   {

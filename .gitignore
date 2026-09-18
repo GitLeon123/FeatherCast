@@ -22,3 +22,6 @@ FeatherCast-*.exe
 FeatherCast-*/
 *.sha256
 screen_test.png
+build/Testing/
+Testing/
+

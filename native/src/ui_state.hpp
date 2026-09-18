@@ -159,6 +159,10 @@ struct CaptureUiState {
   std::optional<PixelPoint> selectionEnd;
   std::uint64_t elapsedMilliseconds = 0;
   int controlFocus = 0;
+  // A recording bar is deliberately non-activating. This flag records the
+  // keyboard/accessibility focus that the bar owns even while the foreground
+  // application keeps the real Win32 focus.
+  bool controlFocusActive = false;
   int controlHover = -1;
 };
 
@@ -363,6 +367,7 @@ class CaptureUiController {
     if (state.phase == CapturePhase::Recording) return true;
     if (state.phase != CapturePhase::StartingRecording) return false;
     state.phase = CapturePhase::Recording;
+    state.controlFocusActive = true;
     return true;
   }
 
@@ -388,6 +393,7 @@ class CaptureUiController {
       return false;
     }
     state.phase = CapturePhase::Stopping;
+    state.controlFocusActive = false;
     return true;
   }
 
@@ -415,6 +421,17 @@ class CaptureUiController {
 
   static void SetControlFocus(CaptureUiState& state, int focus) {
     state.controlFocus = std::clamp(focus, 0, 1);
+  }
+
+  static int NextControlFocus(int focus, bool reverse = false) {
+    const int current = std::clamp(focus, 0, 1);
+    return reverse ? (current == 0 ? 1 : 0) : (current == 1 ? 0 : 1);
+  }
+
+  static bool RecordingControlsEnabled(const CaptureUiState& state) {
+    return state.controlFocusActive &&
+           (state.phase == CapturePhase::Recording ||
+            state.phase == CapturePhase::Paused);
   }
 
   static void SetControlHover(CaptureUiState& state, int hover) {

@@ -85,6 +85,26 @@ inline bool IsHostExecutable(const std::wstring& path) {
   return hosts.contains(fn);
 }
 
+inline bool SupportsAdminLaunchTarget(const std::wstring& target) {
+  if (target.empty()) return false;
+
+  // URLs and shell: targets are opened by their registered handler and are
+  // not executable files that can be passed to the runas verb.
+  const size_t colon = target.find(L':');
+  const bool drivePath = colon == 1 && std::iswalpha(target.front());
+  const bool extendedDrivePath = target.rfind(L"\\\\?\\", 0) == 0 &&
+                                 colon == 5 && std::iswalpha(target[4]);
+  if (colon != std::wstring::npos && !drivePath && !extendedDrivePath) {
+    return false;
+  }
+
+  const std::wstring extension = Lower(
+      std::filesystem::path(target).extension().wstring());
+  return extension == L".exe" || extension == L".com" ||
+         extension == L".bat" || extension == L".cmd" ||
+         extension == L".lnk";
+}
+
 inline std::wstring DisambiguateShortcutName(const std::wstring& stemName, const std::filesystem::path& shortcutPath) {
   const std::wstring parent = shortcutPath.parent_path().filename().wstring();
   if (parent.empty()) return stemName;

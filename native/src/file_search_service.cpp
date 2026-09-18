@@ -1,6 +1,7 @@
 #include "file_search_service.hpp"
 
 #include "extension_protocol.hpp"
+#include "discovery.hpp"
 #include "sqlite3.h"
 
 #include <windows.h>
@@ -30,6 +31,7 @@ app::AppEntry ProjectStorageEntry(const storage::FileIndexEntry& entry) {
   app.source = L"file";
   app.launchType = app::LaunchType::Exe;
   app.launchTarget = entry.path;
+  app.adminSupported = discovery::SupportsAdminLaunchTarget(entry.path);
   app.iconKey = entry.iconKey.empty() ? entry.path : entry.iconKey;
   app.fileIsDirectory = entry.isDirectory;
   app.fileLastWriteTime = entry.lastWriteTime;

@@ -430,8 +430,8 @@ std::vector<app::DisplayItem> BuildActions(
                                L"Launch " + target.app.name, target));
   if (target.app.adminSupported) {
     actions.push_back(ActionItem(app::ActionKind::RunAsAdmin,
-                                 L"Run as Administrator", L"Launch elevated",
-                                 target));
+                                 L"Run as Administrator",
+                                 L"Launch elevated · Ctrl+Shift+Enter", target));
   }
   if (target.app.launchType != app::LaunchType::Shell &&
       (!target.app.path.empty() || !target.app.targetPath.empty())) {

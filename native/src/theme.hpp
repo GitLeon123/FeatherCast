@@ -4,6 +4,7 @@
 #include "filesystem_semantics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
@@ -50,6 +51,34 @@ struct Theme {
   float controlRadius = 8.0f;
 };
 
+inline Color ClampColor(Color color) noexcept {
+  color.r = std::clamp(color.r, 0.0f, 1.0f);
+  color.g = std::clamp(color.g, 0.0f, 1.0f);
+  color.b = std::clamp(color.b, 0.0f, 1.0f);
+  color.a = std::clamp(color.a, 0.0f, 1.0f);
+  return color;
+}
+
+// DirectComposition surfaces are premultiplied and may contain translucent
+// theme colors. Contrast must therefore be measured after compositing the
+// foreground and the surface over the same opaque backdrop.
+inline Color CompositeOver(Color foreground, Color background) noexcept {
+  foreground = ClampColor(foreground);
+  background = ClampColor(background);
+  const float inverse = 1.0f - foreground.a;
+  const float alpha = foreground.a + background.a * inverse;
+  if (alpha <= 0.0f) return {0.0f, 0.0f, 0.0f, 0.0f};
+  return ClampColor({
+      (foreground.r * foreground.a + background.r * background.a * inverse) /
+          alpha,
+      (foreground.g * foreground.a + background.g * background.a * inverse) /
+          alpha,
+      (foreground.b * foreground.a + background.b * background.a * inverse) /
+          alpha,
+      alpha,
+  });
+}
+
 inline float SrgbToLinear(float channel) {
   channel = std::clamp(channel, 0.0f, 1.0f);
   return channel <= 0.04045f
@@ -71,15 +100,33 @@ inline float ContrastRatio(const Color& first, const Color& second) {
   return (lighter + 0.05f) / (darker + 0.05f);
 }
 
+inline float CompositedContrastRatio(const Color& foreground,
+                                     const Color& background,
+                                     const Color& canvas = {}) {
+  const Color opaqueCanvas{canvas.r, canvas.g, canvas.b, 1.0f};
+  const Color effectiveBackground =
+      CompositeOver(background, opaqueCanvas);
+  const Color effectiveForeground =
+      CompositeOver(foreground, effectiveBackground);
+  return ContrastRatio(effectiveForeground, effectiveBackground);
+}
+
 // Preserve a theme's hue as far as possible, but never let secondary text fall
 // below the requested contrast against the panel it is rendered on.
 inline Color EnsureContrast(Color foreground, const Color& background,
-                            float minimumRatio = 4.5f) {
+                            float minimumRatio = 4.5f,
+                            const Color& canvas = {}) {
+  foreground = ClampColor(foreground);
   foreground.a = 1.0f;
-  if (ContrastRatio(foreground, background) >= minimumRatio) return foreground;
+  if (CompositedContrastRatio(foreground, background, canvas) >=
+      minimumRatio) {
+    return foreground;
+  }
 
+  const Color effectiveBackground = CompositeOver(
+      background, Color{canvas.r, canvas.g, canvas.b, 1.0f});
   const bool moveTowardWhite = RelativeLuminance(foreground) >
-                                RelativeLuminance(background);
+                                RelativeLuminance(effectiveBackground);
   const Color endpoint = moveTowardWhite
                              ? Color{1.0f, 1.0f, 1.0f, 1.0f}
                              : Color{0.0f, 0.0f, 0.0f, 1.0f};
@@ -90,9 +137,127 @@ inline Color EnsureContrast(Color foreground, const Color& background,
     candidate.r = foreground.r + (endpoint.r - foreground.r) * amount;
     candidate.g = foreground.g + (endpoint.g - foreground.g) * amount;
     candidate.b = foreground.b + (endpoint.b - foreground.b) * amount;
-    if (ContrastRatio(candidate, background) >= minimumRatio) return candidate;
+    if (CompositedContrastRatio(candidate, background, canvas) >=
+        minimumRatio) {
+      return candidate;
+    }
   }
   return endpoint;
+}
+
+template <std::size_t Count>
+inline Color EnsureContrastOnSurfaces(Color foreground,
+                                     const std::array<Color, Count>& surfaces,
+                                     float minimumRatio) {
+  foreground = ClampColor(foreground);
+  foreground.a = 1.0f;
+  const auto minimumContrast = [&](const Color& candidate) {
+    float result = 100.0f;
+    for (const auto& surface : surfaces) {
+      result = std::min(result,
+                        CompositedContrastRatio(candidate, surface));
+    }
+    return result;
+  };
+  if (minimumContrast(foreground) >= minimumRatio) return foreground;
+
+  Color best = foreground;
+  float bestRatio = minimumContrast(best);
+  const std::array<Color, 2> endpoints = {
+      Color{1.0f, 1.0f, 1.0f, 1.0f},
+      Color{0.0f, 0.0f, 0.0f, 1.0f},
+  };
+  for (const auto& endpoint : endpoints) {
+    for (int step = 1; step <= 32; ++step) {
+      const float amount = static_cast<float>(step) / 32.0f;
+      Color candidate = foreground;
+      candidate.r += (endpoint.r - foreground.r) * amount;
+      candidate.g += (endpoint.g - foreground.g) * amount;
+      candidate.b += (endpoint.b - foreground.b) * amount;
+      const float ratio = minimumContrast(candidate);
+      if (ratio > bestRatio) {
+        best = candidate;
+        bestRatio = ratio;
+      }
+      if (ratio >= minimumRatio) return candidate;
+    }
+  }
+  return best;
+}
+
+inline std::array<Color, 7> ThemeTextSurfaces(const Theme& theme) {
+  const Color canvas{0.0f, 0.0f, 0.0f, 1.0f};
+  const Color overlay = CompositeOver(theme.overlayBackground, canvas);
+  const Color settings = CompositeOver(theme.settingsBackground, canvas);
+  const Color surface = CompositeOver(theme.surface, overlay);
+  const Color hover = CompositeOver(theme.surfaceHover, surface);
+  const Color selected = CompositeOver(theme.selectedBase, overlay);
+  const Color icon = CompositeOver(theme.iconTile, overlay);
+  return {overlay, settings, surface, hover, selected, icon,
+          CompositeOver(theme.surface, settings)};
+}
+
+inline Theme NormalizeTheme(Theme theme) {
+  theme.overlayBackground = ClampColor(theme.overlayBackground);
+  theme.settingsBackground = ClampColor(theme.settingsBackground);
+  theme.border = ClampColor(theme.border);
+  theme.divider = ClampColor(theme.divider);
+  theme.surface = ClampColor(theme.surface);
+  theme.surfaceHover = ClampColor(theme.surfaceHover);
+  theme.selectedBase = ClampColor(theme.selectedBase);
+  theme.iconTile = ClampColor(theme.iconTile);
+  theme.textPrimary = ClampColor(theme.textPrimary);
+  theme.textMuted = ClampColor(theme.textMuted);
+  theme.textDim = ClampColor(theme.textDim);
+  theme.sectionText = ClampColor(theme.sectionText);
+  theme.danger = ClampColor(theme.danger);
+  theme.success = ClampColor(theme.success);
+  theme.recording = ClampColor(theme.recording);
+  theme.accentFallback = ClampColor(theme.accentFallback);
+
+  const auto surfaces = ThemeTextSurfaces(theme);
+  theme.textPrimary = EnsureContrastOnSurfaces(theme.textPrimary, surfaces, 4.5f);
+  theme.textMuted = EnsureContrastOnSurfaces(theme.textMuted, surfaces, 4.5f);
+  theme.textDim = EnsureContrastOnSurfaces(theme.textDim, surfaces, 4.5f);
+  theme.sectionText = EnsureContrastOnSurfaces(theme.sectionText, surfaces, 4.5f);
+
+  // Status colors and the accent are used as control fills, focus rings, and
+  // icon treatments. Three-to-one is the appropriate non-body-text floor.
+  theme.danger = EnsureContrastOnSurfaces(theme.danger, surfaces, 3.0f);
+  theme.success = EnsureContrastOnSurfaces(theme.success, surfaces, 3.0f);
+  theme.recording = EnsureContrastOnSurfaces(theme.recording, surfaces, 3.0f);
+  theme.accentFallback = EnsureContrastOnSurfaces(theme.accentFallback, surfaces,
+                                                  3.0f);
+  return theme;
+}
+
+inline Color NormalizeAccent(Color accent, const Theme& theme,
+                             float minimumRatio = 3.0f) {
+  const auto surfaces = ThemeTextSurfaces(theme);
+  return EnsureContrastOnSurfaces(ClampColor(accent), surfaces, minimumRatio);
+}
+
+inline Theme HighContrastTheme(Theme theme, Color window, Color button,
+                               Color highlight, Color windowText) {
+  theme.overlayBackground = window;
+  theme.settingsBackground = window;
+  theme.surface = button;
+  theme.surfaceHover = highlight;
+  theme.selectedBase = highlight;
+  theme.iconTile = button;
+  theme.border = windowText;
+  theme.divider = windowText;
+  theme.textPrimary = windowText;
+  // COLOR_GRAYTEXT is a disabled-control role. Ordinary secondary copy must
+  // remain readable as normal window text in High Contrast mode.
+  theme.textMuted = windowText;
+  theme.textDim = windowText;
+  theme.sectionText = windowText;
+  theme.danger = highlight;
+  theme.success = highlight;
+  theme.recording = highlight;
+  theme.accentFallback = highlight;
+  return theme;
 }
 
 inline int HexNibble(wchar_t ch) {

@@ -224,6 +224,14 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"appearance.custom-accent", SettingsCategory::Appearance, HitType::AccentColor,
        ControlKind::Custom, L"Accent Color", L"Choose a custom launcher accent color.",
        L"Pick accent color", Requirement::CustomAccent},
+      {L"appearance.text-size.down", SettingsCategory::Appearance,
+       HitType::TextSizeDown, ControlKind::Decrement, L"Text Size",
+       L"Adjust FeatherCast text independently of Windows text-size settings.",
+       L"Decrease FeatherCast text size"},
+      {L"appearance.text-size.up", SettingsCategory::Appearance,
+       HitType::TextSizeUp, ControlKind::Increment, L"Text Size",
+       L"Adjust FeatherCast text independently of Windows text-size settings.",
+       L"Increase FeatherCast text size"},
       {L"maintenance.clear-recents", SettingsCategory::Maintenance, HitType::ClearRecents,
        ControlKind::Action, L"Clear Recents", L"Forget recent apps and usage ranking.",
        L"Clear recents"},
@@ -374,6 +382,10 @@ std::wstring AccessibleValue(app::HitType hit,
     case HitType::FileIndexLimitUp:
       return std::to_wstring(settings.fileIndexMaxEntries) + L" entries";
     case HitType::AccentColor: return settings.customAccentColor;
+    case HitType::TextSizeDown:
+    case HitType::TextSizeUp:
+      return feathercast::settings::TextSizePercentLabel(
+          settings.textSizePercent);
     default: return L"";
   }
 }

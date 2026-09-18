@@ -145,7 +145,9 @@ class Window final : public IAccessible {
   }
   HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR*) override { return S_FALSE; }
   HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR*, VARIANT, LONG*) override { return S_FALSE; }
-  HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT, BSTR*) override { return S_FALSE; }
+  HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT, BSTR*) override {
+    return S_FALSE;
+  }
   HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT* focus) override {
     if (!focus) return E_POINTER;
     VariantInit(focus);
@@ -168,7 +170,9 @@ class Window final : public IAccessible {
     const LONG child = model_->AccessibleSelectedChild(hwnd_);
     selection->vt = VT_I4;
     const auto items = Items();
-    if (child > 0 && child <= static_cast<LONG>(items.size())) {
+    if (child > 0 && child <= static_cast<LONG>(items.size()) &&
+        (items[static_cast<size_t>(child - 1)].state &
+         (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) == 0) {
       selection->lVal = child;
     } else {
       selection->lVal = CHILDID_SELF;
@@ -240,6 +244,7 @@ class Window final : public IAccessible {
     const auto items = Items();
     for (size_t i = 0; i < items.size(); ++i) {
       POINT point{x, y};
+      if ((items[i].state & STATE_SYSTEM_INVISIBLE) != 0) continue;
       if (PtInRect(&items[i].screenRect, point)) {
         child->vt = VT_I4;
         child->lVal = static_cast<LONG>(i + 1);

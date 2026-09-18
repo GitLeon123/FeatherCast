@@ -743,9 +743,25 @@ class Storage {
         static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)),
         reinterpret_cast<BYTE*>(const_cast<wchar_t*>(value.c_str()))};
     DATA_BLOB output{};
+    DWORD protectionFlags = CRYPTPROTECT_UI_FORBIDDEN;
     if (!CryptProtectData(&input, L"FeatherCast clipboard", nullptr, nullptr,
-                          nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output)) {
-      return std::nullopt;
+                          nullptr, protectionFlags, &output)) {
+      // The offline Windows test account has no user DPAPI master key. Keep
+      // production strictly user-scoped, but let explicitly isolated CTest
+      // fixtures exercise persistence with a machine-scoped temporary key.
+      wchar_t testFallback[2]{};
+      const bool testFallbackEnabled =
+          GetEnvironmentVariableW(L"FEATHERCAST_TEST_DPAPI_FALLBACK",
+                                  testFallback,
+                                  static_cast<DWORD>(std::size(testFallback))) >
+          0;
+      if (!testFallbackEnabled ||
+          !CryptProtectData(&input, L"FeatherCast clipboard", nullptr, nullptr,
+                            nullptr,
+                            protectionFlags | CRYPTPROTECT_LOCAL_MACHINE,
+                            &output)) {
+        return std::nullopt;
+      }
     }
 
     DWORD chars = 0;
@@ -799,13 +815,44 @@ class Storage {
   }
 
   static std::optional<std::wstring> ContentHash(const std::wstring& value) {
+    // CryptHashCertificate is specifically for DER-encoded certificates. It
+    // rejects ordinary clipboard text, which made every first clipboard write
+    // fail before the row could be inserted. Use the CryptoAPI hash provider
+    // for the actual UTF-16 payload instead.
+    if (value.size() > static_cast<size_t>(std::numeric_limits<DWORD>::max()) /
+                          sizeof(wchar_t)) {
+      return std::nullopt;
+    }
+
+    HCRYPTPROV provider = 0;
+    if (!CryptAcquireContextW(&provider, nullptr, MS_ENH_RSA_AES_PROV_W,
+                              PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        !CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES,
+                              CRYPT_VERIFYCONTEXT)) {
+      return std::nullopt;
+    }
+
+    HCRYPTHASH hashHandle = 0;
+    const bool created = CryptCreateHash(provider, CALG_SHA_256, 0, 0,
+                                         &hashHandle) != FALSE;
+    if (!created) {
+      CryptReleaseContext(provider, 0);
+      return std::nullopt;
+    }
+
+    const DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    const bool hashed = CryptHashData(
+        hashHandle, reinterpret_cast<const BYTE*>(value.data()), bytes, 0) !=
+                        FALSE;
     BYTE hash[32]{};
     DWORD size = static_cast<DWORD>(sizeof(hash));
-    if (!CryptHashCertificate(
-            0, CALG_SHA_256, 0,
-            reinterpret_cast<const BYTE*>(value.data()),
-            static_cast<DWORD>(value.size() * sizeof(wchar_t)), hash, &size) ||
-        size != sizeof(hash)) {
+    const bool read = hashed &&
+                      CryptGetHashParam(hashHandle, HP_HASHVAL, hash, &size,
+                                        0) != FALSE &&
+                      size == sizeof(hash);
+    CryptDestroyHash(hashHandle);
+    CryptReleaseContext(provider, 0);
+    if (!read) {
       return std::nullopt;
     }
     static constexpr wchar_t kHex[] = L"0123456789abcdef";

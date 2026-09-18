@@ -1,0 +1,64 @@
+{
+  "product": "FeatherCast",
+  "platform": "windows-native",
+  "renderer": "Win32 + Direct2D + DirectWrite + DirectComposition",
+  "sourceOfTruth": [
+    "native/src/theme.hpp",
+    "native/src/layout_contract.hpp",
+    "native/src/main.cpp"
+  ],
+  "identity": {
+    "tone": "compact, dark, keyboard-first",
+    "surfaceModel": "short-lived native overlay with supporting native windows",
+    "frameworkConstraints": ["no web view", "no Electron", "no Qt", "no Node runtime"]
+  },
+  "color": {
+    "overlayBackground": { "hex": "#101012", "alpha": 0.92 },
+    "settingsBackground": { "hex": "#101012", "alpha": 0.92 },
+    "surface": { "hex": "#18181B", "alpha": 1.0 },
+    "surfaceHover": { "hex": "#FFFFFF", "alpha": 0.12 },
+    "selectedBase": { "hex": "#1C1C21", "alpha": 1.0 },
+    "iconTile": { "hex": "#3B3B47", "alpha": 1.0 },
+    "textPrimary": { "hex": "#F2F2F5", "alpha": 1.0 },
+    "textMuted": { "hex": "#9999A3", "alpha": 1.0 },
+    "textDim": { "hex": "#878793", "alpha": 1.0 },
+    "sectionText": { "hex": "#9EA3BD", "alpha": 1.0 },
+    "danger": { "hex": "#FF5C5C", "alpha": 1.0 },
+    "success": { "hex": "#4DC77A", "alpha": 1.0 },
+    "recording": { "hex": "#F22E33", "alpha": 1.0 },
+    "accentFallback": { "hex": "#5C6BFF", "alpha": 1.0 },
+    "contrast": { "bodyTextMinimum": 4.5, "controlMinimum": 3.0, "measureAfterCompositing": true },
+    "highContrast": "system window/button/highlight/window-text roles"
+  },
+  "typography": {
+    "family": "Segoe UI Variable Text",
+    "roles": {
+      "search": { "size": 18, "weight": "normal", "lineHeight": 25 },
+      "result": { "size": 14, "weight": "medium", "lineHeight": 20 },
+      "subtitle": { "size": 12, "weight": "normal", "lineHeight": 17 },
+      "settingsLabel": { "size": 14, "weight": "semibold", "lineHeight": 20 },
+      "settingsBody": { "size": 13, "weight": "normal", "lineHeight": 18 },
+      "button": { "size": 13, "weight": "semibold", "lineHeight": 18 },
+      "title": { "size": 17, "weight": "semibold", "lineHeight": 23 },
+      "volumeValue": { "size": 28, "weight": "semibold", "lineHeight": 32 }
+    },
+    "supportedScalePercent": [90, 100, 110, 120],
+    "overflow": "DirectWrite ellipsis for compact single-line roles; wrapping for larger blocks"
+  },
+  "radii": { "overlay": 10, "settings": 10, "row": 6, "control": 8 },
+  "geometry": {
+    "contract": "native/src/layout_contract.hpp",
+    "units": "DIP",
+    "dpiConversion": "rounded physical pixels",
+    "cornerHitTest": "HTTRANSPARENT outside Direct2D rounded silhouette",
+    "persistentWindowRegion": false
+  },
+  "accessibility": {
+    "transport": "IAccessible",
+    "recordingControls": ["Pause/Resume", "Stop"],
+    "recordingKeyboard": ["Tab", "Shift+Tab", "Enter", "Space", "Escape"],
+    "recordingFocus": "explicit logical focus for non-activating WS_EX_NOACTIVATE bar",
+    "notifications": ["EVENT_OBJECT_SHOW", "EVENT_OBJECT_HIDE", "EVENT_OBJECT_FOCUS", "EVENT_OBJECT_NAMECHANGE", "EVENT_OBJECT_VALUECHANGE", "EVENT_OBJECT_STATECHANGE"]
+  },
+  "motion": { "interruptible": true, "respectsReducedMotion": true, "respectsHighContrast": true }
+}

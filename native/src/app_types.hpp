@@ -80,6 +80,8 @@ enum class HitType {
   AnimationLevel,
   AccentToggle,
   AccentColor,
+  TextSizeDown,
+  TextSizeUp,
   StartupToggle,
   UpdateChecksToggle,
   ShowWindowsToggle,
