@@ -34,7 +34,7 @@ try {
   $portable = Join-Path $temporaryRoot (
     "feathercast-package-smoke-portable-" + [Guid]::NewGuid().ToString("N"))
   Expand-Archive $zip.FullName $portable -Force
-  foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe")) {
+  foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
     $binary = Get-ChildItem $portable -Recurse -Filter $name | Select-Object -First 1
     if (-not $binary) { throw "$name is missing from the ZIP package." }
     $process = Start-Process $binary.FullName -ArgumentList "--self-test" -PassThru -Wait
@@ -62,7 +62,7 @@ try {
   if (-not ($shortcutCandidates | Where-Object { Test-Path $_ })) {
     throw "The FeatherCast Start menu shortcut is missing."
   }
-  foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe")) {
+  foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
     $binary = Join-Path $installRoot "bin\$name"
     $process = Start-Process $binary -ArgumentList "--self-test" -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "$name installed self-test failed." }

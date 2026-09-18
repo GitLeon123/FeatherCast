@@ -161,6 +161,7 @@ constexpr UINT WM_PREWARM_SURFACES = WM_APP + 22;
 constexpr UINT WM_SHELL_CHANGE = WM_APP + 23;
 constexpr UINT WM_FOREGROUND_CHANGE = WM_APP + 24;
 constexpr UINT WM_APP_WINKEY_TRIGGER = WM_APP + 25;
+constexpr UINT WM_BROKER_STATE_CHANGED = WM_APP + 26;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
 constexpr int HOTKEY_SCREENSHOT_FULLSCREEN = 0x4C45;
@@ -1653,6 +1654,262 @@ struct ClipboardObservation {
 class FeatherCastApp;
 FeatherCastApp* g_app = nullptr;
 
+std::atomic<HHOOK> g_keyboardHook{nullptr};
+std::atomic<HWND> g_mainWindow{nullptr};
+std::atomic<bool> g_winKeyDown{false};
+std::atomic<bool> g_isExclusiveWinShortcut{true};
+
+struct WinKeyState {
+  bool leftDown = false;
+  bool rightDown = false;
+  bool hadOtherKey = false;
+};
+
+static WinKeyState g_win;
+
+std::wstring GetVkName(UINT vk, DWORD scanCode, DWORD flags) {
+  if (vk == VK_LWIN) return L"LWIN";
+  if (vk == VK_RWIN) return L"RWIN";
+  if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return L"SHIFT";
+  if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return L"CTRL";
+  if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return L"ALT";
+  if (vk == VK_TAB) return L"TAB";
+  if (vk == VK_RETURN) return L"ENTER";
+  if (vk == VK_ESCAPE) return L"ESC";
+  if (vk == VK_SPACE) return L"SPACE";
+  if (vk >= 'A' && vk <= 'Z') return std::wstring(1, static_cast<wchar_t>(vk));
+  if (vk >= '0' && vk <= '9') return std::wstring(1, static_cast<wchar_t>(vk));
+  LONG lParam = static_cast<LONG>(scanCode << 16);
+  if (flags & LLKHF_EXTENDED) lParam |= (1 << 24);
+  wchar_t name[64]{};
+  if (GetKeyNameTextW(lParam, name, 64) > 0) {
+    return name;
+  }
+  wchar_t fallback[32]{};
+  swprintf_s(fallback, L"0x%02X", vk);
+  return fallback;
+}
+
+std::mutex g_hookLogMutex;
+void AppendHookLog(const wchar_t* text) {
+  if (!text || !text[0]) return;
+  try {
+    std::lock_guard lock(g_hookLogMutex);
+    wchar_t local[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) return;
+    std::wstring path = std::wstring(local) + L"\\FeatherCast\\hook.log";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
+      fputws(text, f);
+      fclose(f);
+    }
+  } catch (...) {
+  }
+}
+
+void LogHookLifetime(const wchar_t* action, HHOOK hook, DWORD lastError, DWORD tid) {
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  wchar_t buf[512]{};
+  swprintf_s(buf, L"[Hook] Lifetime: %ls | hook=%p | err=%lu | tid=%lu | ts=%02d:%02d:%02d.%03d\n",
+             action, hook, lastError, tid, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+  OutputDebugStringW(buf);
+  AppendHookLog(buf);
+}
+
+void LogWinHookEvent(
+    UINT vk,
+    WPARAM wParam,
+    DWORD flags,
+    DWORD scanCode,
+    bool isUp,
+    HWND fg,
+    const wchar_t* decision) {
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  wchar_t ts[32]{};
+  swprintf_s(ts, L"%02d:%02d:%02d.%03d", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+  DWORD pid = 0;
+  if (fg && IsWindow(fg)) {
+    GetWindowThreadProcessId(fg, &pid);
+  }
+
+  std::wstring procName = L"unknown";
+  if (pid != 0) {
+    const std::wstring fullPath = ProcessPath(pid);
+    if (!fullPath.empty()) {
+      procName = std::filesystem::path(fullPath).filename().wstring();
+    } else {
+      wchar_t title[128]{};
+      if (GetWindowTextW(fg, title, 128) > 0) {
+        procName = title;
+      }
+    }
+  }
+
+  const std::wstring vkName = GetVkName(vk, scanCode, flags);
+  const wchar_t* stateName = isUp ? L"UP  " : L"DOWN";
+  const int injected = (flags & LLKHF_INJECTED) ? 1 : 0;
+  const int lowerIl = (flags & 0x00000002) ? 1 : 0;
+  const DWORD tid = GetCurrentThreadId();
+
+  wchar_t line1[512]{};
+  swprintf_s(line1, L"[Hook] %-5ls %ls   %-15ls   %ls\n",
+             vkName.c_str(), stateName, procName.c_str(), decision);
+
+  wchar_t line2[512]{};
+  swprintf_s(line2,
+             L"[Hook] details: ts=%ls vk=0x%02X sc=0x%02X wp=0x%IX fl=0x%02X "
+             L"LLKHF_UP=%d LLKHF_INJECTED=%d LLKHF_LOWER_IL_INJECTED=%d "
+             L"fg=%p pid=%lu proc=%ls tid=%lu decision=%ls\n",
+             ts, vk, scanCode, wParam, flags,
+             isUp ? 1 : 0, injected, lowerIl,
+             fg, pid, procName.c_str(), tid, decision);
+
+  OutputDebugStringW(line1);
+  OutputDebugStringW(line2);
+  AppendHookLog(line1);
+  AppendHookLog(line2);
+}
+
+void LogDummySend(UINT sent, DWORD err, HWND fg) {
+  DWORD pid = 0;
+  if (fg && IsWindow(fg)) {
+    GetWindowThreadProcessId(fg, &pid);
+  }
+
+  std::wstring procName = L"unknown";
+  if (pid != 0) {
+    const std::wstring fullPath = ProcessPath(pid);
+    if (!fullPath.empty()) {
+      procName = std::filesystem::path(fullPath).filename().wstring();
+    } else {
+      wchar_t title[128]{};
+      if (GetWindowTextW(fg, title, 128) > 0) {
+        procName = title;
+      }
+    }
+  }
+
+  wchar_t buf[512]{};
+  swprintf_s(buf, L"[Hook] DUMMY SendInput=%u err=%lu foreground=%ls\n",
+             sent, err, procName.c_str());
+  OutputDebugStringW(buf);
+  AppendHookLog(buf);
+}
+
+void LogWinHookTrigger() {
+  const wchar_t* msg = L"[Hook] APP TRIGGER\n";
+  OutputDebugStringW(msg);
+  AppendHookLog(msg);
+}
+
+#pragma pack(push, 1)
+struct BrokerRegistration {
+  DWORD pid = 0;
+  std::uint64_t hwnd = 0;
+  DWORD threadId = 0;
+};
+#pragma pack(pop)
+
+std::atomic<bool> g_inputBrokerConnected{false};
+std::atomic<bool> g_stopBrokerClient{false};
+std::atomic<HANDLE> g_brokerClientPipe{INVALID_HANDLE_VALUE};
+std::thread g_brokerClientThread;
+
+void StartInputBrokerClient(HWND hwnd) {
+  g_stopBrokerClient.store(false);
+  g_brokerClientThread = std::thread([hwnd]() {
+    const wchar_t* pipeName = L"\\\\.\\pipe\\FeatherCastInputBroker";
+
+    // If broker pipe is not present, attempt to launch InputBroker.exe elevated
+    if (!WaitNamedPipeW(pipeName, 50)) {
+      wchar_t exePath[MAX_PATH]{};
+      if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+        std::filesystem::path brokerPath =
+            std::filesystem::path(exePath).parent_path() / L"InputBroker.exe";
+        if (std::filesystem::exists(brokerPath)) {
+          SHELLEXECUTEINFOW sei{};
+          sei.cbSize = sizeof(sei);
+          sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+          sei.lpVerb = L"runas";
+          sei.lpFile = brokerPath.c_str();
+          sei.nShow = SW_HIDE;
+          if (ShellExecuteExW(&sei) && sei.hProcess) {
+            CloseHandle(sei.hProcess);
+          }
+        }
+      }
+    }
+
+    while (!g_stopBrokerClient.load()) {
+      HANDLE pipe = CreateFileW(
+          pipeName,
+          GENERIC_READ | GENERIC_WRITE,
+          0,
+          nullptr,
+          OPEN_EXISTING,
+          0,
+          nullptr);
+
+      if (pipe == INVALID_HANDLE_VALUE) {
+        for (int i = 0; i < 20 && !g_stopBrokerClient.load(); ++i) {
+          Sleep(100);
+        }
+        continue;
+      }
+
+      g_brokerClientPipe.store(pipe);
+
+      BrokerRegistration reg{};
+      reg.pid = GetCurrentProcessId();
+      reg.hwnd = reinterpret_cast<std::uint64_t>(hwnd);
+      reg.threadId = GetWindowThreadProcessId(hwnd, nullptr);
+
+      DWORD written = 0;
+      if (WriteFile(pipe, &reg, sizeof(reg), &written, nullptr) && written == sizeof(reg)) {
+        g_inputBrokerConnected.store(true);
+        AppendHookLog(L"[Hook] Connected to elevated InputBroker\n");
+        PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
+
+        while (!g_stopBrokerClient.load()) {
+          DWORD bytesAvail = 0;
+          if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
+            break;
+          }
+          Sleep(200);
+        }
+      }
+
+      g_inputBrokerConnected.store(false);
+      g_brokerClientPipe.store(INVALID_HANDLE_VALUE);
+      CloseHandle(pipe);
+      AppendHookLog(L"[Hook] Disconnected from InputBroker\n");
+      PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
+
+      if (!g_stopBrokerClient.load()) {
+        Sleep(1000);
+      }
+    }
+  });
+}
+
+void StopInputBrokerClient() {
+  g_stopBrokerClient.store(true);
+  HANDLE pipe = g_brokerClientPipe.exchange(INVALID_HANDLE_VALUE);
+  if (pipe != INVALID_HANDLE_VALUE) {
+    const char cmd[] = "SHUTDOWN\n";
+    DWORD written = 0;
+    WriteFile(pipe, cmd, static_cast<DWORD>(sizeof(cmd) - 1), &written, nullptr);
+    CancelIoEx(pipe, nullptr);
+    CloseHandle(pipe);
+  }
+  if (g_brokerClientThread.joinable()) {
+    g_brokerClientThread.join();
+  }
+}
+
 class KeyboardHookThread {
  public:
   KeyboardHookThread() = default;
@@ -1673,19 +1930,29 @@ class KeyboardHookThread {
 
       hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, proc,
                                 GetModuleHandleW(nullptr), 0);
+      const DWORD err = GetLastError();
+      g_keyboardHook.store(hook_, std::memory_order_release);
+      LogHookLifetime(L"SetWindowsHookEx", hook_, err, threadId_);
+
       running_ = (hook_ != nullptr);
       SetEvent(readyEvent);
 
       if (!running_) return;
+
+      LogHookLifetime(L"thread start", hook_, 0, threadId_);
 
       while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
       }
 
+      LogHookLifetime(L"thread stop", hook_, 0, threadId_);
+
       if (hook_) {
+        LogHookLifetime(L"UnhookWindowsHookEx", hook_, 0, threadId_);
         UnhookWindowsHookEx(hook_);
         hook_ = nullptr;
+        g_keyboardHook.store(nullptr, std::memory_order_release);
       }
       running_ = false;
     });
@@ -1705,6 +1972,7 @@ class KeyboardHookThread {
     }
     threadId_ = 0;
     hook_ = nullptr;
+    g_keyboardHook.store(nullptr, std::memory_order_release);
     running_ = false;
   }
 
@@ -1874,6 +2142,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     g_diagnosticsEnabled = settings_.diagnosticsEnabled;
     hadLegacyOperationalData_ = MigrateLegacyOperationalData();
     shortcut_ = ParseShortcut(settings_.shortcut);
+    g_isExclusiveWinShortcut.store(IsExclusiveWinShortcut(shortcut_), std::memory_order_release);
     screenshotFullscreenShortcut_ =
         ParseShortcut(settings_.screenshotFullscreenShortcut);
     screenshotRegionShortcut_ =
@@ -1963,6 +2232,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return 1;
     }
     RegisterShellChangeNotifications();
+    StartInputBrokerClient(hwnd_);
     // Move the cold D2D/DWrite/DirectComposition setup out of the first
     // shortcut reveal. The normal startup path lets the message loop process
     // input between each later operation; --show prewarms before revealing.
@@ -1980,10 +2250,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SetSettingsStatus(StatusSeverity::Error, L"Timers could not be initialized.");
     }
     UpdateClipboardListenerRegistration();
-    if (!CreateTray()) {
-      MessageBoxW(hwnd_, L"FeatherCast could not create its tray icon.",
-                  L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
-    }
+    CreateTray();
     if (!startupSettingsNotice_.empty()) {
       SetSettingsStatus(settingsPersistenceBlocked_ ? StatusSeverity::Error
                                                     : StatusSeverity::Info,
@@ -1998,9 +2265,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     extensions_.Initialize(UserDataPath(), ExeDirectory(), hwnd_, WM_REBUILD_RESULTS);
     extensions_.SetConcurrencyLimit(
         performanceGovernor_.Policy().pluginWorkers);
-    hookThread_.Start(StaticKeyboardProc);
     const bool hotKeyReady = RegisterAllHotKeys();
-    const bool hookReady = hookThread_.IsRunning();
+    const bool hookReady = hookThread_.IsRunning() || g_inputBrokerConnected.load(std::memory_order_relaxed);
     if (!hotKeyReady && !hookReady) {
       MessageBoxW(hwnd_, L"FeatherCast could not register the global shortcut or keyboard hook.",
                   L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
@@ -2158,7 +2424,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool WinShortcutTransitionPending() const {
     return IsExclusiveWinShortcut(shortcut_) &&
-           (hookModifiers_.win || pendingShortcutToggleRequestId_ != 0 ||
+           (g_winKeyDown.load(std::memory_order_relaxed) ||
+            hookModifiers_.win || pendingShortcutToggleRequestId_ != 0 ||
             !shortcutToggleRequests_.empty());
   }
 
@@ -2201,48 +2468,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (recording_) {
       return HandleRecordingKey(vk, down, up);
-    }
-
-    if (IsExclusiveWinShortcut(shortcut_)) {
-      if (nCode == HC_ACTION && (vk == VK_LWIN || vk == VK_RWIN)) {
-        if (down) {
-          HWND fg = GetForegroundWindow();
-          DWORD pid = 0;
-          if (fg) GetWindowThreadProcessId(fg, &pid);
-          const std::wstring proc = pid ? ProcessPath(pid) : L"";
-          wchar_t logBuf[512]{};
-          swprintf_s(logBuf,
-                     L"[Hook] WIN DOWN received (vk=0x%02X, flags=0x%X, injected=%d, extra=0x%llX)\n"
-                     L"[Hook] WIN DOWN swallowed\n"
-                     L"[Hook] foreground hwnd=%p, pid=%lu, process=%ls\n",
-                     vk, kb->flags, (kb->flags & LLKHF_INJECTED) ? 1 : 0,
-                     static_cast<unsigned long long>(kb->dwExtraInfo),
-                     fg, pid, proc.c_str());
-          OutputDebugStringW(logBuf);
-
-          winDown_ = true;
-          return 1;
-        }
-
-        if (up) {
-          wchar_t logBuf[512]{};
-          swprintf_s(logBuf,
-                     L"[Hook] WIN UP received (vk=0x%02X, flags=0x%X, injected=%d, extra=0x%llX)\n"
-                     L"[Hook] WIN UP swallowed\n",
-                     vk, kb->flags, (kb->flags & LLKHF_INJECTED) ? 1 : 0,
-                     static_cast<unsigned long long>(kb->dwExtraInfo));
-          OutputDebugStringW(logBuf);
-
-          if (winDown_) {
-            winDown_ = false;
-            OutputDebugStringW(L"[Hook] trigger posted\n");
-            if (hwnd_) {
-              PostMessageW(hwnd_, WM_APP_WINKEY_TRIGGER, 0, 0);
-            }
-          }
-          return 1;
-        }
-      }
     }
 
     if (down && IsModifier(vk)) SetHookModifier(vk, true);
@@ -3256,7 +3481,100 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   static LRESULT CALLBACK StaticKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    return g_app ? g_app->LowLevelKeyboard(nCode, wParam, lParam) : CallNextHookEx(nullptr, nCode, wParam, lParam);
+    if (nCode < 0) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    if (!k) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+    // Eigene injizierte Events ueber dwExtraInfo == OUR_INPUT_TAG erkennen
+    // und im Hook nicht als Benutzerkombination behandeln.
+    if (k->dwExtraInfo == kOurInputTag) {
+      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
+    // If elevated InputBroker is connected, it handles the global Win-key hook and dummy injection.
+    // Deactivate local Win-key hook logic so two hooks do not run in parallel.
+    if (g_inputBrokerConnected.load(std::memory_order_relaxed)) {
+      if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) {
+        wchar_t buf[128]{};
+        swprintf_s(buf, L"[Hook] Win key %ls in FeatherCast (brokerConnected=1, pass)\n",
+                   (k->flags & LLKHF_UP) ? L"UP" : L"DOWN");
+        AppendHookLog(buf);
+      }
+      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
+    if (!g_isExclusiveWinShortcut.load(std::memory_order_relaxed)) {
+      return g_app ? g_app->LowLevelKeyboard(nCode, wParam, lParam)
+                   : CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
+    const bool isUp = (k->flags & LLKHF_UP) != 0;
+    const UINT vk = k->vkCode;
+    HWND fg = GetForegroundWindow();
+
+    if (vk == VK_LWIN || vk == VK_RWIN) {
+      if (!isUp) {
+        const bool wasAlreadyDown = g_win.leftDown || g_win.rightDown;
+        if (vk == VK_LWIN) g_win.leftDown = true;
+        if (vk == VK_RWIN) g_win.rightDown = true;
+        if (!wasAlreadyDown) g_win.hadOtherKey = false;
+        g_winKeyDown.store(true, std::memory_order_relaxed);
+
+        LogWinHookEvent(vk, wParam, k->flags, k->scanCode, isUp, fg, L"PASS");
+        return CallNextHookEx(nullptr, nCode, wParam, lParam);
+      } else {
+        if (vk == VK_LWIN) g_win.leftDown = false;
+        if (vk == VK_RWIN) g_win.rightDown = false;
+        if (!g_win.leftDown && !g_win.rightDown) {
+          g_winKeyDown.store(false, std::memory_order_relaxed);
+        }
+
+        if (g_win.hadOtherKey) {
+          if (!g_win.leftDown && !g_win.rightDown) {
+            g_win.hadOtherKey = false;
+          }
+          LogWinHookEvent(vk, wParam, k->flags, k->scanCode, isUp, fg, L"COMBO PASS");
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        } else {
+          // Solo Win tap!
+          LogWinHookEvent(vk, wParam, k->flags, k->scanCode, isUp, fg, L"SOLO");
+
+          INPUT dummy{};
+          dummy.type = INPUT_KEYBOARD;
+          dummy.ki.wVk = 0xFF;
+          dummy.ki.dwFlags = KEYEVENTF_KEYUP;
+          dummy.ki.dwExtraInfo = kOurInputTag;
+
+          SetLastError(0);
+          const UINT sent = SendInput(1, &dummy, sizeof(INPUT));
+          const DWORD sendErr = GetLastError();
+
+          LogDummySend(sent, sendErr, fg);
+
+          HWND target = g_mainWindow.load(std::memory_order_relaxed);
+          if (target) {
+            LogWinHookTrigger();
+            PostMessageW(target, WM_APP_WINKEY_TRIGGER, 0, 0);
+          }
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        }
+      }
+    }
+
+    if (g_win.leftDown || g_win.rightDown) {
+      if (vk != VK_LWIN && vk != VK_RWIN) {
+        if (!isUp) {
+          g_win.hadOtherKey = true;
+          LogWinHookEvent(vk, wParam, k->flags, k->scanCode, isUp, fg, L"COMBO PASS");
+        } else {
+          LogWinHookEvent(vk, wParam, k->flags, k->scanCode, isUp, fg, L"PASS");
+        }
+      }
+      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
+    return g_app ? g_app->LowLevelKeyboard(nCode, wParam, lParam)
+                 : CallNextHookEx(nullptr, nCode, wParam, lParam);
   }
 
   LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -3416,7 +3734,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_APP_WINKEY_TRIGGER:
         HandleWinKeyTrigger();
         return 0;
+      case WM_BROKER_STATE_CHANGED:
+        RegisterShortcutHotKey();
+        return 0;
       case WM_DESTROY:
+        StopInputBrokerClient();
+        g_mainWindow.store(nullptr, std::memory_order_release);
         KillTimer(hwnd, TIMER_APP_DISCOVERY_REFRESH);
         UnregisterShellChangeNotifications();
         CancelRenderRetry(hwnd);
@@ -7057,6 +7380,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       this);
 
     if (!hwnd_) return false;
+    g_mainWindow.store(hwnd_, std::memory_order_release);
+    ChangeWindowMessageFilterEx(hwnd_, WM_APP_WINKEY_TRIGGER, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(hwnd_, WM_BROKER_STATE_CHANGED, MSGFLT_ALLOW, nullptr);
     SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, width, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
     if (!CreateBlurWindow(overlayBlurHwnd_, true)) return false;
     // DirectComposition supplies per-pixel alpha over the separate blur window.
@@ -8026,6 +8352,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
     wcscpy_s(nid.szTip, L"FeatherCast");
+    Shell_NotifyIconW(NIM_DELETE, &nid);
     if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
       if (nid.hIcon) DestroyIcon(nid.hIcon);
       return false;
@@ -8049,9 +8376,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void UpdateKeyboardHook() {
-    bool needed = true;
-    needed = needed || recording_ ||
-             ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_);
+    bool needed = false;
+    needed = needed || recording_;
+    if (!g_inputBrokerConnected.load(std::memory_order_relaxed)) {
+      needed = needed || ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_);
+    }
     const auto specs = CaptureShortcutSpecs();
     for (std::size_t i = 0; i < specs.size(); ++i) {
       needed = needed || ShouldHandleInLowLevelHook(*specs[i], captureHotKeyRegistered_[i]);
@@ -8076,7 +8405,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool RegisterShortcutHotKey() {
     UnregisterShortcutHotKey();
+    g_isExclusiveWinShortcut.store(IsExclusiveWinShortcut(shortcut_), std::memory_order_release);
     if (IsExclusiveWinShortcut(shortcut_)) {
+      if (g_inputBrokerConnected.load(std::memory_order_relaxed)) {
+        UpdateKeyboardHook();
+        return true;
+      }
       return InstallHook();
     }
     if (!shortcut_.valid) { UpdateKeyboardHook(); return true; }
@@ -8099,7 +8433,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool CanActivateShortcut(const ShortcutSpec& candidate) const {
     if (candidate.display.empty() || candidate.display == L"none") return true;
     if (IsExclusiveWinShortcut(candidate)) {
-      return hookThread_.IsRunning();
+      return g_inputBrokerConnected.load(std::memory_order_relaxed) || hookThread_.IsRunning();
     }
     const auto hotKey = ToHotKeySpec(candidate);
     if (!hotKey.supported) return hookThread_.IsRunning();
@@ -19475,7 +19809,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   NOTIFYICONDATAW tray_{};
   KeyboardHookThread hookThread_;
   bool hotKeyRegistered_ = false;
-  bool winDown_ = false;
   bool clipboardListenerRegistered_ = false;
   bool hadLegacyOperationalData_ = false;
   UINT taskbarCreatedMessage_ = 0;

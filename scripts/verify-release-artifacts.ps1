@@ -89,7 +89,7 @@ function Test-PackageContents(
       throw "The MSIX package does not contain AppxManifest.xml."
     }
 
-    foreach ($name in @('FeatherCast.exe', 'FeatherCastPluginHost.exe')) {
+    foreach ($name in @('FeatherCast.exe', 'FeatherCastPluginHost.exe', 'InputBroker.exe')) {
       $binary = Get-ChildItem -LiteralPath $temporaryRoot -Recurse -File |
         Where-Object Name -eq $name | Select-Object -First 1
       if (-not $binary) { throw "$Label does not contain $name." }

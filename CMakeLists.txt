@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.10.0 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.10.1 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -122,6 +122,11 @@ add_executable(FeatherCastPluginHost
   native/src/plugin_host.cpp
 )
 
+add_executable(InputBroker WIN32
+  native/src/input_broker.cpp
+  native/broker.manifest
+)
+
 target_compile_definitions(FeatherCast PRIVATE
   UNICODE
   _UNICODE
@@ -139,6 +144,19 @@ target_compile_definitions(FeatherCastPluginHost PRIVATE
 )
 
 target_include_directories(FeatherCastPluginHost PRIVATE native/src)
+
+target_compile_definitions(InputBroker PRIVATE
+  UNICODE
+  _UNICODE
+  NOMINMAX
+  WIN32_LEAN_AND_MEAN
+)
+
+target_include_directories(InputBroker PRIVATE native/src)
+target_link_libraries(InputBroker PRIVATE advapi32 user32)
+if(MSVC)
+  target_link_options(InputBroker PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
+endif()
 
 target_link_libraries(FeatherCast PRIVATE
   FeatherCastRuntime
@@ -337,6 +355,7 @@ if(MSVC)
 endif()
 
 feathercast_apply_project_warnings(FeatherCast)
+feathercast_apply_project_warnings(InputBroker)
 feathercast_apply_project_warnings(FeatherCastPluginHost)
 feathercast_apply_project_warnings(FeatherCastCoreTests)
 feathercast_apply_project_warnings(FeatherCastPluginHostTests)
@@ -442,7 +461,7 @@ set_tests_properties(
   PROPERTIES ENVIRONMENT "FEATHERCAST_TEST_DPAPI_FALLBACK=1"
 )
 
-install(TARGETS FeatherCast FeatherCastPluginHost RUNTIME DESTINATION bin)
+install(TARGETS FeatherCast FeatherCastPluginHost InputBroker RUNTIME DESTINATION bin)
 
 set(CPACK_PACKAGE_NAME "FeatherCast")
 set(CPACK_PACKAGE_VENDOR "Leon")

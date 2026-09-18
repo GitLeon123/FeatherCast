@@ -67,7 +67,8 @@ jobs:
           if (-not $dumpbin) { throw "Unable to locate dumpbin.exe." }
           foreach ($file in @(
             "build-native\Release\FeatherCast.exe",
-            "build-native\Release\FeatherCastPluginHost.exe"
+            "build-native\Release\FeatherCastPluginHost.exe",
+            "build-native\Release\InputBroker.exe"
           )) {
             $dependencies = & $dumpbin.FullName /dependents $file | Out-String
             if ($dependencies -match '(?im)^\s+(MSVCP|VCRUNTIME)[^\s]*\.dll\s*$') {
@@ -76,6 +77,7 @@ jobs:
           }
           Invoke-SelfTest 'build-native\Release\FeatherCast.exe' 'FeatherCast'
           Invoke-SelfTest 'build-native\Release\FeatherCastPluginHost.exe' 'Plugin host'
+          Invoke-SelfTest 'build-native\Release\InputBroker.exe' 'Input broker'
 
       - name: Install NSIS for PR and nightly package smoke
         if: github.event_name == 'pull_request' || github.event_name == 'schedule'
@@ -145,7 +147,8 @@ jobs:
           $certificate = "$env:RUNNER_TEMP\feathercast-signing.pfx"
           foreach ($file in @(
             "build-native\Release\FeatherCast.exe",
-            "build-native\Release\FeatherCastPluginHost.exe"
+            "build-native\Release\FeatherCastPluginHost.exe",
+            "build-native\Release\InputBroker.exe"
           )) {
             signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
               /f $certificate /p $env:CERTIFICATE_PASSWORD $file
@@ -164,7 +167,8 @@ jobs:
             Where-Object { $_ })
           foreach ($file in @(
             "build-native\Release\FeatherCast.exe",
-            "build-native\Release\FeatherCastPluginHost.exe"
+            "build-native\Release\FeatherCastPluginHost.exe",
+            "build-native\Release\InputBroker.exe"
           )) {
             $signature = Get-AuthenticodeSignature $file
             if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) {
@@ -194,6 +198,7 @@ jobs:
           path: |
             build-native/Release/FeatherCast.pdb
             build-native/Release/FeatherCastPluginHost.pdb
+            build-native/Release/InputBroker.pdb
 
       - name: Install NSIS
         if: startsWith(github.ref, 'refs/tags/v')
@@ -369,6 +374,9 @@ jobs:
           $pluginHost = Join-Path $installRoot 'bin\FeatherCastPluginHost.exe'
           if (-not (Test-Path $pluginHost)) { throw "Installed plugin host was not found." }
           Invoke-SelfTest $pluginHost 'Installed plugin host'
+          $broker = Join-Path $installRoot 'bin\InputBroker.exe'
+          if (-not (Test-Path $broker)) { throw "Installed input broker was not found." }
+          Invoke-SelfTest $broker 'Installed input broker'
 
           $zip = Get-ChildItem FeatherCast-*-win64.zip | Select-Object -First 1
           $portableRoot = Join-Path $env:RUNNER_TEMP 'portable-release'
@@ -377,11 +385,14 @@ jobs:
             Select-Object -First 1
           $portableHost = Get-ChildItem $portableRoot -Recurse -Filter FeatherCastPluginHost.exe |
             Select-Object -First 1
-          if (-not $portableApp -or -not $portableHost) {
+          $portableBroker = Get-ChildItem $portableRoot -Recurse -Filter InputBroker.exe |
+            Select-Object -First 1
+          if (-not $portableApp -or -not $portableHost -or -not $portableBroker) {
             throw "Portable release binaries were not found."
           }
           Invoke-SelfTest $portableApp.FullName 'Portable FeatherCast'
           Invoke-SelfTest $portableHost.FullName 'Portable plugin host'
+          Invoke-SelfTest $portableBroker.FullName 'Portable input broker'
 
           $uninstallRoots = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',

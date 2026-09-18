@@ -48,12 +48,12 @@ content, updates, and optional background features.
 - Settings, snippets, themes, plugins, recent usage, and privacy choices persist
   locally under the user's Windows profile. Clipboard history and file/content
   indexing are explicit opt-in features; sensitive local data is protected where
-  applicable and is not sent to an AI service.
+  applicable and is not sent to external cloud services.
 - The app is Windows-only and must remain a native C++/Win32 application using
   native Windows interaction and rendering APIs. Do not add Electron, WebView,
   Qt, or a Node runtime without explicit approval.
-- The product has no accounts, AI chat, AI provider settings, or network AI
-  calls. Do not reintroduce them unless explicitly requested.
+- The product has no mandatory user accounts or external network services. Do
+  not reintroduce them unless explicitly requested.
 - The experience is keyboard-first but must remain usable with pointer input,
   Narrator/UI Automation, High Contrast, reduced-motion settings, IME input,
   and 100%, 150%, and 200% display scaling across supported Windows displays.
@@ -69,7 +69,7 @@ content, updates, and optional background features.
 - Product name: FeatherCast.
 - The experience should feel clean, premium, quick, and unobtrusive.
 - The product's credibility rests on low resource use, native Windows behavior,
-  and responsive interaction rather than account-based or AI functionality.
+  and responsive interaction rather than heavy cloud-reliant features.
 - UI text and comments remain in English.
 
 ## Evidence on Hand
