@@ -32,8 +32,9 @@ inline std::int64_t DisplayFramePeriodQpc(std::int64_t qpcFrequency,
       1, (qpcFrequency + refresh / 2) / refresh);
 }
 
-// Keeps one future deadline per display frame. A late frame is re-anchored to
-// the next period instead of catching up with a burst of immediate wakeups.
+// Keeps one future deadline per display frame. Timer wake-up latency does not
+// accumulate into every following frame, while genuinely missed frames are
+// skipped instead of being replayed in a burst.
 class DisplayFrameClock {
  public:
   void Start(std::int64_t now, std::int64_t period) {
@@ -52,11 +53,10 @@ class DisplayFrameClock {
 
   void Advance(std::int64_t now) {
     if (!Active()) return;
-    if (nextDeadline_ <= now) {
-      nextDeadline_ = now + period_;
-    } else {
-      nextDeadline_ += period_;
-    }
+    const std::int64_t elapsed = std::max<std::int64_t>(
+        0, now - nextDeadline_);
+    const std::int64_t periods = elapsed / period_ + 1;
+    nextDeadline_ += periods * period_;
   }
 
  private:

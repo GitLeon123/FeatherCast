@@ -54,3 +54,7 @@ cpack --config build-native/CPackConfig.cmake -C Release -B build-native/package
 - Keep the app Windows-native; do not add Electron, WebView, Qt, or Node runtime dependencies without explicit approval.
 - Regenerate app icons through `scripts/gen-icons.ps1`; do not hand-edit generated icon files.
 - After making app changes, always rebuild and restart FeatherCast with the newest successful build so the user can test the changes immediately.
+
+## User Reminder
+
+- When a future task is completed, remind the user that they planned to implement phone connectivity for FeatherCast.

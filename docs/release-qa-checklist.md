@@ -88,9 +88,11 @@ Confirm that:
 
 The accessibility smoke test covers the stable Search, Status, Result, and
 Preview child numbering; hidden/loading/empty/error/preview status projection;
-accessible names, values, descriptions, roles, states, and default actions;
-focus and selection forwarding; hit testing; navigation; and default-action
-invocation.
+accessible names, values, descriptions, roles, states, keyboard shortcuts, and
+default actions; focus and selection forwarding; hit testing; navigation; and
+default-action invocation. It also exercises the native UI Automation bridge,
+control-type and accelerator properties, and Invoke, Value, RangeValue, Toggle,
+and SelectionItem pattern routing.
 
 The test source is `native/tests/accessibility_smoke_tests.cpp`. It must be
 registered as a normal 30-second CTest target and linked with the Windows

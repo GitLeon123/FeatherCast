@@ -3,6 +3,7 @@
 #include "app_types.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 
 namespace feathercast::layout {
@@ -22,6 +23,16 @@ inline feathercast::app::RectF Inflate(feathercast::app::RectF rect,
   rect.top -= vertical;
   rect.bottom += vertical;
   return rect;
+}
+
+inline float TextScale(int textSizePercent) noexcept {
+  return std::clamp(static_cast<float>(textSizePercent) / 100.0f, 0.9f, 2.0f);
+}
+
+inline float GrowForText(float base, float growthAt200Percent,
+                         int textSizePercent) noexcept {
+  return base + growthAt200Percent *
+                    std::max(0.0f, TextScale(textSizePercent) - 1.0f);
 }
 
 inline bool Contains(const feathercast::app::RectF& rect, float x,
@@ -54,15 +65,24 @@ struct RecordingLayout {
   feathercast::app::RectF stop;
 };
 
+inline float RecordingPanelWidth(int textSizePercent = 100) noexcept {
+  return GrowForText(360.0f, 120.0f, textSizePercent);
+}
+
+inline float RecordingPanelHeight(int textSizePercent = 100) noexcept {
+  return GrowForText(64.0f, 8.0f, textSizePercent);
+}
+
 inline RecordingLayout RecordingControls(float width = 360.0f,
-                                         float height = 64.0f) {
+                                         float height = 64.0f,
+                                         int textSizePercent = 100) {
   width = std::max(1.0f, width);
   height = std::max(1.0f, height);
   constexpr float rightInset = 12.0f;
   constexpr float gap = 8.0f;
-  constexpr float pauseWidth = 80.0f;
-  constexpr float stopWidth = 76.0f;
-  constexpr float buttonHeight = 40.0f;
+  const float pauseWidth = GrowForText(80.0f, 40.0f, textSizePercent);
+  const float stopWidth = GrowForText(76.0f, 20.0f, textSizePercent);
+  const float buttonHeight = GrowForText(44.0f, 4.0f, textSizePercent);
   const float right = std::max(1.0f, width - rightInset);
   const float stopLeft = std::max(0.0f, right - stopWidth);
   const float pauseRight = std::max(0.0f, stopLeft - gap);
@@ -76,18 +96,50 @@ inline RecordingLayout RecordingControls(float width = 360.0f,
 }
 
 struct VolumeLayout {
+  float panelHeight = 210.0f;
+  feathercast::app::RectF title;
+  feathercast::app::RectF output;
+  feathercast::app::RectF value;
   feathercast::app::RectF track;
   feathercast::app::RectF trackHit;
   feathercast::app::RectF mute;
   feathercast::app::RectF muteHit;
+  feathercast::app::RectF footer;
 };
 
-inline VolumeLayout VolumeControl(float width) {
+inline VolumeLayout VolumeControl(float width, int textSizePercent = 100) {
   width = std::max(56.0f, width);
-  const feathercast::app::RectF track{28.0f, 82.0f,
-                                      std::max(29.0f, width - 28.0f), 94.0f};
-  const feathercast::app::RectF mute{24.0f, 112.0f, 128.0f, 148.0f};
-  return {track, Inflate(track, 4.0f, 16.0f), mute, Inflate(mute, 4.0f, 4.0f)};
+  const float scale = TextScale(textSizePercent);
+  const float titleHeight = std::max(28.0f, 23.0f * scale);
+  const float outputHeight = std::max(22.0f, 18.0f * scale);
+  const feathercast::app::RectF title{24.0f, 18.0f, width - 150.0f,
+                                      18.0f + titleHeight};
+  const feathercast::app::RectF output{24.0f, title.bottom + 2.0f,
+                                       width - 150.0f,
+                                       title.bottom + 2.0f + outputHeight};
+  const float valueHeight = std::max(42.0f, 32.0f * scale);
+  const feathercast::app::RectF value{width - 145.0f, 10.0f,
+                                      width - 24.0f, 10.0f + valueHeight};
+  const float trackTop = output.bottom + 12.0f;
+  const feathercast::app::RectF track{28.0f, trackTop,
+                                      std::max(29.0f, width - 28.0f),
+                                      trackTop + 12.0f};
+  const float muteHeight = GrowForText(36.0f, 8.0f, textSizePercent);
+  const feathercast::app::RectF mute{24.0f, track.bottom + 18.0f,
+                                     128.0f, track.bottom + 18.0f + muteHeight};
+  const float footerHeight = std::max(22.0f, 18.0f * scale);
+  const feathercast::app::RectF footer{24.0f, mute.bottom + 22.0f,
+                                       width - 24.0f,
+                                       mute.bottom + 22.0f + footerHeight};
+  return {footer.bottom + 18.0f,
+          title,
+          output,
+          value,
+          track,
+          Inflate(track, 4.0f, 16.0f),
+          mute,
+          Inflate(mute, 4.0f, 4.0f),
+          footer};
 }
 
 inline feathercast::app::RectF LauncherSearch(float width) {
@@ -101,18 +153,63 @@ struct LauncherLayout {
   feathercast::app::RectF settings;
 };
 
-inline LauncherLayout Launcher(float width, bool compactHintVisible) {
+struct TextLayoutMetrics {
+  float scale = 1.0f;
+  float launcherHeaderHeight = 60.0f;
+  float sectionHeaderHeight = 26.0f;
+  float resultRowHeight = 50.0f;
+  float resultRowGap = 2.0f;
+  float settingsRowHeight = 60.0f;
+
+  float ResultRowStride() const noexcept {
+    return resultRowHeight + resultRowGap;
+  }
+};
+
+inline TextLayoutMetrics TextMetrics(int textSizePercent) noexcept {
+  const float scale = TextScale(textSizePercent);
+  const float growth = std::max(0.0f, scale - 1.0f);
+  return {scale,
+          60.0f + 24.0f * growth,
+          26.0f + 14.0f * growth,
+          50.0f + 34.0f * growth,
+          2.0f,
+          60.0f + 20.0f * growth};
+}
+
+inline float SettingsCategoryRowHeight(float availableHeight,
+                                       std::size_t categoryCount) noexcept {
+  if (categoryCount == 0) return 44.0f;
+  return std::clamp(availableHeight / static_cast<float>(categoryCount),
+                    24.0f, 44.0f);
+}
+
+inline float SettingsCategoryTargetHeight(float rowHeight) noexcept {
+  return std::max(24.0f, rowHeight - 6.0f);
+}
+
+inline LauncherLayout Launcher(float width, bool compactHintVisible,
+                               int textSizePercent = 100) {
   width = std::max(1.0f, width);
-  const auto searchHit = LauncherSearch(width);
+  const auto metrics = TextMetrics(textSizePercent);
+  const auto searchHit = feathercast::app::RectF{
+      0.0f, 0.0f, std::max(1.0f, width - 60.0f),
+      metrics.launcherHeaderHeight};
   const float hintLeft = width - 360.0f;
   const float inputRight = compactHintVisible ? hintLeft - 12.0f
                                                : width - 94.0f;
+  const float settingsTop =
+      (metrics.launcherHeaderHeight - 44.0f) * 0.5f;
   return {searchHit,
-          {52.0f, 15.0f, std::max(53.0f, inputRight), 48.0f},
-          {width - 52.0f, 14.0f, width - 16.0f, 50.0f}};
+          {52.0f, 12.0f, std::max(53.0f, inputRight),
+           metrics.launcherHeaderHeight - 10.0f},
+          {width - 56.0f, settingsTop, width - 12.0f,
+           settingsTop + 44.0f}};
 }
 
-inline constexpr float LauncherResultsTop() noexcept { return 60.0f; }
+inline float LauncherResultsTop(int textSizePercent = 100) noexcept {
+  return TextMetrics(textSizePercent).launcherHeaderHeight;
+}
 
 inline feathercast::app::RectF SettingsFilter(float width) {
   width = std::max(1.0f, width);
@@ -124,8 +221,8 @@ inline feathercast::app::RectF SettingsFilter(float width) {
 
 inline feathercast::app::RectF SettingsClose(float width) {
   width = std::max(1.0f, width);
-  return {std::max(0.0f, width - 46.0f), 12.0f,
-          std::max(1.0f, width - 14.0f), 44.0f};
+  return {std::max(0.0f, width - 52.0f), 6.0f,
+          std::max(1.0f, width - 8.0f), 50.0f};
 }
 
 }  // namespace feathercast::layout

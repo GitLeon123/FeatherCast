@@ -52,7 +52,7 @@ DirectWrite uses `Segoe UI Variable Text` by default with a compact role ramp:
 - Titles: 17 px semibold
 - Volume value: 28 px semibold
 
-The supported FeatherCast text-size preference is 90%, 100%, 110%, or 120%.
+The supported FeatherCast text-size preference ranges from 90% to 200% in 10% steps.
 It scales DirectWrite role sizes and leading, then uses native DirectWrite
 single-line ellipsis trimming for compact controls. Larger blocks wrap. Layout
 rows and scroll ranges are recalculated after the preference changes.

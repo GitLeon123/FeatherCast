@@ -211,8 +211,18 @@ int main() {
 
     clock.Advance(100 + period60);
     assert(clock.NextDeadline() == 100 + 2 * period60);
-    clock.Advance(100 + 3 * period60 + 5);
-    assert(clock.NextDeadline() == 100 + 3 * period60 + 5 + period60);
+    clock.Advance(100 + 2 * period60 + 5);
+    assert(clock.NextDeadline() == 100 + 3 * period60);
+    clock.Advance(100 + 5 * period60 + 5);
+    assert(clock.NextDeadline() == 100 + 6 * period60);
+
+    // Small, normal timer lateness must not compound into a frame rate below
+    // the display cadence.
+    clock.Start(0, period120);
+    for (int frame = 1; frame <= 120; ++frame) {
+      clock.Advance(clock.NextDeadline() + 1'000);
+    }
+    assert(clock.NextDeadline() == 121 * period120);
 
     clock.Reset();
     assert(!clock.Active());

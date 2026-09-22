@@ -241,9 +241,11 @@ inline const wchar_t* ToolbarActionLabel(ToolbarAction action) noexcept {
   return L"";
 }
 
-inline ToolbarLayout BuildToolbarLayout(float width, float height) {
+inline ToolbarLayout BuildToolbarLayout(float width, float height,
+                                        float textScale = 1.0f) {
   width = std::max(0.0f, width);
   height = std::max(0.0f, height);
+  textScale = std::clamp(textScale, 0.9f, 2.0f);
   const bool compact = width < 920.0f;
   const float outer = std::min(8.0f, width * 0.5f);
   const float left = outer;
@@ -253,7 +255,8 @@ inline ToolbarLayout BuildToolbarLayout(float width, float height) {
   const float innerRight = std::max(innerLeft, right - inset);
   const float available = std::max(0.0f, innerRight - innerLeft);
   constexpr float gap = 4.0f;
-  constexpr float rowHeight = 32.0f;
+  const float rowHeight = std::max(32.0f, 18.0f * textScale + 12.0f);
+  const float widthScale = 1.0f + 0.65f * std::max(0.0f, textScale - 1.0f);
 
   constexpr std::array<ToolbarAction, 21> actions = {
       ToolbarAction::Select,       ToolbarAction::Rectangle,
@@ -273,8 +276,9 @@ inline ToolbarLayout BuildToolbarLayout(float width, float height) {
   float x = innerLeft;
   float y = 0.0f;
   for (const ToolbarAction action : actions) {
-    const float preferred = std::min(ToolbarPreferredWidth(action, compact),
-                                     available);
+    const float preferred =
+        std::min(ToolbarPreferredWidth(action, compact) * widthScale,
+                 available);
     const float buttonWidth = std::min(preferred, available);
     if (x > innerLeft && x + buttonWidth > innerRight) {
       x = innerLeft;

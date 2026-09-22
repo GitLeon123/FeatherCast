@@ -623,6 +623,8 @@ int main() {
     assert(recording.pause.right == 264.0f);
     assert(recording.stop.left == 272.0f);
     assert(recording.stop.right == 348.0f);
+    assert(recording.pause.bottom - recording.pause.top >= 44.0f);
+    assert(recording.stop.bottom - recording.stop.top >= 44.0f);
     assert(feathercast::layout::Contains(recording.pause, 200.0f, 20.0f));
     assert(!feathercast::layout::Contains(recording.pause, 264.0f, 20.0f));
     assert(!feathercast::layout::ContainsRounded(recording.panel, 0.0f, 0.0f,
@@ -634,6 +636,22 @@ int main() {
     assert(feathercast::layout::Contains(volume.trackHit, 24.0f, 66.0f));
     const auto filter = feathercast::layout::SettingsFilter(760.0f);
     assert(filter.left < filter.right);
+    const auto launcher = feathercast::layout::Launcher(760.0f, false);
+    assert(launcher.settings.right - launcher.settings.left >= 44.0f);
+    assert(launcher.settings.bottom - launcher.settings.top >= 44.0f);
+    const auto close = feathercast::layout::SettingsClose(760.0f);
+    assert(close.right - close.left >= 44.0f);
+    assert(close.bottom - close.top >= 44.0f);
+    const auto defaultText = feathercast::layout::TextMetrics(100);
+    const auto largeText = feathercast::layout::TextMetrics(200);
+    assert(defaultText.launcherHeaderHeight == 60.0f);
+    assert(defaultText.resultRowHeight == 50.0f);
+    assert(largeText.launcherHeaderHeight == 84.0f);
+    assert(largeText.sectionHeaderHeight == 40.0f);
+    assert(largeText.resultRowHeight == 84.0f);
+    assert(largeText.settingsRowHeight == 80.0f);
+    assert(feathercast::settings::ClampTextSizePercent(250) == 200);
+    assert(feathercast::settings::StepTextSizePercent(190, 1) == 200);
     assert(feathercast::layout::DipToPixelsRounded(10.0f, 1.5f) == 15);
   }
 

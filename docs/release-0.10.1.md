@@ -18,3 +18,15 @@
 ## Release Notes
 
 This release includes both the standard NSIS installer (`FeatherCast-0.10.1-win64.exe`) and the standalone portable package (`FeatherCast-0.10.1-win64.zip`), along with their respective SHA-256 checksum sidecars. If repository signing is not configured, the generated binaries are unsigned and intended for manual installation.
+
+## Local verification
+
+- 2026-09-22: Release build completed and all 21 CTest targets passed on Windows.
+- Accessibility coverage includes MSAA plus the native UI Automation bridge and
+  Invoke, Value, RangeValue, Toggle, and SelectionItem provider patterns.
+- Text scaling and layout contracts are covered through 200%, including the
+  44-DIP minimum targets for launcher settings, settings close, and recording
+  controls.
+- The manual Windows gates in `docs/release-qa-checklist.md` remain required on
+  the packaged release candidate; this source-tree verification does not claim
+  Narrator, Accessibility Insights, signing, or installer results.

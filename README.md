@@ -117,7 +117,7 @@ Unlike launchers wrapped in Electron or web runtimes that consume hundreds of me
 
 ### ♿ Accessibility, Typography & Theming
 - **WCAG AA Contrast Guarantee**: Fully contrast-normalized Direct2D palette guaranteeing 4.5:1 contrast for body text and 3.0:1 for interactive badges and controls.
-- **Custom Typography Scaling**: Adjust font sizing (`90%`, `100%`, `110%`, `120%`) with live DirectWrite layout recalculation.
+- **Custom Typography Scaling**: Adjust font sizing from `90%` to `200%` in 10% steps with live DirectWrite layout recalculation.
 - **Native Windows Accommodations**: Full support for Windows High Contrast mode, UI Automation / Narrator screen readers, Windows accent color synchronization, custom color overrides, and reduced-motion preferences.
 
 ### 🧩 Native Plugin Architecture

@@ -24,7 +24,7 @@ namespace feathercast::settings {
 
 inline constexpr int kCurrentSettingsSchemaVersion = 3;
 inline constexpr int kMinimumTextSizePercent = 90;
-inline constexpr int kMaximumTextSizePercent = 120;
+inline constexpr int kMaximumTextSizePercent = 200;
 inline constexpr int kTextSizeStepPercent = 10;
 
 inline constexpr int ClampTextSizePercent(int value) {

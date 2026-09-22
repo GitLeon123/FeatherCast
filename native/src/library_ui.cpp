@@ -419,8 +419,8 @@ class EditorWindow {
     const bool staticControl = message == WM_CTLCOLORSTATIC;
     const bool statusControl = control == status_;
     const COLORREF text = statusControl && statusError_
-                              ? (highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
-                                               : ColorRefFromTheme(theme_.danger))
+                              ? (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                                               : ColorRefFromTheme(theme_.dangerText))
                               : (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
                                                : ColorRefFromTheme(theme_.textPrimary));
     SetTextColor(dc, text);
@@ -934,8 +934,8 @@ class ManagerWindow {
     const bool staticControl = message == WM_CTLCOLORSTATIC;
     const bool statusControl = control == status_;
     const COLORREF text = statusControl && operationStatusError_
-                              ? (highContrast_ ? GetSysColor(COLOR_HIGHLIGHT)
-                                               : ColorRefFromTheme(theme_.danger))
+                              ? (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
+                                               : ColorRefFromTheme(theme_.dangerText))
                               : (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
                                                : ColorRefFromTheme(theme_.textPrimary));
     SetTextColor(dc, text);

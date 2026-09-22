@@ -41,6 +41,7 @@ struct Theme {
   Color textDim{0.53f, 0.53f, 0.58f, 1.0f};
   Color sectionText{0.62f, 0.64f, 0.74f, 1.0f};
   Color danger{1.0f, 0.36f, 0.36f, 1.0f};
+  Color dangerText{1.0f, 0.36f, 0.36f, 1.0f};
   Color success{0.30f, 0.78f, 0.48f, 1.0f};
   Color recording{0.95f, 0.18f, 0.20f, 1.0f};
   Color accentFallback{0.36f, 0.42f, 1.0f, 1.0f};
@@ -211,6 +212,7 @@ inline Theme NormalizeTheme(Theme theme) {
   theme.textDim = ClampColor(theme.textDim);
   theme.sectionText = ClampColor(theme.sectionText);
   theme.danger = ClampColor(theme.danger);
+  theme.dangerText = ClampColor(theme.dangerText);
   theme.success = ClampColor(theme.success);
   theme.recording = ClampColor(theme.recording);
   theme.accentFallback = ClampColor(theme.accentFallback);
@@ -220,6 +222,8 @@ inline Theme NormalizeTheme(Theme theme) {
   theme.textMuted = EnsureContrastOnSurfaces(theme.textMuted, surfaces, 4.5f);
   theme.textDim = EnsureContrastOnSurfaces(theme.textDim, surfaces, 4.5f);
   theme.sectionText = EnsureContrastOnSurfaces(theme.sectionText, surfaces, 4.5f);
+  theme.dangerText =
+      EnsureContrastOnSurfaces(theme.dangerText, surfaces, 4.5f);
 
   // Status colors and the accent are used as control fills, focus rings, and
   // icon treatments. Three-to-one is the appropriate non-body-text floor.
@@ -254,6 +258,7 @@ inline Theme HighContrastTheme(Theme theme, Color window, Color button,
   theme.textDim = windowText;
   theme.sectionText = windowText;
   theme.danger = highlight;
+  theme.dangerText = windowText;
   theme.success = highlight;
   theme.recording = highlight;
   theme.accentFallback = highlight;
@@ -323,6 +328,8 @@ inline Theme ParseThemeJson(const std::string& json, const Theme& defaults = The
   ApplyColor(json, "textDim", theme.textDim);
   ApplyColor(json, "sectionText", theme.sectionText);
   ApplyColor(json, "danger", theme.danger);
+  theme.dangerText = theme.danger;
+  ApplyColor(json, "dangerText", theme.dangerText);
   ApplyColor(json, "success", theme.success);
   ApplyColor(json, "recording", theme.recording);
   ApplyColor(json, "accentFallback", theme.accentFallback);
@@ -373,6 +380,7 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
       "  \"textDim\": \"#878793\",\n"
       "  \"sectionText\": \"#9EA3BD\",\n"
       "  \"danger\": \"#FF5C5C\",\n"
+      "  \"dangerText\": \"#FF5C5C\",\n"
       "  \"success\": \"#4DC77A\",\n"
       "  \"recording\": \"#F22E33\",\n"
       "  \"accentFallback\": \"#5B6CFF\",\n"

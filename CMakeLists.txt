@@ -109,7 +109,7 @@ target_compile_definitions(FeatherCastUi PUBLIC
   NOMINMAX
   WIN32_LEAN_AND_MEAN
 )
-target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime d2d1 oleacc uuid)
+target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime d2d1 oleacc uiautomationcore uuid)
 
 add_executable(FeatherCast WIN32
   native/src/main.cpp
@@ -388,7 +388,7 @@ add_executable(FeatherCastAccessibilitySmokeTests
 )
 target_include_directories(FeatherCastAccessibilitySmokeTests PRIVATE native/src)
 target_compile_definitions(FeatherCastAccessibilitySmokeTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(FeatherCastAccessibilitySmokeTests PRIVATE oleacc oleaut32 user32 uuid)
+target_link_libraries(FeatherCastAccessibilitySmokeTests PRIVATE oleacc oleaut32 uiautomationcore user32 uuid)
 feathercast_apply_project_warnings(FeatherCastAccessibilitySmokeTests)
 
 enable_testing()

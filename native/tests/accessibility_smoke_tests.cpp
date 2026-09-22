@@ -68,11 +68,17 @@ class TestModel final : public feathercast::accessibility::Model {
     return S_OK;
   }
 
+  HRESULT AccessibleSetRangeValue(HWND, int child, double value) override {
+    rangeRequests.emplace_back(child, value);
+    return S_OK;
+  }
+
   std::vector<Item> items;
   int focusedChild = feathercast::accessibility_projection::SearchChild();
   std::vector<int> focusRequests;
   std::vector<int> invokeRequests;
   std::vector<std::pair<int, std::wstring>> valueRequests;
+  std::vector<std::pair<int, double>> rangeRequests;
 };
 
 void VerifyLiveStatusProjection() {
@@ -179,6 +185,7 @@ void VerifyAccessibleModelTransport() {
   settings.name = L"Open settings";
   settings.description = L"Open FeatherCast settings. Keyboard shortcut Ctrl+,";
   settings.defaultAction = L"Open settings";
+  settings.keyboardShortcut = L"Ctrl+,";
   settings.role = ROLE_SYSTEM_PUSHBUTTON;
   settings.state = STATE_SYSTEM_FOCUSABLE;
   settings.screenRect = RECT{320, 10, 355, 45};
@@ -251,6 +258,72 @@ void VerifyAccessibleModelTransport() {
   assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_PUSHBUTTON);
   assert(accessible->get_accDefaultAction(Child(SettingsChild()), &text) == S_OK);
   assert(TakeString(text) == L"Open settings");
+  assert(accessible->get_accKeyboardShortcut(Child(SettingsChild()), &text) ==
+         S_OK);
+  assert(TakeString(text) == L"Ctrl+,");
+
+  IServiceProvider* services = nullptr;
+  assert(accessible->QueryInterface(IID_IServiceProvider,
+                                    reinterpret_cast<void**>(&services)) ==
+         S_OK);
+  IAccessibleEx* rootBridge = nullptr;
+  assert(services->QueryService(IID_IAccessibleEx, IID_IAccessibleEx,
+                                reinterpret_cast<void**>(&rootBridge)) ==
+         S_OK);
+  IAccessibleEx* settingsBridge = nullptr;
+  assert(rootBridge->GetObjectForChild(SettingsChild(), &settingsBridge) ==
+         S_OK);
+  IRawElementProviderSimple* settingsProvider = nullptr;
+  assert(settingsBridge->QueryInterface(
+             IID_IRawElementProviderSimple,
+             reinterpret_cast<void**>(&settingsProvider)) == S_OK);
+  VARIANT property;
+  VariantInit(&property);
+  assert(settingsProvider->GetPropertyValue(UIA_NamePropertyId, &property) ==
+         S_OK);
+  assert(property.vt == VT_BSTR);
+  assert(std::wstring(property.bstrVal, SysStringLen(property.bstrVal)) ==
+         L"Open settings");
+  VariantClear(&property);
+  assert(settingsProvider->GetPropertyValue(UIA_AcceleratorKeyPropertyId,
+                                            &property) == S_OK);
+  assert(property.vt == VT_BSTR);
+  assert(std::wstring(property.bstrVal, SysStringLen(property.bstrVal)) ==
+         L"Ctrl+,");
+  VariantClear(&property);
+  IUnknown* pattern = nullptr;
+  assert(settingsProvider->GetPatternProvider(UIA_InvokePatternId, &pattern) ==
+         S_OK);
+  assert(pattern != nullptr);
+  IInvokeProvider* invokeProvider = nullptr;
+  assert(pattern->QueryInterface(IID_IInvokeProvider,
+                                 reinterpret_cast<void**>(&invokeProvider)) ==
+         S_OK);
+  assert(invokeProvider->Invoke() == S_OK);
+  invokeProvider->Release();
+  pattern->Release();
+  settingsProvider->Release();
+  settingsBridge->Release();
+  const auto verifyPattern = [&](int childId, PATTERNID patternId) {
+    IAccessibleEx* childBridge = nullptr;
+    assert(rootBridge->GetObjectForChild(childId, &childBridge) == S_OK);
+    IRawElementProviderSimple* childProvider = nullptr;
+    assert(childBridge->QueryInterface(
+               IID_IRawElementProviderSimple,
+               reinterpret_cast<void**>(&childProvider)) == S_OK);
+    IUnknown* childPattern = nullptr;
+    assert(childProvider->GetPatternProvider(patternId, &childPattern) == S_OK);
+    assert(childPattern != nullptr);
+    childPattern->Release();
+    childProvider->Release();
+    childBridge->Release();
+  };
+  verifyPattern(SearchChild(), UIA_ValuePatternId);
+  verifyPattern(ResultChild(0), UIA_SelectionItemPatternId);
+  rootBridge->Release();
+  services->Release();
+  assert(model.invokeRequests.size() == 1);
+  assert(model.invokeRequests.front() == SettingsChild());
 
   const int resultChild = ResultChild(0);
   assert(accessible->get_accName(Child(resultChild), &text) == S_OK);
@@ -264,8 +337,8 @@ void VerifyAccessibleModelTransport() {
   assert(accessible->get_accDefaultAction(Child(resultChild), &text) == S_OK);
   assert(TakeString(text) == L"Open");
   assert(accessible->accDoDefaultAction(Child(SettingsChild())) == S_OK);
-  assert(model.invokeRequests.size() == 1);
-  assert(model.invokeRequests.front() == SettingsChild());
+  assert(model.invokeRequests.size() == 2);
+  assert(model.invokeRequests.back() == SettingsChild());
 
   VARIANT focus;
   assert(accessible->get_accFocus(&focus) == S_OK);
@@ -281,8 +354,7 @@ void VerifyAccessibleModelTransport() {
   assert(focus.lVal == resultChild);
 
   assert(accessible->accDoDefaultAction(Child(resultChild)) == S_OK);
-  assert(model.invokeRequests.size() == 2);
-  assert(model.invokeRequests.front() == SettingsChild());
+  assert(model.invokeRequests.size() == 3);
   assert(model.invokeRequests.back() == resultChild);
 
   VARIANT destination;
@@ -508,6 +580,80 @@ void VerifyUnavailableFocusIsNeverReported() {
   accessible->Release();
 }
 
+void VerifyUiaRangeValuePattern() {
+  Item volume;
+  volume.name = L"Volume";
+  volume.value = L"42%";
+  volume.role = ROLE_SYSTEM_SLIDER;
+  volume.state = STATE_SYSTEM_FOCUSABLE;
+  volume.rangeValue = 42.0;
+  volume.rangeSmallChange = 1.0;
+  volume.rangeLargeChange = 10.0;
+
+  Item mute;
+  mute.name = L"Mute audio";
+  mute.defaultAction = L"Mute audio";
+  mute.role = ROLE_SYSTEM_CHECKBUTTON;
+  mute.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_CHECKED;
+
+  TestModel model;
+  model.items = {std::move(volume), std::move(mute)};
+  auto* accessible = new feathercast::accessibility::Window(&model, nullptr);
+  IAccessibleEx* bridge = nullptr;
+  assert(accessible->QueryInterface(IID_IAccessibleEx,
+                                    reinterpret_cast<void**>(&bridge)) ==
+         S_OK);
+  IAccessibleEx* child = nullptr;
+  assert(bridge->GetObjectForChild(1, &child) == S_OK);
+  IRawElementProviderSimple* provider = nullptr;
+  assert(child->QueryInterface(IID_IRawElementProviderSimple,
+                               reinterpret_cast<void**>(&provider)) == S_OK);
+  IUnknown* pattern = nullptr;
+  assert(provider->GetPatternProvider(UIA_RangeValuePatternId, &pattern) ==
+         S_OK);
+  assert(pattern != nullptr);
+  IRangeValueProvider* range = nullptr;
+  assert(pattern->QueryInterface(IID_IRangeValueProvider,
+                                 reinterpret_cast<void**>(&range)) == S_OK);
+  double value = 0.0;
+  assert(range->get_Value(&value) == S_OK && value == 42.0);
+  assert(range->get_Maximum(&value) == S_OK && value == 100.0);
+  assert(range->get_SmallChange(&value) == S_OK && value == 1.0);
+  assert(range->SetValue(65.0) == S_OK);
+  assert(model.rangeRequests.size() == 1);
+  assert(model.rangeRequests.front().first == 1);
+  assert(model.rangeRequests.front().second == 65.0);
+  IAccessibleEx* toggleChild = nullptr;
+  assert(bridge->GetObjectForChild(2, &toggleChild) == S_OK);
+  IRawElementProviderSimple* toggleProvider = nullptr;
+  assert(toggleChild->QueryInterface(
+             IID_IRawElementProviderSimple,
+             reinterpret_cast<void**>(&toggleProvider)) == S_OK);
+  IUnknown* togglePattern = nullptr;
+  assert(toggleProvider->GetPatternProvider(UIA_TogglePatternId,
+                                            &togglePattern) == S_OK);
+  IToggleProvider* toggle = nullptr;
+  assert(togglePattern->QueryInterface(IID_IToggleProvider,
+                                       reinterpret_cast<void**>(&toggle)) ==
+         S_OK);
+  ToggleState toggleState = ToggleState_Off;
+  assert(toggle->get_ToggleState(&toggleState) == S_OK);
+  assert(toggleState == ToggleState_On);
+  assert(toggle->Toggle() == S_OK);
+  assert(model.invokeRequests.size() == 1 &&
+         model.invokeRequests.front() == 2);
+  toggle->Release();
+  togglePattern->Release();
+  toggleProvider->Release();
+  toggleChild->Release();
+  range->Release();
+  pattern->Release();
+  provider->Release();
+  child->Release();
+  bridge->Release();
+  accessible->Release();
+}
+
 }  // namespace
 
 int main() {
@@ -515,5 +661,6 @@ int main() {
   VerifyAccessibleModelTransport();
   VerifyScreenshotEditorAccessibility();
   VerifyUnavailableFocusIsNeverReported();
+  VerifyUiaRangeValuePattern();
   return 0;
 }
