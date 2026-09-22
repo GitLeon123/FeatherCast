@@ -3491,16 +3491,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return CallNextHookEx(nullptr, nCode, wParam, lParam);
     }
 
-    // If elevated InputBroker is connected, it handles the global Win-key hook and dummy injection.
-    // Deactivate local Win-key hook logic so two hooks do not run in parallel.
+    // The elevated InputBroker owns the global Win-key activation path. Keep
+    // the local hook in the pipeline for all other shortcuts (including the
+    // built-in Print Screen screenshot fallback), but skip the local launcher
+    // Win-key state machine so the two hooks do not run it in parallel.
     if (g_inputBrokerConnected.load(std::memory_order_relaxed)) {
-      if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) {
-        wchar_t buf[128]{};
-        swprintf_s(buf, L"[Hook] Win key %ls in FeatherCast (brokerConnected=1, pass)\n",
-                   (k->flags & LLKHF_UP) ? L"UP" : L"DOWN");
-        AppendHookLog(buf);
-      }
-      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+      return g_app ? g_app->LowLevelKeyboard(nCode, wParam, lParam)
+                   : CallNextHookEx(nullptr, nCode, wParam, lParam);
     }
 
     if (!g_isExclusiveWinShortcut.load(std::memory_order_relaxed)) {
@@ -8376,7 +8373,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void UpdateKeyboardHook() {
-    bool needed = false;
+    // Bare Print Screen is the built-in region screenshot shortcut. Keep the
+    // local hook active even while the elevated broker handles Win-key input.
+    bool needed = true;
     needed = needed || recording_;
     if (!g_inputBrokerConnected.load(std::memory_order_relaxed)) {
       needed = needed || ShouldHandleInLowLevelHook(shortcut_, hotKeyRegistered_);

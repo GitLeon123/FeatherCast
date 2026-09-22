@@ -23,7 +23,10 @@ struct FileQuery {
   std::wstring terms;
   int limit = 200;
   bool contentEnabled = false;
-  std::size_t maxWorkers = 1;
+  // Zero lets the search core choose its bounded automatic worker count. The
+  // interactive caller may still provide a lower cap through the performance
+  // governor when sharing the machine with other work.
+  std::size_t maxWorkers = 0;
 };
 
 struct PreparedFileIndex {
