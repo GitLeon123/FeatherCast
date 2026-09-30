@@ -35,6 +35,7 @@
   - [Screen Capture & Silent Screen Recording](#screen-capture--silent-screen-recording)
   - [Accessibility, Typography & Theming](#accessibility-typography--theming)
   - [Native Plugin Architecture](#native-plugin-architecture)
+  - [Phone Connection](#phone-connection)
 - [Search Scopes & Cheat Sheet](#search-scopes--cheat-sheet)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
 - [Download & Installation](#download--installation)
@@ -123,6 +124,16 @@ Unlike launchers wrapped in Electron or web runtimes that consume hundreds of me
 ### 🧩 Native Plugin Architecture
 - **Out-of-Process Isolation**: Plugins run in an isolated native companion process (`FeatherCastPluginHost.exe`). If a plugin crashes or hangs, FeatherCast remains unaffected.
 - **C/C++ Plugin API**: Write lightweight native DLLs with complete type safety. See [docs/plugin-development.md](docs/plugin-development.md) for full specifications.
+
+---
+
+### 📱 Phone Connection
+- **Pair in seconds**: Open **Phone** from the tray menu or search, install the Android app by scanning the download QR code, then scan the pairing QR code in the app.
+- **See your phone on the PC**: Notifications (messages, mail, …), your newest photos, the phone clipboard, and battery level in one window.
+- **Right in the search panel**: Search **Phone Notifications**, **Phone Photos** (thumbnail grid), or **Phone Clipboard** to browse, filter, copy, paste, or open phone data without leaving the launcher.
+- **Both directions**: Text copied on the PC lands on the phone; share text, photos, or files from the phone with **Send to PC** (saved to `Downloads\FeatherCast`).
+- **Control your phone from the keyboard**: Reply to notifications and text messages, send files with **Send to → FeatherCast Phone**, make a lost phone ring with **Find My Phone**, pause or skip music with **Phone Media**, reject or silence incoming calls, and browse and download phone files with **Phone Files**.
+- **Local and encrypted**: Wi-Fi only, no cloud. Pairing uses ECDH keys from the QR code and every message is AES-256-GCM encrypted. See [Phone Connection](docs/phone-link.md).
 
 ---
 
@@ -243,6 +254,7 @@ FeatherCast stores all data locally under your Windows user profile following na
 - `snippets.json` — Custom text expansions and user-authored snippets.
 - `theme.json` — Optional custom color schemes and UI theme overrides.
 - `plugins/` — Installed native plugins (`.dll`).
+- `phone-link.dat` — Paired phones and their link keys (DPAPI-encrypted), only when Phone Connection is used.
 
 ### Local Machine Cache & Database (`%LOCALAPPDATA%\FeatherCast`)
 - `feathercast.db` — SQLite database with WAL journaling:
@@ -255,6 +267,7 @@ FeatherCast stores all data locally under your Windows user profile following na
 - **No Cloud Tracking**: FeatherCast never dials home. It connects to the internet strictly for two opt-in actions:
   1. Checking GitHub Releases for app updates (verified via Authenticode certificate thumbprint pinning).
   2. Fetching public foreign exchange conversion rates from `open.er-api.com`.
+- **Phone Connection stays in your network**: When enabled, FeatherCast listens on TCP port 47800 in your local network and only talks to phones you paired.
 - **Zero Process / Game Polling**: FeatherCast does not poll running processes in loops. App and game discovery run on-demand or upon shell notifications.
 - **Resource Suspension**: When the search overlay is closed, query execution, indexing pipelines, and thumbnail decoding are immediately paused or canceled.
 
@@ -265,6 +278,7 @@ FeatherCast stores all data locally under your Windows user profile following na
 - 🏛️ [Architecture & Technical Design](docs/architecture.md) — Deep dive into Win32 threading, Direct2D rendering, and lifetime guarantees.
 - 🔌 [Plugin Development Guide](docs/plugin-development.md) — How to build out-of-process C/C++ plugins.
 - 🚀 [Release Packaging & Publishing](docs/releasing.md) — Signing, updater manifest creation, and distribution workflow.
+- 📱 [Phone Connection](docs/phone-link.md) — Pairing your Android phone, what is shared, and the protocol.
 - ✅ [Manual Regression & QA Checklist](docs/manual-regression-checklist.md) — Testing protocols for scaling, accessibility, and input hooks.
 
 ---

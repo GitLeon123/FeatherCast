@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.10.1 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.11.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -70,6 +70,8 @@ add_library(FeatherCastRuntime STATIC
   native/src/preview_service.cpp
   native/src/library.cpp
   native/src/snippets_io.cpp
+  native/src/phone_crypto.cpp
+  native/src/phone_service.cpp
 )
 
 target_include_directories(FeatherCastRuntime PUBLIC native/src)
@@ -94,13 +96,21 @@ target_link_libraries(FeatherCastRuntime PUBLIC
   windowsapp
   windowscodecs
   winhttp
+  ws2_32
+  bcrypt
+  iphlpapi
 )
 
 add_library(FeatherCastUi STATIC
   native/src/ui.cpp
   native/src/result_icons.cpp
   native/src/library_ui.cpp
+  native/src/phone_ui.cpp
 )
+
+# Vendored MIT QR code encoder; kept out of the project warning policy.
+add_library(FeatherCastQrCode STATIC third_party/qrcodegen/qrcodegen.cpp)
+target_include_directories(FeatherCastQrCode PUBLIC third_party/qrcodegen)
 
 target_include_directories(FeatherCastUi PUBLIC native/src)
 target_compile_definitions(FeatherCastUi PUBLIC
@@ -109,7 +119,7 @@ target_compile_definitions(FeatherCastUi PUBLIC
   NOMINMAX
   WIN32_LEAN_AND_MEAN
 )
-target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime d2d1 oleacc uiautomationcore uuid)
+target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime FeatherCastQrCode d2d1 dwrite dwmapi shlwapi windowscodecs oleacc uiautomationcore uuid)
 
 add_executable(FeatherCast WIN32
   native/src/main.cpp
@@ -426,6 +436,20 @@ add_test(NAME FeatherCastSearchFilesTests COMMAND FeatherCastSearchFilesTests)
 add_test(NAME FeatherCastGameDiscoveryTests COMMAND FeatherCastGameDiscoveryTests)
 add_test(NAME FeatherCastAccessibilitySmokeTests COMMAND FeatherCastAccessibilitySmokeTests)
 add_test(NAME FeatherCastSilentLifecycleTests COMMAND FeatherCast --self-test)
+add_executable(FeatherCastPhoneProtocolTests native/tests/phone_protocol_tests.cpp)
+target_include_directories(FeatherCastPhoneProtocolTests PRIVATE native/src)
+target_compile_definitions(FeatherCastPhoneProtocolTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FeatherCastPhoneProtocolTests PRIVATE FeatherCastRuntime ws2_32 bcrypt)
+feathercast_apply_project_warnings(FeatherCastPhoneProtocolTests)
+add_test(NAME FeatherCastPhoneProtocolTests COMMAND FeatherCastPhoneProtocolTests)
+set_tests_properties(FeatherCastPhoneProtocolTests PROPERTIES TIMEOUT 60
+  ENVIRONMENT "FEATHERCAST_TEST_DPAPI_FALLBACK=1")
+add_executable(FeatherCastPhoneStoreTests native/tests/phone_store_tests.cpp)
+target_include_directories(FeatherCastPhoneStoreTests PRIVATE native/src)
+target_compile_definitions(FeatherCastPhoneStoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FeatherCastPhoneStoreTests PRIVATE FeatherCastRuntime)
+feathercast_apply_project_warnings(FeatherCastPhoneStoreTests)
+add_test(NAME FeatherCastPhoneStoreTests COMMAND FeatherCastPhoneStoreTests)
 
 set_tests_properties(
   FeatherCastCoreTests
@@ -462,6 +486,9 @@ set_tests_properties(
 )
 
 install(TARGETS FeatherCast FeatherCastPluginHost InputBroker RUNTIME DESTINATION bin)
+# The phone app is built separately (scripts/build-android.ps1); FeatherCast serves it
+# to phones from next to its exe, so ship it when it has been built.
+install(FILES "${CMAKE_BINARY_DIR}/FeatherCast-Phone.apk" DESTINATION bin OPTIONAL)
 
 set(CPACK_PACKAGE_NAME "FeatherCast")
 set(CPACK_PACKAGE_VENDOR "Leon")

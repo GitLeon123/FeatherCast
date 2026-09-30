@@ -30,6 +30,10 @@
 #include "motion.hpp"
 #include "network_client.hpp"
 #include "persistence_service.hpp"
+#include "phone_messages.hpp"
+#include "phone_service.hpp"
+#include "phone_store.hpp"
+#include "phone_ui.hpp"
 #include "preview_service.hpp"
 #include "run_command.hpp"
 #include "search_coordinator.hpp"
@@ -484,6 +488,82 @@ DisplayItem ClipboardDisplay(const ClipboardEntry& entry) {
   item.commandDetail = L"Clipboard History";
   item.commandKeywords = {L"clipboard", L"history", L"paste", entry.text};
   return item;
+}
+
+// Short "5 min ago" style label for phone timestamps (Unix milliseconds).
+std::wstring PhoneTimeAgo(long long timeMs, long long nowMs) {
+  if (timeMs <= 0) return L"";
+  const long long seconds = std::max(0LL, (nowMs - timeMs) / 1000);
+  if (seconds < 60) return L"just now";
+  if (seconds < 3600) return std::to_wstring(seconds / 60) + L" min ago";
+  if (seconds < 86400) return std::to_wstring(seconds / 3600) + L" h ago";
+  if (seconds < 7 * 86400) {
+    const long long days = seconds / 86400;
+    return days == 1 ? L"yesterday" : std::to_wstring(days) + L" days ago";
+  }
+  const std::time_t captured = static_cast<std::time_t>(timeMs / 1000);
+  std::tm local{};
+  if (localtime_s(&local, &captured) != 0) return L"";
+  wchar_t buffer[32]{};
+  std::wcsftime(buffer, std::size(buffer), L"%d %b %Y", &local);
+  return buffer;
+}
+
+// "1.2 MB" style size label for phone files.
+std::wstring PhoneFileSize(long long bytes) {
+  if (bytes < 1024) return std::to_wstring(std::max(0LL, bytes)) + L" B";
+  const wchar_t* units[] = {L"KB", L"MB", L"GB"};
+  double value = static_cast<double>(bytes) / 1024.0;
+  int unit = 0;
+  while (value >= 1024.0 && unit < 2) {
+    value /= 1024.0;
+    ++unit;
+  }
+  wchar_t buffer[32]{};
+  swprintf_s(buffer, value < 10.0 ? L"%.1f %s" : L"%.0f %s", value, units[unit]);
+  return buffer;
+}
+
+// True for input like "+1 555 0100" that can start a new text message.
+bool LooksLikePhoneNumber(const std::wstring& text) {
+  int digits = 0;
+  for (const wchar_t ch : text) {
+    if (ch >= L'0' && ch <= L'9') {
+      ++digits;
+    } else if (ch != L'+' && ch != L' ' && ch != L'-' && ch != L'(' && ch != L')') {
+      return false;
+    }
+  }
+  return digits >= 3;
+}
+
+// WM_COPYDATA id used by a second process to forward --send-to-phone paths.
+constexpr ULONG_PTR kSendToPhoneCopyData = 0x46435350;  // "FCSP"
+
+// Paths after --send-to-phone on a command line (Explorer's Send To menu
+// appends the selected files).
+std::vector<std::wstring> SendToPhoneArgs(const wchar_t* commandLine) {
+  std::vector<std::wstring> paths;
+  int count = 0;
+  LPWSTR* arguments = CommandLineToArgvW(commandLine, &count);
+  if (!arguments) return paths;
+  bool collecting = false;
+  for (int i = 1; i < count; ++i) {
+    const std::wstring argument = arguments[i];
+    if (argument == L"--send-to-phone") {
+      collecting = true;
+    } else if (collecting && !argument.starts_with(L"--")) {
+      paths.push_back(argument);
+    }
+  }
+  LocalFree(arguments);
+  return paths;
+}
+
+long long UnixNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
 bool PointInRect(const RectF& rect, float x, float y) {
@@ -1631,6 +1711,7 @@ struct LaunchCompletion {
   std::wstring id;
   std::wstring name;
   bool succeeded = false;
+  bool asAdmin = false;
 };
 
 struct SnippetSaveCompleted {
@@ -2003,6 +2084,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         clipboardEvents_([this] {
           NotifyRuntimeEvents();
         }),
+        phoneEvents_([this] {
+          NotifyRuntimeEvents();
+        }),
         persistence_(
             SettingsPath(), DatabasePath(),
             [this](feathercast::persistence::Event event) {
@@ -2123,8 +2207,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     settingsSurfaceScale_.Snap(1.0);
     volumeSurfaceScale_.Snap(1.0);
     confirmationProgress_.Snap(0.0);
+    overlayVisualScroll_.Configure(kOverlayScrollResponseSeconds, 1.0);
+    settingsVisualScroll_.Configure(kSettingsScrollResponseSeconds, 1.0);
+    previewVisualScroll_.Configure(kPreviewScrollResponseSeconds, 1.0);
+    overlayBounds_.Configure(kOverlayResizeResponseSeconds, 1.0);
+    settingsBounds_.Configure(kSettingsResizeResponseSeconds, 1.0);
+    volumeBounds_.Configure(kOverlayResizeResponseSeconds, 1.0);
     overlayVisualScroll_.Snap(0.0);
     settingsVisualScroll_.Snap(0.0);
+    previewVisualScroll_.Snap(0.0);
     settingsPageProgress_.Snap(1.0);
     settingsCategoryTop_.Snap(0.0);
     volumeVisualPercent_.Snap(0.0);
@@ -2185,6 +2276,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snippetSaveEvents_.Close();
     snippetLoadEvents_.Close();
     clipboardEvents_.Close();
+    phoneService_.Stop();
+    phoneEvents_.Close();
     extensions_.Shutdown();
     fileIndexService_.Stop();
     fileIndexEvents_.Close();
@@ -2245,6 +2338,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!timerService_.Start() || !persistence_.LoadTimers()) {
       SetSettingsStatus(StatusSeverity::Error, L"Timers could not be initialized.");
     }
+    UpdatePhoneService();
     UpdateClipboardListenerRegistration();
     CreateTray();
     if (!startupSettingsNotice_.empty()) {
@@ -2292,6 +2386,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       ShowOverlay(View::Search);
     } else {
       UpdateBackgroundState();
+    }
+    if (cmdLine_.find(L"--send-to-phone") != std::wstring::npos) {
+      SendFilesToPhone(SendToPhoneArgs(GetCommandLineW()));
+    } else if (cmdLine_.find(L"--phone") != std::wstring::npos) {
+      OpenPhoneWindow();
     }
 
     MSG msg{};
@@ -2885,6 +2984,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       int index = 0;
       for (const auto& section : sections_) {
         y += kSectionHeaderHeight;
+        const float bodyTop = y;
+        std::size_t inSection = 0;
         for (const auto& display : section.items) {
           Item result;
           result.key = L"result:" + display.Key();
@@ -2903,16 +3004,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               result.state |= STATE_SYSTEM_FOCUSED;
             }
           }
-          result.screenRect = screenRect({8, y, static_cast<float>(client.right) / scale - 8,
-                                          y + kResultRowHeight});
+          result.screenRect = screenRect(ResultItemRect(
+              inSection, bodyTop, static_cast<float>(client.right) / scale));
           if (result.screenRect.bottom < origin.y ||
               result.screenRect.top > origin.y + client.bottom) {
             result.state |= STATE_SYSTEM_OFFSCREEN;
           }
           items.push_back(std::move(result));
-          y += kResultRowStride;
+          ++inSection;
           ++index;
         }
+        y = bodyTop + SectionBodyHeight(section.items.size());
       }
 
       Item preview;
@@ -3245,7 +3347,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::size_t PendingRuntimeEvents() const {
     return captureEvents_.Size() + persistenceEvents_.Size() +
            snippetSaveEvents_.Size() + snippetLoadEvents_.Size() +
-           clipboardEvents_.Size() +
+           clipboardEvents_.Size() + phoneEvents_.Size() +
            searchEvents_.Size() + discoveryEvents_.Size() +
            fileIndexEvents_.Size() + fileSearchEvents_.Size() +
            fileProjectionEvents_.Size() + previewEvents_.Size() +
@@ -3952,7 +4054,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_TRAYICON:
         OnTray(lParam);
         return 0;
+      case WM_COPYDATA: {
+        const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        if (!data || data->dwData != kSendToPhoneCopyData || !data->lpData) return FALSE;
+        // Paths separated by newlines, from a second process with --send-to-phone.
+        const std::wstring text(static_cast<const wchar_t*>(data->lpData),
+                                data->cbData / sizeof(wchar_t));
+        std::vector<std::wstring> paths;
+        for (std::size_t start = 0; start < text.size();) {
+          std::size_t end = text.find(L'\n', start);
+          if (end == std::wstring::npos) end = text.size();
+          if (end > start) paths.push_back(text.substr(start, end - start));
+          start = end + 1;
+        }
+        SendFilesToPhone(paths);
+        return TRUE;
+      }
       case WM_SHOW_SEARCH:
+        if (wParam == 1) {  // second process launched with --phone
+          OpenPhoneWindow();
+          return 0;
+        }
         // A second process launched with --show uses this message to wake the
         // resident instance. Keep the explicit launch visible even when
         // Windows temporarily refuses the foreground request.
@@ -3976,11 +4098,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           if (completion.succeeded) {
             TrackRecent(completion.id);
           } else {
+            const std::wstring subject = completion.name.empty()
+                ? L"the selected item" : completion.name;
             ShowTrayNotification(
                 L"FeatherCast Launch Failed",
-                completion.name.empty()
-                    ? L"Windows could not open the selected item."
-                    : L"Windows could not open " + completion.name + L".");
+                completion.asAdmin
+                    ? L"Windows could not run " + subject + L" as administrator."
+                    : L"Windows could not open " + subject + L".");
           }
         }
         return 0;
@@ -4127,7 +4251,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           Trim(*observation.text).empty()) {
         continue;
       }
-      HandleClipboardText(std::move(*observation.text));
+      ForwardClipboardToPhone(*observation.text);
+      if (ClipboardHistoryActive()) {
+        HandleClipboardText(std::move(*observation.text));
+      }
+    }
+    auto phone = drain(phoneEvents_, 8);
+    for (auto& event : phone.events) {
+      OnPhoneEvent(std::move(event));
     }
     auto timers = drain(timerEvents_, 4);
     for (const auto& due : timers.events) {
@@ -4192,7 +4323,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       previewResult_ = std::move(result);
       previewBitmap_.Reset();
       PromotePreviewBitmap();
-      previewScroll_ = 0.0f;
+      ResetPreviewScroll();
       InvalidateRect(hwnd_, nullptr, FALSE);
       NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
       NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 2);
@@ -7884,7 +8015,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   static D2D1_MATRIX_3X2_F SurfaceBoundsTransform(
-      const feathercast::motion::AnimatedBounds* bounds) {
+      const feathercast::motion::SpringBounds* bounds) {
     if (!bounds) return D2D1::Matrix3x2F::Identity();
     const double targetWidth = bounds->width.Target();
     const double targetHeight = bounds->height.Target();
@@ -8031,7 +8162,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   HRESULT SetSurfaceVisualState(
       GlassSurface& surface, HWND hwnd, double scale, bool topAnchored,
-      double opacity, const feathercast::motion::AnimatedBounds* bounds) {
+      double opacity, const feathercast::motion::SpringBounds* bounds) {
     surface.visualStateChanged = false;
     if (!surface.visual || !hwnd) return S_OK;
 
@@ -8284,6 +8415,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     } else {
       theme_ = feathercast::theme::NormalizeTheme(std::move(theme_));
     }
+    if (phoneWindowConfigured_) ApplyPhoneWindowTheme();
     // Preference changes invalidate text formats, but healthy composition
     // surfaces survive; DPI changes and device failures recreate them.
     ResetTextFormats();
@@ -8798,7 +8930,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void UpdateClipboardListenerRegistration() {
-    const bool shouldListen = settings_.privacyConsentVersion >= 1 && settings_.clipboardHistoryEnabled;
+    const bool shouldListen = ClipboardHistoryActive() || PhoneClipboardSyncActive();
     if (shouldListen && !clipboardListenerRegistered_ && hwnd_) {
       clipboardListenerRegistered_ = AddClipboardFormatListener(hwnd_) != FALSE;
     } else if (!shouldListen && clipboardListenerRegistered_ && hwnd_) {
@@ -9708,7 +9840,408 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::vector<DisplayItem> ActionsFor(const DisplayItem& target) const {
     if (target.timerRequest) return feathercast::timers::Actions(timerState_, target.timerRequest->id);
     if (!target.settingId.empty()) return {};
+    if (target.isPhone) return PhoneActions(target.phone);
     return feathercast::commands::BuildActions(target, settings_);
+  }
+
+  static DisplayItem PhoneActionItem(ActionKind kind, std::wstring label,
+                                     std::wstring detail,
+                                     ActionTarget target) {
+    DisplayItem item;
+    item.isAction = true;
+    item.action = kind;
+    item.commandKeywords = {label, detail};
+    item.commandName = std::move(label);
+    item.commandDetail = std::move(detail);
+    item.actionTarget = std::move(target);
+    return item;
+  }
+
+  static std::wstring PhoneNotificationText(const feathercast::app::PhoneItem& item) {
+    if (item.title.empty()) return item.text;
+    if (item.text.empty()) return item.title;
+    return item.title + L"\n" + item.text;
+  }
+
+  std::vector<DisplayItem> PhoneActions(const feathercast::app::PhoneItem& item) const {
+    using feathercast::app::PhoneItemKind;
+    std::vector<DisplayItem> actions;
+    switch (item.kind) {
+      case PhoneItemKind::Notification:
+        for (const auto& stored : phoneStore_.Notifications()) {
+          if (Utf8ToWide(stored.info.key) != item.id) continue;
+          for (const auto& action : stored.info.actions) {
+            feathercast::app::PhoneItem target = item;
+            target.actionIndex = action.index;
+            const std::wstring title = Utf8ToWide(action.title);
+            if (action.reply) {
+              actions.push_back(PhoneActionItem(
+                  ActionKind::ReplyToPhoneNotification, title,
+                  L"Type a reply here and send it from your phone", target));
+            } else {
+              actions.push_back(PhoneActionItem(
+                  ActionKind::PhoneNotificationAction, title,
+                  L"Run this notification action on your phone", target));
+            }
+          }
+          break;
+        }
+        actions.push_back(PhoneActionItem(
+            ActionKind::CopyText, L"Copy Text",
+            L"Copy the notification title and text",
+            feathercast::app::TextActionPayload{PhoneNotificationText(item)}));
+        actions.push_back(PhoneActionItem(
+            ActionKind::PasteText, L"Paste Text",
+            L"Paste the notification text into the previous app",
+            feathercast::app::TextActionPayload{PhoneNotificationText(item)}));
+        actions.push_back(PhoneActionItem(
+            ActionKind::DismissPhoneNotification, L"Dismiss on Phone",
+            L"Clear this notification on your phone · Ctrl+Delete", item));
+        break;
+      case PhoneItemKind::Photo:
+        actions.push_back(PhoneActionItem(
+            ActionKind::OpenPhonePhoto, L"Open Photo",
+            L"Download the full photo and open it", item));
+        actions.push_back(PhoneActionItem(
+            ActionKind::SavePhonePhoto, L"Save to Downloads",
+            L"Download the full photo to Downloads\\FeatherCast", item));
+        break;
+      case PhoneItemKind::Clip:
+        actions.push_back(PhoneActionItem(
+            ActionKind::PasteText, L"Paste",
+            L"Paste this text into the previous app",
+            feathercast::app::TextActionPayload{item.text}));
+        actions.push_back(PhoneActionItem(
+            ActionKind::CopyText, L"Copy", L"Copy this text to the clipboard",
+            feathercast::app::TextActionPayload{item.text}));
+        break;
+      case PhoneItemKind::SmsMessage:
+        actions.push_back(PhoneActionItem(
+            ActionKind::CopyText, L"Copy Text", L"Copy this message",
+            feathercast::app::TextActionPayload{item.text}));
+        actions.push_back(PhoneActionItem(
+            ActionKind::PasteText, L"Paste Text",
+            L"Paste this message into the previous app",
+            feathercast::app::TextActionPayload{item.text}));
+        break;
+      case PhoneItemKind::SmsThread:
+        if (!item.appName.empty()) {
+          actions.push_back(PhoneActionItem(
+              ActionKind::CopyText, L"Copy Number", item.appName,
+              feathercast::app::TextActionPayload{item.appName}));
+        }
+        break;
+      case PhoneItemKind::File:
+        if (!item.directory) {
+          actions.push_back(PhoneActionItem(
+              ActionKind::OpenPhoneFile, L"Open File",
+              L"Download the file and open it", item));
+          actions.push_back(PhoneActionItem(
+              ActionKind::SavePhoneFile, L"Save to Downloads",
+              L"Download the file to Downloads\\FeatherCast", item));
+        }
+        break;
+      default:
+        break;
+    }
+    return actions;
+  }
+
+  // Items for the active phone browse view, built from the UI-thread store.
+  std::vector<DisplayItem> PhoneBrowseItems(BrowseView view) const {
+    using feathercast::app::PhoneItemKind;
+    std::vector<DisplayItem> items;
+    const long long now = UnixNowMs();
+    auto make = [](PhoneItemKind kind) {
+      DisplayItem item;
+      item.isPhone = true;
+      item.phone.kind = kind;
+      return item;
+    };
+    if (view == BrowseView::PhoneNotifications) {
+      for (const auto& stored : phoneStore_.Notifications()) {
+        const auto& info = stored.info;
+        DisplayItem item = make(PhoneItemKind::Notification);
+        item.phone.id = Utf8ToWide(info.key);
+        item.phone.appName = Utf8ToWide(info.appName.empty() ? info.app : info.appName);
+        item.phone.title = SingleLinePreview(Utf8ToWide(info.title), 160);
+        item.phone.text = Utf8ToWide(info.text);
+        if (item.phone.title.empty()) {
+          item.phone.title = SingleLinePreview(item.phone.text, 160);
+          if (item.phone.title.empty()) item.phone.title = item.phone.appName;
+        }
+        item.phone.time = info.time;
+        item.phone.hasImage = stored.icon != nullptr;
+        std::wstring detail = item.phone.appName;
+        const std::wstring body = SingleLinePreview(item.phone.text, 140);
+        if (!body.empty() && body != item.phone.title) {
+          detail += (detail.empty() ? L"" : L" · ") + body;
+        }
+        const std::wstring ago = PhoneTimeAgo(info.time, now);
+        if (!ago.empty()) detail += (detail.empty() ? L"" : L" · ") + ago;
+        item.commandDetail = std::move(detail);
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhonePhotos) {
+      for (const auto& stored : phoneStore_.Photos()) {
+        DisplayItem item = make(PhoneItemKind::Photo);
+        item.phone.id = Utf8ToWide(stored.info.id);
+        item.phone.title = Utf8ToWide(stored.info.name);
+        item.phone.time = stored.info.time;
+        item.phone.hasImage = stored.thumb != nullptr;
+        item.phone.downloading = stored.downloading;
+        item.commandDetail = PhoneTimeAgo(stored.info.time, now);
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhoneClipboard) {
+      for (const auto& stored : phoneStore_.Clips()) {
+        DisplayItem item = make(PhoneItemKind::Clip);
+        item.phone.id = std::to_wstring(stored.serial);
+        item.phone.text = Utf8ToWide(stored.text);
+        item.phone.title = SingleLinePreview(item.phone.text);
+        item.phone.time = stored.time;
+        item.commandDetail = L"Phone clipboard";
+        const std::wstring ago = PhoneTimeAgo(stored.time, now);
+        if (!ago.empty()) item.commandDetail += L" · " + ago;
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhoneMedia) {
+      const auto& media = phoneStore_.Media();
+      if (!media.active) return items;
+      const std::wstring appName = Utf8ToWide(media.appName.empty() ? media.app : media.appName);
+      DisplayItem playing = make(PhoneItemKind::Media);
+      playing.phone.id = L"now";
+      playing.phone.title = media.title.empty() ? appName : Utf8ToWide(media.title);
+      playing.phone.text = Utf8ToWide(media.artist);
+      playing.phone.appName = appName;
+      playing.phone.hasImage = phoneStore_.MediaArt() != nullptr && !phoneArtKey_.empty();
+      playing.phone.imageKey = phoneArtKey_;
+      std::wstring detail = media.playing ? L"Playing" : L"Paused";
+      if (!playing.phone.text.empty()) detail += L" · " + playing.phone.text;
+      if (!appName.empty()) detail += L" · " + appName;
+      playing.commandDetail = std::move(detail);
+      items.push_back(std::move(playing));
+      auto control = [&](const wchar_t* id, std::wstring title, std::wstring detail) {
+        DisplayItem item = make(PhoneItemKind::Media);
+        item.phone.id = id;
+        item.phone.title = std::move(title);
+        item.commandDetail = std::move(detail);
+        items.push_back(std::move(item));
+      };
+      control(L"toggle", media.playing ? L"Pause" : L"Play", L"Space also plays and pauses");
+      control(L"next", L"Next Track", appName);
+      control(L"prev", L"Previous Track", appName);
+      if (media.volume >= 0 && media.volumeMax > 0) {
+        const std::wstring level = L"Volume " + std::to_wstring(media.volume) + L" of " +
+                                   std::to_wstring(media.volumeMax);
+        control(L"vol-up", L"Volume Up", level);
+        control(L"vol-down", L"Volume Down", level);
+      }
+    } else if (view == BrowseView::PhoneMessages) {
+      const std::wstring typed = Trim(query_);
+      if (LooksLikePhoneNumber(typed)) {
+        DisplayItem item = make(PhoneItemKind::Compose);
+        item.phone.id = L"new:" + typed;
+        item.phone.title = L"New message to " + typed;
+        item.phone.text = typed;
+        item.commandDetail = L"Start a new text message";
+        items.push_back(std::move(item));
+      }
+      for (const auto& thread : phoneStore_.SmsThreads()) {
+        DisplayItem item = make(PhoneItemKind::SmsThread);
+        item.phone.id = Utf8ToWide(thread.thread);
+        const std::wstring address = Utf8ToWide(thread.address);
+        item.phone.title = thread.name.empty() ? address : Utf8ToWide(thread.name);
+        item.phone.text = Utf8ToWide(thread.snippet);
+        item.phone.appName = address;
+        item.phone.time = thread.time;
+        std::wstring detail = thread.unread ? L"Unread · " : L"";
+        detail += SingleLinePreview(item.phone.text, 120);
+        const std::wstring ago = PhoneTimeAgo(thread.time, now);
+        if (!ago.empty()) detail += L" · " + ago;
+        item.commandDetail = std::move(detail);
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhoneThread) {
+      const std::wstring draft = Trim(query_);
+      const std::wstring to = phoneCompose_.name.empty()
+                                  ? Utf8ToWide(phoneCompose_.address)
+                                  : phoneCompose_.name;
+      DisplayItem compose = make(PhoneItemKind::Compose);
+      compose.phone.id = L"sms";
+      compose.phone.title = draft.empty() ? L"Type a message to " + to
+                                          : L"Send \u201c" + SingleLinePreview(draft, 80) + L"\u201d";
+      compose.commandDetail = L"Text message to " + to;
+      items.push_back(std::move(compose));
+      const auto& messages = phoneStore_.SmsMessages();
+      for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        DisplayItem item = make(PhoneItemKind::SmsMessage);
+        item.phone.id = Utf8ToWide(it->message.id);
+        item.phone.text = Utf8ToWide(it->message.body);
+        item.phone.title = SingleLinePreview(item.phone.text, 160);
+        item.phone.time = it->message.time;
+        std::wstring detail = it->message.outgoing ? L"You" : to;
+        if (it->failed) detail += L" · Not sent";
+        else if (it->pending) detail += L" · Sending...";
+        const std::wstring ago = PhoneTimeAgo(it->message.time, now);
+        if (!ago.empty()) detail += L" · " + ago;
+        item.commandDetail = std::move(detail);
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhoneFiles) {
+      const std::string& path = phoneStore_.FilesPath();
+      if (path != "/") {
+        DisplayItem up = make(PhoneItemKind::File);
+        up.phone.id = Utf8ToWide(feathercast::phone::RemotePathParent(path));
+        up.phone.title = L"..";
+        up.phone.directory = true;
+        up.commandDetail = L"Parent folder · Backspace";
+        items.push_back(std::move(up));
+      }
+      for (const auto& file : phoneStore_.Files()) {
+        DisplayItem item = make(PhoneItemKind::File);
+        const std::string full = feathercast::phone::RemotePathJoin(path, file.name);
+        item.phone.id = Utf8ToWide(full);
+        item.phone.title = Utf8ToWide(file.name);
+        item.phone.directory = file.directory;
+        item.phone.time = file.time;
+        item.phone.downloading = phoneStore_.FileDownloading(full);
+        std::wstring detail = file.directory ? L"Folder" : PhoneFileSize(file.size);
+        const std::wstring ago = PhoneTimeAgo(file.time, now);
+        if (!ago.empty()) detail += L" · " + ago;
+        item.commandDetail = std::move(detail);
+        items.push_back(std::move(item));
+      }
+    } else if (view == BrowseView::PhoneCompose) {
+      const std::wstring draft = Trim(query_);
+      DisplayItem compose = make(PhoneItemKind::Compose);
+      compose.phone.id = L"draft";
+      compose.phone.title = draft.empty() ? PhoneComposePrompt()
+                                          : L"Send \u201c" + SingleLinePreview(draft, 80) + L"\u201d";
+      compose.commandDetail = phoneCompose_.sms
+                                  ? L"Text message · Enter sends · Esc cancels"
+                                  : L"Reply from your phone · Enter sends · Esc cancels";
+      items.push_back(std::move(compose));
+    }
+    return items;
+  }
+
+  // Reject and Silence while a call rings on the phone.
+  std::vector<DisplayItem> PhoneCallItems() const {
+    const auto& call = phoneStore_.Call();
+    if (!settings_.phoneLinkEnabled || call.state != feathercast::phone::CallState::Ringing) {
+      return {};
+    }
+    std::wstring caller = call.name.empty() ? Utf8ToWide(call.number) : Utf8ToWide(call.name);
+    if (caller.empty()) caller = L"Unknown caller";
+    std::vector<DisplayItem> items;
+    for (const auto* id : {L"reject", L"silence"}) {
+      DisplayItem item;
+      item.isPhone = true;
+      item.phone.kind = feathercast::app::PhoneItemKind::Call;
+      item.phone.id = id;
+      const bool reject = item.phone.id == L"reject";
+      item.phone.title = reject ? L"Reject call from " + caller : L"Silence ringer";
+      item.commandDetail = reject ? Utf8ToWide(call.number) : L"Stop the ringing without rejecting";
+      items.push_back(std::move(item));
+    }
+    return items;
+  }
+
+  std::wstring PhoneComposePrompt() const {
+    if (phoneCompose_.sms) {
+      return L"Type a message to " + (phoneCompose_.name.empty()
+                                          ? Utf8ToWide(phoneCompose_.address)
+                                          : phoneCompose_.name);
+    }
+    return L"Type your reply to " + phoneCompose_.name;
+  }
+
+  // The phone view commands with a live summary, suggested in normal search.
+  std::vector<DisplayItem> PhoneSuggestionItems() const {
+    if (!settings_.phoneLinkEnabled) return {};
+    const std::wstring device = Utf8ToWide(phoneStore_.DeviceName());
+    const std::wstring status =
+        device.empty() ? L"Phone not connected"
+        : phoneStore_.Connected() ? device
+                                  : device + L" (offline)";
+    auto countLabel = [](std::size_t count, const wchar_t* one, const wchar_t* many) {
+      return std::to_wstring(count) + L" " + (count == 1 ? one : many);
+    };
+    std::vector<DisplayItem> items;
+    for (const auto kind : {CommandKind::PhoneNotifications, CommandKind::PhonePhotos,
+                            CommandKind::PhoneClipboard, CommandKind::PhoneMedia,
+                            CommandKind::PhoneMessages, CommandKind::PhoneFiles,
+                            CommandKind::FindMyPhone}) {
+      const auto* descriptor = feathercast::commands::Find(kind);
+      if (!descriptor) continue;
+      DisplayItem item;
+      item.isCommand = true;
+      item.command = kind;
+      item.commandStableId = descriptor->stableId;
+      item.commandName = descriptor->label;
+      item.commandKeywords = descriptor->keywords;
+      std::wstring summary;
+      if (kind == CommandKind::PhoneNotifications) {
+        const auto& notifications = phoneStore_.Notifications();
+        if (!notifications.empty()) {
+          summary = countLabel(notifications.size(), L"notification", L"notifications");
+          const std::wstring latest = SingleLinePreview(
+              Utf8ToWide(notifications.front().info.title), 60);
+          if (!latest.empty()) summary += L" · latest: " + latest;
+        }
+      } else if (kind == CommandKind::PhonePhotos) {
+        if (!phoneStore_.Photos().empty()) {
+          summary = countLabel(phoneStore_.Photos().size(), L"photo", L"photos");
+        }
+      } else if (kind == CommandKind::PhoneMedia) {
+        const auto& media = phoneStore_.Media();
+        if (media.active && !media.title.empty()) {
+          summary = (media.playing ? L"Playing: " : L"Paused: ") +
+                    SingleLinePreview(Utf8ToWide(media.title), 60);
+        }
+      } else if (kind == CommandKind::PhoneMessages) {
+        const auto unread = std::count_if(
+            phoneStore_.SmsThreads().begin(), phoneStore_.SmsThreads().end(),
+            [](const auto& thread) { return thread.unread; });
+        if (unread > 0) {
+          summary = countLabel(static_cast<std::size_t>(unread), L"unread conversation",
+                               L"unread conversations");
+        }
+      } else if (kind == CommandKind::FindMyPhone) {
+        if (phoneStore_.Ringing()) summary = L"Ringing now · run again to stop";
+      } else if (kind == CommandKind::PhoneFiles) {
+        // No summary; the storage is listed on demand.
+      } else if (!phoneStore_.Clips().empty()) {
+        summary = countLabel(phoneStore_.Clips().size(), L"copied item", L"copied items");
+      }
+      item.commandDetail = summary.empty() ? status : summary + L" · " + status;
+      items.push_back(std::move(item));
+    }
+    return items;
+  }
+
+  std::wstring PhoneSectionTitle(BrowseView view) const {
+    std::wstring title;
+    switch (view) {
+      case BrowseView::PhoneNotifications: title = L"Phone Notifications"; break;
+      case BrowseView::PhonePhotos: title = L"Phone Photos"; break;
+      case BrowseView::PhoneMedia: title = L"Phone Media"; break;
+      case BrowseView::PhoneMessages: title = L"Phone Messages"; break;
+      case BrowseView::PhoneThread:
+        title = phoneCompose_.name.empty() ? Utf8ToWide(phoneCompose_.address) : phoneCompose_.name;
+        break;
+      case BrowseView::PhoneFiles:
+        title = L"Phone Files · " + Utf8ToWide(phoneStore_.FilesPath());
+        if (phoneStore_.FilesLoading()) title += L" · Loading...";
+        break;
+      case BrowseView::PhoneCompose: title = phoneCompose_.sms ? L"New Message" : L"Reply"; break;
+      default: title = L"Phone Clipboard"; break;
+    }
+    const std::wstring device = Utf8ToWide(phoneStore_.DeviceName());
+    if (!device.empty()) title += L" · " + device;
+    if (!phoneStore_.Connected()) title += L" (offline)";
+    return title;
   }
 
   // Entry point for every "results changed" trigger (formerly BuildSections).
@@ -9852,6 +10385,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     req.actionMode = actionMode_;
     req.browseView = browseView_;
     if (browseView_ == BrowseView::Timers) req.timerItems = feathercast::timers::Items(timerState_, feathercast::timers::Now(), GetTickCount64());
+    if (feathercast::app::IsPhoneBrowseView(browseView_)) {
+      req.phoneItems = PhoneBrowseItems(browseView_);
+      req.phoneSectionTitle = PhoneSectionTitle(browseView_);
+    } else if (!empty && browseView_ == BrowseView::None && !actionMode_) {
+      req.phoneSuggestions = PhoneSuggestionItems();
+    }
+    if (browseView_ == BrowseView::None && !actionMode_) req.phoneCallItems = PhoneCallItems();
     req.compactClear = settings_.compactMode && Trim(query_).empty() &&
                        view_ == View::Search &&
                        !actionMode_ && browseView_ == BrowseView::None;
@@ -10117,58 +10657,67 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       positions.headers[section.title] = headerY;
       y += kSectionHeaderHeight;
-      for (const auto& item : section.items) {
-        const std::wstring key = item.Key();
-        float rowY = y;
+      const float bodyTop = y;
+      for (std::size_t i = 0; i < section.items.size(); ++i) {
+        const std::wstring key = section.items[i].Key();
+        float rowY = bodyTop + ItemOffsetInSection(i);
         if (const auto motion = resultRowMotion_.find(key);
             motion != resultRowMotion_.end()) {
           rowY += static_cast<float>(motion->second.offsetY.Value());
         }
         positions.rows[key] = rowY;
-        y += kResultRowStride;
       }
+      y = bodyTop + SectionBodyHeight(section.items.size());
     }
     return positions;
   }
 
   void StartResultTransitions(const ResultPositions& oldPositions) {
+    // Rows that are still fading in keep their current opacity, so typing
+    // quickly continues each fade instead of popping rows back to opaque.
+    auto previousRows = std::move(resultRowMotion_);
+    auto previousHeaders = std::move(resultHeaderMotion_);
     resultRowMotion_.clear();
     resultHeaderMotion_.clear();
     // The opening reveal owns the row timing. A result batch arriving during
     // that reveal must not start a second, staggered-looking transition.
     if (!FadeAnimationsAllowed() || !visible_ || animating_) return;
 
+    const bool spatial = SpatialAnimationsAllowed();
+    auto start = [&](ResultElementMotion& motion, bool existed,
+                     double previousTop, double top,
+                     const ResultElementMotion* previous) {
+      motion.offsetY.Snap(spatial && existed ? previousTop - top : 0.0);
+      double opacity = existed ? 1.0 : kResultEnterOpacity;
+      if (existed && previous) opacity = previous->opacity.Value();
+      motion.opacity.Snap(opacity);
+      motion.offsetY.Retarget(0.0, kResultTransitionSeconds, spatial);
+      motion.opacity.Retarget(1.0, kResultTransitionSeconds, true);
+    };
+
     float y = kResultsTop;
     for (const auto& section : sections_) {
-      auto& header = resultHeaderMotion_[section.title];
       const auto oldHeader = oldPositions.headers.find(section.title);
-      header.offsetY.Snap(
-          SpatialAnimationsAllowed()
-              ? (oldHeader == oldPositions.headers.end()
-                     ? 4.0
-                     : oldHeader->second - y)
-              : 0.0);
-      header.opacity.Snap(oldHeader == oldPositions.headers.end() ? 0.65
-                                                                  : 1.0);
-      header.offsetY.Retarget(0.0, kResultTransitionSeconds,
-                              SpatialAnimationsAllowed());
-      header.opacity.Retarget(1.0, kResultTransitionSeconds, true);
+      const auto previousHeader = previousHeaders.find(section.title);
+      const bool headerExisted = oldHeader != oldPositions.headers.end();
+      start(resultHeaderMotion_[section.title], headerExisted,
+            headerExisted ? oldHeader->second : 0.0, y,
+            previousHeader != previousHeaders.end() ? &previousHeader->second
+                                                    : nullptr);
       y += kSectionHeaderHeight;
-      for (const auto& item : section.items) {
-        const std::wstring key = item.Key();
-        auto& row = resultRowMotion_[key];
+      const float bodyTop = y;
+      for (std::size_t i = 0; i < section.items.size(); ++i) {
+        const std::wstring key = section.items[i].Key();
+        const float rowTop = bodyTop + ItemOffsetInSection(i);
         const auto oldRow = oldPositions.rows.find(key);
-        row.offsetY.Snap(
-            SpatialAnimationsAllowed()
-                ? (oldRow == oldPositions.rows.end() ? 4.0
-                                                     : oldRow->second - y)
-                : 0.0);
-        row.opacity.Snap(oldRow == oldPositions.rows.end() ? 0.65 : 1.0);
-        row.offsetY.Retarget(0.0, kResultTransitionSeconds,
-                             SpatialAnimationsAllowed());
-        row.opacity.Retarget(1.0, kResultTransitionSeconds, true);
-        y += kResultRowStride;
+        const auto previousRow = previousRows.find(key);
+        const bool rowExisted = oldRow != oldPositions.rows.end();
+        start(resultRowMotion_[key], rowExisted,
+              rowExisted ? oldRow->second : 0.0, rowTop,
+              previousRow != previousRows.end() ? &previousRow->second
+                                                : nullptr);
       }
+      y = bodyTop + SectionBodyHeight(section.items.size());
     }
     RequestAnimationFrame();
   }
@@ -10890,9 +11439,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       overlayOpacity_.Retarget(1.0, kSurfaceOpenSeconds,
                                FadeAnimationsAllowed() &&
-                                   (wasClosing || revealWasInProgress));
+                                   (wasClosing || revealWasInProgress),
+                               feathercast::motion::Easing::OutQuint);
       overlaySurfaceScale_.Retarget(1.0, kSurfaceOpenSeconds,
-                                    SpatialAnimationsAllowed());
+                                    SpatialAnimationsAllowed(),
+                                    feathercast::motion::Easing::OutQuint);
     }
 
     // Prepare the reveal's zero-progress frame while the HWND is still hidden.
@@ -10976,7 +11527,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     previewService_.Invalidate(previewGeneration_);
     previewResult_.reset();
     previewBitmap_.Reset();
-    previewScroll_ = 0.0f;
+    ResetPreviewScroll();
     confirmation_.reset();
     confirmationFocus_ = 0;
     confirmationHover_ = -1;
@@ -11018,10 +11569,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // still gets a useful fade while spatial scaling remains disabled.
       overlayOpacity_.Snap(overlayOpacity_.Value());
       overlayOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
-                               FadeAnimationsAllowed());
+                               FadeAnimationsAllowed(),
+                               feathercast::motion::Easing::InCubic);
       if (SpatialAnimationsAllowed()) {
         overlaySurfaceScale_.Retarget(kSurfaceScaleStart,
-                                      kSurfaceCloseSeconds, true);
+                                      kSurfaceCloseSeconds, true,
+                                      feathercast::motion::Easing::InCubic);
       } else {
         overlaySurfaceScale_.Snap(1.0);
       }
@@ -11359,10 +11912,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       volumeClosing_ = true;
       volumeOpacity_.Snap(volumeOpacity_.Value());
       volumeOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
-                              FadeAnimationsAllowed());
+                              FadeAnimationsAllowed(),
+                               feathercast::motion::Easing::InCubic);
       if (SpatialAnimationsAllowed()) {
         volumeSurfaceScale_.Retarget(kSurfaceScaleStart,
-                                     kSurfaceCloseSeconds, true);
+                                     kSurfaceCloseSeconds, true,
+                                      feathercast::motion::Easing::InCubic);
       } else {
         volumeSurfaceScale_.Snap(1.0);
       }
@@ -11857,10 +12412,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       CancelPointerPress(settingsHwnd_);
       settingsOpacity_.Snap(settingsOpacity_.Value());
       settingsOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
-                                FadeAnimationsAllowed());
+                                FadeAnimationsAllowed(),
+                               feathercast::motion::Easing::InCubic);
       if (SpatialAnimationsAllowed()) {
         settingsSurfaceScale_.Retarget(kSurfaceScaleStart,
-                                       kSurfaceCloseSeconds, true);
+                                       kSurfaceCloseSeconds, true,
+                                      feathercast::motion::Easing::InCubic);
       } else {
         settingsSurfaceScale_.Snap(1.0);
       }
@@ -11905,6 +12462,336 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ExitBrowseView() {
     RestoreNavigationState();
+  }
+
+  void EnterPhoneBrowseView(BrowseView view) {
+    EnterBrowseView(view);
+    if (view == BrowseView::PhonePhotos) RefreshPhonePhotos(false);
+    if (view == BrowseView::PhoneMessages && phoneService_.Connected()) {
+      phoneService_.RequestSmsThreads();
+    }
+    if (view == BrowseView::PhoneFiles) OpenPhoneFolder(phoneStore_.FilesPath());
+  }
+
+  // Shows a short message in the launcher, or as a toast when it is hidden.
+  void PhoneNotice(StatusSeverity severity, const std::wstring& text) {
+    if (visible_) {
+      SetOverlayStatus(severity, text);
+    } else {
+      ShowTrayNotification(L"FeatherCast Phone", text);
+    }
+  }
+
+  // False (with a notice) when the connected phone lacks a feature switch.
+  bool PhoneFeatureReady(const char* feature, const wchar_t* name) {
+    if (!phoneStore_.Connected() || phoneStore_.HasFeature(feature)) return true;
+    PhoneNotice(StatusSeverity::Error, std::wstring(L"Turn on \u201c") + name +
+                                           L"\u201d in the FeatherCast app on your phone.");
+    return false;
+  }
+
+  void OpenPhoneFolder(const std::string& path) {
+    phoneStore_.OpenFolder(path);
+    if (phoneService_.Connected()) phoneService_.ListFiles(path);
+    if (browseView_ == BrowseView::PhoneFiles) {
+      ClearQuery();
+      RequestSearch();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+  }
+
+  void RequestPhoneFile(const std::wstring& path, bool open) {
+    const std::string remotePath = WideToUtf8(path);
+    if (!phoneService_.Connected() || !phoneService_.RequestFile(remotePath)) {
+      PhoneNotice(StatusSeverity::Error, L"Connect your phone to download this file.");
+      return;
+    }
+    phoneStore_.SetFileDownloading(remotePath, true);
+    if (open) phoneFileOpens_.insert(remotePath);
+    else phoneFileOpens_.erase(remotePath);
+    if (visible_) SetOverlayStatus(StatusSeverity::Progress, L"Downloading file...");
+    RequestSearch();
+  }
+
+  void OpenSmsThread(const std::string& thread, const std::string& address,
+                     const std::wstring& name) {
+    phoneCompose_ = {};
+    phoneCompose_.sms = true;
+    phoneCompose_.thread = thread;
+    phoneCompose_.address = address;
+    phoneCompose_.name = name;
+    phoneStore_.OpenSmsThread(thread);
+    EnterBrowseView(BrowseView::PhoneThread);
+    if (phoneService_.Connected()) phoneService_.RequestSmsMessages(thread);
+  }
+
+  void BeginNotificationReply(const feathercast::app::PhoneItem& target) {
+    phoneCompose_ = {};
+    phoneCompose_.notificationKey = WideToUtf8(target.id);
+    phoneCompose_.actionIndex = target.actionIndex;
+    phoneCompose_.name = target.title.empty() ? target.appName : target.title;
+    EnterBrowseView(BrowseView::PhoneCompose);
+  }
+
+  // Sends the search box text as an SMS or notification reply.
+  void SendPhoneDraft() {
+    const std::wstring draft = Trim(query_);
+    if (draft.empty()) {
+      SetOverlayStatus(StatusSeverity::Info, L"Type a message first.");
+      return;
+    }
+    if (!phoneService_.Connected()) {
+      SetOverlayStatus(StatusSeverity::Error, L"Connect your phone to send messages.");
+      return;
+    }
+    if (!phoneCompose_.sms) {
+      if (!phoneService_.NotificationAction(phoneCompose_.notificationKey,
+                                            phoneCompose_.actionIndex, WideToUtf8(draft))) {
+        SetOverlayStatus(StatusSeverity::Error, L"The reply could not be sent.");
+        return;
+      }
+      ExitBrowseView();
+      SetOverlayStatus(StatusSeverity::Success, L"Reply sent to " + phoneCompose_.name + L".");
+      return;
+    }
+    const std::string ref = std::to_string(UnixNowMs()) + "-" + std::to_string(++phoneSmsSerial_);
+    if (!phoneService_.SendSms(ref, phoneCompose_.address, WideToUtf8(draft))) {
+      SetOverlayStatus(StatusSeverity::Error, L"The message could not be sent.");
+      return;
+    }
+    phoneSmsRecipients_[ref] = phoneCompose_.name.empty() ? Utf8ToWide(phoneCompose_.address)
+                                                          : phoneCompose_.name;
+    if (browseView_ == BrowseView::PhoneThread) {
+      phoneStore_.AddPendingSms(ref, WideToUtf8(draft), UnixNowMs());
+      ClearQuery();
+      RequestSearch();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    } else {
+      ExitBrowseView();
+      SetOverlayStatus(StatusSeverity::Success,
+                       L"Sending message to " + phoneSmsRecipients_[ref] + L"...");
+    }
+  }
+
+  void RunPhoneMediaControl(const std::wstring& id) {
+    if (!phoneService_.Connected()) {
+      SetOverlayStatus(StatusSeverity::Error, L"Connect your phone to control its media.");
+      return;
+    }
+    const auto& media = phoneStore_.Media();
+    if (id == L"now" || id == L"toggle") {
+      phoneService_.MediaCommand("toggle");
+    } else if (id == L"next") {
+      phoneService_.MediaCommand("next");
+    } else if (id == L"prev") {
+      phoneService_.MediaCommand("prev");
+    } else if (id == L"vol-up" || id == L"vol-down") {
+      if (media.volume < 0) return;
+      const int step = std::max(1, media.volumeMax / 15);
+      phoneService_.MediaVolume(std::clamp(media.volume + (id == L"vol-up" ? step : -step),
+                                           0, media.volumeMax));
+    }
+  }
+
+  void RunPhoneCallControl(const std::wstring& id) {
+    const bool sent = id == L"reject" ? phoneService_.CallReject() : phoneService_.CallSilence();
+    if (!sent) PhoneNotice(StatusSeverity::Error, L"Your phone is not connected.");
+  }
+
+  void ToggleFindMyPhone() {
+    if (!phoneService_.Connected()) {
+      PhoneNotice(StatusSeverity::Error, L"Connect your phone to make it ring.");
+      return;
+    }
+    if (!PhoneFeatureReady("ring", L"Find my phone")) return;
+    const bool start = !phoneStore_.Ringing();
+    if (!phoneService_.Ring(start)) {
+      PhoneNotice(StatusSeverity::Error, L"Your phone is not connected.");
+      return;
+    }
+    phoneStore_.SetRinging(start);
+    const std::wstring device = Utf8ToWide(phoneStore_.DeviceName());
+    if (visible_) HideOverlay(OverlayCloseReason::Action);
+    ShowTrayNotification(L"FeatherCast Phone",
+                         start ? L"Ringing " + device + L". Run Find My Phone again to stop."
+                               : L"Stopped ringing " + device + L".");
+  }
+
+  // Sends files to the phone now, or once it connects.
+  void SendFilesToPhone(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+    if (!settings_.phoneLinkEnabled) {
+      OpenPhoneWindow();
+      return;
+    }
+    if (!phoneService_.Connected()) {
+      pendingPhoneSends_.insert(pendingPhoneSends_.end(), paths.begin(), paths.end());
+      ShowTrayNotification(L"FeatherCast Phone",
+                           L"The file will be sent when your phone connects.");
+      return;
+    }
+    if (!PhoneFeatureReady("files.receive", L"Files from the PC")) return;
+    for (const auto& path : paths) {
+      std::string error;
+      const std::string id = phoneService_.SendFile(path, &error);
+      const std::wstring name = std::filesystem::path(path).filename().wstring();
+      if (id.empty()) {
+        ShowTrayNotification(L"FeatherCast Phone", name + L": " + Utf8ToWide(error));
+      } else {
+        phoneSendNames_[id] = name;
+      }
+    }
+  }
+
+  std::vector<std::wstring> PickFilesToSend() {
+    std::vector<std::wstring> paths;
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog)))) {
+      return paths;
+    }
+    FILEOPENDIALOGOPTIONS options{};
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM |
+                       FOS_FILEMUSTEXIST);
+    dialog->SetTitle(L"Send files to your phone");
+    if (FAILED(dialog->Show(nullptr))) return paths;
+    ComPtr<IShellItemArray> items;
+    if (FAILED(dialog->GetResults(&items))) return paths;
+    DWORD count = 0;
+    items->GetCount(&count);
+    for (DWORD i = 0; i < count; ++i) {
+      ComPtr<IShellItem> item;
+      if (FAILED(items->GetItemAt(i, &item))) continue;
+      PWSTR rawPath = nullptr;
+      if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) || !rawPath) continue;
+      CoMemPtr<wchar_t> pathOwner(rawPath);
+      paths.emplace_back(rawPath);
+    }
+    return paths;
+  }
+
+  // "FeatherCast Phone" in Explorer's Send To menu while the link is on.
+  void UpdatePhoneSendToShortcut() {
+    const std::wstring sendTo = KnownFolderPath(FOLDERID_SendTo);
+    if (sendTo.empty()) return;
+    const std::filesystem::path link = std::filesystem::path(sendTo) / L"FeatherCast Phone.lnk";
+    std::error_code ec;
+    if (!settings_.phoneLinkEnabled) {
+      std::filesystem::remove(link, ec);
+      return;
+    }
+    if (std::filesystem::exists(link, ec)) return;
+    const std::filesystem::path exe = ExePath();
+    if (exe.empty()) return;
+    ComPtr<IShellLinkW> shellLink;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&shellLink)))) {
+      return;
+    }
+    shellLink->SetPath(exe.c_str());
+    shellLink->SetArguments(L"--send-to-phone");
+    shellLink->SetIconLocation(exe.c_str(), 0);
+    shellLink->SetDescription(L"Send files to your phone with FeatherCast");
+    ComPtr<IPersistFile> persist;
+    if (SUCCEEDED(shellLink.As(&persist))) persist->Save(link.c_str(), TRUE);
+  }
+
+  // Asks the phone for its recent photo list when it is missing or stale.
+  void RefreshPhonePhotos(bool force) {
+    if (!phoneService_.Connected()) return;
+    constexpr long long kPhotoListMaxAgeMs = 60 * 1000;
+    if (!force && !phoneStore_.Photos().empty() &&
+        UnixNowMs() - phoneStore_.PhotosFetchedAt() < kPhotoListMaxAgeMs) {
+      return;
+    }
+    phoneService_.RequestPhotos();
+  }
+
+  void RequestPhonePhoto(const std::wstring& id, bool open) {
+    const std::string photoId = WideToUtf8(id);
+    if (!phoneService_.Connected() || !phoneService_.RequestPhoto(photoId)) {
+      SetOverlayStatus(StatusSeverity::Error,
+                       L"Connect your phone to download this photo.");
+      return;
+    }
+    phoneStore_.SetDownloading(photoId, true);
+    pendingPhotoOpens_.insert(photoId);
+    if (open) {
+      phonePhotoSaveOnly_.erase(photoId);
+    } else {
+      phonePhotoSaveOnly_.insert(photoId);
+    }
+    SetOverlayStatus(StatusSeverity::Progress, L"Downloading photo...");
+    RequestSearch();
+  }
+
+  void DismissPhoneNotification(const std::wstring& key) {
+    const std::string notificationKey = WideToUtf8(key);
+    if (!phoneService_.DismissNotification(notificationKey)) {
+      SetOverlayStatus(StatusSeverity::Error,
+                       L"Connect your phone to dismiss notifications.");
+      return;
+    }
+    phoneStore_.RemoveNotification(notificationKey);
+    RequestSearch();
+  }
+
+  void CopyPhoneTextToPc(const std::wstring& text) {
+    // Remember the text so the clipboard listener does not echo it back.
+    lastPhoneClipboardText_ = text;
+    if (CopyTextToClipboard(text)) {
+      HideOverlay(OverlayCloseReason::Action);
+    } else {
+      SetOverlayStatus(StatusSeverity::Error, L"Could not copy the selected text.");
+    }
+  }
+
+  void ActivatePhoneItem(const DisplayItem& item) {
+    using feathercast::app::PhoneItemKind;
+    switch (item.phone.kind) {
+      case PhoneItemKind::Notification:
+        CopyPhoneTextToPc(PhoneNotificationText(item.phone));
+        return;
+      case PhoneItemKind::Clip:
+        lastPhoneClipboardText_ = item.phone.text;
+        PasteTextToLastActiveWindow(item.phone.text);
+        return;
+      case PhoneItemKind::Photo:
+        RequestPhonePhoto(item.phone.id, true);
+        return;
+      case PhoneItemKind::Media:
+        RunPhoneMediaControl(item.phone.id);
+        return;
+      case PhoneItemKind::SmsThread:
+        OpenSmsThread(WideToUtf8(item.phone.id), WideToUtf8(item.phone.appName),
+                      item.phone.title == item.phone.appName ? std::wstring{} : item.phone.title);
+        return;
+      case PhoneItemKind::SmsMessage:
+        CopyPhoneTextToPc(item.phone.text);
+        return;
+      case PhoneItemKind::Compose:
+        if (item.phone.id.starts_with(L"new:")) {
+          if (!PhoneFeatureReady("sms", L"Text messages")) return;
+          phoneCompose_ = {};
+          phoneCompose_.sms = true;
+          phoneCompose_.address = WideToUtf8(item.phone.text);
+          EnterBrowseView(BrowseView::PhoneCompose);
+        } else {
+          SendPhoneDraft();
+        }
+        return;
+      case PhoneItemKind::File:
+        if (item.phone.directory) {
+          OpenPhoneFolder(WideToUtf8(item.phone.id));
+        } else {
+          RequestPhoneFile(item.phone.id, true);
+        }
+        return;
+      case PhoneItemKind::Call:
+        RunPhoneCallControl(item.phone.id);
+        return;
+    }
   }
 
   void CaptureProductivityQueryForResume() {
@@ -11953,6 +12840,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (browseView_ == BrowseView::Emoji) return L"Search emoji...";
     if (browseView_ == BrowseView::Games) return L"Search installed games...";
     if (browseView_ == BrowseView::Capabilities) return L"Search FeatherCast features...";
+    if (browseView_ == BrowseView::PhoneNotifications) return L"Search phone notifications...";
+    if (browseView_ == BrowseView::PhonePhotos) return L"Search phone photos...";
+    if (browseView_ == BrowseView::PhoneClipboard) return L"Search phone clipboard...";
+    if (browseView_ == BrowseView::PhoneMedia) return L"Search media controls...";
+    if (browseView_ == BrowseView::PhoneMessages) return L"Search conversations or type a number...";
+    if (browseView_ == BrowseView::PhoneThread || browseView_ == BrowseView::PhoneCompose) {
+      return PhoneComposePrompt() + L"...";
+    }
+    if (browseView_ == BrowseView::PhoneFiles) return L"Search this folder...";
     if (actionMode_) return L"Actions for " + actionTarget_.Name();
     return L"Search apps, files, commands, and more...";
   }
@@ -11975,6 +12871,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (browseView_ == BrowseView::Capabilities) {
       return emptyQuery ? L"No features available"
                         : L"No matching features — try apps, calculator, clipboard, or shortcuts";
+    }
+    if (feathercast::app::IsPhoneBrowseView(browseView_)) {
+      if (!emptyQuery) return L"No matching items from your phone";
+      if (!settings_.phoneLinkEnabled) return L"Phone Connection is turned off";
+      if (!phoneStore_.Connected()) {
+        return phoneService_.Devices().empty()
+                   ? L"No phone paired yet — open the Phone command to pair one"
+                   : L"Phone not connected — open FeatherCast Phone on your phone";
+      }
+      if (browseView_ == BrowseView::PhoneNotifications) return L"No notifications yet";
+      if (browseView_ == BrowseView::PhonePhotos) return L"Loading photos from your phone...";
+      if (browseView_ == BrowseView::PhoneMedia) {
+        return phoneStore_.HasFeature("media")
+                   ? L"Nothing is playing on your phone"
+                   : L"Turn on \u201cMedia controls\u201d in the FeatherCast app on your phone";
+      }
+      if (browseView_ == BrowseView::PhoneMessages) {
+        return phoneStore_.HasFeature("sms")
+                   ? L"Loading conversations..."
+                   : L"Turn on \u201cText messages\u201d in the FeatherCast app on your phone";
+      }
+      if (browseView_ == BrowseView::PhoneFiles) {
+        if (!phoneStore_.FilesError().empty()) return Utf8ToWide(phoneStore_.FilesError());
+        if (phoneStore_.FilesLoading()) return L"Loading folder...";
+        return L"This folder is empty";
+      }
+      return L"Nothing copied on your phone yet";
     }
     if (actionMode_) {
       return emptyQuery ? L"No actions available" : L"No matching actions";
@@ -12205,11 +13128,80 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     float dy;
   };
 
+  // The phone photo view lays its results out as a thumbnail grid; every
+  // other view uses one full-width row per result.
+  bool PhotoGridActive() const {
+    return browseView_ == BrowseView::PhonePhotos;
+  }
+
+  feathercast::layout::ResultGrid CurrentResultGrid() const {
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const float scale = GetWindowScale(hwnd_);
+    const float width = static_cast<float>(rc.right - rc.left) / scale;
+    return feathercast::layout::FitResultGrid(width - 16.0f);
+  }
+
+  float ItemOffsetInSection(std::size_t index) const {
+    if (PhotoGridActive()) {
+      const auto grid = CurrentResultGrid();
+      return static_cast<float>(grid.RowOf(static_cast<int>(index))) * grid.Stride();
+    }
+    return static_cast<float>(index) * kResultRowStride;
+  }
+
+  float SectionBodyHeight(std::size_t count) const {
+    if (PhotoGridActive()) return CurrentResultGrid().Height(count);
+    return static_cast<float>(count) * kResultRowStride;
+  }
+
+  float ItemHeight() const {
+    return PhotoGridActive() ? CurrentResultGrid().cell : kResultRowHeight;
+  }
+
+  // Rectangle of a result inside its section; bodyTop is the top of the
+  // section's first row and width the full results width.
+  RectF ResultItemRect(std::size_t index, float bodyTop, float width) const {
+    const float top = bodyTop + ItemOffsetInSection(index);
+    if (PhotoGridActive()) {
+      const auto grid = CurrentResultGrid();
+      const float left =
+          8.0f + static_cast<float>(grid.ColumnOf(static_cast<int>(index))) * grid.Stride();
+      return {left, top, left + grid.cell, top + grid.cell};
+    }
+    return {8.0f, top, width - 8.0f, top + kResultRowHeight};
+  }
+
+  // Arrow-key movement in the photo grid. Returns false when the key should
+  // keep its normal meaning (e.g. Left on the first tile leaves the view).
+  bool MoveInResultGrid(int dx, int dy) {
+    if (!PhotoGridActive() || selected_ < 0 ||
+        selected_ >= static_cast<int>(flatItems_.size())) {
+      return false;
+    }
+    int sectionStart = 0;
+    int sectionCount = 0;
+    for (const auto& section : sections_) {
+      const int count = static_cast<int>(section.items.size());
+      if (selected_ < sectionStart + count) {
+        sectionCount = count;
+        break;
+      }
+      sectionStart += count;
+    }
+    const int inSection = selected_ - sectionStart;
+    const int next = feathercast::layout::GridMove(
+        inSection, sectionCount, CurrentResultGrid().columns, dx, dy);
+    if (next == inSection) return dy != 0;
+    SelectResult(sectionStart + next, true, true);
+    return true;
+  }
+
   int ResultsContentHeight() const {
     int height = 0;
     for (const auto& section : sections_) {
       height += static_cast<int>(kSectionHeaderHeight);
-      height += static_cast<int>(section.items.size() * kResultRowStride);
+      height += static_cast<int>(SectionBodyHeight(section.items.size()));
     }
     return height;
   }
@@ -12264,8 +13256,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           std::max(workTop, workBottom - height));
       if (IsWindowVisible(hwnd_) && SpatialAnimationsAllowed()) {
         RECT target{left, top, left + width, top + height};
-        StartBoundsTransition(hwnd_, overlayBounds_, target,
-                              kOverlayResizeSeconds);
+        StartBoundsTransition(hwnd_, overlayBounds_, target);
         RequestAnimationFrame();
       } else {
         SetWindowPos(hwnd_, HWND_TOPMOST, left, top, width, height,
@@ -12287,14 +13278,24 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // Spring response, not duration: how quickly the pill reaches the row.
   // Critically damped, so it settles without overshoot.
   static constexpr double kSelectionKeyboardResponseSeconds = 0.190;
-  static constexpr double kSurfaceOpenSeconds = 0.150;
-  static constexpr double kSurfaceCloseSeconds = 0.110;
-  static constexpr double kSurfaceScaleStart = 0.94;
-  static constexpr double kOverlayResizeSeconds = 0.140;
-  static constexpr double kSettingsResizeSeconds = 0.160;
-  static constexpr double kOverlayScrollSeconds = 0.085;
-  static constexpr double kSettingsScrollSeconds = 0.090;
-  static constexpr double kResultTransitionSeconds = 0.110;
+  // Entrances decelerate into place; exits accelerate away and are
+  // shorter, so dismissing never feels like it lags behind the key press.
+  static constexpr double kSurfaceOpenSeconds = 0.160;
+  static constexpr double kSurfaceCloseSeconds = 0.100;
+  static constexpr double kSurfaceScaleStart = 0.96;
+  // Scroll and resize use springs so a new wheel notch or keystroke that
+  // retargets them mid-flight keeps the current velocity (no pulsing).
+  static constexpr double kSelectionPointerResponseSeconds = 0.120;
+  static constexpr double kOverlayResizeResponseSeconds = 0.200;
+  static constexpr double kSettingsResizeResponseSeconds = 0.220;
+  static constexpr double kOverlayScrollResponseSeconds = 0.130;
+  static constexpr double kSettingsScrollResponseSeconds = 0.140;
+  static constexpr double kPreviewScrollResponseSeconds = 0.140;
+  static constexpr double kResultTransitionSeconds = 0.140;
+  // New rows only cross-fade from mostly visible. Rows often arrive in a
+  // second batch just after opening (the window list refreshes on show),
+  // and a deep fade or rise there reads as the panel opening a second time.
+  static constexpr double kResultEnterOpacity = 0.65;
 
   double ConsumeAnimationDeltaSeconds() {
     if (!qpcFrequency_.QuadPart) return 0.0;
@@ -12303,19 +13304,45 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       lastAnimationFrameQpc_ = now;
       return 0.0;
     }
-    const double dt = static_cast<double>(now - lastAnimationFrameQpc_) / static_cast<double>(qpcFrequency_.QuadPart);
+    double measured =
+        static_cast<double>(now - lastAnimationFrameQpc_) /
+        static_cast<double>(qpcFrequency_.QuadPart);
     lastAnimationFrameQpc_ = now;
-    return std::clamp(dt, 0.0, 0.05);
+    // Work between starting an animation and its first frame (building the
+    // result list, the first paint) happened while nothing was on screen.
+    // Counting it would make the first visible frame jump well into the
+    // animation, so the first tick advances by at most one refresh.
+    if (animationClockFresh_) {
+      animationClockFresh_ = false;
+      const double firstFrame =
+          animationFrameClock_.Active()
+              ? static_cast<double>(animationFrameClock_.Period()) /
+                    static_cast<double>(qpcFrequency_.QuadPart)
+              : 1.0 / 60.0;
+      measured = std::min(measured, firstFrame);
+    }
+    // While the clock is locked to the compositor, advance animation time in
+    // whole refresh periods. Every displayed frame then moves by the same
+    // amount; timer wake-up jitter no longer leaks into positions.
+    if (animationVblankAligned_ && animationFrameClock_.Active()) {
+      const double period =
+          static_cast<double>(animationFrameClock_.Period()) /
+          static_cast<double>(qpcFrequency_.QuadPart);
+      const double periods =
+          std::max(1.0, std::round(measured / std::max(period, 1e-6)));
+      return std::clamp(periods * period, 0.0, 0.05);
+    }
+    return std::clamp(measured, 0.0, 0.05);
   }
 
-  void SnapWindowBounds(feathercast::motion::AnimatedBounds& bounds,
+  void SnapWindowBounds(feathercast::motion::SpringBounds& bounds,
                         const RECT& rect) {
     bounds.Snap(rect.left, rect.top, rect.right - rect.left,
                 rect.bottom - rect.top);
   }
 
   void ApplyAnimatedBounds(HWND hwnd,
-                           feathercast::motion::AnimatedBounds& bounds) {
+                           feathercast::motion::SpringBounds& bounds) {
     if (!hwnd) return;
     if (surfaceResizeFailed_) {
       surfaceResizeFailed_ = false;
@@ -12332,15 +13359,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void StartBoundsTransition(
-      HWND hwnd, feathercast::motion::AnimatedBounds& bounds,
-      const RECT& target, double durationSeconds) {
+      HWND hwnd, feathercast::motion::SpringBounds& bounds,
+      const RECT& target) {
     if (!hwnd) return;
     RECT current{};
     GetWindowRect(hwnd, &current);
     if (!bounds.Active()) SnapWindowBounds(bounds, current);
     bounds.Retarget(target.left, target.top,
                     target.right - target.left, target.bottom - target.top,
-                    durationSeconds, true);
+                    true);
 
     // Resize the native window and swap chain once. The intermediate geometry
     // is now represented by the DirectComposition visual, so WM_SIZE and
@@ -12353,7 +13380,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void StartSurfaceOpen(HWND hwnd,
                         GlassSurface& surface,
-                        feathercast::motion::AnimatedBounds& bounds,
+                        feathercast::motion::SpringBounds& bounds,
                         feathercast::motion::ScalarAnimation& opacity,
                         feathercast::motion::ScalarAnimation& scale,
                         bool topAnchored) {
@@ -12372,13 +13399,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (SpatialAnimationsAllowed()) {
       scale.Snap(kSurfaceScaleStart);
-      scale.Retarget(1.0, kSurfaceOpenSeconds, true);
+      scale.Retarget(1.0, kSurfaceOpenSeconds, true,
+                     feathercast::motion::Easing::OutQuint);
     } else {
       scale.Snap(1.0);
     }
     if (FadeAnimationsAllowed()) {
       opacity.Snap(0.0);
-      opacity.Retarget(1.0, kSurfaceOpenSeconds, true);
+      opacity.Retarget(1.0, kSurfaceOpenSeconds, true,
+                       feathercast::motion::Easing::OutQuint);
     } else {
       opacity.Snap(1.0);
     }
@@ -12389,25 +13418,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void RetargetOverlayScroll(bool animate = true) {
-    overlayVisualScroll_.Retarget(
-        static_cast<double>(scroll_), kOverlayScrollSeconds,
-        animate && SpatialAnimationsAllowed());
+    overlayVisualScroll_.Retarget(static_cast<double>(scroll_),
+                                  animate && SpatialAnimationsAllowed());
     if (overlayVisualScroll_.Active()) RequestAnimationFrame();
   }
 
   void RetargetSettingsScroll(bool animate = true) {
-    settingsVisualScroll_.Retarget(
-        static_cast<double>(settingsScroll_), kSettingsScrollSeconds,
-        animate && SpatialAnimationsAllowed());
+    settingsVisualScroll_.Retarget(static_cast<double>(settingsScroll_),
+                                   animate && SpatialAnimationsAllowed());
     if (settingsVisualScroll_.Active()) RequestAnimationFrame();
   }
 
+  void RetargetPreviewScroll(bool animate = true) {
+    previewVisualScroll_.Retarget(static_cast<double>(previewScroll_),
+                                  animate && SpatialAnimationsAllowed());
+    if (previewVisualScroll_.Active()) RequestAnimationFrame();
+  }
+
+  void ResetPreviewScroll() {
+    previewScroll_ = 0.0f;
+    previewVisualScroll_.Snap(0.0);
+  }
+
   void SnapSpatialMotionToTargets() {
-    auto snap = [](feathercast::motion::ScalarAnimation& animation) {
-      animation.Snap(animation.Target());
-    };
+    auto snap = [](auto& animation) { animation.Snap(animation.Target()); };
     snap(overlayVisualScroll_);
     snap(settingsVisualScroll_);
+    snap(previewVisualScroll_);
     snap(settingsCategoryTop_);
     snap(volumeVisualPercent_);
     snap(overlaySurfaceScale_);
@@ -12431,7 +13468,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                        volumeBounds_.width.Target(),
                        volumeBounds_.height.Target());
     auto applySnapped = [](HWND hwnd,
-                           const feathercast::motion::AnimatedBounds& bounds) {
+                           const feathercast::motion::SpringBounds& bounds) {
       if (!hwnd || !IsWindowVisible(hwnd) || bounds.width.Value() <= 0.0 ||
           bounds.height.Value() <= 0.0) {
         return;
@@ -12462,6 +13499,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snap(confirmationProgress_);
     snap(settingsPageProgress_);
     for (auto& [_, animation] : switchAnimations_) snap(animation);
+    for (auto& [_, animation] : settingsHoverMotion_) snap(animation);
+    snap(gearHoverMotion_);
     for (auto& [_, element] : resultRowMotion_) snap(element.opacity);
     for (auto& [_, element] : resultHeaderMotion_) snap(element.opacity);
     animating_ = false;
@@ -12483,18 +13522,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     int row = 0;
     for (const auto& section : sections_) {
       y += kSectionHeaderHeight;
-      for (size_t i = 0; i < section.items.size(); ++i) {
-        if (row == selected_) {
-          if (const auto motion =
-                  resultRowMotion_.find(section.items[i].Key());
-              motion != resultRowMotion_.end()) {
-            y += static_cast<float>(motion->second.offsetY.Value());
-          }
-          return y;
+      const int count = static_cast<int>(section.items.size());
+      if (selected_ < row + count) {
+        const auto i = static_cast<std::size_t>(selected_ - row);
+        float top = y + ItemOffsetInSection(i);
+        if (const auto motion = resultRowMotion_.find(section.items[i].Key());
+            motion != resultRowMotion_.end()) {
+          top += static_cast<float>(motion->second.offsetY.Value());
         }
-        y += kResultRowStride;
-        ++row;
+        return top;
       }
+      y += SectionBodyHeight(section.items.size());
+      row += count;
     }
     return std::nullopt;
   }
@@ -12507,7 +13546,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     StopSelectionAnimationTimer();
   }
 
-  void StartSelectionAnimationFrom(std::optional<float> previousY, int previousScroll) {
+  void StartSelectionAnimationFrom(std::optional<float> previousY,
+                                   double responseSeconds) {
     const auto targetY = SelectedRowTop();
     if (!SpatialAnimationsAllowed() || !previousY || !targetY) {
       SyncSelectionAnimationToTarget();
@@ -12517,9 +13557,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // A held arrow key retargets before the previous move settles. Keeping the
     // spring's velocity through the retarget is what turns a burst of key
     // repeats into one continuous glide instead of a stutter of restarts.
-    selectionSpring_.Configure(kSelectionKeyboardResponseSeconds, 1.0);
+    selectionSpring_.Configure(responseSeconds, 1.0);
+    // previousY is the on-screen position read before the scroll target
+    // changed. The visual scroll is animated too, so it is still accurate.
     if (!animatingSelection_ || visualSelectedY_ < 0.0f) {
-      visualSelectedY_ = *previousY - static_cast<float>(scroll_ - previousScroll);
+      visualSelectedY_ = *previousY;
       selectionSpring_.Snap(visualSelectedY_);
     }
     selectionSpring_.Retarget(*targetY);
@@ -12527,7 +13569,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     StartSelectionAnimationTimer();
   }
 
-  void SelectResult(int next, bool animate, bool ensureVisible) {
+  void SelectResult(int next, bool animate, bool ensureVisible,
+                    double responseSeconds = kSelectionKeyboardResponseSeconds) {
     if (!ResultsActivationAllowed()) return;
     if (flatItems_.empty()) {
       feathercast::ui::OverlayController::Select(
@@ -12553,12 +13596,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     const auto previousY = SelectedRowTop();
-    const int previousScroll = scroll_;
     feathercast::ui::OverlayController::Select(
         overlayState_, next, static_cast<int>(flatItems_.size()), false);
     if (ensureVisible) EnsureSelectedVisible(animate);
     if (animate) {
-      StartSelectionAnimationFrom(previousY, previousScroll);
+      StartSelectionAnimationFrom(previousY, responseSeconds);
     } else {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -12585,7 +13627,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     previewService_.Invalidate(previewGeneration_);
     previewResult_.reset();
     previewBitmap_.Reset();
-    previewScroll_ = 0.0f;
+    ResetPreviewScroll();
     KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
     ApplyWindowSize();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -12684,17 +13726,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     });
   }
 
+  bool HasSettingsHoverMotion() const {
+    return std::any_of(settingsHoverMotion_.begin(), settingsHoverMotion_.end(),
+                       [](const auto& entry) { return entry.second.Active(); });
+  }
+
   bool HasActiveMotion() const {
     const bool switchMotion =
         std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
                     [](const auto& entry) { return entry.second.Active(); });
     return HasRevealAnimation() || animatingSelection_ ||
+           gearHoverMotion_.Active() || HasSettingsHoverMotion() ||
            overlayOpacity_.Active() || settingsOpacity_.Active() ||
            volumeOpacity_.Active() || overlaySurfaceScale_.Active() ||
            settingsSurfaceScale_.Active() || volumeSurfaceScale_.Active() ||
            confirmationProgress_.Active() ||
            overlayVisualScroll_.Active() || settingsVisualScroll_.Active() ||
-           settingsPageProgress_.Active() ||
+           previewVisualScroll_.Active() || settingsPageProgress_.Active() ||
            settingsCategoryTop_.Active() || volumeVisualPercent_.Active() ||
            overlayBounds_.Active() || settingsBounds_.Active() ||
            volumeBounds_.Active() || HasElementMotion(resultRowMotion_) ||
@@ -12724,15 +13772,55 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return 60;
   }
 
+  // DWM's composition clock. Its period is exact (59.94 Hz stays 59.94 Hz)
+  // and its vblank timestamp lets the animation clock tick in phase with
+  // the display.
+  std::optional<DWM_TIMING_INFO> CompositorTiming() const {
+    DWM_TIMING_INFO info{};
+    info.cbSize = sizeof(info);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)) ||
+        info.qpcRefreshPeriod == 0 || info.qpcVBlank == 0) {
+      return std::nullopt;
+    }
+    return info;
+  }
+
   std::int64_t AnimationFramePeriodQpc(HWND window) {
     const HMONITOR monitor =
         MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     if (monitor != animationClockMonitor_ || animationFramePeriodQpc_ <= 0) {
       animationClockMonitor_ = monitor;
-      animationFramePeriodQpc_ = feathercast::motion::DisplayFramePeriodQpc(
+      const std::int64_t nominal = feathercast::motion::DisplayFramePeriodQpc(
           qpcFrequency_.QuadPart, DisplayRefreshRateHz(monitor));
+      animationFramePeriodQpc_ = nominal;
+      animationVblankAligned_ = false;
+      // With mixed refresh rates the compositor clock may belong to another
+      // monitor. Only lock to it when it matches this window's display.
+      if (const auto timing = CompositorTiming()) {
+        const auto compositor =
+            static_cast<std::int64_t>(timing->qpcRefreshPeriod);
+        if (std::abs(compositor - nominal) * 100 <= nominal * 3) {
+          animationFramePeriodQpc_ = compositor;
+          animationVblankAligned_ = true;
+        }
+      }
     }
     return animationFramePeriodQpc_;
+  }
+
+  void StartAnimationFrameClock(LONGLONG now, std::int64_t period) {
+    if (animationVblankAligned_) {
+      if (const auto timing = CompositorTiming()) {
+        // Tick mid-interval: the point farthest from DWM's composition
+        // wake-up, so timer jitter cannot push a frame into a neighbouring
+        // refresh (one refresh with two new frames, the next with none).
+        animationFrameClock_.StartAligned(
+            now, period, static_cast<std::int64_t>(timing->qpcVBlank),
+            period / 2);
+        return;
+      }
+    }
+    animationFrameClock_.Start(now, period);
   }
 
   UINT AnimationFrameIntervalMs(std::int64_t periodQpc) const {
@@ -12810,7 +13898,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void RephaseAnimationClock() {
     if (!animationLoopRunning_ || !HasActiveMotion()) return;
     const LONGLONG now = NowQpc();
-    animationFrameClock_.Start(
+    StartAnimationFrameClock(
         now, AnimationFramePeriodQpc(AnimationClockWindow()));
     CancelAnimationFrameTimer();
     if (!animationFrameGate_.Queued()) {
@@ -12836,11 +13924,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         AnimationFramePeriodQpc(AnimationClockWindow());
     if (!animationLoopRunning_) {
       lastAnimationFrameQpc_ = now;
-      animationFrameClock_.Start(now, period);
+      animationClockFresh_ = true;
+      StartAnimationFrameClock(now, period);
       animationLoopRunning_ = true;
     } else if (!animationFrameClock_.Active() ||
                animationFrameClock_.Period() != period) {
-      animationFrameClock_.Start(now, period);
+      StartAnimationFrameClock(now, period);
       if (animationTimerArmed_) CancelAnimationFrameTimer();
     }
     ArmOrPostAnimationFrame();
@@ -12853,7 +13942,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     const LONGLONG now = NowQpc();
     lastAnimationFrameQpc_ = now;
-    animationFrameClock_.Start(
+    animationClockFresh_ = true;
+    StartAnimationFrameClock(
         now, AnimationFramePeriodQpc(AnimationClockWindow()));
     animationLoopRunning_ = true;
     CancelAnimationFrameTimer();
@@ -12871,13 +13961,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     const bool overlayContentMotion =
         animating_ || animatingSelection_ || overlayVisualScroll_.Active() ||
-        confirmationProgress_.Active() || HasElementMotion(resultRowMotion_) ||
+        previewVisualScroll_.Active() || confirmationProgress_.Active() ||
+        gearHoverMotion_.Active() || HasElementMotion(resultRowMotion_) ||
         HasElementMotion(resultHeaderMotion_) ||
         std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
                     [](const auto& entry) { return entry.second.Active(); });
     const bool settingsContentMotion =
         settingsVisualScroll_.Active() || settingsPageProgress_.Active() ||
-        settingsCategoryTop_.Active();
+        settingsCategoryTop_.Active() || HasSettingsHoverMotion();
     const bool volumeContentMotion = volumeVisualPercent_.Active();
     const double deltaTime = ConsumeAnimationDeltaSeconds();
     if (animatingSelection_) UpdateSelectionAnimation(deltaTime);
@@ -12894,6 +13985,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     confirmationProgress_.Update(deltaTime);
     overlayVisualScroll_.Update(deltaTime);
     settingsVisualScroll_.Update(deltaTime);
+    previewVisualScroll_.Update(deltaTime);
     settingsPageProgress_.Update(deltaTime);
     settingsCategoryTop_.Update(deltaTime);
     volumeVisualPercent_.Update(deltaTime);
@@ -12914,6 +14006,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (auto& [_, animation] : switchAnimations_) {
       animation.Update(deltaTime);
     }
+    for (auto& [_, animation] : settingsHoverMotion_) {
+      animation.Update(deltaTime);
+    }
+    gearHoverMotion_.Update(deltaTime);
 
     if (overlayBoundsChanged) ApplyAnimatedBounds(hwnd_, overlayBounds_);
     if (settingsBoundsChanged) {
@@ -14083,6 +15179,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         line(12.0f, 4.0f, 10.5f, 2.5f);
         line(12.0f, 4.0f, 10.5f, 5.5f);
         break;
+      case ResultIcon::Phone:
+        rect(4.0f, 1.5f, 12.0f, 14.5f, 1.8f);
+        line(6.8f, 12.0f, 9.2f, 12.0f);
+        break;
       case ResultIcon::Edit:
         line(3.0f, 13.0f, 5.2f, 8.2f);
         line(5.2f, 8.2f, 11.8f, 1.6f);
@@ -14177,14 +15277,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     const float contentTop = rect.top + 120.0f;
+    const float visualPreviewScroll =
+        static_cast<float>(previewVisualScroll_.Value());
     if (preview.kind == feathercast::preview::Kind::Text) {
       activeRT_->PushAxisAlignedClip(
           D2D1::RectF(left, contentTop, right, rect.bottom - 16.0f),
           D2D1_ANTIALIAS_MODE_ALIASED);
       DrawLaidOutTextBlock(
           preview.text,
-          {left, contentTop - previewScroll_, right,
-           contentTop - previewScroll_ + 4096.0f},
+          {left, contentTop - visualPreviewScroll, right,
+           contentTop - visualPreviewScroll + 4096.0f},
           bodyFormat_.Get(), D2DColor(theme_.textPrimary), false, false);
       activeRT_->PopAxisAlignedClip();
     } else if (preview.kind == feathercast::preview::Kind::Image &&
@@ -14286,12 +15388,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FillRound({width - 82, 26, width - 74, 34}, 4, D2DColor(accent));
     }
     hits_.push_back({launcherLayout.settings, HitType::Gear});
-    if (gearHovered_) {
+    if (const float gearHover = HoverAmount(gearHoverMotion_, gearHovered_);
+        gearHover > 0.0f) {
       FillRound({launcherLayout.settings.left + 2.0f,
                  launcherLayout.settings.top + 2.0f,
                  launcherLayout.settings.right - 2.0f,
                  launcherLayout.settings.bottom - 2.0f},
-                theme_.controlRadius, D2DColor(theme_.surfaceHover));
+                theme_.controlRadius,
+                WithAlpha(D2DColor(theme_.surfaceHover), gearHover));
     }
     if (launcherAccessibleFocus_.kind == FocusKind::Settings) {
       DrawFocusFrame(launcherLayout.settings, theme_.controlRadius);
@@ -14383,6 +15487,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (headerLayer) activeRT_->PopLayer();
       }
       y += kSectionHeaderHeight;
+      const float bodyTop = y;
+      std::size_t inSection = 0;
       for (const auto& item : section.items) {
         float rowOffset = 0.0f;
         float rowOpacity = 1.0f;
@@ -14391,8 +15497,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           rowOffset = static_cast<float>(motion->second.offsetY.Value());
           rowOpacity = static_cast<float>(motion->second.opacity.Value());
         }
-        RectF rowRect{8, y + rowOffset, resultsRight - 8,
-                      y + rowOffset + kResultRowHeight};
+        RectF rowRect = ResultItemRect(inSection, bodyTop + rowOffset, resultsRight);
         if (rowRect.bottom >= resultsTop && rowRect.top <= resultsBottom) {
           const RowAnim anim = ComputeRowAnim(rowIndex);
           const float combinedOpacity = anim.opacity * rowOpacity;
@@ -14414,9 +15519,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             DrawResultRow(item, rowRect, rowIndex);
           }
         }
-        y += kResultRowStride;
+        ++inSection;
         ++rowIndex;
       }
+      y = bodyTop + SectionBodyHeight(section.items.size());
     }
     activeRT_->PopAxisAlignedClip();
 
@@ -14617,8 +15723,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!ResultsActivationAllowed()) return;
     const auto targetY = SelectedRowTop();
     if (!targetY) return;
+    if (PhotoGridActive()) {
+      // Photo tiles draw their own selection outline.
+      visualSelectedY_ = *targetY;
+      selectionSpring_.Snap(visualSelectedY_);
+      animatingSelection_ = false;
+      return;
+    }
+    // At rest the pill tracks its row exactly (including while the list
+    // scrolls); only an active selection glide follows the spring.
     if (!SpatialAnimationsAllowed() || visualSelectedY_ < 0.0f ||
-        overlayVisualScroll_.Active() || HasElementMotion(resultRowMotion_)) {
+        !animatingSelection_ || HasElementMotion(resultRowMotion_)) {
       visualSelectedY_ = *targetY;
       selectionSpring_.Snap(visualSelectedY_);
       animatingSelection_ = false;
@@ -14799,9 +15914,95 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return inserted->second;
   }
 
+  void DrawPhotoTile(const DisplayItem& item, RectF rect, int rowIndex) {
+    const bool selected = rowIndex == selected_;
+    if (ResultsActivationAllowed()) {
+      hits_.push_back({rect, HitType::Result, rowIndex});
+    }
+    constexpr float kTileRadius = 8.0f;
+    FillRound(rect, kTileRadius, D2DColor(theme_.iconTile));
+    if (auto bitmap = IconBitmap(item.IconKey())) {
+      // Center-crop the thumbnail to the square tile.
+      const auto size = bitmap->GetSize();
+      const float side = std::min(size.width, size.height);
+      const D2D1_RECT_F source{(size.width - side) * 0.5f,
+                               (size.height - side) * 0.5f,
+                               (size.width + side) * 0.5f,
+                               (size.height + side) * 0.5f};
+      ComPtr<ID2D1Factory> factory;
+      activeRT_->GetFactory(factory.GetAddressOf());
+      ComPtr<ID2D1RoundedRectangleGeometry> clip;
+      if (factory) {
+        factory->CreateRoundedRectangleGeometry(
+            D2D1::RoundedRect(ToD2D(rect), kTileRadius, kTileRadius),
+            clip.GetAddressOf());
+      }
+      if (clip) {
+        activeRT_->PushLayer(
+            D2D1::LayerParameters(D2D1::InfiniteRect(), clip.Get()), nullptr);
+      }
+      activeRT_->DrawBitmap(bitmap.Get(), ToD2D(rect), 1.0f,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, source);
+      if (clip) activeRT_->PopLayer();
+    } else {
+      constexpr float kGlyph = 28.0f;
+      const float cx = (rect.left + rect.right) * 0.5f;
+      const float cy = (rect.top + rect.bottom) * 0.5f;
+      DrawResultIcon(ResultIcon::Phone,
+                     {cx - kGlyph * 0.5f, cy - kGlyph * 0.5f,
+                      cx + kGlyph * 0.5f, cy + kGlyph * 0.5f},
+                     D2DColor(theme_.textMuted));
+    }
+
+    const float captionHeight = 22.0f *
+        feathercast::layout::TextMetrics(settings_.textSizePercent).scale;
+    const D2D1_COLOR_F veil = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f);
+    const D2D1_COLOR_F white = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+    if (item.phone.downloading) {
+      FillRound(rect, kTileRadius, veil);
+      const float mid = (rect.top + rect.bottom) * 0.5f;
+      DrawTextBlock(L"Downloading...",
+                    {rect.left + 6.0f, mid - captionHeight * 0.5f,
+                     rect.right - 6.0f, mid + captionHeight * 0.5f},
+                    centerFormat_.Get(), white);
+    } else if (selected && !item.commandDetail.empty()) {
+      const RectF caption{rect.left + 4.0f, rect.bottom - captionHeight - 4.0f,
+                          rect.right - 4.0f, rect.bottom - 4.0f};
+      FillRound(caption, 6.0f, veil);
+      DrawTextBlock(item.commandDetail,
+                    {caption.left + 4.0f, caption.top + 2.0f,
+                     caption.right - 4.0f, caption.bottom - 2.0f},
+                    centerFormat_.Get(), white);
+    }
+    if (selected && ResultsActivationAllowed()) {
+      StrokeRound(feathercast::layout::Inflate(rect, -1.5f, -1.5f),
+                  kTileRadius - 1.0f, D2DColor(ActiveAccent()), 3.0f);
+    }
+  }
+
+  // How much of the row the selection pill currently covers (0..1). While the
+  // pill glides between rows, selection-only text follows it instead of
+  // snapping to the new row before the pill arrives.
+  float SelectionCoverage(RectF rowRect, bool selected) const {
+    if (!animatingSelection_ || visualSelectedY_ < 0.0f) {
+      return selected ? 1.0f : 0.0f;
+    }
+    const float overlap =
+        std::min(rowRect.top + kResultRowHeight,
+                 visualSelectedY_ + kResultRowHeight) -
+        std::max(rowRect.top, visualSelectedY_);
+    return std::clamp(overlap / kResultRowHeight, 0.0f, 1.0f);
+  }
+
   void DrawResultRow(const DisplayItem& item, RectF rowRect, int rowIndex) {
+    if (item.isPhone && item.phone.kind == feathercast::app::PhoneItemKind::Photo &&
+        PhotoGridActive()) {
+      DrawPhotoTile(item, rowRect, rowIndex);
+      return;
+    }
     const auto& renderData = ResultRenderDataFor(item);
     const bool selected = rowIndex == selected_;
+    const float coverage = SelectionCoverage(rowRect, selected);
     const D2D1_COLOR_F primaryText =
         TextOnHighlight(selected, D2DColor(theme_.textPrimary));
     const D2D1_COLOR_F mutedText =
@@ -14837,11 +16038,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     {rowRect.left + 52, subtitleTop, rowRect.right - 180,
                      rowRect.bottom},
                     subFormat_.Get(), mutedText);
-      if (selected && rowRect.right - rowRect.left > 520.0f) {
+      if (coverage > 0.0f && rowRect.right - rowRect.left > 520.0f) {
         DrawTextBlock(ActionHint(item),
                       {rowRect.right - 330, rowRect.top + 16,
                        rowRect.right - 10, rowRect.bottom},
-                      footerRightFormat_.Get(), mutedText);
+                      footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
       }
       return;
     }
@@ -14879,17 +16080,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     {resultLeft, titleTop, contentRight, titleBottom},
                     calculationResultFormat_.Get(),
                     primaryText);
-      if (selected) {
+      if (coverage > 0.0f) {
         DrawTextBlock(ActionHint(item),
                       {resultLeft, subtitleTop, contentRight,
                        rowRect.bottom},
-                      footerRightFormat_.Get(), mutedText);
+                      footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
       }
       return;
     }
 
-    const bool showHint = selected && rowRect.right - rowRect.left > 520.0f;
-    const float titleRight = rowRect.right - (showHint ? 200.0f : 14.0f);
+    const bool showHint = coverage > 0.0f && rowRect.right - rowRect.left > 520.0f;
+    // Narrow the title gradually so a long name's ellipsis slides with the
+    // pill rather than truncating all at once.
+    const float titleRight =
+        rowRect.right - (showHint ? 14.0f + 186.0f * coverage : 14.0f);
     DrawTextBlock(renderData.name,
                   {rowRect.left + 52, titleTop, titleRight, titleBottom},
                   rowFormat_.Get(), primaryText);
@@ -14899,9 +16103,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                   subFormat_.Get(), mutedText);
     if (showHint) {
       DrawTextBlock(ActionHint(item),
-                    {titleRight + 8, titleTop, rowRect.right - 14,
+                    {rowRect.right - 192.0f, titleTop, rowRect.right - 14,
                      titleBottom},
-                    footerRightFormat_.Get(), mutedText);
+                    footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
     }
   }
 
@@ -14925,6 +16129,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
              (item.capability.example.empty()
                   ? L""
                   : L" Example: " + item.capability.example);
+    }
+    if (item.isPhone) {
+      using feathercast::app::PhoneItemKind;
+      const wchar_t* verb = L"Open";
+      switch (item.phone.kind) {
+        case PhoneItemKind::Notification:
+        case PhoneItemKind::SmsMessage: verb = L"Copy"; break;
+        case PhoneItemKind::Clip: verb = L"Paste"; break;
+        case PhoneItemKind::Media:
+        case PhoneItemKind::Call: verb = L"Run"; break;
+        case PhoneItemKind::Compose: verb = L"Send"; break;
+        case PhoneItemKind::File: verb = item.phone.directory ? L"Open" : L"Download"; break;
+        default: break;
+      }
+      return item.commandDetail.empty() ? std::wstring(verb)
+                                        : verb + std::wstring(L" · ") + item.commandDetail;
     }
     if (item.isCalculator || item.isConversion) return L"Copy · " + item.commandDetail;
     if (item.isWebSearch) return L"Open · " + item.commandDetail;
@@ -14979,6 +16199,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         case CapabilityActionKind::RunCommand: return L"Enter Open";
       }
     }
+    if (item.isPhone) {
+      using feathercast::app::PhoneItemKind;
+      if (item.phone.downloading) return L"Downloading...";
+      switch (item.phone.kind) {
+        case PhoneItemKind::Notification:
+        case PhoneItemKind::SmsMessage: return L"Enter Copy";
+        case PhoneItemKind::Clip: return L"Enter Paste";
+        case PhoneItemKind::Media:
+        case PhoneItemKind::Call: return L"Enter Run";
+        case PhoneItemKind::Compose:
+          return item.phone.id.starts_with(L"new:") ? L"Enter Write" : L"Enter Send";
+        case PhoneItemKind::File: return item.phone.directory ? L"Enter Open" : L"Enter Download";
+        default: return L"Enter Open";
+      }
+    }
     if (item.isCalculator || item.isConversion) return L"Enter Copy";
     if (item.isWebSearch) return L"Enter Open";
     if (item.isExtension) return L"Enter Run";
@@ -14989,12 +16224,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isCommand) return L"Enter run · Tab actions";
     if (item.isAction) return L"Enter apply";
     if (item.isWindow) return L"Enter Switch";
-    if (item.app.adminSupported) return L"Ctrl+Shift+Enter admin";
+    if (feathercast::discovery::AdminRouteFor(item.app) !=
+        feathercast::discovery::AdminLaunchRoute::Unsupported)
+      return L"Ctrl+Shift+Enter admin";
     return L"Enter open · Tab actions";
   }
 
   std::wstring SearchHint() const {
     if (actionMode_) return L"Enter apply · Esc back";
+    if (browseView_ == BrowseView::PhoneNotifications) return L"Enter copy · Tab actions · Ctrl+Del dismiss · Esc back";
+    if (browseView_ == BrowseView::PhonePhotos) return L"Enter open · Tab actions · F5 refresh · Esc back";
+    if (browseView_ == BrowseView::PhoneClipboard) return L"Enter paste · Tab actions · Esc back";
+    if (browseView_ == BrowseView::PhoneMedia) return L"Enter run · Space play/pause · Esc back";
+    if (browseView_ == BrowseView::PhoneMessages) return L"Enter open · F5 refresh · Esc back";
+    if (browseView_ == BrowseView::PhoneThread) return L"Type and press Enter to send · F5 refresh · Esc back";
+    if (browseView_ == BrowseView::PhoneCompose) return L"Enter send · Esc cancel";
+    if (browseView_ == BrowseView::PhoneFiles) return L"Enter open · Tab actions · Backspace up · F5 refresh · Esc back";
     if (browseView_ != BrowseView::None) return L"Enter select · Esc back";
     return L"Enter open · Tab actions · @ scopes";
   }
@@ -15161,7 +16406,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
       case SettingsCategory::Privacy:
-        h += kSettSection + 9 * kSettRow;
+        h += kSettSection + 11 * kSettRow;
         if (contentWidth < 360.0f) {
           h += 2.0f * SettingsActionGroupHeight(contentWidth, 2) +
                SettingsActionGroupHeight(contentWidth, 3) + kSettMaint +
@@ -15189,6 +16434,41 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool SettHover(HitType type) const { return settingsHover_ == static_cast<int>(type); }
+
+  // Hover styling fades in quickly and out a little slower, so sweeping the
+  // pointer across controls leaves a soft trail instead of flickering.
+  static constexpr double kHoverInSeconds = 0.080;
+  static constexpr double kHoverOutSeconds = 0.160;
+
+  float HoverAmount(feathercast::motion::ScalarAnimation& motion,
+                    bool hovered) {
+    const double target = hovered ? 1.0 : 0.0;
+    if (std::abs(motion.Target() - target) > 0.001) {
+      motion.Retarget(target, hovered ? kHoverInSeconds : kHoverOutSeconds,
+                      ControlAnimationsAllowed(),
+                      hovered ? feathercast::motion::Easing::OutCubic
+                              : feathercast::motion::Easing::InOutCubic);
+      if (motion.Active()) RequestAnimationFrame();
+    }
+    return static_cast<float>(std::clamp(motion.Value(), 0.0, 1.0));
+  }
+
+  float SettHoverAmount(HitType type, bool hovered) {
+    return HoverAmount(settingsHoverMotion_[type], hovered);
+  }
+
+  static D2D1_COLOR_F LerpColor(D2D1_COLOR_F from, D2D1_COLOR_F to,
+                                float t) {
+    return D2D1::ColorF(from.r + (to.r - from.r) * t,
+                        from.g + (to.g - from.g) * t,
+                        from.b + (to.b - from.b) * t,
+                        from.a + (to.a - from.a) * t);
+  }
+
+  static D2D1_COLOR_F WithAlpha(D2D1_COLOR_F color, float alpha) {
+    color.a *= alpha;
+    return color;
+  }
   bool SettFocused(HitType type) const {
     const auto order = SettingsFocusOrder();
     return settingsFocusIndex_ >= 0 && settingsFocusIndex_ < static_cast<int>(order.size()) &&
@@ -15347,10 +16627,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const RectF track = AnimationSliderTrackRect(hit);
     const COLORREF accent = ActiveAccent();
     const int selected = static_cast<int>(settings_.animationLevel);
-    const bool hover = SettHover(HitType::AnimationLevel);
+    const float hover = SettHoverAmount(HitType::AnimationLevel,
+                                        SettHover(HitType::AnimationLevel));
 
-    if (hover) {
-      FillRound(hit, theme_.controlRadius, D2DColor(theme_.surfaceHover));
+    if (hover > 0.0f) {
+      FillRound(hit, theme_.controlRadius,
+                WithAlpha(D2DColor(theme_.surfaceHover), hover));
     }
     if (SettFocused(HitType::AnimationLevel)) {
       DrawFocusFrame(hit, theme_.controlRadius);
@@ -15417,7 +16699,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const RectF rect{12.0f, top, kSettSidebarWidth - 12.0f,
                        top + categoryHeight};
       const bool selected = category == settingsCategory_;
-      const bool hover = SettHover(type);
+      const float hover = SettHoverAmount(type, SettHover(type));
       if (selected) {
         const float selectedTop =
             static_cast<float>(settingsCategoryTop_.Value());
@@ -15425,17 +16707,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                  selectedTop + categoryHeight};
         FillRound(animatedRect, theme_.controlRadius,
                   Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.22f));
-      } else if (hover) {
-        FillRound(rect, theme_.controlRadius, D2DColor(theme_.surfaceHover));
+      } else if (hover > 0.0f) {
+        FillRound(rect, theme_.controlRadius,
+                  WithAlpha(D2DColor(theme_.surfaceHover), hover));
       }
       if (SettFocused(type)) DrawFocusFrame(rect, theme_.controlRadius);
       DrawVerticallyCenteredTextBlock(
           descriptor.label.data(),
           {24.0f, top, rect.right - 12.0f, top + categoryHeight},
           bodyFormat_.Get(),
-          selected || hover
-              ? TextOnHighlight(true, SettWhite())
-              : SettGray());
+          LerpColor(SettGray(), TextOnHighlight(true, SettWhite()),
+                    selected ? 1.0f : hover));
       hits_.push_back({rect, type});
     }
 
@@ -15523,10 +16805,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     DrawTextBlock(L"Drag this bar to move", {24, 38, width - 360, 54}, bodyFormat_.Get(), D2DColor(theme_.textDim));
     const RectF filterRect = SettingsFilterRect(width);
     const bool filterFocused = SettFocused(HitType::SettingsFilter);
-    const bool filterHover = SettHover(HitType::SettingsFilter);
+    const float filterHover = SettHoverAmount(
+        HitType::SettingsFilter, SettHover(HitType::SettingsFilter));
     FillRound(filterRect, theme_.controlRadius,
-              filterHover ? D2DColor(theme_.surfaceHover)
-                          : D2DColor(theme_.surface));
+              LerpColor(D2DColor(theme_.surface),
+                        D2DColor(theme_.surfaceHover), filterHover));
     if (filterFocused) {
       DrawFocusFrame(filterRect, theme_.controlRadius);
     } else {
@@ -15570,10 +16853,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     hits_.push_back({filterRect, HitType::SettingsFilter});
     const RectF closeBtn = feathercast::layout::SettingsClose(width);
-    const bool closeHover = SettHover(HitType::CloseSettings);
-    FillRound(closeBtn, theme_.controlRadius, closeHover ? D2DColor(theme_.danger) : D2DColor(theme_.divider));
+    const float closeHover = SettHoverAmount(
+        HitType::CloseSettings, SettHover(HitType::CloseSettings));
+    FillRound(closeBtn, theme_.controlRadius,
+              LerpColor(D2DColor(theme_.divider), D2DColor(theme_.danger),
+                        closeHover));
     {
-      auto xBrush = Brush(closeHover ? EmphasisTextColor() : SettGray());
+      auto xBrush = Brush(LerpColor(SettGray(), EmphasisTextColor(),
+                                    closeHover));
       const float cx = (closeBtn.left + closeBtn.right) / 2.0f;
       const float cyc = (closeBtn.top + closeBtn.bottom) / 2.0f;
       activeRT_->DrawLine(D2D1::Point2F(cx - 6, cyc - 6), D2D1::Point2F(cx + 6, cyc + 6), xBrush.Get(), 2.0f);
@@ -15644,13 +16931,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         RectF record{contentLeft, btnTop,
                      compactActions ? contentRight : contentRight - 106,
                      btnTop + 38};
-        const bool recHover = SettHover(HitType::RecordShortcut);
+        const float recHover = SettHoverAmount(
+            HitType::RecordShortcut, SettHover(HitType::RecordShortcut));
         FillRound(
             record, theme_.controlRadius,
             recording_
                 ? Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.28f)
-                : (recHover ? D2DColor(theme_.surfaceHover)
-                            : D2DColor(theme_.surface)));
+                : LerpColor(D2DColor(theme_.surface),
+                            D2DColor(theme_.surfaceHover), recHover));
         if (SettFocused(HitType::RecordShortcut)) {
           DrawFocusFrame(record, theme_.controlRadius);
         } else {
@@ -16009,6 +17297,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawSwitch(y, kSettRow, settings_.diagnosticsEnabled,
                    HitType::DiagnosticsToggle, contentLeft, contentRight);
         y += kSettRow;
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::PhoneLinkToggle, contentLeft,
+            contentRight - 66, true, PhoneSettingsDetail());
+        DrawSwitch(y, kSettRow, settings_.phoneLinkEnabled,
+                   HitType::PhoneLinkToggle, contentLeft, contentRight);
+        y += kSettRow;
+        DrawCatalogSettingRowLabel(y, kSettRow, HitType::OpenPhoneWindow,
+                                   contentLeft, contentRight - 138);
+        DrawSettingsButton(
+            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Open", HitType::OpenPhoneWindow);
+        y += kSettRow;
 
         y = DrawSettingsActionGroup(
             y, contentLeft, contentRight,
@@ -16167,15 +17467,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void DrawSettingsButton(RectF rect, const std::wstring& text, HitType type,
                           bool enabled = true) {
     const bool hover = enabled && SettHover(type);
-    D2D1_COLOR_F fill =
-        hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface);
+    const float hoverAmount = SettHoverAmount(type, hover);
+    D2D1_COLOR_F fill = LerpColor(D2DColor(theme_.surface),
+                                  D2DColor(theme_.surfaceHover), hoverAmount);
     if (!enabled) fill.a *= 0.45f;
     FillRound(rect, theme_.controlRadius, fill);
     if (enabled && SettFocused(type)) {
       DrawFocusFrame(rect, theme_.controlRadius);
     } else {
       StrokeRound(rect, theme_.controlRadius,
-                  hover ? D2DColor(theme_.textMuted) : D2DColor(theme_.border));
+                  LerpColor(D2DColor(theme_.border),
+                            D2DColor(theme_.textMuted), hoverAmount));
     }
     DrawCenteredButtonText(
         text, rect,
@@ -16203,6 +17505,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       iconBitmaps_.erase(iconLru_.back());
       iconLru_.pop_back();
     }
+  }
+
+  // Forgets one cached bitmap so the next paint decodes it again, e.g. when a
+  // phone thumbnail arrives after a placeholder was drawn.
+  void DropIconBitmap(const std::wstring& key) {
+    if (auto existing = iconBitmaps_.find(key); existing != iconBitmaps_.end()) {
+      iconLru_.erase(existing->second.lruIt);
+      iconBitmaps_.erase(existing);
+    }
+    if (auto pending = pendingDecodedIcons_.find(key);
+        pending != pendingDecodedIcons_.end()) {
+      pendingDecodedIconBytes_ -=
+          std::min(pendingDecodedIconBytes_, pending->second.pixels.size());
+      pendingDecodedIcons_.erase(pending);
+    }
+    std::lock_guard lock(phoneImageMutex_);
+    failedPhoneImages_.erase(key);
   }
 
   void ClearIconBitmaps() {
@@ -16304,7 +17623,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void QueueVisibleResultIcons() {
     visibleIconKeys_.clear();
-    constexpr size_t kVisibleIconPrefetchCap = 24;
+    // The photo grid shows many small tiles at once.
+    const size_t kVisibleIconPrefetchCap =
+        browseView_ == BrowseView::PhonePhotos ? 120 : 24;
     for (const auto& item : flatItems_) {
       if (item.isSymbol) continue;
       const std::wstring key = item.IconKey();
@@ -16381,6 +17702,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // so repeated searches no longer accumulate threads.
   void QueueIcon(const std::wstring& key) {
     if (iconCacheClearPending_.load(std::memory_order_acquire)) return;
+    if (StartsWith(key, kPhoneImagePrefix) && !RegisterPhoneImageBytes(key)) return;
     // Start workers only when an icon is actually requested by a visible
     // result.  This keeps idle startup free of icon threads and shell work.
     StartIconWorkers();
@@ -16402,6 +17724,49 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     });
   }
 
+  static constexpr wchar_t kPhoneImagePrefix[] = L"phone-";
+  static constexpr wchar_t kPhoneIconPrefix[] = L"phone-icon:";
+  static constexpr wchar_t kPhoneThumbPrefix[] = L"phone-thumb:";
+
+  // Phone icons and thumbnails live in memory only. The UI thread hands their
+  // bytes to the icon workers through phoneImageBytes_.
+  bool RegisterPhoneImageBytes(const std::wstring& key) {
+    feathercast::phone::SharedBytes bytes;
+    if (StartsWith(key, kPhoneIconPrefix)) {
+      bytes = phoneStore_.NotificationIcon(
+          WideToUtf8(key.substr(std::wstring_view(kPhoneIconPrefix).size())));
+    } else if (StartsWith(key, kPhoneThumbPrefix)) {
+      bytes = phoneStore_.PhotoThumb(
+          WideToUtf8(key.substr(std::wstring_view(kPhoneThumbPrefix).size())));
+    } else if (!phoneArtKey_.empty() && key == phoneArtKey_) {
+      bytes = phoneStore_.MediaArt();
+    }
+    if (!bytes || bytes->empty()) return false;
+    std::lock_guard lock(phoneImageMutex_);
+    if (failedPhoneImages_.contains(key)) return false;
+    phoneImageBytes_[key] = std::move(bytes);
+    return true;
+  }
+
+  std::optional<feathercast::runtime::DecodedIcon> ResolvePhoneImage(
+      IWICImagingFactory* wicFactory, const std::wstring& key) {
+    feathercast::phone::SharedBytes bytes;
+    {
+      std::lock_guard lock(phoneImageMutex_);
+      const auto found = phoneImageBytes_.find(key);
+      if (found == phoneImageBytes_.end()) return std::nullopt;
+      bytes = found->second;
+      phoneImageBytes_.erase(found);
+    }
+    const std::uint32_t maxEdge = StartsWith(key, kPhoneThumbPrefix) ? 256 : 64;
+    auto decoded = feathercast::runtime::DecodeImageBytes(wicFactory, *bytes, key, maxEdge);
+    if (!decoded) {
+      std::lock_guard lock(phoneImageMutex_);
+      failedPhoneImages_.insert(key);
+    }
+    return decoded;
+  }
+
   std::optional<feathercast::runtime::DecodedIcon> DecodeIconFile(
       IWICImagingFactory* wicFactory, const std::filesystem::path& path,
       const std::wstring& key) {
@@ -16415,6 +17780,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                 CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&workerWicFactory)))) {
       return std::nullopt;
+    }
+    if (StartsWith(key, kPhoneImagePrefix)) {
+      return ResolvePhoneImage(workerWicFactory.Get(), key);
     }
     const std::filesystem::path sourcePath(key);
     const std::wstring sourceExtension =
@@ -16632,6 +18000,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         (vk == VK_PRIOR || vk == VK_NEXT)) {
       previewScroll_ = std::max(
           0.0f, previewScroll_ + (vk == VK_NEXT ? 240.0f : -240.0f));
+      RetargetPreviewScroll();
       InvalidateRect(hwnd_, nullptr, FALSE);
       return;
     }
@@ -16703,10 +18072,46 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
+    if (control && vk == VK_DELETE &&
+        browseView_ == BrowseView::PhoneNotifications &&
+        caret_ >= query_.size() && !SelectionRange() && selected_ >= 0 &&
+        selected_ < static_cast<int>(flatItems_.size()) &&
+        flatItems_[static_cast<std::size_t>(selected_)].isPhone) {
+      DismissPhoneNotification(
+          flatItems_[static_cast<std::size_t>(selected_)].phone.id);
+      return;
+    }
+    if (vk == VK_F5 && browseView_ == BrowseView::PhonePhotos) {
+      RefreshPhonePhotos(true);
+      return;
+    }
+    if (vk == VK_F5 && browseView_ == BrowseView::PhoneMessages) {
+      phoneService_.RequestSmsThreads();
+      return;
+    }
+    if (vk == VK_F5 && browseView_ == BrowseView::PhoneThread) {
+      phoneService_.RequestSmsMessages(phoneCompose_.thread);
+      return;
+    }
+    if (vk == VK_F5 && browseView_ == BrowseView::PhoneFiles) {
+      OpenPhoneFolder(phoneStore_.FilesPath());
+      return;
+    }
+    if (vk == VK_RETURN && feathercast::app::IsPhoneDraftView(browseView_) &&
+        !Trim(query_).empty()) {
+      SendPhoneDraft();
+      return;
+    }
+    if (vk == VK_BACK && browseView_ == BrowseView::PhoneFiles && query_.empty() &&
+        phoneStore_.FilesPath() != "/") {
+      OpenPhoneFolder(feathercast::phone::RemotePathParent(phoneStore_.FilesPath()));
+      return;
+    }
+
     if (vk == VK_DOWN) {
-      SelectResult(selected_ + 1, false, true);
+      if (!MoveInResultGrid(0, 1)) SelectResult(selected_ + 1, true, true);
     } else if (vk == VK_UP) {
-      SelectResult(selected_ - 1, false, true);
+      if (!MoveInResultGrid(0, -1)) SelectResult(selected_ - 1, true, true);
     } else if (vk == VK_HOME) {
       if (!query_.empty()) {
         SetLauncherAccessibilityFocus(
@@ -16742,7 +18147,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         // A resumed calculator/conversion query is selected on reopen. Right
         // at the end clears that selection so the next text extends it.
         MoveCaret(caret_, false);
-      } else if (query_.empty() && browseView_ == BrowseView::None &&
+      } else if (MoveInResultGrid(1, 0)) {
+        // Moved to the next photo tile.
+      } else if (query_.empty() && !PhotoGridActive() &&
+                 (browseView_ == BrowseView::None ||
+                  feathercast::app::IsPhoneBrowseView(browseView_)) &&
                  ResultsActivationAllowed()) {
         OpenSelectedResultActions();
       }
@@ -16770,6 +18179,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       : feathercast::text_edit::PreviousCodePoint(query_, caret_),
                   shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
+      } else if (MoveInResultGrid(-1, 0)) {
+        // Moved to the previous photo tile; Left on the first tile exits.
       } else if (browseView_ != BrowseView::None) {
         ExitBrowseView();
       } else if (actionMode_) {
@@ -16829,6 +18240,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (confirmation_) return;
     if (view_ != View::Search) return;
+    if (ch == L' ' && query_.empty() && browseView_ == BrowseView::PhoneMedia) {
+      RunPhoneMediaControl(L"toggle");
+      return;
+    }
     if (ch >= 32 && ch != 127) {
       SetLauncherAccessibilityFocus(
           feathercast::accessibility_projection::SearchFocus());
@@ -16841,14 +18256,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void EnsureSelectedVisible(bool animate = true) {
-    int y = 0;
+    float y = 0.0f;
     int row = 0;
     for (const auto& section : sections_) {
-      y += static_cast<int>(kSectionHeaderHeight);
+      y += kSectionHeaderHeight;
       for (size_t i = 0; i < section.items.size(); ++i) {
         if (row == selected_) {
-          const int rowTop = y;
-          const int rowBottom = y + static_cast<int>(kResultRowHeight);
+          const int rowTop = static_cast<int>(y + ItemOffsetInSection(i));
+          const int rowBottom = rowTop + static_cast<int>(ItemHeight());
           RECT rc{};
           GetClientRect(hwnd_, &rc);
           const float scale = GetWindowScale(hwnd_);
@@ -16865,9 +18280,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           RetargetOverlayScroll(animate);
           return;
         }
-        y += static_cast<int>(kResultRowStride);
         ++row;
       }
+      y += SectionBodyHeight(section.items.size());
     }
   }
 
@@ -16920,7 +18335,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     for (const auto& hit : hits_) {
       if (hit.type == HitType::Result && PointInRect(hit.rect, x, y) && hit.index != selected_) {
-        SelectResult(hit.index, false, false);
+        SelectResult(hit.index, true, false, kSelectionPointerResponseSeconds);
         return;
       }
     }
@@ -17009,6 +18424,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SnapAllMotionToTargets();
     } else if (level == AnimationLevel::Reduced) {
       SnapSpatialMotionToTargets();
+    }
+    if (phoneWindowConfigured_) {
+      phoneWindow_.SetMotionPolicy(FadeAnimationsAllowed(),
+                                   SpatialAnimationsAllowed(),
+                                   ControlAnimationsAllowed());
     }
     PersistSettings();
     if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
@@ -17217,7 +18637,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void OpenSelectedResultActions() {
     if (!ResultsActivationAllowed() || actionMode_ ||
-        browseView_ != BrowseView::None ||
+        (browseView_ != BrowseView::None &&
+         !feathercast::app::IsPhoneBrowseView(browseView_)) ||
         selected_ < 0 || selected_ >= static_cast<int>(flatItems_.size())) {
       return;
     }
@@ -17245,8 +18666,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                std::max(minTop, maxTop));
     if (animate && SpatialAnimationsAllowed()) {
       RECT target{rc.left, top, rc.left + width, top + physicalHeight};
-      StartBoundsTransition(settingsHwnd_, settingsBounds_, target,
-                            kSettingsResizeSeconds);
+      StartBoundsTransition(settingsHwnd_, settingsBounds_, target);
       RequestAnimationFrame();
     } else {
       SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, rc.left, top, width,
@@ -18385,6 +19805,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ReportBackgroundFailure(L"The live file index worker is unavailable.");
         }
         break;
+      case HitType::PhoneLinkToggle:
+        SetPhoneLinkEnabled(!settings_.phoneLinkEnabled);
+        break;
+      case HitType::OpenPhoneWindow:
+        OpenPhoneWindow();
+        break;
       case HitType::DiagnosticsToggle:
         settings_.diagnosticsEnabled = !settings_.diagnosticsEnabled;
         g_diagnosticsEnabled.store(settings_.diagnosticsEnabled,
@@ -18529,15 +19955,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         previewScroll_ = std::max(
             0.0f, previewScroll_ -
                       static_cast<float>(feathercast::motion::WheelDeltaPixels(delta)));
+        RetargetPreviewScroll();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       }
     }
     if (sections_.empty()) return;
     const int previousScroll = scroll_;
-    const int nextScroll = static_cast<int>(std::lround(
-        static_cast<double>(scroll_) -
-        feathercast::motion::WheelDeltaPixels(delta)));
+    // Precision touchpads send many small deltas. Carry the sub-pixel rest
+    // forward instead of rounding it away on every message.
+    const double desiredScroll = static_cast<double>(scroll_) +
+                                 wheelRemainder_ -
+                                 feathercast::motion::WheelDeltaPixels(delta);
+    const int nextScroll = static_cast<int>(std::lround(desiredScroll));
+    wheelRemainder_ = desiredScroll - static_cast<double>(nextScroll);
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     const float scale = GetWindowScale(hwnd_);
@@ -18545,6 +19976,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     feathercast::ui::OverlayController::SetScroll(
         overlayState_, nextScroll,
         std::max(0, ResultsContentHeight() - visible));
+    if (scroll_ != nextScroll) wheelRemainder_ = 0.0;
     if (scroll_ != previousScroll) RetargetOverlayScroll();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -18787,6 +20219,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       return;
     }
+    if (item.isPhone) {
+      ActivatePhoneItem(item);
+      return;
+    }
     TrackRecentInvocation(item);
 
     if (item.isCapability) {
@@ -18878,13 +20314,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
+    if (asAdmin && feathercast::discovery::AdminRouteFor(item.app) ==
+                       feathercast::discovery::AdminLaunchRoute::Unsupported) {
+      SetOverlayStatus(StatusSeverity::Error,
+                       L"This app cannot be run as administrator.");
+      return;
+    }
     HideOverlay(OverlayCloseReason::Action);
     auto appPtr = std::make_shared<AppEntry>(item.app);
     if (!launchExecutor_.Submit([this, appPtr, asAdmin, id = PrimaryAppId(item.app)](std::stop_token stopToken) {
       if (stopToken.stop_requested()) return;
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-      const bool ok = this->LaunchApp(*appPtr, asAdmin && appPtr->adminSupported);
-      if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
+      const bool ok = this->LaunchApp(*appPtr, asAdmin);
+      if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok, asAdmin);
       CoUninitialize();
     })) {
       ShowTrayNotification(L"FeatherCast Launch Failed",
@@ -18893,11 +20335,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void NotifyLaunchCompleted(const std::wstring& id, const std::wstring& name,
-                             bool succeeded) {
+                             bool succeeded, bool asAdmin = false) {
     if (stopThreads_) return;
     {
       std::lock_guard lock(completedLaunchMutex_);
-      completedLaunches_.push_back({id, name, succeeded});
+      completedLaunches_.push_back({id, name, succeeded, asAdmin});
     }
     if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, 0)) {
       std::lock_guard lock(completedLaunchMutex_);
@@ -19076,6 +20518,56 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     switch (command) {
       case CommandKind::Timers:
         EnterBrowseView(BrowseView::Timers);
+        return;
+      case CommandKind::OpenPhone:
+        actionMode_ = false;
+        if (visible_) HideOverlay(OverlayCloseReason::Action);
+        OpenPhoneWindow();
+        return;
+      case CommandKind::PhoneNotifications:
+      case CommandKind::PhonePhotos:
+      case CommandKind::PhoneClipboard:
+        if (!settings_.phoneLinkEnabled) {
+          // Pairing and turning the link on live in the Phone window.
+          actionMode_ = false;
+          if (visible_) HideOverlay(OverlayCloseReason::Action);
+          OpenPhoneWindow();
+          return;
+        }
+        EnterPhoneBrowseView(command == CommandKind::PhoneNotifications
+                                 ? BrowseView::PhoneNotifications
+                             : command == CommandKind::PhonePhotos
+                                 ? BrowseView::PhonePhotos
+                                 : BrowseView::PhoneClipboard);
+        return;
+      case CommandKind::PhoneMedia:
+      case CommandKind::PhoneMessages:
+      case CommandKind::PhoneFiles:
+      case CommandKind::FindMyPhone:
+      case CommandKind::SendFileToPhone:
+        if (!settings_.phoneLinkEnabled) {
+          actionMode_ = false;
+          if (visible_) HideOverlay(OverlayCloseReason::Action);
+          OpenPhoneWindow();
+          return;
+        }
+        if (command == CommandKind::FindMyPhone) {
+          ToggleFindMyPhone();
+        } else if (command == CommandKind::SendFileToPhone) {
+          actionMode_ = false;
+          if (visible_) HideOverlay(OverlayCloseReason::Action);
+          SendFilesToPhone(PickFilesToSend());
+        } else if (command == CommandKind::PhoneMedia) {
+          if (PhoneFeatureReady("media", L"Media controls")) {
+            EnterPhoneBrowseView(BrowseView::PhoneMedia);
+          }
+        } else if (command == CommandKind::PhoneMessages) {
+          if (PhoneFeatureReady("sms", L"Text messages")) {
+            EnterPhoneBrowseView(BrowseView::PhoneMessages);
+          }
+        } else if (PhoneFeatureReady("storage", L"Phone storage")) {
+          EnterPhoneBrowseView(BrowseView::PhoneFiles);
+        }
         return;
       case CommandKind::ClipboardHistory:
         if (!settings_.clipboardHistoryEnabled) {
@@ -19422,6 +20914,31 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
+    if (const auto* phoneTarget =
+            std::get_if<feathercast::app::PhoneItem>(&item.actionTarget)) {
+      const auto target = *phoneTarget;
+      // Return to the phone view the actions were opened from.
+      ExitActionMode();
+      if (item.action == ActionKind::DismissPhoneNotification) {
+        DismissPhoneNotification(target.id);
+      } else if (item.action == ActionKind::OpenPhonePhoto ||
+                 item.action == ActionKind::SavePhonePhoto) {
+        RequestPhonePhoto(target.id, item.action == ActionKind::OpenPhonePhoto);
+      } else if (item.action == ActionKind::OpenPhoneFile ||
+                 item.action == ActionKind::SavePhoneFile) {
+        RequestPhoneFile(target.id, item.action == ActionKind::OpenPhoneFile);
+      } else if (item.action == ActionKind::ReplyToPhoneNotification) {
+        BeginNotificationReply(target);
+      } else if (item.action == ActionKind::PhoneNotificationAction) {
+        if (phoneService_.NotificationAction(WideToUtf8(target.id), target.actionIndex)) {
+          SetOverlayStatus(StatusSeverity::Success, L"Done on your phone.");
+        } else {
+          SetOverlayStatus(StatusSeverity::Error, L"Connect your phone to use this action.");
+        }
+      }
+      return;
+    }
+
     if (const auto* aliasTarget = std::get_if<AliasTarget>(&item.actionTarget)) {
       if (item.action == ActionKind::EditAlias) {
         HideOverlay(OverlayCloseReason::Action);
@@ -19460,6 +20977,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const AppEntry& app = *appTarget;
     const std::wstring id = PrimaryAppId(app);
     switch (item.action) {
+      case ActionKind::SendToPhone:
+        HideOverlay(OverlayCloseReason::Action);
+        SendFilesToPhone({AppPathForActions(app)});
+        return;
       case ActionKind::Preview:
         ExitActionMode();
         previewOpen_ = true;
@@ -19468,13 +20989,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case ActionKind::Open:
       case ActionKind::RunAsAdmin: {
+        const bool runAsAdmin = item.action == ActionKind::RunAsAdmin;
+        if (runAsAdmin && feathercast::discovery::AdminRouteFor(app) ==
+                              feathercast::discovery::AdminLaunchRoute::Unsupported) {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"This app cannot be run as administrator.");
+          return;
+        }
         HideOverlay(OverlayCloseReason::Action);
         auto appPtr = std::make_shared<AppEntry>(app);
-        if (!launchExecutor_.Submit([this, appPtr, runAsAdmin = (item.action == ActionKind::RunAsAdmin), id](std::stop_token stopToken) {
+        if (!launchExecutor_.Submit([this, appPtr, runAsAdmin, id](std::stop_token stopToken) {
           if (stopToken.stop_requested()) return;
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-          const bool ok = this->LaunchApp(*appPtr, runAsAdmin && appPtr->adminSupported);
-          if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
+          const bool ok = this->LaunchApp(*appPtr, runAsAdmin);
+          if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok, runAsAdmin);
           CoUninitialize();
         })) {
           ShowTrayNotification(L"FeatherCast Launch Failed",
@@ -19626,10 +21154,398 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
-  void OnClipboardUpdate() {
-    if (!settings_.clipboardHistoryEnabled || settings_.privacyConsentVersion < 1) {
+  // ------------------------------------------------------------ phone link
+
+  static std::filesystem::path PhoneApkPath() {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    return std::filesystem::path(exePath).parent_path() / L"FeatherCast-Phone.apk";
+  }
+
+  static std::string PhonePcName() {
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW(name, &size)) return "Windows PC";
+    return WideToUtf8(name);
+  }
+
+  std::wstring PhoneSettingsDetail() const {
+    if (!settings_.phoneLinkEnabled) {
+      return L"Off. Turn on to pair the FeatherCast Phone app.";
+    }
+    if (!phoneError_.empty()) return Utf8ToWide(phoneError_);
+    if (phoneService_.Connected()) {
+      return L"Connected to " + Utf8ToWide(phoneService_.ConnectedDeviceName()) + L".";
+    }
+    if (phoneService_.Devices().empty()) return L"On. No phone paired yet.";
+    return L"On. Waiting for your phone on the local network.";
+  }
+
+  void UpdatePhoneService() {
+    if (settings_.phoneLinkEnabled && !phoneService_.Running()) {
+      feathercast::phone::ServiceConfig config;
+      config.pcName = PhonePcName();
+      config.stateFile = (UserDataPath() / L"phone-link.dat").wstring();
+      std::filesystem::path downloads = KnownFolderPath(FOLDERID_Downloads);
+      if (downloads.empty()) downloads = LocalDataPath();
+      config.downloadsDir = (downloads / L"FeatherCast").wstring();
+      config.apkPath = PhoneApkPath().wstring();
+      config.onEvent = [this](feathercast::phone::Event event) {
+        phoneEvents_.Push(std::move(event));
+      };
+      phoneError_.clear();
+      if (!phoneService_.Start(std::move(config), &phoneError_) && phoneError_.empty()) {
+        phoneError_ = "The phone connection could not be started.";
+      }
+      // Development hook for headless end-to-end tests with phone-sim.
+      wchar_t testUriFile[MAX_PATH]{};
+      if (phoneService_.Running() &&
+          GetEnvironmentVariableW(L"FEATHERCAST_PHONE_TEST_URI_FILE", testUriFile, MAX_PATH) > 0) {
+        std::ofstream(testUriFile, std::ios::binary) << phoneService_.CreatePairingUri();
+      }
+    } else if (!settings_.phoneLinkEnabled) {
+      if (phoneService_.Running()) phoneService_.Stop();
+      phoneStore_ = {};
+      pendingPhoneSends_.clear();
+      pendingPhotoOpens_.clear();
+      phonePhotoSaveOnly_.clear();
+      phoneFileOpens_.clear();
+      lastPhoneClipboardText_.clear();
+      phoneError_.clear();
+    }
+    UpdatePhoneSendToShortcut();
+    RefreshPhoneWindowState();
+  }
+
+  void SetPhoneLinkEnabled(bool enabled) {
+    settings_.phoneLinkEnabled = enabled;
+    PersistSettings();
+    UpdatePhoneService();
+    UpdateClipboardListenerRegistration();
+    if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
+  }
+
+  void RefreshPhoneWindowState() {
+    feathercast::phone_ui::State state;
+    state.enabled = settings_.phoneLinkEnabled;
+    state.running = phoneService_.Running();
+    state.error = phoneError_;
+    std::error_code ec;
+    state.apkAvailable = std::filesystem::is_regular_file(PhoneApkPath(), ec);
+    state.clipboardSync = settings_.phoneClipboardSync;
+    state.notificationToasts = settings_.phoneNotificationToasts;
+    state.lowBatteryAlert = settings_.phoneLowBatteryPercent > 0;
+    if (state.running) state.devices = phoneService_.Devices();
+    phoneWindow_.SetState(std::move(state));
+    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+      InvalidateRect(settingsHwnd_, nullptr, FALSE);
+    }
+  }
+
+  void ApplyPhoneWindowTheme() {
+    phoneWindow_.SetTheme(theme_, ThemeColorFromSystem(ActiveAccent()));
+    phoneWindow_.SetMotionPolicy(FadeAnimationsAllowed(),
+                                 SpatialAnimationsAllowed(),
+                                 ControlAnimationsAllowed());
+  }
+
+  void ConfigurePhoneWindow() {
+    if (phoneWindowConfigured_) return;
+    phoneWindowConfigured_ = true;
+    feathercast::phone_ui::Callbacks callbacks;
+    callbacks.setEnabled = [this](bool enabled) { SetPhoneLinkEnabled(enabled); };
+    callbacks.setClipboardSync = [this](bool enabled) {
+      settings_.phoneClipboardSync = enabled;
+      PersistSettings();
+      UpdateClipboardListenerRegistration();
+      RefreshPhoneWindowState();
+    };
+    callbacks.setNotificationToasts = [this](bool enabled) {
+      settings_.phoneNotificationToasts = enabled;
+      PersistSettings();
+      RefreshPhoneWindowState();
+    };
+    callbacks.createPairingUri = [this] { return phoneService_.CreatePairingUri(); };
+    callbacks.apkUrl = [this] { return phoneService_.ApkUrl(); };
+    callbacks.copyToPc = [this](const std::string& text) {
+      lastPhoneClipboardText_ = Utf8ToWide(text);
+      CopyTextToClipboard(lastPhoneClipboardText_);
+    };
+    callbacks.sendPcClipboard = [this] {
+      if (const auto text = ReadClipboardText(); text && !Trim(*text).empty()) {
+        phoneService_.SendClipboard(WideToUtf8(*text));
+      }
+    };
+    callbacks.requestPhotos = [this] { phoneService_.RequestPhotos(); };
+    callbacks.requestPhoto = [this](const std::string& id) {
+      phoneService_.RequestPhoto(id);
+    };
+    callbacks.dismissNotification = [this](const std::string& key) {
+      phoneService_.DismissNotification(key);
+    };
+    callbacks.forgetDevice = [this](const std::string& id) {
+      phoneService_.Forget(id);
+      RefreshPhoneWindowState();
+    };
+    callbacks.setLowBatteryAlert = [this](bool enabled) {
+      settings_.phoneLowBatteryPercent = enabled ? 20 : 0;
+      PersistSettings();
+      RefreshPhoneWindowState();
+    };
+    callbacks.findPhone = [this] {
+      if (!phoneService_.Connected()) return;
+      const bool start = !phoneStore_.Ringing();
+      if (phoneService_.Ring(start)) phoneStore_.SetRinging(start);
+    };
+    callbacks.mediaCommand = [this](const std::string& command) {
+      phoneService_.MediaCommand(command);
+    };
+    callbacks.pickFilesToSend = [this] { SendFilesToPhone(PickFilesToSend()); };
+    callbacks.sendFiles = [this](const std::vector<std::wstring>& paths) {
+      SendFilesToPhone(paths);
+    };
+    callbacks.requestSmsThreads = [this] { phoneService_.RequestSmsThreads(); };
+    callbacks.openSmsThread = [this](const feathercast::phone::SmsThread& thread) {
+      ShowOverlay(View::Search);
+      SetQueryText(L"");
+      OpenSmsThread(thread.thread, thread.address, Utf8ToWide(thread.name));
+    };
+    phoneWindow_.SetCallbacks(std::move(callbacks));
+  }
+
+  void OpenPhoneWindow() {
+    ConfigurePhoneWindow();
+    ApplyPhoneWindowTheme();
+    RefreshPhoneWindowState();
+    phoneWindow_.Show(nullptr);
+  }
+
+  void ForwardClipboardToPhone(const std::wstring& text) {
+    if (!PhoneClipboardSyncActive() || !phoneService_.Connected()) return;
+    if (text == lastPhoneClipboardText_) return;  // came from the phone
+    lastPhoneClipboardText_.clear();
+    phoneService_.SendClipboard(WideToUtf8(text.substr(0, CLIPBOARD_TEXT_CAP_CHARS)));
+  }
+
+  void SendClipboardHistoryToPhone() {
+    std::vector<feathercast::phone::ClipboardHistoryItem> items;
+    if (ClipboardHistoryActive()) {
+      std::lock_guard lock(dataMutex_);
+      for (const auto& entry : clipboardHistory_) {
+        if (items.size() >= 30) break;
+        items.push_back({WideToUtf8(entry.text.substr(0, 4000)), entry.capturedAt * 1000});
+      }
+    }
+    phoneService_.SendClipboardHistory(items);
+  }
+
+  // Refreshes the launcher when the open phone view shows changed data.
+  void ApplyPhoneStoreChanges(const feathercast::phone::StoreChanges& changes) {
+    if (!changes.thumbId.empty()) {
+      const std::wstring key = L"phone-thumb:" + Utf8ToWide(changes.thumbId);
+      DropIconBitmap(key);
+    }
+    if (changes.media && phoneStore_.MediaArt() != phoneArtSource_) {
+      // New cover art gets a new icon key so the old bitmap is not reused.
+      if (!phoneArtKey_.empty()) DropIconBitmap(phoneArtKey_);
+      phoneArtSource_ = phoneStore_.MediaArt();
+      phoneArtKey_ = phoneArtSource_ ? L"phone-art:" + std::to_wstring(++phoneArtSerial_)
+                                     : std::wstring{};
+    }
+    if (!visible_) return;
+    if (browseView_ == BrowseView::None && !actionMode_ && changes.call) {
+      RequestSearch();
       return;
     }
+    if (!feathercast::app::IsPhoneBrowseView(browseView_)) return;
+    const bool relevant =
+        changes.connection ||
+        (browseView_ == BrowseView::PhoneNotifications && changes.notifications) ||
+        (browseView_ == BrowseView::PhonePhotos && changes.photos) ||
+        (browseView_ == BrowseView::PhoneClipboard && changes.clips) ||
+        (browseView_ == BrowseView::PhoneMedia && (changes.media || changes.status)) ||
+        (browseView_ == BrowseView::PhoneMessages && (changes.smsThreads || changes.status)) ||
+        (browseView_ == BrowseView::PhoneThread && changes.smsMessages) ||
+        (browseView_ == BrowseView::PhoneFiles && changes.files);
+    if (relevant) RequestSearch();
+  }
+
+  void OnPhoneEvent(feathercast::phone::Event event) {
+    using feathercast::phone::EventKind;
+    if (!settings_.phoneLinkEnabled) return;
+    ConfigurePhoneWindow();
+    phoneWindow_.OnEvent(event);
+    phoneStore_.SetLowBatteryPercent(settings_.phoneLowBatteryPercent);
+    const auto changes = phoneStore_.Apply(event, UnixNowMs());
+    ApplyPhoneStoreChanges(changes);
+    // The launcher's phone views count as looking at the phone data, like the
+    // Phone window in the foreground.
+    const bool overlayPhoneView =
+        visible_ && feathercast::app::IsPhoneBrowseView(browseView_);
+    const bool windowActive =
+        overlayPhoneView ||
+        (phoneWindow_.Visible() && GetForegroundWindow() == phoneWindow_.Hwnd());
+    switch (event.kind) {
+      case EventKind::Paired:
+        RefreshPhoneWindowState();
+        ShowTrayNotification(L"FeatherCast Phone",
+                             L"Paired with " + Utf8ToWide(event.deviceName) + L".");
+        break;
+      case EventKind::Connected:
+        RefreshPhoneWindowState();
+        if (phoneWindow_.Visible() ||
+            (visible_ && browseView_ == BrowseView::PhonePhotos)) {
+          phoneService_.RequestPhotos();
+        }
+        if (!windowActive) {
+          ShowTrayNotification(L"FeatherCast Phone",
+                               Utf8ToWide(event.deviceName) + L" is connected.");
+        }
+        if (visible_ && browseView_ == BrowseView::PhoneMessages) {
+          phoneService_.RequestSmsThreads();
+        } else if (visible_ && browseView_ == BrowseView::PhoneThread) {
+          phoneService_.RequestSmsMessages(phoneCompose_.thread);
+        } else if (visible_ && browseView_ == BrowseView::PhoneFiles) {
+          OpenPhoneFolder(phoneStore_.FilesPath());
+        }
+        break;
+      case EventKind::Status:
+        if (changes.lowBattery) {
+          ShowTrayNotification(
+              L"Phone battery low",
+              Utf8ToWide(phoneStore_.DeviceName()) + L" is at " +
+                  std::to_wstring(phoneStore_.Battery()) + L"%.");
+        }
+        // Files queued while the phone was offline wait for its feature list.
+        if (!pendingPhoneSends_.empty()) {
+          SendFilesToPhone(std::exchange(pendingPhoneSends_, {}));
+        }
+        break;
+      case EventKind::FileDelivered: {
+        std::wstring name = Utf8ToWide(event.photo.name);
+        if (const auto it = phoneSendNames_.find(event.id); it != phoneSendNames_.end()) {
+          if (name.empty()) name = it->second;
+          phoneSendNames_.erase(it);
+        }
+        ShowTrayNotification(
+            L"FeatherCast Phone",
+            event.ok ? L"Sent " + name + L" to " + Utf8ToWide(phoneStore_.DeviceName()) + L"."
+                     : name + L": " + (event.text.empty() ? std::wstring(L"The phone could not save the file.")
+                                                          : Utf8ToWide(event.text)));
+        break;
+      }
+      case EventKind::Call:
+        if (changes.incomingCall && settings_.phoneNotificationToasts) {
+          std::wstring caller = event.call.name.empty() ? Utf8ToWide(event.call.number)
+                                                        : Utf8ToWide(event.call.name);
+          if (caller.empty()) caller = L"Unknown caller";
+          ShowTrayNotification(L"Incoming call",
+                               caller + L" · Open FeatherCast to reject or silence it.");
+        }
+        break;
+      case EventKind::SmsSent:
+        if (const auto it = phoneSmsRecipients_.find(event.id); it != phoneSmsRecipients_.end()) {
+          const std::wstring recipient = it->second;
+          phoneSmsRecipients_.erase(it);
+          if (!event.ok) {
+            PhoneNotice(StatusSeverity::Error, L"The message to " + recipient + L" was not sent.");
+          } else if (visible_ && browseView_ == BrowseView::PhoneMessages) {
+            phoneService_.RequestSmsThreads();
+          }
+        }
+        break;
+      case EventKind::RemoteFileSaved:
+        if (phoneFileOpens_.erase(event.remotePath) > 0) {
+          ShellExecuteW(nullptr, L"open", event.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else {
+          ShowTrayNotification(
+              L"FeatherCast Phone",
+              L"Saved " + std::filesystem::path(event.path).filename().wstring() +
+                  L" in Downloads\\FeatherCast.");
+        }
+        if (overlayStatus_ && overlayStatus_->severity == StatusSeverity::Progress) {
+          overlayStatus_.reset();
+          if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        break;
+      case EventKind::Disconnected:
+        RefreshPhoneWindowState();
+        break;
+      case EventKind::NotificationPosted:
+        if (settings_.phoneNotificationToasts && !windowActive) {
+          const auto& info = event.notification;
+          std::wstring title = Utf8ToWide(info.appName.empty() ? info.app : info.appName);
+          if (!info.title.empty()) title += L": " + Utf8ToWide(info.title);
+          ShowTrayNotification(title, Utf8ToWide(info.text));
+        }
+        break;
+      case EventKind::Clipboard:
+        if (settings_.phoneClipboardSync && !event.text.empty()) {
+          lastPhoneClipboardText_ = Utf8ToWide(event.text);
+          CopyTextToClipboard(lastPhoneClipboardText_);
+          if (!windowActive) {
+            ShowTrayNotification(L"FeatherCast Phone",
+                                 L"Copied the phone clipboard to this PC.");
+          }
+        }
+        break;
+      case EventKind::ClipboardHistoryRequested:
+        SendClipboardHistoryToPhone();
+        break;
+      case EventKind::PhotoSaved:
+        if (pendingPhotoOpens_.erase(event.photo.id) > 0) {
+          if (phonePhotoSaveOnly_.erase(event.photo.id) > 0) {
+            ShowTrayNotification(
+                L"FeatherCast Phone",
+                L"Saved " + std::filesystem::path(event.path).filename().wstring() +
+                    L" in Downloads\\FeatherCast.");
+          } else {
+            ShellExecuteW(nullptr, L"open", event.path.c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
+          }
+          if (overlayStatus_ && overlayStatus_->severity == StatusSeverity::Progress) {
+            overlayStatus_.reset();
+            if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
+          }
+        }
+        break;
+      case EventKind::FileSaved:
+        ShowTrayNotification(
+            L"FeatherCast Phone",
+            L"Received " + std::filesystem::path(event.path).filename().wstring() +
+                L" in Downloads\\FeatherCast.");
+        break;
+      case EventKind::Error:
+        phoneSendNames_.erase(event.id);
+        if (!event.remotePath.empty()) {
+          phoneFileOpens_.erase(event.remotePath);
+          if (overlayStatus_ && overlayStatus_->severity == StatusSeverity::Progress) {
+            overlayStatus_.reset();
+          }
+          if (visible_) {
+            SetOverlayStatus(StatusSeverity::Error, Utf8ToWide(event.text));
+            break;
+          }
+        }
+        if (!event.text.empty() && !windowActive) {
+          ShowTrayNotification(L"FeatherCast Phone", Utf8ToWide(event.text));
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  bool ClipboardHistoryActive() const {
+    return settings_.clipboardHistoryEnabled && settings_.privacyConsentVersion >= 1;
+  }
+
+  bool PhoneClipboardSyncActive() const {
+    return settings_.phoneLinkEnabled && settings_.phoneClipboardSync;
+  }
+
+  void OnClipboardUpdate() {
+    if (!ClipboardHistoryActive() && !PhoneClipboardSyncActive()) return;
     const auto exclusions = settings_.clipboardExcludedApps;
     const HWND foreground = GetForegroundWindow();
     if (clipboardUpdatePending_.exchange(true, std::memory_order_acq_rel)) {
@@ -19783,6 +21699,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool LaunchApp(const AppEntry& app, bool asAdmin) {
+    const auto adminRoute = feathercast::discovery::AdminRouteFor(app);
+    if (asAdmin && adminRoute ==
+                       feathercast::discovery::AdminLaunchRoute::Unsupported)
+      return false;
+
     if (app.launchType == LaunchType::Shell) {
       HINSTANCE result = ShellExecuteW(nullptr, L"open", app.launchTarget.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
       return reinterpret_cast<intptr_t>(result) > 32;
@@ -19792,7 +21713,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (asAdmin) {
         // Prefer the execution alias (e.g. wt.exe) when we have one — it is a
         // real executable that the runas verb understands natively.
-        if (!app.targetPath.empty()) {
+        if (feathercast::discovery::SupportsAdminExecutableTarget(app.targetPath)) {
           SHELLEXECUTEINFOW sei{};
           sei.cbSize = sizeof(sei);
           sei.fMask = SEE_MASK_NOASYNC;
@@ -19800,6 +21721,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           sei.lpFile = app.targetPath.c_str();
           sei.nShow = SW_SHOWNORMAL;
           if (ShellExecuteExW(&sei)) return true;
+          if (GetLastError() == ERROR_CANCELLED) return false;
         }
         // Fallback for packaged/Store apps without a known alias: open the
         // shell:AppsFolder item with the runas verb so the user gets a UAC
@@ -19842,12 +21764,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     std::wstring args = app.args;
     std::wstring cwd = app.cwd;
 
-    if (asAdmin && app.launchType == LaunchType::Shortcut) {
+    const bool launchTargetIsShortcut =
+        Lower(std::filesystem::path(app.launchTarget).extension().wstring()) ==
+        L".lnk";
+    if (asAdmin && (app.launchType == LaunchType::Shortcut ||
+                    launchTargetIsShortcut)) {
       ShortcutInfo info;
-      if (LoadShortcut(app.launchTarget, info) && !info.target.empty()) {
+      if (LoadShortcut(app.launchTarget, info) &&
+          feathercast::discovery::SupportsAdminExecutableTarget(info.target)) {
         file = info.target;
         args = info.args;
         cwd = info.cwd;
+      } else if (!app.appUserModelId.empty()) {
+        file = L"shell:AppsFolder\\" + app.appUserModelId;
+        args.clear();
+        cwd.clear();
+      } else {
+        return false;
       }
     }
 
@@ -19887,6 +21820,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       GetCursorPos(&pt);
       HMENU menu = CreatePopupMenu();
       AppendMenuW(menu, MF_STRING, 1, L"Open FeatherCast");
+      AppendMenuW(menu, MF_STRING, 4, L"Phone");
       AppendMenuW(menu, MF_STRING, 2, L"Settings");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, 3, L"Quit");
@@ -19896,6 +21830,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (cmd == 1) ShowOverlay(View::Search);
       else if (cmd == 2) OpenSettings();
       else if (cmd == 3) DestroyWindow(hwnd_);
+      else if (cmd == 4) OpenPhoneWindow();
     }
   }
 
@@ -19909,6 +21844,40 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::runtime::UiEventQueue<SnippetLoadCompleted>
       snippetLoadEvents_;
   feathercast::runtime::UiEventQueue<ClipboardObservation> clipboardEvents_;
+  feathercast::runtime::UiEventQueue<feathercast::phone::Event> phoneEvents_;
+  feathercast::phone::PhoneService phoneService_;
+  feathercast::phone_ui::PhoneWindow phoneWindow_;
+  bool phoneWindowConfigured_ = false;
+  std::string phoneError_;
+  std::wstring lastPhoneClipboardText_;
+  // Phone data shown by the launcher's phone browse views (UI thread only).
+  feathercast::phone::PhoneStore phoneStore_;
+  // Photos the launcher asked for; they are opened once saved unless listed in
+  // phonePhotoSaveOnly_.
+  std::set<std::string> pendingPhotoOpens_;
+  std::set<std::string> phonePhotoSaveOnly_;
+  // Target of the compose view and the SMS thread view.
+  struct PhoneCompose {
+    bool sms = false;
+    std::string notificationKey;
+    int actionIndex = -1;
+    std::string thread;
+    std::string address;
+    std::wstring name;
+  };
+  PhoneCompose phoneCompose_;
+  std::uint64_t phoneSmsSerial_ = 0;
+  std::map<std::string, std::wstring> phoneSmsRecipients_;  // SMS ref -> name
+  std::map<std::string, std::wstring> phoneSendNames_;      // transfer id -> file name
+  std::set<std::string> phoneFileOpens_;  // phone files opened once downloaded
+  std::vector<std::wstring> pendingPhoneSends_;  // waiting for the phone
+  feathercast::phone::SharedBytes phoneArtSource_;
+  std::wstring phoneArtKey_;
+  std::uint64_t phoneArtSerial_ = 0;
+  // Encoded phone images handed to the icon workers, keyed by icon key.
+  std::mutex phoneImageMutex_;
+  std::map<std::wstring, feathercast::phone::SharedBytes> phoneImageBytes_;
+  std::set<std::wstring> failedPhoneImages_;
   feathercast::persistence::PersistenceService persistence_;
   feathercast::runtime::UiEventQueue<feathercast::search::CoordinatorEvent>
       searchEvents_;
@@ -20002,6 +21971,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   UniqueHandle animationFrameTimer_;
   HMONITOR animationClockMonitor_ = nullptr;
   std::int64_t animationFramePeriodQpc_ = 0;
+  bool animationVblankAligned_ = false;
+  bool animationClockFresh_ = false;
   feathercast::motion::DisplayFrameClock animationFrameClock_;
   bool animating_ = false;
   feathercast::motion::FrameRequestGate animationFrameGate_;
@@ -20016,16 +21987,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::motion::ScalarAnimation settingsSurfaceScale_;
   feathercast::motion::ScalarAnimation volumeSurfaceScale_;
   feathercast::motion::ScalarAnimation confirmationProgress_;
-  feathercast::motion::ScalarAnimation overlayVisualScroll_;
-  feathercast::motion::ScalarAnimation settingsVisualScroll_;
+  feathercast::motion::Spring overlayVisualScroll_;
+  feathercast::motion::Spring settingsVisualScroll_;
+  feathercast::motion::Spring previewVisualScroll_;
+  double wheelRemainder_ = 0.0;
   feathercast::motion::ScalarAnimation settingsPageProgress_;
   feathercast::motion::ScalarAnimation settingsCategoryTop_;
   feathercast::motion::ScalarAnimation volumeVisualPercent_;
-  feathercast::motion::AnimatedBounds overlayBounds_;
-  feathercast::motion::AnimatedBounds settingsBounds_;
-  feathercast::motion::AnimatedBounds volumeBounds_;
+  feathercast::motion::SpringBounds overlayBounds_;
+  feathercast::motion::SpringBounds settingsBounds_;
+  feathercast::motion::SpringBounds volumeBounds_;
   feathercast::motion::PendingNavigation pendingNavigation_;
   std::map<HitType, feathercast::motion::ScalarAnimation> switchAnimations_;
+  std::map<HitType, feathercast::motion::ScalarAnimation> settingsHoverMotion_;
+  feathercast::motion::ScalarAnimation gearHoverMotion_;
   struct ResultElementMotion {
     feathercast::motion::ScalarAnimation offsetY;
     feathercast::motion::ScalarAnimation opacity;
@@ -20515,13 +22490,29 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
   const DWORD mutexError = GetLastError();
   if (!mutex || mutexError == ERROR_ALREADY_EXISTS) {
+    if (wcsstr(GetCommandLineW(), L"--send-to-phone")) {
+      std::wstring joined;
+      for (const auto& path : SendToPhoneArgs(GetCommandLineW())) joined += path + L"\n";
+      if (const HWND existing = FindWindowW(kWindowClass, L"FeatherCast"); existing && !joined.empty()) {
+        COPYDATASTRUCT data{};
+        data.dwData = kSendToPhoneCopyData;
+        data.cbData = static_cast<DWORD>(joined.size() * sizeof(wchar_t));
+        data.lpData = joined.data();
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data),
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &result);
+      }
+      return 0;
+    }
+    const WPARAM showRequest = wcsstr(GetCommandLineW(), L"--phone") ? 1 : 0;
+    AllowSetForegroundWindow(ASFW_ANY);
     const feathercast::window_activation::ExistingInstanceAdapter adapter{
         [] { return FindWindowW(kWindowClass, L"FeatherCast"); },
         [](HWND window) { return IsWindow(window) != FALSE; },
-        [](HWND window, unsigned timeout) {
+        [showRequest](HWND window, unsigned timeout) {
           DWORD_PTR acknowledged = 0;
           return SendMessageTimeoutW(
-                     window, WM_SHOW_SEARCH, 0, 0,
+                     window, WM_SHOW_SEARCH, showRequest, 0,
                      SMTO_ABORTIFHUNG | SMTO_BLOCK,
                      static_cast<UINT>(timeout), &acknowledged) != 0;
         }};

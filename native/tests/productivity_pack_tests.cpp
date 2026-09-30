@@ -912,7 +912,8 @@ int main() {
   appItem.app.id = L"app:test";
   appItem.app.name = L"Test App";
   appItem.app.source = L"start-menu";
-  appItem.app.adminSupported = true;
+  appItem.app.launchType = feathercast::app::LaunchType::Exe;
+  appItem.app.launchTarget = L"C:\\Apps\\Test App.exe";
   const auto appActions = feathercast::commands::BuildActions(
       appItem, feathercast::app::Settings{});
   assert(HasAction(appActions, feathercast::app::ActionKind::RunAsAdmin));
@@ -923,6 +924,18 @@ int main() {
   assert(runAsAdmin != appActions.end());
   assert(runAsAdmin->commandDetail.find(L"Ctrl+Shift+Enter") !=
          std::wstring::npos);
+  appItem.app.launchType = feathercast::app::LaunchType::Shell;
+  appItem.app.launchTarget = L"example://open";
+  appItem.app.adminSupported = true;  // A stale flag must not expose admin.
+  assert(!HasAction(feathercast::commands::BuildActions(
+                        appItem, feathercast::app::Settings{}),
+                    feathercast::app::ActionKind::RunAsAdmin));
+  appItem.app.launchType = feathercast::app::LaunchType::AppsFolder;
+  appItem.app.launchTarget = L"Publisher.App!Main";
+  appItem.app.adminSupported = false;
+  assert(HasAction(feathercast::commands::BuildActions(
+                       appItem, feathercast::app::Settings{}),
+                   feathercast::app::ActionKind::RunAsAdmin));
   assert(HasAction(appActions,
                    feathercast::app::ActionKind::EditAppAlias));
 

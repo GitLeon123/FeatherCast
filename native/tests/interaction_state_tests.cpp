@@ -254,6 +254,76 @@ int main() {
   }
 
   {
+    using feathercast::motion::Easing;
+    for (const Easing easing : {Easing::OutCubic, Easing::OutQuint,
+                                Easing::InCubic, Easing::InOutCubic}) {
+      assert(std::abs(feathercast::motion::Ease(easing, 0.0)) < 1e-9);
+      assert(std::abs(feathercast::motion::Ease(easing, 1.0) - 1.0) < 1e-9);
+      double previous = 0.0;
+      for (int step = 1; step <= 20; ++step) {
+        const double value =
+            feathercast::motion::Ease(easing, static_cast<double>(step) / 20.0);
+        assert(value >= previous);
+        previous = value;
+      }
+    }
+    // Exits accelerate: an ease-in covers less ground early than an ease-out.
+    assert(feathercast::motion::Ease(Easing::InCubic, 0.25) <
+           feathercast::motion::Ease(Easing::OutCubic, 0.25));
+
+    feathercast::motion::ScalarAnimation closing;
+    closing.Snap(1.0);
+    closing.Retarget(0.0, 0.1, true, Easing::InCubic);
+    closing.Update(0.025);
+    assert(closing.Value() > 0.95);
+    closing.Update(0.05);
+    closing.Update(0.05);
+    assert(!closing.Active() && closing.Value() == 0.0);
+  }
+
+  {
+    constexpr std::int64_t kPeriod = 166'667;
+    constexpr std::int64_t kVblank = 1'000'000;
+    feathercast::motion::DisplayFrameClock clock;
+    // Deadlines land mid-interval (half a period before each vblank),
+    // whatever "now" is.
+    clock.StartAligned(kVblank + 12'345, kPeriod, kVblank, kPeriod / 2);
+    assert(clock.NextDeadline() > kVblank + 12'345);
+    assert((clock.NextDeadline() - (kVblank - kPeriod / 2)) % kPeriod == 0);
+    clock.StartAligned(kVblank - 3 * kPeriod + 7, kPeriod, kVblank,
+                       kPeriod / 2);
+    assert((clock.NextDeadline() - (kVblank - kPeriod / 2)) % kPeriod == 0);
+    assert(clock.NextDeadline() - (kVblank - 3 * kPeriod + 7) <= kPeriod);
+
+    // A missed frame skips ahead but keeps the vblank phase.
+    const std::int64_t first = clock.NextDeadline();
+    const std::int64_t periods = clock.Advance(first + 2 * kPeriod + 99);
+    assert(periods == 3);
+    assert(clock.NextDeadline() == first + 3 * kPeriod);
+    assert(clock.Advance(clock.NextDeadline() + 10) == 1);
+  }
+
+  {
+    feathercast::motion::SpringBounds bounds;
+    bounds.Configure(0.2, 1.0);
+    bounds.Snap(0.0, 0.0, 400.0, 300.0);
+    bounds.Retarget(0.0, 0.0, 400.0, 500.0, true);
+    for (int frame = 0; frame < 6; ++frame) bounds.Update(1.0 / 120.0);
+    const double velocity = bounds.height.Velocity();
+    assert(velocity > 0.0);
+    // Retargeting mid-flight (another keystroke) keeps the momentum.
+    bounds.Retarget(0.0, 0.0, 400.0, 520.0, true);
+    assert(std::abs(bounds.height.Velocity() - velocity) < 1e-9);
+    for (int frame = 0; frame < 240 && bounds.Active(); ++frame) {
+      bounds.Update(1.0 / 120.0);
+    }
+    assert(!bounds.Active());
+    assert(std::abs(bounds.height.Value() - 520.0) < 0.001);
+    bounds.Retarget(10.0, 0.0, 400.0, 520.0, false);
+    assert(!bounds.Active() && bounds.left.Value() == 10.0);
+  }
+
+  {
     feathercast::motion::PendingNavigation pending;
     pending.Move(1);
     pending.Move(8);

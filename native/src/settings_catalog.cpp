@@ -203,6 +203,14 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Toggle, L"Diagnostics",
        L"Write bounded troubleshooting logs without queries or clipboard text.",
        L"Enable diagnostics"},
+      {L"privacy.phone", SettingsCategory::Privacy, HitType::PhoneLinkToggle,
+       ControlKind::Toggle, L"Phone Connection",
+       L"Link the FeatherCast Phone app over your local network.",
+       L"Phone connection"},
+      {L"privacy.phone-open", SettingsCategory::Privacy, HitType::OpenPhoneWindow,
+       ControlKind::Action, L"Phone Window",
+       L"Pair a phone and see its notifications, photos, and clipboard.",
+       L"Open phone window"},
       {L"privacy.clear-clipboard", SettingsCategory::Privacy, HitType::ClearClipboardData,
        ControlKind::Action, L"Delete Clipboard Data", L"Delete saved clipboard entries.",
        L"Delete clipboard data", Requirement::ClipboardEnabled},
@@ -340,6 +348,7 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
     case HitType::FileContentIndexToggle:
       return settings.fileContentIndexEnabled;
     case HitType::DiagnosticsToggle: return settings.diagnosticsEnabled;
+    case HitType::PhoneLinkToggle: return settings.phoneLinkEnabled;
     case HitType::AccentToggle: return settings.syncAccentColor;
     default: return false;
   }

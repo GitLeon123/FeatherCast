@@ -1,4 +1,5 @@
 #include "command_catalog.hpp"
+#include "discovery.hpp"
 
 #include <algorithm>
 #include <set>
@@ -149,6 +150,40 @@ const std::vector<CommandDescriptor>& Catalog() {
       {L"timers", app::CommandKind::Timers, L"Timers & Stopwatch",
        L"Manage saved timers and a stopwatch. Try: timer 10m Tea",
        {L"timer", L"timers", L"countdown", L"stopwatch", L"alarm"}},
+      {L"phone", app::CommandKind::OpenPhone, L"Phone",
+       L"Connect your Android phone: notifications, photos, and clipboard",
+       {L"phone", L"android", L"mobile", L"connect", L"pair", L"devices"}},
+      {L"phone-notifications", app::CommandKind::PhoneNotifications,
+       L"Phone Notifications", L"Browse recent notifications from your phone",
+       {L"notifications", L"notification", L"alerts", L"messages", L"phone",
+        L"android", L"mobile"}},
+      {L"phone-photos", app::CommandKind::PhonePhotos, L"Phone Photos",
+       L"Browse and open recent photos from your phone",
+       {L"photos", L"pictures", L"images", L"gallery", L"camera", L"phone",
+        L"android", L"mobile"}},
+      {L"phone-clipboard", app::CommandKind::PhoneClipboard,
+       L"Phone Clipboard", L"Paste text copied on your phone",
+       {L"phone clipboard", L"clipboard", L"copied", L"paste", L"phone",
+        L"android", L"mobile"}},
+      {L"find-my-phone", app::CommandKind::FindMyPhone, L"Find My Phone",
+       L"Make your phone ring loudly, even on silent",
+       {L"find", L"ring", L"lost", L"locate", L"where", L"phone", L"android"}},
+      {L"phone-media", app::CommandKind::PhoneMedia, L"Phone Media",
+       L"See and control what is playing on your phone",
+       {L"media", L"music", L"playing", L"spotify", L"pause", L"play",
+        L"remote", L"phone", L"android"}},
+      {L"phone-messages", app::CommandKind::PhoneMessages, L"Phone Messages",
+       L"Read and send text messages (SMS) from your phone",
+       {L"sms", L"text", L"messages", L"texts", L"conversation", L"phone",
+        L"android"}},
+      {L"phone-files", app::CommandKind::PhoneFiles, L"Phone Files",
+       L"Browse your phone's storage and download files",
+       {L"files", L"storage", L"folders", L"download", L"browse", L"phone",
+        L"android"}},
+      {L"send-file-to-phone", app::CommandKind::SendFileToPhone,
+       L"Send File to Phone", L"Send files from this PC to your phone",
+       {L"send", L"file", L"transfer", L"share", L"upload", L"phone",
+        L"android"}},
       {L"clipboard-history", app::CommandKind::ClipboardHistory,
        L"Clipboard History", L"Browse and paste copied items",
        {L"clipboard", L"history", L"paste", L"copy"}},
@@ -425,10 +460,17 @@ std::vector<app::DisplayItem> BuildActions(
     actions.push_back(ActionItem(app::ActionKind::Preview, L"Preview",
                                  L"Show text, image, or metadata preview",
                                  target));
+    if (settings.phoneLinkEnabled && !target.app.fileIsDirectory) {
+      actions.push_back(ActionItem(app::ActionKind::SendToPhone,
+                                   L"Send to Phone",
+                                   L"Save a copy in Download/FeatherCast on your phone",
+                                   target));
+    }
   }
   actions.push_back(ActionItem(app::ActionKind::Open, L"Open",
                                L"Launch " + target.app.name, target));
-  if (target.app.adminSupported) {
+  if (discovery::AdminRouteFor(target.app) !=
+      discovery::AdminLaunchRoute::Unsupported) {
     actions.push_back(ActionItem(app::ActionKind::RunAsAdmin,
                                  L"Run as Administrator",
                                  L"Launch elevated · Ctrl+Shift+Enter", target));

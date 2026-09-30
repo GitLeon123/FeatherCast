@@ -177,6 +177,68 @@ inline TextLayoutMetrics TextMetrics(int textSizePercent) noexcept {
           60.0f + 20.0f * growth};
 }
 
+// Thumbnail grid used by result browse views such as phone photos. Cells are
+// square and laid out left to right, then top to bottom.
+struct ResultGrid {
+  int columns = 1;
+  float cell = 0.0f;
+  float gap = 8.0f;
+
+  float Stride() const noexcept { return cell + gap; }
+  int RowOf(int index) const noexcept {
+    return columns > 0 ? std::max(0, index) / columns : 0;
+  }
+  int ColumnOf(int index) const noexcept {
+    return columns > 0 ? std::max(0, index) % columns : 0;
+  }
+  int Rows(std::size_t count) const noexcept {
+    return columns > 0
+               ? static_cast<int>((count + static_cast<std::size_t>(columns) - 1) /
+                                  static_cast<std::size_t>(columns))
+               : 0;
+  }
+  // Height taken by count cells, including the gap below the last row.
+  float Height(std::size_t count) const noexcept {
+    return static_cast<float>(Rows(count)) * Stride();
+  }
+};
+
+// Fits as many cells of at least minCell as possible into width and then
+// stretches them so the row fills the available width exactly.
+inline ResultGrid FitResultGrid(float width, float minCell = 112.0f,
+                                float gap = 8.0f) noexcept {
+  ResultGrid grid;
+  grid.gap = gap;
+  width = std::max(minCell, width);
+  grid.columns = std::max(1, static_cast<int>((width + gap) / (minCell + gap)));
+  grid.cell = (width - gap * static_cast<float>(grid.columns - 1)) /
+              static_cast<float>(grid.columns);
+  return grid;
+}
+
+// Arrow-key movement inside a grid. Returns the index unchanged when the move
+// would leave the grid.
+inline int GridMove(int index, int count, int columns, int dx,
+                    int dy) noexcept {
+  if (count <= 0 || columns <= 0) return index;
+  index = std::clamp(index, 0, count - 1);
+  if (dx != 0) {
+    const int next = index + dx;
+    return next < 0 || next >= count ? index : next;
+  }
+  if (dy != 0) {
+    const int next = index + dy * columns;
+    if (next < 0) return index;
+    if (next >= count) {
+      // Moving down from a row above a shorter last row lands on its last cell.
+      const int lastRow = (count - 1) / columns;
+      return index / columns < lastRow ? count - 1 : index;
+    }
+    return next;
+  }
+  return index;
+}
+
 inline float SettingsCategoryRowHeight(float availableHeight,
                                        std::size_t categoryCount) noexcept {
   if (categoryCount == 0) return 44.0f;

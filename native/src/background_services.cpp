@@ -49,6 +49,76 @@ std::optional<DecodedIcon> DecodePngIcon(
   return icon;
 }
 
+std::optional<DecodedIcon> DecodeImageBytes(
+    IWICImagingFactory* factory, const std::vector<std::uint8_t>& bytes,
+    const std::wstring& key, std::uint32_t maxEdge) {
+  if (!factory || bytes.empty() || maxEdge == 0 ||
+      bytes.size() > 64u * 1024u * 1024u) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IWICStream> stream;
+  if (FAILED(factory->CreateStream(stream.GetAddressOf())) ||
+      FAILED(stream->InitializeFromMemory(
+          const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size())))) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+  Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(factory->CreateDecoderFromStream(
+          stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad,
+          decoder.GetAddressOf())) ||
+      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+    return std::nullopt;
+  }
+  UINT sourceWidth = 0;
+  UINT sourceHeight = 0;
+  if (FAILED(frame->GetSize(&sourceWidth, &sourceHeight)) ||
+      sourceWidth == 0 || sourceHeight == 0) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IWICBitmapSource> source = frame;
+  const double fit = std::min(
+      1.0, static_cast<double>(maxEdge) /
+               static_cast<double>(std::max(sourceWidth, sourceHeight)));
+  if (fit < 1.0) {
+    const UINT width = std::max(1u, static_cast<UINT>(sourceWidth * fit + 0.5));
+    const UINT height = std::max(1u, static_cast<UINT>(sourceHeight * fit + 0.5));
+    Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())) ||
+        FAILED(scaler->Initialize(frame.Get(), width, height,
+                                  WICBitmapInterpolationModeFant))) {
+      return std::nullopt;
+    }
+    source = scaler;
+  }
+  Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
+      FAILED(converter->Initialize(
+          source.Get(), GUID_WICPixelFormat32bppPBGRA,
+          WICBitmapDitherTypeNone, nullptr, 0,
+          WICBitmapPaletteTypeMedianCut))) {
+    return std::nullopt;
+  }
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(converter->GetSize(&width, &height)) || width == 0 ||
+      height == 0) {
+    return std::nullopt;
+  }
+  DecodedIcon icon;
+  icon.key = key;
+  icon.width = width;
+  icon.height = height;
+  icon.stride = width * 4u;
+  icon.pixels.resize(static_cast<std::size_t>(icon.stride) * height);
+  if (FAILED(converter->CopyPixels(
+          nullptr, icon.stride, static_cast<UINT>(icon.pixels.size()),
+          icon.pixels.data()))) {
+    return std::nullopt;
+  }
+  return icon;
+}
+
 void LaunchService::Start(std::size_t workers, ErrorHandler errorHandler) {
   executor_.Start(workers, std::move(errorHandler));
 }

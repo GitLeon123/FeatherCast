@@ -41,6 +41,15 @@ try {
     if ($process.ExitCode -ne 0) { throw "$name ZIP self-test failed." }
   }
 
+  $phoneApp = Join-Path $build 'FeatherCast-Phone.apk'
+  if (Test-Path -LiteralPath $phoneApp) {
+    $packagedPhone = Get-ChildItem $portable -Recurse -Filter 'FeatherCast-Phone.apk' | Select-Object -First 1
+    if (-not $packagedPhone -or
+        (Get-FileHash $packagedPhone.FullName).Hash -ne (Get-FileHash $phoneApp).Hash) {
+      throw 'The portable ZIP does not contain the built companion APK.'
+    }
+  }
+
   if ($SkipInstalledSmoke) { return }
 
   if (-not $InstallRoot) {
@@ -66,6 +75,13 @@ try {
     $binary = Join-Path $installRoot "bin\$name"
     $process = Start-Process $binary -ArgumentList "--self-test" -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "$name installed self-test failed." }
+  }
+  if (Test-Path -LiteralPath $phoneApp) {
+    $installedPhone = Join-Path $installRoot 'bin\FeatherCast-Phone.apk'
+    if (-not (Test-Path -LiteralPath $installedPhone) -or
+        (Get-FileHash $installedPhone).Hash -ne (Get-FileHash $phoneApp).Hash) {
+      throw 'The installer does not contain the built companion APK.'
+    }
   }
 
   $repeatInstall = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait

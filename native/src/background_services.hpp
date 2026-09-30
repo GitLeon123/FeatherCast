@@ -35,6 +35,12 @@ std::optional<DecodedIcon> DecodePngIcon(
     ::IWICImagingFactory* factory, const std::filesystem::path& path,
     const std::wstring& key);
 
+// Decodes PNG/JPEG bytes held in memory, scaled down so neither edge exceeds
+// maxEdge while keeping the aspect ratio.
+std::optional<DecodedIcon> DecodeImageBytes(
+    ::IWICImagingFactory* factory, const std::vector<std::uint8_t>& bytes,
+    const std::wstring& key, std::uint32_t maxEdge);
+
 template <typename Result>
 class SingleOperationService {
  public:

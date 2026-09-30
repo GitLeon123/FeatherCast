@@ -119,6 +119,8 @@ enum class HitType {
   RemoveClipboardExcludedApp,
   AddFileIndexPattern,
   RemoveFileIndexPattern,
+  PhoneLinkToggle,
+  OpenPhoneWindow,
 };
 
 enum class CommandKind {
@@ -160,6 +162,15 @@ enum class CommandKind {
   RecordFullscreen,
   RecordRegion,
   Timers,
+  OpenPhone,
+  PhoneNotifications,
+  PhonePhotos,
+  PhoneClipboard,
+  FindMyPhone,
+  PhoneMedia,
+  PhoneMessages,
+  PhoneFiles,
+  SendFileToPhone,
 };
 
 struct ConfirmationDialog {
@@ -199,7 +210,31 @@ enum class BrowseView {
   Games,
   Capabilities,
   Timers,
+  PhoneNotifications,
+  PhonePhotos,
+  PhoneClipboard,
+  PhoneMedia,
+  PhoneMessages,
+  PhoneThread,   // one SMS conversation; the search box is the reply draft
+  PhoneFiles,
+  PhoneCompose,  // the search box is a reply draft (notification or SMS)
 };
+
+inline bool IsPhoneBrowseView(BrowseView view) {
+  return view == BrowseView::PhoneNotifications ||
+         view == BrowseView::PhonePhotos ||
+         view == BrowseView::PhoneClipboard ||
+         view == BrowseView::PhoneMedia ||
+         view == BrowseView::PhoneMessages ||
+         view == BrowseView::PhoneThread ||
+         view == BrowseView::PhoneFiles ||
+         view == BrowseView::PhoneCompose;
+}
+
+// Views where the query is a message draft, so results are not filtered.
+inline bool IsPhoneDraftView(BrowseView view) {
+  return view == BrowseView::PhoneThread || view == BrowseView::PhoneCompose;
+}
 
 enum class CapabilityActionKind {
   SeedQuery,
@@ -263,6 +298,14 @@ enum class ActionKind {
   PasteText,
   PinClipboard,
   UnpinClipboard,
+  DismissPhoneNotification,
+  OpenPhonePhoto,
+  SavePhonePhoto,
+  PhoneNotificationAction,
+  ReplyToPhoneNotification,
+  SendToPhone,
+  OpenPhoneFile,
+  SavePhoneFile,
 };
 
 struct RectF {
@@ -340,6 +383,33 @@ struct ClipboardEntry {
   bool pinned = false;
 };
 
+enum class PhoneItemKind {
+  Notification,
+  Photo,
+  Clip,
+  Media,       // id: now, toggle, next, prev, vol-up, vol-down
+  SmsThread,   // id: thread id, text: address
+  SmsMessage,  // id: message id
+  File,        // id: path on the phone
+  Compose,     // the draft being written (PhoneCompose / PhoneThread)
+  Call,        // id: reject or silence
+};
+
+// An item received from, or a control for, the linked phone.
+struct PhoneItem {
+  PhoneItemKind kind = PhoneItemKind::Notification;
+  std::wstring id;  // notification key, photo id, clip serial, ...
+  std::wstring title;
+  std::wstring text;
+  std::wstring appName;
+  long long time = 0;  // Unix milliseconds
+  bool hasImage = false;
+  bool downloading = false;
+  bool directory = false;  // File: a folder
+  int actionIndex = -1;    // notification action for PhoneNotificationAction
+  std::wstring imageKey;   // Media: key of the cover art
+};
+
 struct CurrencyRates {
   std::map<std::wstring, double> perUsd;
   long long fetchedAt = 0;
@@ -372,7 +442,22 @@ struct AliasTarget {
 
 using ActionTarget =
     std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload,
-                 ClipboardEntry, AliasTarget>;
+                 ClipboardEntry, AliasTarget, PhoneItem>;
+
+inline std::wstring PhoneKey(const PhoneItem& item) {
+  switch (item.kind) {
+    case PhoneItemKind::Notification: return L"phone:n:" + item.id;
+    case PhoneItemKind::Photo: return L"phone:p:" + item.id;
+    case PhoneItemKind::Clip: return L"phone:c:" + item.id;
+    case PhoneItemKind::Media: return L"phone:m:" + item.id;
+    case PhoneItemKind::SmsThread: return L"phone:t:" + item.id;
+    case PhoneItemKind::SmsMessage: return L"phone:s:" + item.id;
+    case PhoneItemKind::File: return L"phone:f:" + item.id;
+    case PhoneItemKind::Compose: return L"phone:w:" + item.id;
+    case PhoneItemKind::Call: return L"phone:k:" + item.id;
+  }
+  return L"phone:" + item.id;
+}
 
 struct DisplayItem {
   std::optional<feathercast::timers::Request> timerRequest;
@@ -390,6 +475,7 @@ struct DisplayItem {
   bool isSymbol = false;
   bool isCapability = false;
   bool isSectionExpander = false;
+  bool isPhone = false;
   std::optional<UtilityResult> utility;
   AppEntry app;
   WindowEntry window;
@@ -399,6 +485,7 @@ struct DisplayItem {
   feathercast::run_command::Command runCommand;
   feathercast::symbols::Symbol symbol;
   CapabilityItem capability;
+  PhoneItem phone;
   CommandKind command = CommandKind::Settings;
   std::wstring commandStableId;
   ActionKind action = ActionKind::None;
@@ -441,6 +528,7 @@ struct DisplayItem {
     if (isExtension) return L"ext:" + extension.pluginId + L":" + extension.id;
     if (isSnippet) return L"snippet:" + snippet.keyword;
     if (isClipboard) return L"clip:" + clipboard.id;
+    if (isPhone) return PhoneKey(phone);
     if (isRunCommand) {
       return L"run:" + std::to_wstring(static_cast<int>(runCommand.kind)) +
              L":" + runCommand.target;
@@ -464,6 +552,12 @@ struct DisplayItem {
       } else if (const auto* aliasTarget =
                      std::get_if<AliasTarget>(&actionTarget)) {
         target = aliasTarget->invocationKey;
+      } else if (const auto* phoneTarget =
+                     std::get_if<PhoneItem>(&actionTarget)) {
+        target = PhoneKey(*phoneTarget);
+        if (phoneTarget->actionIndex >= 0) {
+          target += L"#" + std::to_wstring(phoneTarget->actionIndex);
+        }
       }
       return L"act:" + std::to_wstring(static_cast<int>(action)) + L":" +
              target;
@@ -484,6 +578,7 @@ struct DisplayItem {
     if (isExtension) return extension.title;
     if (isSnippet) return snippet.name;
     if (isClipboard) return clipboard.preview;
+    if (isPhone) return phone.title;
     if (isRunCommand) return runCommand.label;
     if (isSymbol) return symbol.label;
     if (utility) return utility->title;
@@ -501,6 +596,13 @@ struct DisplayItem {
     }
     if (isExtension) return extension.iconPath;
     if (isSnippet || isClipboard) return L"";
+    if (isPhone) {
+      if (!phone.hasImage) return L"";
+      if (phone.kind == PhoneItemKind::Notification) return L"phone-icon:" + phone.id;
+      if (phone.kind == PhoneItemKind::Photo) return L"phone-thumb:" + phone.id;
+      if (phone.kind == PhoneItemKind::Media) return phone.imageKey;
+      return L"";
+    }
     if (isAction) {
       if (const auto* windowTarget = std::get_if<WindowEntry>(&actionTarget)) {
         return !windowTarget->iconKey.empty() ? windowTarget->iconKey
@@ -586,6 +688,12 @@ struct QueryRequest {
   std::vector<DisplayItem> extensionItems;
   std::vector<DisplayItem> actions;
   std::vector<DisplayItem> timerItems;
+  std::vector<DisplayItem> phoneItems;
+  std::wstring phoneSectionTitle;
+  // Phone view commands with live details, suggested in normal search.
+  std::vector<DisplayItem> phoneSuggestions;
+  // Reject/Silence items shown on top while the phone rings.
+  std::vector<DisplayItem> phoneCallItems;
   std::vector<feathercast::core::SearchItem> actionSearchItems;
 };
 

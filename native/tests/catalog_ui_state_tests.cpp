@@ -110,6 +110,12 @@ int main() {
       std::pair{L"symbols", ResultIcon::Symbols},
       std::pair{L"files", ResultIcon::FolderSearch},
       std::pair{L"clipboard", ResultIcon::Clipboard},
+      std::pair{L"phone-notifications", ResultIcon::Phone},
+      std::pair{L"phone-photos", ResultIcon::Phone},
+      std::pair{L"phone-clipboard", ResultIcon::Phone},
+      std::pair{L"phone-media", ResultIcon::PlayPause},
+      std::pair{L"phone-messages", ResultIcon::Phone},
+      std::pair{L"phone-files", ResultIcon::Folder},
       std::pair{L"snippets", ResultIcon::Document},
       std::pair{L"quicklinks", ResultIcon::Link},
       std::pair{L"system-commands", ResultIcon::Terminal},
@@ -169,6 +175,15 @@ int main() {
       std::pair{CommandKind::RecordFullscreen, ResultIcon::Monitor},
       std::pair{CommandKind::RecordRegion, ResultIcon::Monitor},
       std::pair{CommandKind::Timers, ResultIcon::Clock},
+      std::pair{CommandKind::OpenPhone, ResultIcon::Phone},
+      std::pair{CommandKind::PhoneNotifications, ResultIcon::Phone},
+      std::pair{CommandKind::PhonePhotos, ResultIcon::Phone},
+      std::pair{CommandKind::PhoneClipboard, ResultIcon::Phone},
+      std::pair{CommandKind::FindMyPhone, ResultIcon::Phone},
+      std::pair{CommandKind::PhoneMedia, ResultIcon::PlayPause},
+      std::pair{CommandKind::PhoneMessages, ResultIcon::Phone},
+      std::pair{CommandKind::PhoneFiles, ResultIcon::Folder},
+      std::pair{CommandKind::SendFileToPhone, ResultIcon::Download},
   };
   assert(commandIcons.size() == feathercast::commands::Catalog().size());
   for (const auto& [kind, expected] : commandIcons) {

@@ -73,6 +73,7 @@ enum class ResultIcon {
   Center,
   MultiMonitor,
   Edit,
+  Phone,
 };
 
 // Resolves the semantic fallback used when a result has no Shell/plugin bitmap.

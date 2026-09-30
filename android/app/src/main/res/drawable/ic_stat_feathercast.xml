@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome feather used for status bar notifications and themed icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M20.2,3.1C15.6,3.4 11.3,6.1 9.1,10.2L6.9,14.7L14.9,7.6L7.6,15.9L4.3,19.9C4,20.4 4.6,20.9 5,20.5L7.9,18.3L11.8,18.1C15.8,17.9 19.3,15.2 20.4,11.3L17.3,11.9L20.8,9.4C21.1,7.3 21,5.1 20.2,3.1Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2,8.5h4.5v1.3H2z M3,11.3h3v1.3H3z M2.5,5.7h5v1.3h-5z" />
+</vector>

@@ -1308,6 +1308,7 @@ int main() {
     assert(mergedA.targetPath == shortcutApp.targetPath);
     assert(mergedA.appUserModelId == L"com.squirrel.Discord.Discord");
     assert(mergedA.adminSupported == true);
+    assert(fd::AdminRouteFor(mergedA) == fd::AdminLaunchRoute::Direct);
 
     // When merging Shortcut into AppsFolder, upgrade launchType to Shortcut and keep AUMID
     auto mergedB = appsFolderApp;
@@ -1317,6 +1318,18 @@ int main() {
     assert(mergedB.targetPath == shortcutApp.targetPath);
     assert(mergedB.appUserModelId == L"com.squirrel.Discord.Discord");
     assert(mergedB.adminSupported == true);
+    assert(fd::AdminRouteFor(mergedB) == fd::AdminLaunchRoute::Direct);
+
+    auto protocolGame = shortcutApp;
+    protocolGame.isGame = true;
+    protocolGame.launchType = feathercast::app::LaunchType::Shell;
+    protocolGame.launchTarget = L"steam://rungameid/123";
+    protocolGame.adminSupported = true;
+    auto mergedGame = shortcutApp;
+    fd::MergeAppEntries(mergedGame, protocolGame);
+    assert(mergedGame.launchType == feathercast::app::LaunchType::Shell);
+    assert(fd::AdminRouteFor(mergedGame) ==
+           fd::AdminLaunchRoute::Unsupported);
 
     // Desktop shortcut and Start Menu shortcut pointing to same executable
     feathercast::app::AppEntry desktopApp;
@@ -1381,6 +1394,18 @@ int main() {
     assert(fd::SupportsAdminLaunchTarget(L"C:\\ProgramData\\Demo\\Demo.lnk"));
     assert(!fd::SupportsAdminLaunchTarget(L"C:\\Users\\User\\Desktop\\notes.txt"));
     assert(!fd::SupportsAdminLaunchTarget(L"https://example.com/demo.exe"));
+    feathercast::app::AppEntry directApp;
+    directApp.launchType = feathercast::app::LaunchType::Exe;
+    directApp.launchTarget = L"C:\\Apps\\Demo.exe";
+    assert(fd::AdminRouteFor(directApp) == fd::AdminLaunchRoute::Direct);
+    directApp.launchTarget = L"uplay://launch/123";
+    assert(fd::AdminRouteFor(directApp) ==
+           fd::AdminLaunchRoute::Unsupported);
+    feathercast::app::AppEntry storeApp;
+    storeApp.launchType = feathercast::app::LaunchType::AppsFolder;
+    storeApp.launchTarget = L"Publisher.App!Main";
+    assert(fd::AdminRouteFor(storeApp) ==
+           fd::AdminLaunchRoute::AppsFolder);
 
     // Host executables with different names must NOT merge
     feathercast::app::AppEntry cmdApp1;

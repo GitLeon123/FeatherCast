@@ -1,6 +1,6 @@
 ﻿# FeatherCast Releasing
 
-FeatherCast releases are distributed through GitHub Releases for `GenericLeon0/FeatherCast`. The in-app updater checks the latest stable release and expects the Windows installer plus a SHA-256 sidecar file.
+FeatherCast releases are distributed through GitHub Releases for `GitLeon123/FeatherCast`. The in-app updater checks the latest stable release and expects the Windows installer plus a SHA-256 sidecar file.
 
 The release candidate must also pass the
 [Release QA Checklist](release-qa-checklist.md), including accessibility,
@@ -9,6 +9,14 @@ benchmark, package, and Authenticode gates for both application executables.
 ## Automated Release (preferred)
 
 Pushing a tag `vX.Y.Z` triggers `.github/workflows/ci.yml`: it builds, runs tests, packages via CPack, generates `.sha256` sidecars, and creates a **draft** GitHub Release with all assets attached. The updater ignores drafts, so verify the draft and publish it manually. The manual flow below remains as fallback.
+
+The Android job runs protocol tests and release lint before building the companion
+APK. Windows packages include that same APK, which is also uploaded separately
+with its SHA-256 sidecar. Tag builds require `PHONE_KEYSTORE_BASE64` (the base64
+contents of the existing `phone-release.jks`) and `PHONE_KEYSTORE_PASSWORD`
+repository secrets. The key alias is `feathercast`; its password matches the store
+password. Keep the original key so installed Android apps can accept updates.
+Branch and pull-request builds use a debug signature for testing.
 
 Signed release tags use the `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD` secrets plus the `FEATHERCAST_EXPECTED_PUBLISHER` and `FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS` repository variables. The thumbprint variable is a semicolon-separated list of SHA-256 signer-certificate thumbprints; keep the old and new certificates listed together during rotation. CI rejects a partial signing configuration. When all four values are present, it signs and timestamps the application, plugin host, and installer, then verifies their status, publisher, timestamp, and certificate pin.
 
@@ -22,6 +30,7 @@ Run from a Visual Studio developer PowerShell:
 cmake --preset windows-x64
 cmake --build --preset release
 ctest --preset release
+scripts\build-android.ps1
 cpack --config build-native/CPackConfig.cmake -C Release -B build-native/packages
 # Full ZIP/NSIS package smoke (including Start menu and uninstall artifacts)
 scripts\package-smoke.ps1 -BuildDirectory build-native -Configuration Release

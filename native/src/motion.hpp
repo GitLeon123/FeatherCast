@@ -19,6 +19,36 @@ inline double EaseOutCubic(double progress) {
   return 1.0 - remaining * remaining * remaining;
 }
 
+inline double EaseOutQuint(double progress) {
+  const double remaining = 1.0 - std::clamp(progress, 0.0, 1.0);
+  return 1.0 - remaining * remaining * remaining * remaining * remaining;
+}
+
+inline double EaseInCubic(double progress) {
+  const double t = std::clamp(progress, 0.0, 1.0);
+  return t * t * t;
+}
+
+inline double EaseInOutCubic(double progress) {
+  const double t = std::clamp(progress, 0.0, 1.0);
+  if (t < 0.5) return 4.0 * t * t * t;
+  const double remaining = -2.0 * t + 2.0;
+  return 1.0 - remaining * remaining * remaining * 0.5;
+}
+
+// Entrances decelerate into place (Out*), exits accelerate away (In*).
+enum class Easing { OutCubic, OutQuint, InCubic, InOutCubic };
+
+inline double Ease(Easing easing, double progress) {
+  switch (easing) {
+    case Easing::OutQuint: return EaseOutQuint(progress);
+    case Easing::InCubic: return EaseInCubic(progress);
+    case Easing::InOutCubic: return EaseInOutCubic(progress);
+    case Easing::OutCubic: break;
+  }
+  return EaseOutCubic(progress);
+}
+
 inline double NormalizedProgress(double elapsedSeconds, double durationSeconds) {
   if (durationSeconds <= 0.0) return 1.0;
   return std::clamp(elapsedSeconds / durationSeconds, 0.0, 1.0);
@@ -42,6 +72,20 @@ class DisplayFrameClock {
     nextDeadline_ = now + period_;
   }
 
+  // Phase-locks the deadlines to the compositor's vblank. Each tick then lands
+  // `lead` before a vblank, so exactly one new frame is ready per refresh
+  // instead of the timer phase drifting against the display and occasionally
+  // producing two frames in one refresh and none in the next.
+  void StartAligned(std::int64_t now, std::int64_t period,
+                    std::int64_t vblank, std::int64_t lead) {
+    period_ = std::max<std::int64_t>(1, period);
+    lead = std::clamp<std::int64_t>(lead, 0, period_ / 2);
+    const std::int64_t anchor = vblank - lead;
+    std::int64_t offset = (now - anchor) % period_;
+    if (offset < 0) offset += period_;
+    nextDeadline_ = now - offset + period_;
+  }
+
   void Reset() {
     period_ = 0;
     nextDeadline_ = 0;
@@ -51,12 +95,15 @@ class DisplayFrameClock {
   std::int64_t Period() const { return period_; }
   std::int64_t NextDeadline() const { return nextDeadline_; }
 
-  void Advance(std::int64_t now) {
-    if (!Active()) return;
+  // Returns how many display periods passed, so callers can advance
+  // animation time in whole refreshes rather than by jittery wall time.
+  std::int64_t Advance(std::int64_t now) {
+    if (!Active()) return 0;
     const std::int64_t elapsed = std::max<std::int64_t>(
         0, now - nextDeadline_);
     const std::int64_t periods = elapsed / period_ + 1;
     nextDeadline_ += periods * period_;
+    return periods;
   }
 
  private:
@@ -97,7 +144,8 @@ class ScalarAnimation {
     active_ = false;
   }
 
-  void Retarget(double target, double durationSeconds, bool animate = true) {
+  void Retarget(double target, double durationSeconds, bool animate = true,
+                Easing easing = Easing::OutCubic) {
     if (!animate || durationSeconds <= 0.0 ||
         std::abs(target - value_) <= 0.001) {
       Snap(target);
@@ -107,6 +155,7 @@ class ScalarAnimation {
     target_ = target;
     elapsedSeconds_ = 0.0;
     durationSeconds_ = durationSeconds;
+    easing_ = easing;
     active_ = true;
   }
 
@@ -116,7 +165,7 @@ class ScalarAnimation {
     const double progress = durationSeconds_ <= 0.0
                                 ? 1.0
                                 : elapsedSeconds_ / durationSeconds_;
-    value_ = start_ + (target_ - start_) * EaseOutCubic(progress);
+    value_ = start_ + (target_ - start_) * Ease(easing_, progress);
     if (progress >= 1.0 || std::abs(target_ - value_) <= 0.001) {
       Snap(target_);
     }
@@ -129,6 +178,7 @@ class ScalarAnimation {
   double target_ = 0.0;
   double elapsedSeconds_ = 0.0;
   double durationSeconds_ = 0.0;
+  Easing easing_ = Easing::OutCubic;
   bool active_ = false;
 };
 
@@ -263,6 +313,49 @@ struct AnimatedBounds {
     top.Retarget(y, durationSeconds, animate);
     width.Retarget(w, durationSeconds, animate);
     height.Retarget(h, durationSeconds, animate);
+  }
+};
+
+// Window geometry driven by springs: when the target changes mid-flight (for
+// example the result count changing on every keystroke) the resize keeps its
+// velocity instead of restarting from a standstill.
+struct SpringBounds {
+  Spring left;
+  Spring top;
+  Spring width;
+  Spring height;
+
+  void Configure(double responseSeconds, double dampingRatio) {
+    left.Configure(responseSeconds, dampingRatio);
+    top.Configure(responseSeconds, dampingRatio);
+    width.Configure(responseSeconds, dampingRatio);
+    height.Configure(responseSeconds, dampingRatio);
+  }
+
+  bool Active() const {
+    return left.Active() || top.Active() || width.Active() || height.Active();
+  }
+
+  bool Update(double deltaSeconds) {
+    left.Update(deltaSeconds);
+    top.Update(deltaSeconds);
+    width.Update(deltaSeconds);
+    height.Update(deltaSeconds);
+    return Active();
+  }
+
+  void Snap(double x, double y, double w, double h) {
+    left.Snap(x);
+    top.Snap(y);
+    width.Snap(w);
+    height.Snap(h);
+  }
+
+  void Retarget(double x, double y, double w, double h, bool animate) {
+    left.Retarget(x, animate);
+    top.Retarget(y, animate);
+    width.Retarget(w, animate);
+    height.Retarget(h, animate);
   }
 };
 

@@ -58,3 +58,38 @@ $bw.Flush(); $bw.Dispose(); $fs.Dispose()
 # The tray icon uses the same embedded application icon resource.
 $big.Dispose(); $source.Dispose()
 Write-Host "Icons generated in $buildDir : icon.ico, icon.png"
+
+# Android launcher icons for the FeatherCast Phone app (android/app).
+$resDir = Join-Path $PSScriptRoot "..\android\app\src\main\res"
+$source = [System.Drawing.Bitmap]::FromFile((Resolve-Path $assetPath))
+# Bounds of the rounded-square artwork inside the transparent source margin.
+$content = New-Object System.Drawing.Rectangle(35, 30, 1184, 1194)
+$densities = @{ "mdpi" = 1.0; "hdpi" = 1.5; "xhdpi" = 2.0; "xxhdpi" = 3.0; "xxxhdpi" = 4.0 }
+foreach ($density in $densities.Keys) {
+  $scale = $densities[$density]
+  $dir = Join-Path $resDir "mipmap-$density"
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+  $legacy = New-IconBitmap $source ([int](48 * $scale))
+  $legacy.Save((Join-Path $dir "ic_launcher.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+  $legacy.Dispose()
+
+  # Adaptive foreground: 108dp canvas, artwork centered at 76dp so the
+  # launcher mask trims the rounded corners onto the matching background.
+  $size = [int](108 * $scale)
+  $inner = [int](76 * $scale)
+  $offset = [int](($size - $inner) / 2)
+  $fg = New-Object System.Drawing.Bitmap($size, $size)
+  $g = [System.Drawing.Graphics]::FromImage($fg)
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+  $g.Clear([System.Drawing.Color]::Transparent)
+  $g.DrawImage($source, (New-Object System.Drawing.Rectangle($offset, $offset, $inner, $inner)),
+               $content, [System.Drawing.GraphicsUnit]::Pixel)
+  $g.Dispose()
+  $fg.Save((Join-Path $dir "ic_launcher_foreground.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+  $fg.Dispose()
+}
+$source.Dispose()
+Write-Host "Android launcher icons generated in $resDir"

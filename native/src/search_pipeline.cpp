@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <map>
 #include <set>
 #include <utility>
@@ -21,6 +22,45 @@ namespace feathercast::search_pipeline {
 namespace {
 
 using namespace app;
+
+std::vector<std::wstring> LowerWords(const std::wstring& text) {
+  std::vector<std::wstring> words;
+  std::wstring current;
+  for (const wchar_t ch : core::Lower(text)) {
+    if (std::iswalnum(ch)) {
+      current.push_back(ch);
+    } else if (!current.empty()) {
+      words.push_back(std::move(current));
+      current.clear();
+    }
+  }
+  if (!current.empty()) words.push_back(std::move(current));
+  return words;
+}
+
+}  // namespace
+
+bool MatchesPhoneSuggestion(const std::wstring& query,
+                            const app::DisplayItem& item) {
+  const auto queryWords = LowerWords(query);
+  std::size_t letters = 0;
+  for (const auto& word : queryWords) letters += word.size();
+  // One or two letters match too much to be worth a suggestion.
+  if (queryWords.empty() || letters < 3) return false;
+  std::vector<std::wstring> tokens = LowerWords(item.commandName);
+  for (const auto& keyword : item.commandKeywords) {
+    for (auto& word : LowerWords(keyword)) tokens.push_back(std::move(word));
+  }
+  return std::all_of(queryWords.begin(), queryWords.end(),
+                     [&](const std::wstring& queryWord) {
+                       return std::any_of(tokens.begin(), tokens.end(),
+                                          [&](const std::wstring& token) {
+                                            return token.starts_with(queryWord);
+                                          });
+                     });
+}
+
+namespace {
 
 DisplayItem CalculatorDisplay(const calculator::Result& calculation) {
   DisplayItem item;
@@ -220,6 +260,27 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       if (request.empty || core::Lower(item.Name()).find(core::Lower(request.query)) != std::wstring::npos) items.push_back(item);
     }
     addSection(L"Timers & Stopwatch", take(items));
+  } else if (IsPhoneBrowseView(request.browseView)) {
+    if (request.empty || IsPhoneDraftView(request.browseView)) {
+      addSection(request.phoneSectionTitle, take(request.phoneItems));
+    } else {
+      std::vector<core::SearchItem> searchItems;
+      searchItems.reserve(request.phoneItems.size());
+      for (const auto& item : request.phoneItems) {
+        core::SearchItem searchItem;
+        searchItem.id = item.Key();
+        searchItem.kind = L"phone";
+        searchItem.source = L"phone";
+        searchItem.name = item.phone.title;
+        searchItem.keywords = {item.phone.text, item.phone.appName};
+        searchItems.push_back(std::move(searchItem));
+      }
+      const auto order = core::Search(request.query, searchItems);
+      std::vector<DisplayItem> hits;
+      hits.reserve(order.size());
+      for (const auto index : order) hits.push_back(request.phoneItems[index]);
+      addSection(request.phoneSectionTitle, take(hits));
+    }
   } else if (request.browseView == BrowseView::Clipboard) {
     if (request.empty) {
       addSection(L"Clipboard History", take(snapshot->clipboardItems));
@@ -305,6 +366,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
     addSection(ScopeTitle(request.scope, request.empty), take(hits));
   } else if (request.empty) {
+    addSection(L"Incoming Call", take(request.phoneCallItems));
     // pinned/recent are intentionally generic DisplayItem buckets. The
     // snapshot builder resolves stable invocation keys and supplies them in
     // deterministic settings order; take() removes overlap between favorites,
@@ -322,6 +384,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                          capabilities::EmptyStateAction::MoreTools)},
                     1));
   } else {
+    addSection(L"Incoming Call", take(request.phoneCallItems));
     const std::wstring trimmed = core::Trim(request.query);
     if (trimmed.starts_with(L">")) {
       if (const auto command = run_command::Classify(trimmed)) {
@@ -446,6 +509,19 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
         }
       }
 
+      // Phone views are suggested near the top as soon as the query looks
+      // like one ("notif", "photos", "phone"). An app whose name starts with
+      // the query (e.g. the Photos app) keeps the first place.
+      std::vector<DisplayItem> phoneSuggestions;
+      for (const auto& item : request.phoneSuggestions) {
+        if (MatchesPhoneSuggestion(request.query, item)) phoneSuggestions.push_back(item);
+      }
+      const auto queryWords = LowerWords(request.query);
+      const bool strongAppMatch =
+          !apps.empty() && !queryWords.empty() &&
+          core::Lower(apps.front().Name()).starts_with(queryWords.front());
+      if (!strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
+
       const bool hasLaunchableApps = !apps.empty() || !games.empty();
       if (hasLaunchableApps) {
         addSection(L"Apps", take(apps, 80));
@@ -453,6 +529,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       } else if (!hits.empty()) {
         addSection(L"Best match", take({hits.front()}, 1));
       }
+      if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
       addSection(L"FeatherCast Settings", take(settingMatches));
       addSection(L"Extensions", take(request.extensionItems, 20));
       addSection(L"Commands", take(commands, 20));

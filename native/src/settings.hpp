@@ -177,6 +177,12 @@ struct Settings {
   std::vector<std::wstring> fileIndexRoots;
   std::vector<std::wstring> fileIndexExcludePatterns;
   bool diagnosticsEnabled = false;
+  // Phone link (LAN server for the FeatherCast Phone app) is opt-in.
+  bool phoneLinkEnabled = false;
+  bool phoneClipboardSync = true;
+  bool phoneNotificationToasts = true;
+  // Toast when the phone battery drops to this level; 0 turns it off.
+  int phoneLowBatteryPercent = 20;
   // Web search prefixes: keyword -> URL template containing "%s" for the query.
   std::map<std::wstring, std::wstring> searchEngines =
       DefaultSearchEngines();
@@ -423,6 +429,11 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   ReadBool(*root, "showStoreApps", settings.showStoreApps);
   ReadInt(*root, "privacyConsentVersion", settings.privacyConsentVersion);
   ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
+  ReadBool(*root, "phoneLinkEnabled", settings.phoneLinkEnabled);
+  ReadBool(*root, "phoneClipboardSync", settings.phoneClipboardSync);
+  ReadBool(*root, "phoneNotificationToasts", settings.phoneNotificationToasts);
+  ReadInt(*root, "phoneLowBatteryPercent", settings.phoneLowBatteryPercent);
+  settings.phoneLowBatteryPercent = std::clamp(settings.phoneLowBatteryPercent, 0, 100);
   ReadInt(*root, "clipboardHistoryLimit", settings.clipboardHistoryLimit);
   ReadInt(*root, "clipboardRetentionDays", settings.clipboardRetentionDays);
   settings.clipboardExcludedApps =
@@ -582,6 +593,10 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"showStoreApps\": " << (settings.showStoreApps ? "true" : "false") << ",\n";
   out << "  \"privacyConsentVersion\": " << settings.privacyConsentVersion << ",\n";
   out << "  \"clipboardHistoryEnabled\": " << (settings.clipboardHistoryEnabled ? "true" : "false") << ",\n";
+  out << "  \"phoneLinkEnabled\": " << (settings.phoneLinkEnabled ? "true" : "false") << ",\n";
+  out << "  \"phoneClipboardSync\": " << (settings.phoneClipboardSync ? "true" : "false") << ",\n";
+  out << "  \"phoneNotificationToasts\": " << (settings.phoneNotificationToasts ? "true" : "false") << ",\n";
+  out << "  \"phoneLowBatteryPercent\": " << settings.phoneLowBatteryPercent << ",\n";
   out << "  \"clipboardHistoryLimit\": " << settings.clipboardHistoryLimit << ",\n";
   out << "  \"clipboardRetentionDays\": " << settings.clipboardRetentionDays
       << ",\n";

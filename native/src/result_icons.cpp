@@ -21,6 +21,12 @@ ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
   if (id == L"symbols") return ResultIcon::Symbols;
   if (id == L"files") return ResultIcon::FolderSearch;
   if (id == L"clipboard") return ResultIcon::Clipboard;
+  if (id == L"phone-notifications") return ResultIcon::Phone;
+  if (id == L"phone-photos") return ResultIcon::Phone;
+  if (id == L"phone-clipboard") return ResultIcon::Phone;
+  if (id == L"phone-media") return ResultIcon::PlayPause;
+  if (id == L"phone-messages") return ResultIcon::Phone;
+  if (id == L"phone-files") return ResultIcon::Folder;
   if (id == L"snippets") return ResultIcon::Document;
   if (id == L"quicklinks") return ResultIcon::Link;
   if (id == L"system-commands") return ResultIcon::Terminal;
@@ -35,6 +41,15 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
   using app::CommandKind;
   switch (kind) {
     case CommandKind::Timers: return ResultIcon::Clock;
+    case CommandKind::OpenPhone:
+    case CommandKind::PhoneNotifications:
+    case CommandKind::PhonePhotos:
+    case CommandKind::PhoneClipboard:
+    case CommandKind::FindMyPhone:
+    case CommandKind::PhoneMessages: return ResultIcon::Phone;
+    case CommandKind::PhoneMedia: return ResultIcon::PlayPause;
+    case CommandKind::PhoneFiles: return ResultIcon::Folder;
+    case CommandKind::SendFileToPhone: return ResultIcon::Download;
     case CommandKind::Settings: return ResultIcon::Gear;
     case CommandKind::Quit: return ResultIcon::Exit;
     case CommandKind::Restart:
@@ -115,6 +130,14 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::EditAppAlias:
     case ActionKind::EditAlias: return ResultIcon::Edit;
     case ActionKind::PasteText: return ResultIcon::Clipboard;
+    case ActionKind::DismissPhoneNotification: return ResultIcon::Close;
+    case ActionKind::OpenPhonePhoto: return ResultIcon::ExternalLink;
+    case ActionKind::SavePhonePhoto:
+    case ActionKind::SavePhoneFile: return ResultIcon::Download;
+    case ActionKind::OpenPhoneFile: return ResultIcon::ExternalLink;
+    case ActionKind::PhoneNotificationAction: return ResultIcon::Actions;
+    case ActionKind::ReplyToPhoneNotification: return ResultIcon::Edit;
+    case ActionKind::SendToPhone: return ResultIcon::Phone;
     case ActionKind::None: return ResultIcon::Actions;
   }
   return ResultIcon::Actions;
@@ -135,6 +158,25 @@ ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
   if (item.isExtension) return ResultIcon::Puzzle;
   if (item.isSnippet) return ResultIcon::Document;
   if (item.isClipboard) return ResultIcon::Clipboard;
+  if (item.isPhone) {
+    using app::PhoneItemKind;
+    switch (item.phone.kind) {
+      case PhoneItemKind::Clip: return ResultIcon::Clipboard;
+      case PhoneItemKind::Media:
+        if (item.phone.id == L"next") return ResultIcon::NextTrack;
+        if (item.phone.id == L"prev") return ResultIcon::PreviousTrack;
+        if (item.phone.id == L"vol-up") return ResultIcon::SpeakerPlus;
+        if (item.phone.id == L"vol-down") return ResultIcon::SpeakerMinus;
+        return ResultIcon::PlayPause;
+      case PhoneItemKind::File:
+        return item.phone.directory ? ResultIcon::Folder : ResultIcon::File;
+      case PhoneItemKind::SmsMessage: return ResultIcon::Document;
+      case PhoneItemKind::Compose: return ResultIcon::Edit;
+      case PhoneItemKind::Call:
+        return item.phone.id == L"reject" ? ResultIcon::Close : ResultIcon::SpeakerOff;
+      default: return ResultIcon::Phone;
+    }
+  }
   if (item.isRunCommand) return ResultIcon::Terminal;
   if (item.isSymbol) return ResultIcon::Symbols;
   if (item.utility) {

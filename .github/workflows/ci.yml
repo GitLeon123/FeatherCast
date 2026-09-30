@@ -17,10 +17,17 @@ on:
 
 jobs:
   build:
+    needs: phone-app
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download companion app for packaging
+        uses: actions/download-artifact@v4
+        with:
+          name: FeatherCast-Phone-apk
+          path: build-native
 
       - name: Configure
         shell: pwsh
@@ -230,6 +237,7 @@ jobs:
                            $_.Name -like 'FeatherCast-*-win64.zip' })
           if (-not ($packages | Where-Object Extension -eq '.exe')) { throw "NSIS installer was not generated." }
           if (-not ($packages | Where-Object Extension -eq '.zip')) { throw "ZIP package was not generated." }
+          Copy-Item build-native/FeatherCast-Phone.apk FeatherCast-Phone.apk
 
       - name: Sign installer
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
@@ -444,7 +452,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          foreach ($f in Get-ChildItem FeatherCast-*-win64.exe, FeatherCast-*-win64.zip) {
+          foreach ($f in Get-ChildItem FeatherCast-*-win64.exe, FeatherCast-*-win64.zip, FeatherCast-Phone.apk) {
             "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant())  $($f.Name)" |
               Set-Content -Encoding ascii "$($f.FullName).sha256"
           }
@@ -460,10 +468,58 @@ jobs:
             FeatherCast-*-win64.exe
             FeatherCast-*-win64.zip
             FeatherCast-*-win64.*.sha256
+            FeatherCast-Phone.apk
+            FeatherCast-Phone.apk.sha256
+
+  phone-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Test protocol and build phone app
+        working-directory: android
+        env:
+          PHONE_KEYSTORE_BASE64: ${{ secrets.PHONE_KEYSTORE_BASE64 }}
+          PHONE_KEYSTORE_PASSWORD: ${{ secrets.PHONE_KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [[ -z "$PHONE_KEYSTORE_BASE64" || -z "$PHONE_KEYSTORE_PASSWORD" ]]; then
+              echo "Release tags require PHONE_KEYSTORE_BASE64 and PHONE_KEYSTORE_PASSWORD."
+              exit 1
+            fi
+            printf '%s' "$PHONE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/phone-release.jks"
+            export ORG_GRADLE_PROJECT_fcStoreFile="$RUNNER_TEMP/phone-release.jks"
+            export ORG_GRADLE_PROJECT_fcStorePassword="$PHONE_KEYSTORE_PASSWORD"
+            export ORG_GRADLE_PROJECT_fcKeyAlias=feathercast
+            export ORG_GRADLE_PROJECT_fcKeyPassword="$PHONE_KEYSTORE_PASSWORD"
+          fi
+          ./gradlew --no-daemon :protocol:test :app:lintRelease :app:assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk FeatherCast-Phone.apk
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/phone-release.jks"
+
+      - name: Retain phone app
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeatherCast-Phone-apk
+          if-no-files-found: error
+          retention-days: 14
+          path: android/FeatherCast-Phone.apk
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, phone-app]
     runs-on: windows-latest
     permissions:
       contents: write

@@ -105,6 +105,32 @@ inline bool SupportsAdminLaunchTarget(const std::wstring& target) {
          extension == L".lnk";
 }
 
+inline bool SupportsAdminExecutableTarget(const std::wstring& target) {
+  return SupportsAdminLaunchTarget(target) &&
+         Lower(std::filesystem::path(target).extension().wstring()) != L".lnk";
+}
+
+enum class AdminLaunchRoute { Unsupported, Direct, AppsFolder };
+
+inline AdminLaunchRoute AdminRouteFor(const app::AppEntry& app) {
+  switch (app.launchType) {
+    case app::LaunchType::Exe:
+      return SupportsAdminLaunchTarget(app.launchTarget)
+                 ? AdminLaunchRoute::Direct : AdminLaunchRoute::Unsupported;
+    case app::LaunchType::Shortcut:
+      if (SupportsAdminExecutableTarget(app.targetPath))
+        return AdminLaunchRoute::Direct;
+      return app.appUserModelId.empty() ? AdminLaunchRoute::Unsupported
+                                        : AdminLaunchRoute::AppsFolder;
+    case app::LaunchType::AppsFolder:
+      return app.launchTarget.empty() ? AdminLaunchRoute::Unsupported
+                                      : AdminLaunchRoute::AppsFolder;
+    case app::LaunchType::Shell:
+      return AdminLaunchRoute::Unsupported;
+  }
+  return AdminLaunchRoute::Unsupported;
+}
+
 inline std::wstring DisambiguateShortcutName(const std::wstring& stemName, const std::filesystem::path& shortcutPath) {
   const std::wstring parent = shortcutPath.parent_path().filename().wstring();
   if (parent.empty()) return stemName;
