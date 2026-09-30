@@ -19,6 +19,7 @@ repository-wide architectural rewrite.
 | APKs were built separately but omitted from tagged Windows packages and releases. | Make Windows builds consume the tested APK, require persistent signing on tags, and publish the APK with a checksum. |
 | Android release lint failed on an API 29 helper despite its guarded caller. | Annotate the helper's API requirement and run lint in local and CI release builds. |
 | Gradle signing passwords appeared in command arguments. | Supply signing properties through process environment variables and restore them after the local build. |
+| The existing CodeQL alert identified an intermediate integer overflow in SQLite's Windows shared-memory offset. | Promote the multiplication operand to 64 bits and document the local vendor patch. |
 
 Tests cover concurrent single-use pairing, unpairing during authentication,
 stopping and restarting, expired invites after stopping, bounded Android reads,

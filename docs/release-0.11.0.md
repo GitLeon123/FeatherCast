@@ -20,6 +20,8 @@ as a separate release download.
   unpairing, and prevent concurrent requests from reusing a pairing invite.
 - Limit connection workers and file reads; keep queued transfers attached to
   their original session and clear phone data when Phone Connection is disabled.
+- Correct a Windows shared-memory offset multiplication in the vendored SQLite
+  code to avoid an intermediate integer overflow flagged by CodeQL.
 - Test Android protocol and release lint in CI, sign release APKs with the
   persistent release key, and include the companion in Windows release packages.
 

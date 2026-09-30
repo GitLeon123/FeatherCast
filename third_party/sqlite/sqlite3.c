@@ -53418,7 +53418,7 @@ static int winShmMap(
                osGetCurrentProcessId(), pShmNode->nRegion, nByte,
                hMap ? "ok" : "failed"));
       if( hMap ){
-        i64 iOffset = pShmNode->nRegion*szRegion;
+        i64 iOffset = (i64)pShmNode->nRegion*szRegion;
         int iOffsetShift = iOffset % winSysInfo.dwAllocationGranularity;
         pMap = osMapViewOfFile(hMap, flags,
             0, iOffset - iOffsetShift, (i64)szRegion + iOffsetShift
