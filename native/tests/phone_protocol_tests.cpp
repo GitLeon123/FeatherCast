@@ -6,6 +6,7 @@
 #include "phone_messages.hpp"
 #include "phone_protocol.hpp"
 #include "phone_service.hpp"
+#include "phone_screen_buffer.hpp"
 #include "test_framework.hpp"
 
 #include <chrono>
@@ -200,14 +201,16 @@ class FakePhone {
     return UnpackPayload(*plain);
   }
 
-  bool Authenticate(const std::string& deviceId, const Bytes& linkKey) {
-    return BeginAuthentication(deviceId, linkKey) && CompleteAuthentication();
+  bool Authenticate(const std::string& deviceId, const Bytes& linkKey, const std::string& screen = {}) {
+    return BeginAuthentication(deviceId, linkKey, screen) && CompleteAuthentication();
   }
 
-  bool BeginAuthentication(const std::string& deviceId, const Bytes& linkKey) {
+  bool BeginAuthentication(const std::string& deviceId, const Bytes& linkKey, const std::string& screen = {}) {
     linkKey_ = linkKey;
     phoneNonce_ = crypto::RandomBytes(16);
-    SendPlain(Json("hello").Str("deviceId", deviceId).Str("nonce", Base64UrlEncode(phoneNonce_)).Build());
+    auto hello = Json("hello").Str("deviceId", deviceId).Str("nonce", Base64UrlEncode(phoneNonce_));
+    if (!screen.empty()) hello.Str("screen", screen);
+    SendPlain(hello.Build());
     const auto challenge = ReadPlain();
     if (!challenge || JsonString(*challenge, "type") != "challenge") return false;
     pcNonce_ = *Base64UrlDecode(JsonString(*challenge, "nonce"));
@@ -388,6 +391,7 @@ void TestServiceEndToEnd() {
   std::mutex mutex;
   std::condition_variable cv;
   std::vector<Event> events;
+  std::vector<ScreenPacket> screenPackets;
   const auto waitFor = [&](EventKind kind) -> std::optional<Event> {
     std::unique_lock lock(mutex);
     const bool found = cv.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -417,6 +421,11 @@ void TestServiceEndToEnd() {
   config.onEvent = [&](Event event) {
     std::lock_guard lock(mutex);
     events.push_back(std::move(event));
+    cv.notify_all();
+  };
+  config.onScreenPacket = [&](ScreenPacket packet) {
+    std::lock_guard lock(mutex);
+    screenPackets.push_back(std::move(packet));
     cv.notify_all();
   };
   std::string error;
@@ -468,6 +477,49 @@ void TestServiceEndToEnd() {
     assert(phone.Authenticate(deviceId, linkKey));
     assert(waitFor(EventKind::Connected));
     assert(service.Connected());
+
+    // A screen channel has its own single-use key and cannot replace or use the
+    // ordinary connection. Two simultaneous challenges may consume it only once.
+    const auto screenId = service.StartScreen();
+    assert(!screenId.empty());
+    const auto screenStart = phone.ReadSealed();
+    assert(screenStart);
+    const auto startRoot = feathercast::json::Parse(screenStart->json);
+    assert(startRoot && JsonString(*startRoot, "type") == "screen.start");
+    const auto screenKey = *Base64UrlDecode(JsonString(*startRoot, "key"));
+    assert(screenKey.size() == 32 && JsonString(*startRoot, "session") == screenId);
+    {
+      FakePhone wrongKey(service.Port());
+      assert(!wrongKey.Authenticate(deviceId, linkKey, screenId));
+      FakePhone wrongDevice(service.Port());
+      assert(!wrongDevice.Authenticate("unknown-device", screenKey, screenId));
+      FakePhone screenPhone(service.Port());
+      FakePhone concurrent(service.Port());
+      assert(screenPhone.BeginAuthentication(deviceId, screenKey, screenId));
+      assert(concurrent.BeginAuthentication(deviceId, screenKey, screenId));
+      assert(screenPhone.CompleteAuthentication());
+      assert(!concurrent.CompleteAuthentication());
+      assert(service.Connected());
+      assert(service.SendScreenInput({screenId, 1, "text", 0, 0, 0, "Grüße 🌻"}));
+      const auto typed = screenPhone.ReadSealed();
+      assert(typed && typed->json.find("Grüße 🌻") != std::string::npos);
+      assert(!service.SendScreenInput({"old-session", 1, "home"}));
+      screenPhone.SendSealed(Json("screen.video.config").Str("session", screenId)
+          .Int("generation", 1).Int("width", 720).Int("height", 1280).Build(), Bytes{0, 0, 0, 1, 0x67});
+      {
+        std::unique_lock lock(mutex);
+        assert(cv.wait_for(lock, std::chrono::seconds(3), [&] {
+          return std::any_of(screenPackets.begin(), screenPackets.end(), [](const auto& p) { return p.kind == ScreenPacketKind::VideoConfig; });
+        }));
+      }
+      service.StopScreen();
+      const auto stopped = phone.ReadSealed();
+      assert(stopped && stopped->json.find("screen.stop") != std::string::npos);
+      assert(!screenPhone.ReadSealed());
+      FakePhone reused(service.Port());
+      assert(!reused.Authenticate(deviceId, screenKey, screenId));
+      assert(service.Connected());
+    }
 
     phone.SendSealed(Json("notification.posted")
                          .Str("key", "k1")
@@ -627,11 +679,46 @@ void TestServiceEndToEnd() {
 
 }  // namespace
 
+void TestScreenPackets() {
+  const auto config = ParseScreenPacket({R"({"type":"screen.video.config","session":"s1","generation":2,"width":720,"height":1280})", Bytes{0, 0, 1, 0x67}});
+  assert(config && config->generation == 2 && config->width == 720);
+  assert(!ParseScreenPacket({R"({"type":"screen.video.config","session":"s1","generation":2,"width":9000,"height":1280})", Bytes{1}}));
+  assert(!ParseScreenPacket({R"({"type":"screen.video","session":"s1","generation":0})", Bytes{1}}));
+  assert(!ParseScreenPacket({R"({"type":"screen.audio","session":"s1","generation":1})", Bytes(kMaxScreenPacketBytes + 1)}));
+  for (const auto invalid : {"1e30", "1.5", "-1"}) {
+    assert(!ParseScreenPacket({std::string(R"({"type":"screen.video","session":"s1","generation":)") + invalid + "}", Bytes{1}}));
+  }
+  const ScreenInput typed{"s1", 2, "text", 0, 0, 0, "Grüße 🌻"};
+  assert(ValidScreenInput(typed));
+  assert(ScreenInputJson(typed) == R"({"type":"screen.input","session":"s1","generation":2,"action":"text","x":0,"y":0,"value":0,"text":"Grüße 🌻"})");
+  assert(!ValidScreenInput({"s1", 0, "home"}));
+  assert(!ValidScreenInput({"s1", 1, "down", -1, 20}));
+  const auto fit = FitScreenRect({0, 0, 1000, 1000}, 500, 1000);
+  assert(fit.left == 250 && fit.right == 750);
+  assert(!ScreenCoordinates(fit, 249, 500));
+  assert(!ScreenCoordinates(fit, 750, 500));
+  const auto center = ScreenCoordinates(fit, 500, 500);
+  assert(center && center->first == 500000 && center->second == 500000);
+  const auto rotated = FitScreenRect({0, 0, 1000, 1000}, 1000, 500);
+  assert(rotated.top == 250 && rotated.bottom == 750);
+  ScreenPacketBuffer buffer;
+  assert(buffer.Push(*config));
+  ScreenPacket frame;
+  frame.kind = ScreenPacketKind::Video; frame.sessionId = "s1"; frame.generation = 2; frame.data = Bytes{1};
+  assert(!buffer.Push(frame));  // cannot start on a delta frame
+  frame.keyframe = true; assert(buffer.Push(frame)); frame.keyframe = false;
+  for (int i = 1; i < 6; ++i) { frame.ptsUs = i * 30'000; assert(buffer.Push(frame)); }
+  frame.ptsUs = 250'000; assert(!buffer.Push(frame));
+  assert(buffer.Size() == 1);  // only the codec config survives
+  frame.keyframe = true; assert(buffer.Push(frame));
+}
+
 int main() {
   TestEncodings();
   TestFraming();
   TestCrypto();
   TestMessageFixtures();
+  TestScreenPackets();
   TestServiceEndToEnd();
   std::puts("phone protocol tests passed");
   return 0;

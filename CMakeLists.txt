@@ -72,6 +72,7 @@ add_library(FeatherCastRuntime STATIC
   native/src/snippets_io.cpp
   native/src/phone_crypto.cpp
   native/src/phone_service.cpp
+  native/src/phone_screen_playback.cpp
 )
 
 target_include_directories(FeatherCastRuntime PUBLIC native/src)
@@ -91,6 +92,7 @@ target_link_libraries(FeatherCastRuntime PUBLIC
   mfplat
   mfreadwrite
   mfuuid
+  wmcodecdspuuid
   ole32
   shell32
   windowsapp
@@ -106,6 +108,7 @@ add_library(FeatherCastUi STATIC
   native/src/result_icons.cpp
   native/src/library_ui.cpp
   native/src/phone_ui.cpp
+  native/src/phone_screen_ui.cpp
 )
 
 # Vendored MIT QR code encoder; kept out of the project warning policy.
@@ -119,7 +122,7 @@ target_compile_definitions(FeatherCastUi PUBLIC
   NOMINMAX
   WIN32_LEAN_AND_MEAN
 )
-target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime FeatherCastQrCode d2d1 dwrite dwmapi shlwapi windowscodecs oleacc uiautomationcore uuid)
+target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime FeatherCastQrCode d2d1 dwrite dwmapi shlwapi windowscodecs oleacc uiautomationcore uuid comctl32 uxtheme)
 
 add_executable(FeatherCast WIN32
   native/src/main.cpp
@@ -134,6 +137,7 @@ add_executable(FeatherCastPluginHost
 
 add_executable(InputBroker WIN32
   native/src/input_broker.cpp
+  native/src/input_broker_task.cpp
   native/broker.manifest
 )
 
@@ -163,9 +167,11 @@ target_compile_definitions(InputBroker PRIVATE
 )
 
 target_include_directories(InputBroker PRIVATE native/src)
-target_link_libraries(InputBroker PRIVATE advapi32 user32)
+target_link_libraries(InputBroker PRIVATE advapi32 user32 ole32 oleaut32 taskschd)
+target_sources(FeatherCast PRIVATE native/src/input_broker_task.cpp)
+target_link_libraries(FeatherCast PRIVATE taskschd)
 if(MSVC)
-  target_link_options(InputBroker PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
+  target_link_options(InputBroker PRIVATE "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
 endif()
 
 target_link_libraries(FeatherCast PRIVATE
@@ -403,6 +409,9 @@ feathercast_apply_project_warnings(FeatherCastAccessibilitySmokeTests)
 
 enable_testing()
 add_test(NAME FeatherCastCoreTests COMMAND FeatherCastCoreTests)
+add_test(NAME FeatherCastInputBrokerTaskTests
+  COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+    -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-input-broker-task.ps1")
 add_executable(FeatherCastProductivityBehaviorTests native/tests/productivity_behavior_tests.cpp)
 target_link_libraries(FeatherCastProductivityBehaviorTests PRIVATE FeatherCastRuntime)
 feathercast_apply_project_warnings(FeatherCastProductivityBehaviorTests)
@@ -450,6 +459,11 @@ target_compile_definitions(FeatherCastPhoneStoreTests PRIVATE UNICODE _UNICODE N
 target_link_libraries(FeatherCastPhoneStoreTests PRIVATE FeatherCastRuntime)
 feathercast_apply_project_warnings(FeatherCastPhoneStoreTests)
 add_test(NAME FeatherCastPhoneStoreTests COMMAND FeatherCastPhoneStoreTests)
+add_executable(FeatherCastPhoneScreenTests native/tests/phone_screen_tests.cpp)
+target_link_libraries(FeatherCastPhoneScreenTests PRIVATE FeatherCastUi mfreadwrite)
+feathercast_apply_project_warnings(FeatherCastPhoneScreenTests)
+add_test(NAME FeatherCastPhoneScreenTests COMMAND FeatherCastPhoneScreenTests)
+set_tests_properties(FeatherCastPhoneScreenTests PROPERTIES TIMEOUT 30)
 
 set_tests_properties(
   FeatherCastCoreTests
@@ -486,6 +500,7 @@ set_tests_properties(
 )
 
 install(TARGETS FeatherCast FeatherCastPluginHost InputBroker RUNTIME DESTINATION bin)
+install(FILES scripts/input-broker-task.ps1 DESTINATION bin)
 # The phone app is built separately (scripts/build-android.ps1); FeatherCast serves it
 # to phones from next to its exe, so ship it when it has been built.
 install(FILES "${CMAKE_BINARY_DIR}/FeatherCast-Phone.apk" DESTINATION bin OPTIONAL)
@@ -504,8 +519,28 @@ set(CPACK_PACKAGE_EXECUTABLES "FeatherCast" "FeatherCast")
 set(CPACK_NSIS_MUI_ICON "${FEATHERCAST_ICON}")
 set(CPACK_NSIS_MUI_UNIICON "${FEATHERCAST_ICON}")
 set(CPACK_NSIS_MUI_FINISHPAGE_RUN "FeatherCast.exe")
-set(CPACK_NSIS_EXTRA_DEFINES "!define MUI_FINISHPAGE_RUN_PARAMETERS \\\"--show\\\"")
-set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
-    "DeleteRegValue HKCU \\\"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\" \\\"FeatherCast\\\"")
+set(CPACK_NSIS_EXTRA_DEFINES [=[!define MUI_FINISHPAGE_RUN_PARAMETERS "--show"]=])
+# NSIS already requests administrator rights; task setup reuses that approval.
+set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS [=[
+  IfFileExists "$INSTDIR\bin\input-broker-task.ps1" 0 +3
+    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Stop'
+    Pop $0
+]=])
+set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS [=[
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Install'
+  Pop $0
+  StrCmp $0 "0" +3
+    MessageBox MB_OK|MB_ICONEXCLAMATION "The elevated Windows-key broker could not be configured. Install FeatherCast in a protected Program Files folder to enable it." /SD IDOK
+    SetErrorLevel 1
+]=])
+set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS [=[
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Uninstall'
+  Pop $0
+  StrCmp $0 "0" +3
+    MessageBox MB_OK|MB_ICONSTOP "The elevated input broker could not be removed. Uninstall has been stopped so its executable stays protected." /SD IDOK
+    Abort
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "FeatherCast"
+]=])
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_VERBATIM_VARIABLES TRUE)
 include(CPack)

@@ -430,14 +430,19 @@ void TestPhoneSuggestions() {
     return item;
   };
   const auto notifications = command(CommandKind::PhoneNotifications, L"phone-notifications",
-                                     L"Phone Notifications", {L"alerts", L"messages"});
+                                     L"Phone Notifications", {L"notifications", L"alerts", L"messages"});
   const auto photos = command(CommandKind::PhonePhotos, L"phone-photos", L"Phone Photos",
-                              {L"pictures", L"gallery"});
-  assert(MatchesPhoneSuggestion(L"notif", notifications));
+                              {L"photos", L"pictures", L"gallery"});
+  // Only a near-complete name or keyword suggests a phone view.
+  assert(MatchesPhoneSuggestion(L"notificatio", notifications));
   assert(MatchesPhoneSuggestion(L"Notifications", notifications));
-  assert(MatchesPhoneSuggestion(L"phone not", notifications));
-  assert(MatchesPhoneSuggestion(L"mess", notifications));
-  assert(MatchesPhoneSuggestion(L"phone", photos));
+  assert(MatchesPhoneSuggestion(L"phone notificat", notifications));
+  assert(MatchesPhoneSuggestion(L"messag", notifications));
+  assert(MatchesPhoneSuggestion(L"phone photo", photos));
+  assert(!MatchesPhoneSuggestion(L"notif", notifications));
+  assert(!MatchesPhoneSuggestion(L"phone not", notifications));
+  assert(!MatchesPhoneSuggestion(L"mess", notifications));
+  assert(!MatchesPhoneSuggestion(L"phone", photos));
   assert(!MatchesPhoneSuggestion(L"no", notifications));
   assert(!MatchesPhoneSuggestion(L"notepad", notifications));
   assert(!MatchesPhoneSuggestion(L"phone xyz", notifications));
@@ -445,7 +450,7 @@ void TestPhoneSuggestions() {
 
   feathercast::app::QueryRequest request;
   request.limit = 20;
-  request.query = L"notif";
+  request.query = L"notifications";
   request.empty = false;
   request.phoneSuggestions = {notifications, photos};
   auto results = feathercast::search_pipeline::ComputeResults(request);

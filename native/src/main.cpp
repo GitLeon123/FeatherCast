@@ -34,6 +34,7 @@
 #include "phone_service.hpp"
 #include "phone_store.hpp"
 #include "phone_ui.hpp"
+#include "phone_screen_ui.hpp"
 #include "preview_service.hpp"
 #include "run_command.hpp"
 #include "search_coordinator.hpp"
@@ -42,6 +43,8 @@
 #include "settings_catalog.hpp"
 #include "settings_io.hpp"
 #include "shortcut.hpp"
+#include "input_broker_protocol.hpp"
+#include "input_broker_task.hpp"
 #include "snippets.hpp"
 #include "snippets_io.hpp"
 #include "storage.hpp"
@@ -660,6 +663,15 @@ std::vector<AppEntry> SystemFolderEntries() {
   add(SystemShellFolder(L"control-panel", L"Control Panel", L"shell:ControlPanelFolder", {L"settings", L"system"}));
   add(SystemShellFolder(L"network", L"Network", L"shell:NetworkPlacesFolder", {L"network places", L"shares"}));
   for (auto entry : feathercast::system_settings::Catalog()) {
+    // Skip tools this Windows edition does not ship (e.g. gpedit.msc on Home).
+    if (const auto required = feathercast::system_settings::RequiredFile(entry);
+        !required.empty()) {
+      wchar_t found[MAX_PATH]{};
+      if (SearchPathW(nullptr, required.c_str(), nullptr,
+                      static_cast<DWORD>(std::size(found)), found, nullptr) == 0) {
+        continue;
+      }
+    }
     add(std::move(entry));
   }
   addKnown(FOLDERID_Profile, L"profile", L"User Profile", {L"home", L"user folder"});
@@ -1882,35 +1894,47 @@ void LogWinHookTrigger() {
   AppendHookLog(msg);
 }
 
-#pragma pack(push, 1)
-struct BrokerRegistration {
-  DWORD pid = 0;
-  std::uint64_t hwnd = 0;
-  DWORD threadId = 0;
-};
-#pragma pack(pop)
+using BrokerRegistration = feathercast::input_broker::Registration;
+using BrokerCommand = feathercast::input_broker::Command;
+
+std::mutex g_brokerPipeMutex;
+
+void UpdateBrokerShortcut();
 
 std::atomic<bool> g_inputBrokerConnected{false};
 std::atomic<bool> g_stopBrokerClient{false};
 std::atomic<HANDLE> g_brokerClientPipe{INVALID_HANDLE_VALUE};
 std::thread g_brokerClientThread;
 
+void UpdateBrokerShortcut() {
+  std::lock_guard lock(g_brokerPipeMutex);
+  const HANDLE pipe = g_brokerClientPipe.load();
+  if (pipe == INVALID_HANDLE_VALUE) return;
+  const auto command = g_isExclusiveWinShortcut.load()
+      ? BrokerCommand::EnableWinShortcut : BrokerCommand::DisableWinShortcut;
+  DWORD written = 0;
+  WriteFile(pipe, &command, sizeof(command), &written, nullptr);
+}
+
 void StartInputBrokerClient(HWND hwnd) {
   g_stopBrokerClient.store(false);
   g_brokerClientThread = std::thread([hwnd]() {
-    const wchar_t* pipeName = L"\\\\.\\pipe\\FeatherCastInputBroker";
+    const auto brokerPipeName = feathercast::input_broker::PipeName();
+    const wchar_t* pipeName = brokerPipeName.c_str();
 
-    // If broker pipe is not present, attempt to launch InputBroker.exe elevated
+    // Installed copies use the elevated task created by the installer.
+    // Portable/development copies keep a normal-permission fallback, without UAC.
     if (!WaitNamedPipeW(pipeName, 50)) {
       wchar_t exePath[MAX_PATH]{};
       if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
         std::filesystem::path brokerPath =
             std::filesystem::path(exePath).parent_path() / L"InputBroker.exe";
-        if (std::filesystem::exists(brokerPath)) {
+        if (std::filesystem::exists(brokerPath) &&
+            !feathercast::input_broker::StartScheduledBroker(brokerPath.wstring())) {
           SHELLEXECUTEINFOW sei{};
           sei.cbSize = sizeof(sei);
           sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-          sei.lpVerb = L"runas";
+          sei.lpVerb = L"open";
           sei.lpFile = brokerPath.c_str();
           sei.nShow = SW_HIDE;
           if (ShellExecuteExW(&sei) && sei.hProcess) {
@@ -1937,17 +1961,22 @@ void StartInputBrokerClient(HWND hwnd) {
         continue;
       }
 
-      g_brokerClientPipe.store(pipe);
-
       BrokerRegistration reg{};
       reg.pid = GetCurrentProcessId();
       reg.hwnd = reinterpret_cast<std::uint64_t>(hwnd);
       reg.threadId = GetWindowThreadProcessId(hwnd, nullptr);
 
       DWORD written = 0;
-      if (WriteFile(pipe, &reg, sizeof(reg), &written, nullptr) && written == sizeof(reg)) {
+      bool registered = false;
+      {
+        std::lock_guard lock(g_brokerPipeMutex);
+        reg.winShortcutEnabled = g_isExclusiveWinShortcut.load() ? 1 : 0;
+        registered = WriteFile(pipe, &reg, sizeof(reg), &written, nullptr) && written == sizeof(reg);
+        if (registered) g_brokerClientPipe.store(pipe);
+      }
+      if (registered) {
         g_inputBrokerConnected.store(true);
-        AppendHookLog(L"[Hook] Connected to elevated InputBroker\n");
+        AppendHookLog(L"[Hook] Connected to InputBroker\n");
         PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
 
         while (!g_stopBrokerClient.load()) {
@@ -1960,8 +1989,11 @@ void StartInputBrokerClient(HWND hwnd) {
       }
 
       g_inputBrokerConnected.store(false);
-      g_brokerClientPipe.store(INVALID_HANDLE_VALUE);
-      CloseHandle(pipe);
+      {
+        std::lock_guard lock(g_brokerPipeMutex);
+        g_brokerClientPipe.store(INVALID_HANDLE_VALUE);
+        CloseHandle(pipe);
+      }
       AppendHookLog(L"[Hook] Disconnected from InputBroker\n");
       PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
 
@@ -1974,13 +2006,15 @@ void StartInputBrokerClient(HWND hwnd) {
 
 void StopInputBrokerClient() {
   g_stopBrokerClient.store(true);
-  HANDLE pipe = g_brokerClientPipe.exchange(INVALID_HANDLE_VALUE);
-  if (pipe != INVALID_HANDLE_VALUE) {
-    const char cmd[] = "SHUTDOWN\n";
-    DWORD written = 0;
-    WriteFile(pipe, cmd, static_cast<DWORD>(sizeof(cmd) - 1), &written, nullptr);
-    CancelIoEx(pipe, nullptr);
-    CloseHandle(pipe);
+  {
+    std::lock_guard lock(g_brokerPipeMutex);
+    const HANDLE pipe = g_brokerClientPipe.load();
+    if (pipe != INVALID_HANDLE_VALUE) {
+      const auto command = BrokerCommand::Shutdown;
+      DWORD written = 0;
+      WriteFile(pipe, &command, sizeof(command), &written, nullptr);
+      CancelIoEx(pipe, nullptr);
+    }
   }
   if (g_brokerClientThread.joinable()) {
     g_brokerClientThread.join();
@@ -2230,6 +2264,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     hadLegacyOperationalData_ = MigrateLegacyOperationalData();
     shortcut_ = ParseShortcut(settings_.shortcut);
     g_isExclusiveWinShortcut.store(IsExclusiveWinShortcut(shortcut_), std::memory_order_release);
+    UpdateBrokerShortcut();
     screenshotFullscreenShortcut_ =
         ParseShortcut(settings_.screenshotFullscreenShortcut);
     screenshotRegionShortcut_ =
@@ -2276,6 +2311,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snippetSaveEvents_.Close();
     snippetLoadEvents_.Close();
     clipboardEvents_.Close();
+    phoneScreenWindow_.Close();
     phoneService_.Stop();
     phoneEvents_.Close();
     extensions_.Shutdown();
@@ -2417,8 +2453,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       } else if (GetMessageW(&msg, nullptr, 0, 0) <= 0) {
         break;
       }
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
+      if (!phoneScreenWindow_.HandleMessage(msg)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
     }
 
     ShutdownBackgroundWorkers();
@@ -2431,6 +2469,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool DispatchQueuedInput() {
     MSG input{};
     const auto dispatch = [&] {
+      if (phoneScreenWindow_.HandleMessage(input)) return;
       TranslateMessage(&input);
       DispatchMessageW(&input);
     };
@@ -3625,7 +3664,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return CallNextHookEx(nullptr, nCode, wParam, lParam);
     }
 
-    // The elevated InputBroker owns the global Win-key activation path. Keep
+    // InputBroker owns the global Win-key activation path. Keep
     // the local hook in the pipeline for all other shortcuts (including the
     // built-in Print Screen screenshot fallback), but skip the local launcher
     // Win-key state machine so the two hooks do not run it in parallel.
@@ -3867,7 +3906,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OnShellChange(wParam, lParam);
         return 0;
       case WM_APP_WINKEY_TRIGGER:
-        HandleWinKeyTrigger();
+        if (IsExclusiveWinShortcut(shortcut_)) HandleWinKeyTrigger();
         return 0;
       case WM_BROKER_STATE_CHANGED:
         RegisterShortcutHotKey();
@@ -8622,7 +8661,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void UpdateKeyboardHook() {
     // Bare Print Screen is the built-in region screenshot shortcut. Keep the
-    // local hook active even while the elevated broker handles Win-key input.
+    // local hook active even while the broker handles Win-key input.
     bool needed = true;
     needed = needed || recording_;
     if (!g_inputBrokerConnected.load(std::memory_order_relaxed)) {
@@ -8653,6 +8692,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool RegisterShortcutHotKey() {
     UnregisterShortcutHotKey();
     g_isExclusiveWinShortcut.store(IsExclusiveWinShortcut(shortcut_), std::memory_order_release);
+    UpdateBrokerShortcut();
     if (IsExclusiveWinShortcut(shortcut_)) {
       if (g_inputBrokerConnected.load(std::memory_order_relaxed)) {
         UpdateKeyboardHook();
@@ -10172,6 +10212,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (const auto kind : {CommandKind::PhoneNotifications, CommandKind::PhonePhotos,
                             CommandKind::PhoneClipboard, CommandKind::PhoneMedia,
                             CommandKind::PhoneMessages, CommandKind::PhoneFiles,
+                            CommandKind::PhoneScreen,
                             CommandKind::FindMyPhone}) {
       const auto* descriptor = feathercast::commands::Find(kind);
       if (!descriptor) continue;
@@ -10212,6 +10253,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (phoneStore_.Ringing()) summary = L"Ringing now · run again to stop";
       } else if (kind == CommandKind::PhoneFiles) {
         // No summary; the storage is listed on demand.
+      } else if (kind == CommandKind::PhoneScreen) {
+        summary = phoneStore_.HasFeature("screen") ? L"Share and control your screen" : L"Enable Screen sharing on your phone";
       } else if (!phoneStore_.Clips().empty()) {
         summary = countLabel(phoneStore_.Clips().size(), L"copied item", L"copied items");
       }
@@ -16181,7 +16224,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return item.app.path.empty() ? L"Open · System folder"
                                    : L"Open · " + item.app.path;
     }
-    if (item.app.source == L"windows-settings") return L"Open · Windows Settings";
+    if (item.app.source == L"windows-settings") {
+      return feathercast::system_settings::IsAdvanced(item.app)
+                 ? L"Open · Advanced Windows Settings"
+                 : L"Open · Windows Settings";
+    }
     if (item.app.source == L"alias") return L"Open · System app";
     if (item.app.source == L"appx") return L"Open · Store app";
     return L"Open · Start menu app";
@@ -20524,6 +20571,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (visible_) HideOverlay(OverlayCloseReason::Action);
         OpenPhoneWindow();
         return;
+      case CommandKind::PhoneScreen:
+        actionMode_ = false;
+        if (visible_) HideOverlay(OverlayCloseReason::Action);
+        OpenPhoneScreen();
+        return;
       case CommandKind::PhoneNotifications:
       case CommandKind::PhonePhotos:
       case CommandKind::PhoneClipboard:
@@ -21193,6 +21245,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       config.onEvent = [this](feathercast::phone::Event event) {
         phoneEvents_.Push(std::move(event));
       };
+      config.onScreenPacket = [this](feathercast::phone::ScreenPacket packet) {
+        phoneScreenWindow_.OnPacket(std::move(packet));
+      };
       phoneError_.clear();
       if (!phoneService_.Start(std::move(config), &phoneError_) && phoneError_.empty()) {
         phoneError_ = "The phone connection could not be started.";
@@ -21204,6 +21259,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         std::ofstream(testUriFile, std::ios::binary) << phoneService_.CreatePairingUri();
       }
     } else if (!settings_.phoneLinkEnabled) {
+      phoneScreenWindow_.Close();
       if (phoneService_.Running()) phoneService_.Stop();
       phoneStore_ = {};
       pendingPhoneSends_.clear();
@@ -21244,6 +21300,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ApplyPhoneWindowTheme() {
     phoneWindow_.SetTheme(theme_, ThemeColorFromSystem(ActiveAccent()));
+    phoneScreenWindow_.SetTheme(theme_, ThemeColorFromSystem(ActiveAccent()));
+    phoneScreenWindow_.SetTextScale(feathercast::layout::TextScale(settings_.textSizePercent));
     phoneWindow_.SetMotionPolicy(FadeAnimationsAllowed(),
                                  SpatialAnimationsAllowed(),
                                  ControlAnimationsAllowed());
@@ -21252,6 +21310,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void ConfigurePhoneWindow() {
     if (phoneWindowConfigured_) return;
     phoneWindowConfigured_ = true;
+    feathercast::phone_ui::ScreenCallbacks screenCallbacks;
+    screenCallbacks.start = [this](bool audio) { return phoneService_.StartScreen(audio); };
+    screenCallbacks.stop = [this] { phoneService_.StopScreen(); };
+    screenCallbacks.input = [this](feathercast::phone::ScreenInput input) {
+      return phoneService_.SendScreenInput(std::move(input));
+    };
+    phoneScreenWindow_.SetCallbacks(std::move(screenCallbacks));
     feathercast::phone_ui::Callbacks callbacks;
     callbacks.setEnabled = [this](bool enabled) { SetPhoneLinkEnabled(enabled); };
     callbacks.setClipboardSync = [this](bool enabled) {
@@ -21305,6 +21370,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SendFilesToPhone(paths);
     };
     callbacks.requestSmsThreads = [this] { phoneService_.RequestSmsThreads(); };
+    callbacks.openScreen = [this] { OpenPhoneScreen(); };
     callbacks.openSmsThread = [this](const feathercast::phone::SmsThread& thread) {
       ShowOverlay(View::Search);
       SetQueryText(L"");
@@ -21370,6 +21436,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (relevant) RequestSearch();
   }
 
+  void OpenPhoneScreen() {
+    ConfigurePhoneWindow();
+    if (!settings_.phoneLinkEnabled) {
+      OpenPhoneWindow();
+      return;
+    }
+    phoneScreenWindow_.SetConnection(phoneStore_.Connected(), phoneStore_.HasFeature("screen"), phoneStore_.DeviceName());
+    phoneScreenWindow_.Show();
+  }
+
   void OnPhoneEvent(feathercast::phone::Event event) {
     using feathercast::phone::EventKind;
     if (!settings_.phoneLinkEnabled) return;
@@ -21377,6 +21453,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     phoneWindow_.OnEvent(event);
     phoneStore_.SetLowBatteryPercent(settings_.phoneLowBatteryPercent);
     const auto changes = phoneStore_.Apply(event, UnixNowMs());
+    phoneScreenWindow_.SetConnection(phoneStore_.Connected(), phoneStore_.HasFeature("screen"), phoneStore_.DeviceName());
     ApplyPhoneStoreChanges(changes);
     // The launcher's phone views count as looking at the phone data, like the
     // Phone window in the foreground.
@@ -21705,7 +21782,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return false;
 
     if (app.launchType == LaunchType::Shell) {
-      HINSTANCE result = ShellExecuteW(nullptr, L"open", app.launchTarget.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      HINSTANCE result = ShellExecuteW(nullptr, L"open", app.launchTarget.c_str(),
+                                       app.args.empty() ? nullptr : app.args.c_str(),
+                                       nullptr, SW_SHOWNORMAL);
       return reinterpret_cast<intptr_t>(result) > 32;
     }
 
@@ -21846,6 +21925,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::runtime::UiEventQueue<ClipboardObservation> clipboardEvents_;
   feathercast::runtime::UiEventQueue<feathercast::phone::Event> phoneEvents_;
   feathercast::phone::PhoneService phoneService_;
+  feathercast::phone_ui::PhoneScreenWindow phoneScreenWindow_;
   feathercast::phone_ui::PhoneWindow phoneWindow_;
   bool phoneWindowConfigured_ = false;
   std::string phoneError_;

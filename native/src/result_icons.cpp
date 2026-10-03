@@ -50,6 +50,7 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
     case CommandKind::PhoneMedia: return ResultIcon::PlayPause;
     case CommandKind::PhoneFiles: return ResultIcon::Folder;
     case CommandKind::SendFileToPhone: return ResultIcon::Download;
+    case CommandKind::PhoneScreen: return ResultIcon::Phone;
     case CommandKind::Settings: return ResultIcon::Gear;
     case CommandKind::Quit: return ResultIcon::Exit;
     case CommandKind::Restart:

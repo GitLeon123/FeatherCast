@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "phone_protocol.hpp"
+#include "phone_screen_protocol.hpp"
 
 namespace feathercast::phone {
 
@@ -153,6 +156,9 @@ struct ServiceConfig {
   std::wstring apkPath;       // served at http://<pc>:<port>/app.apk
   std::uint16_t port = kDefaultPort;
   std::function<void(Event)> onEvent;
+  // Screen packets bypass the general UI event queue; the receiver must bound
+  // media buffering and marshal its own window notifications.
+  std::function<void(ScreenPacket)> onScreenPacket;
 };
 
 struct ClipboardHistoryItem {
@@ -205,12 +211,17 @@ class PhoneService {
   bool CallSilence();
   bool ListFiles(const std::string& remotePath);
   bool RequestFile(const std::string& remotePath);
+  std::string StartScreen(bool audio = true);
+  void StopScreen(bool report = true);
+  bool SendScreenInput(ScreenInput input);
 
   struct Session;
 
  private:
   void AcceptLoop(std::stop_token stop);
   void BeaconLoop(std::stop_token stop);
+  void ScreenSendLoop(std::stop_token stop);
+  void EmitScreenState(std::string id, std::string state, std::string detail = {});
   void HandleConnection(std::uintptr_t socket);
   void ServeHttp(std::uintptr_t socket, const Bytes& firstBytes);
   bool HandlePlainFrame(const std::shared_ptr<Session>& session,
@@ -231,6 +242,8 @@ class PhoneService {
   std::uintptr_t listenSocket_ = ~std::uintptr_t{0};
   std::jthread acceptThread_;
   std::jthread beaconThread_;
+  std::jthread screenSendThread_;
+  std::condition_variable_any screenWake_;
 
   mutable std::mutex mutex_;
   std::mutex stateSaveMutex_;
@@ -241,6 +254,13 @@ class PhoneService {
   Bytes pairingToken_;
   long long pairingExpiresAt_ = 0;
   std::shared_ptr<Session> active_;
+  std::shared_ptr<Session> screen_;
+  std::weak_ptr<Session> screenOwner_;
+  std::string screenId_;
+  Bytes screenKey_;
+  long long screenExpiresAt_ = 0;
+  std::deque<ScreenInput> screenInputs_;
+  std::deque<std::pair<std::shared_ptr<Session>, std::string>> screenCommands_;
   std::vector<std::shared_ptr<Session>> sessions_;
   struct Worker {
     std::jthread thread;

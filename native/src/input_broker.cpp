@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <sddl.h>
+#include "input_broker_protocol.hpp"
+#include "input_broker_task.hpp"
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -11,18 +13,13 @@
 namespace {
 
 constexpr ULONG_PTR kOurInputTag = 0x4D59415050; // "MYAPP"
-constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\FeatherCastInputBroker";
-constexpr const wchar_t* kBrokerMutexName = L"FeatherCastInputBrokerMutex";
+const std::wstring kPipeName = feathercast::input_broker::PipeName();
+const std::wstring kBrokerMutexName = feathercast::input_broker::MutexName();
 constexpr const wchar_t* kBrokerClassName = L"FeatherCastBrokerMsgClass";
 constexpr UINT WM_APP_TRIGGER_ACTIVATION = WM_APP + 1;
 
-#pragma pack(push, 1)
-struct BrokerRegistration {
-  DWORD pid = 0;
-  std::uint64_t hwnd = 0;
-  DWORD threadId = 0;
-};
-#pragma pack(pop)
+using BrokerRegistration = feathercast::input_broker::Registration;
+using BrokerCommand = feathercast::input_broker::Command;
 
 struct WinState {
   bool leftDown = false;
@@ -30,9 +27,17 @@ struct WinState {
   bool hadOtherKey = false;
 };
 
+std::wstring GetProcessIntegrityLevel(HANDLE process);
+
 std::mutex g_logMutex;
 void AppendBrokerLog(const wchar_t* text) {
   if (!text || !text[0]) return;
+  // An elevated broker must not open log files in a user-writable directory.
+  static const auto integrity = GetProcessIntegrityLevel(GetCurrentProcess());
+  if (integrity == L"HIGH" || integrity == L"SYSTEM") {
+    OutputDebugStringW(text);
+    return;
+  }
   try {
     std::lock_guard lock(g_logMutex);
     wchar_t local[MAX_PATH]{};
@@ -127,6 +132,8 @@ std::wstring GetVkName(UINT vk, DWORD scanCode, DWORD flags) {
 std::mutex g_appMutex;
 BrokerRegistration g_appReg{};
 std::atomic<bool> g_appConnected{false};
+std::atomic<bool> g_winShortcutEnabled{false};
+std::atomic<unsigned> g_shortcutGeneration{0};
 std::atomic<HANDLE> g_activePipe{INVALID_HANDLE_VALUE};
 
 WinState g_win;
@@ -139,7 +146,7 @@ void TriggerAndActivateApp() {
   BrokerRegistration reg{};
   {
     std::lock_guard lock(g_appMutex);
-    if (!g_appConnected) {
+    if (!feathercast::input_broker::ShouldHandleWinKey(g_appConnected.load(), g_winShortcutEnabled.load())) {
       AppendBrokerLog(L"[Broker] Trigger skipped: no app connected\n");
       return;
     }
@@ -152,7 +159,7 @@ void TriggerAndActivateApp() {
   // 1. Post trigger message directly to FeatherCast window
   PostMessageW(appHwnd, WM_APP + 25, 0, 0); // WM_APP_WINKEY_TRIGGER
 
-  // 2. Perform elevated foreground activation
+  // 2. Perform foreground activation
   HWND fg = GetForegroundWindow();
   DWORD fgThread = (fg && IsWindow(fg)) ? GetWindowThreadProcessId(fg, nullptr) : 0;
   DWORD appThread = reg.threadId ? reg.threadId : GetWindowThreadProcessId(appHwnd, nullptr);
@@ -203,6 +210,18 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
   }
 
+  static unsigned lastGeneration = 0;
+  const auto generation = g_shortcutGeneration.load();
+  if (generation != lastGeneration) {
+    g_win = {};
+    lastGeneration = generation;
+  }
+  if (!feathercast::input_broker::ShouldHandleWinKey(
+          g_appConnected.load(), g_winShortcutEnabled.load())) {
+    g_win = {};
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+  }
+
   const bool isUp = (k->flags & LLKHF_UP) != 0;
   const UINT vk = k->vkCode;
 
@@ -216,6 +235,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN DOWN PASS\n" : L"[Broker] LWIN DOWN PASS\n");
       return CallNextHookEx(nullptr, nCode, wParam, lParam);
     } else {
+      const bool wasLeftDown = g_win.leftDown;
+      const bool wasRightDown = g_win.rightDown;
       if (vk == VK_LWIN) g_win.leftDown = false;
       if (vk == VK_RWIN) g_win.rightDown = false;
 
@@ -226,6 +247,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN UP COMBO\n" : L"[Broker] LWIN UP COMBO\n");
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
       } else {
+        // Ignore a release whose press occurred while the shortcut was disabled.
+        if (!g_win.leftDown && !g_win.rightDown &&
+            !(vk == VK_LWIN ? wasLeftDown : wasRightDown)) {
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        }
         // Solo Win tap!
         AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN UP SOLO -> MASK & TRIGGER\n" : L"[Broker] LWIN UP SOLO -> MASK & TRIGGER\n");
 
@@ -281,11 +307,20 @@ LRESULT CALLBACK BrokerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 void RunPipeServer(HWND msgHwnd) {
   PSECURITY_DESCRIPTOR sd = nullptr;
-  ConvertStringSecurityDescriptorToSecurityDescriptorW(
-      L"D:(A;;GRGW;;;WD)S:(ML;;NW;;;LW)",
+  const auto userSid = feathercast::input_broker::CurrentUserSid();
+  if (userSid.empty()) {
+    PostMessageW(msgHwnd, WM_QUIT, 0, 0);
+    return;
+  }
+  const auto security = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;" + userSid + L")S:(ML;;NW;;;ME)";
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+      security.c_str(),
       SDDL_REVISION_1,
       &sd,
-      nullptr);
+      nullptr)) {
+    PostMessageW(msgHwnd, WM_QUIT, 0, 0);
+    return;
+  }
 
   SECURITY_ATTRIBUTES sa{};
   sa.nLength = sizeof(sa);
@@ -294,9 +329,9 @@ void RunPipeServer(HWND msgHwnd) {
 
   while (!g_stopPipeServer.load()) {
     HANDLE pipe = CreateNamedPipeW(
-        kPipeName,
+        kPipeName.c_str(),
         PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1,
         1024, 1024, 0,
         &sa);
@@ -316,10 +351,19 @@ void RunPipeServer(HWND msgHwnd) {
 
     BrokerRegistration reg{};
     DWORD read = 0;
-    if (ReadFile(pipe, &reg, sizeof(reg), &read, nullptr) && read == sizeof(reg)) {
+    ULONG clientPid = 0;
+    DWORD windowPid = 0;
+    if (ReadFile(pipe, &reg, sizeof(reg), &read, nullptr) && read == sizeof(reg) &&
+        GetNamedPipeClientProcessId(pipe, &clientPid) && clientPid == reg.pid &&
+        GetWindowThreadProcessId(reinterpret_cast<HWND>(reg.hwnd), &windowPid) == reg.threadId &&
+        windowPid == reg.pid &&
+        std::filesystem::path(ProcessPath(reg.pid)) ==
+            std::filesystem::path(ProcessPath(GetCurrentProcessId())).parent_path() / L"FeatherCast.exe") {
       {
         std::lock_guard lock(g_appMutex);
         g_appReg = reg;
+        g_winShortcutEnabled.store(reg.winShortcutEnabled != 0);
+        g_shortcutGeneration.fetch_add(1);
         g_appConnected = true;
         g_activePipe.store(pipe);
       }
@@ -329,29 +373,27 @@ void RunPipeServer(HWND msgHwnd) {
                  reg.pid, reg.hwnd, reg.threadId);
       AppendBrokerLog(regBuf);
 
-      // Non-blocking connection monitor: check if pipe is alive without blocking ReadFile
+      // Commands are message framed; blocking here applies shortcut changes promptly.
       while (!g_stopPipeServer.load()) {
-        DWORD bytesAvail = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
-          break; // Client disconnected
+        BrokerCommand command{};
+        DWORD bytesRead = 0;
+        if (!ReadFile(pipe, &command, sizeof(command), &bytesRead, nullptr) ||
+            bytesRead != sizeof(command)) break;
+        if (command == BrokerCommand::Shutdown) {
+          AppendBrokerLog(L"[Broker] Received SHUTDOWN from app\n");
+          break;
         }
-        if (bytesAvail > 0) {
-          char buf[128]{};
-          DWORD bytesRead = 0;
-          if (ReadFile(pipe, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
-            buf[bytesRead] = '\0';
-            if (strstr(buf, "SHUTDOWN") != nullptr) {
-              AppendBrokerLog(L"[Broker] Received SHUTDOWN from app\n");
-              break;
-            }
-          }
+        if (command == BrokerCommand::EnableWinShortcut ||
+            command == BrokerCommand::DisableWinShortcut) {
+          g_winShortcutEnabled.store(command == BrokerCommand::EnableWinShortcut);
+          g_shortcutGeneration.fetch_add(1);
         }
-        Sleep(200);
       }
 
       {
         std::lock_guard lock(g_appMutex);
         g_appConnected = false;
+        g_winShortcutEnabled = false;
         g_activePipe.store(INVALID_HANDLE_VALUE);
         g_appReg = {};
       }
@@ -381,14 +423,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
   }
 
   // Ensure single broker instance
-  HANDLE mutex = CreateMutexW(nullptr, TRUE, kBrokerMutexName);
+  HANDLE mutex = CreateMutexW(nullptr, TRUE, kBrokerMutexName.c_str());
   if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
     AppendBrokerLog(L"[Broker] Another instance already running. Exiting.\n");
     if (mutex) CloseHandle(mutex);
     return 0;
   }
 
-  AppendBrokerLog(L"[Broker] Starting InputBroker (elevated)...\n");
+  AppendBrokerLog(L"[Broker] Starting InputBroker...\n");
 
   // Bind to interactive window station and desktop
   HWINSTA hwinsta = OpenWindowStationW(L"WinSta0", FALSE, MAXIMUM_ALLOWED);

@@ -90,6 +90,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     val isConnected: Boolean get() = session != null
+    fun ownsSession(connection: LinkSession): Boolean = session === connection
 
     /** Starts the reconnect loop; called by [LinkService]. */
     @Synchronized
@@ -254,6 +255,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                     currentCoroutineContext().ensureActive()
                     runSession(connected)
                 } finally {
+                    ScreenBridge.disconnected(context, connected)
                     connected.close()
                     if (session === connected) session = null
                 }
@@ -371,6 +373,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             pinger.cancel()
             active.close()
             Ringer.stop(context)
+            ScreenBridge.disconnected(context, active)
         }
     }
 
@@ -410,6 +413,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             is PcMessage.FilesListRequest -> send(StorageBridge.list(msg.path))
             is PcMessage.FileRequest -> StorageBridge.read(msg.path).let { (json, bytes) -> send(json, bytes) }
             PcMessage.Pong -> Unit
+            is PcMessage.ScreenStart -> session?.let { ScreenBridge.request(context, msg.request, it) }
+            is PcMessage.ScreenStop -> ScreenBridge.stop(context, id = msg.sessionId)
         }
     }
 
@@ -431,6 +436,10 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         if (SmsBridge.active) add(Features.SMS)
         if (CallWatcher.active) add(Features.CALLS)
         if (StorageBridge.active) add(Features.STORAGE)
+        if (store.screenSharing) add(Features.SCREEN)
+        if (store.remoteControl && RemoteControlService.instance != null) add(Features.SCREEN_CONTROL)
+        if (store.remoteControl && PcKeyboardService.selected(context)) add(Features.SCREEN_KEYBOARD)
+        if (Build.VERSION.SDK_INT >= 29) add(Features.SCREEN_AUDIO)
     }
 
     /** Resends status (e.g. after a switch changed) so the PC updates its actions. */

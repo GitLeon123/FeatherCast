@@ -840,7 +840,7 @@ int main() {
   assert(feathercast::commands::RecordsRecentActivation(*aliasedVolume));
 
   const auto settingsTargets = feathercast::system_settings::Catalog();
-  assert(settingsTargets.size() == 5);
+  assert(settingsTargets.size() >= 100);
   std::set<std::wstring> settingsIds;
   std::vector<feathercast::core::SearchItem> settingsSearchItems;
   for (const auto& target : settingsTargets) {
@@ -848,7 +848,14 @@ int main() {
     assert(settingsIds.insert(target.id).second);
     assert(target.source == L"windows-settings");
     assert(target.launchType == feathercast::app::LaunchType::Shell);
-    assert(target.launchTarget.starts_with(L"ms-settings:"));
+    if (feathercast::system_settings::IsAdvanced(target)) {
+      assert(!target.launchTarget.starts_with(L"ms-settings:"));
+      assert(std::find(target.keywords.begin(), target.keywords.end(),
+                       L"advanced") != target.keywords.end());
+    } else {
+      assert(target.launchTarget.starts_with(L"ms-settings:"));
+      assert(feathercast::system_settings::RequiredFile(target).empty());
+    }
     assert(target.systemEssential);
     feathercast::core::SearchItem searchItem;
     searchItem.id = target.id;
@@ -863,6 +870,14 @@ int main() {
            {L"bluetooth", L"windows-settings:bluetooth"},
            {L"installed apps", L"windows-settings:installed-apps"},
            {L"windows update", L"windows-settings:windows-update"},
+           {L"wifi", L"windows-settings:wifi"},
+           {L"dark mode", L"windows-settings:colors"},
+           {L"advanced system settings",
+            L"windows-settings:advanced-system-settings"},
+           {L"environment variables",
+            L"windows-settings:advanced-environment-variables"},
+           {L"device manager", L"windows-settings:advanced-device-manager"},
+           {L"gpedit", L"windows-settings:advanced-group-policy"},
        }) {
     const auto matches = feathercast::core::Search(query, settingsSearchItems);
     assert(!matches.empty());
@@ -1183,14 +1198,52 @@ int main() {
       });
   assert(appsSection != typedResults.sections.end());
   assert(gamesSection != typedResults.sections.end());
-  assert(settingsSection != typedResults.sections.end());
-  assert(appsSection < gamesSection && gamesSection < settingsSection);
+  assert(appsSection < gamesSection);
+  // FeatherCast's own settings and commands need a near-complete match.
+  assert(settingsSection == typedResults.sections.end());
+  assert(std::none_of(typedResults.flatItems.begin(), typedResults.flatItems.end(),
+                      [](const auto& item) { return item.isCommand; }));
   assert(std::any_of(appsSection->items.begin(), appsSection->items.end(),
                      [](const auto& item) {
                        return item.app.id == L"app:store-update-tool";
                      }));
   assert(std::any_of(gamesSection->items.begin(), gamesSection->items.end(),
                      [](const auto& item) { return item.app.isGame; }));
+
+  typedRequest.query = L"automatic update che";
+  const auto settingResults =
+      feathercast::search_pipeline::ComputeResults(typedRequest);
+  assert(std::any_of(settingResults.sections.begin(), settingResults.sections.end(),
+                     [](const auto& section) {
+                       return section.title == L"FeatherCast Settings";
+                     }));
+  typedRequest.query = L"update comman";
+  const auto nearCommandResults =
+      feathercast::search_pipeline::ComputeResults(typedRequest);
+  assert(std::any_of(nearCommandResults.flatItems.begin(), nearCommandResults.flatItems.end(),
+                     [](const auto& item) { return item.isCommand; }));
+
+  // Clipboard history content never shows up in the general search, only in
+  // its own view and scope.
+  feathercast::app::DisplayItem copiedText;
+  copiedText.isClipboard = true;
+  copiedText.clipboard.id = L"clip-42";
+  copiedText.clipboard.preview = L"update notes";
+  copiedText.clipboard.text = L"update notes";
+  addSearchable(copiedText, L"clipboard", L"clipboard");
+  typedRequest.query = L"update notes";
+  const auto clipboardResults =
+      feathercast::search_pipeline::ComputeResults(typedRequest);
+  assert(std::none_of(clipboardResults.flatItems.begin(),
+                      clipboardResults.flatItems.end(),
+                      [](const auto& item) { return item.isClipboard; }));
+  typedRequest.scope = feathercast::search_scope::Scope::Clipboard;
+  const auto clipboardScopeResults =
+      feathercast::search_pipeline::ComputeResults(typedRequest);
+  assert(std::any_of(clipboardScopeResults.flatItems.begin(),
+                     clipboardScopeResults.flatItems.end(),
+                     [](const auto& item) { return item.isClipboard; }));
+  typedRequest.scope = feathercast::search_scope::Scope::All;
 
   auto manyAppsSnapshot = std::make_shared<feathercast::app::SearchSnapshot>();
   for (int index = 0; index < 7; ++index) {
@@ -1272,7 +1325,7 @@ int main() {
   noAppSnapshot->searchItems.push_back(
       feathercast::core::PrepareSearchItem(onlyCommandSearch));
   feathercast::app::QueryRequest noAppRequest;
-  noAppRequest.query = L"settings";
+  noAppRequest.query = L"settings comma";
   noAppRequest.limit = 20;
   noAppRequest.snapshot = noAppSnapshot;
   const auto noAppResults =

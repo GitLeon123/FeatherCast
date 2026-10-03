@@ -24,6 +24,10 @@ object Features {
     const val SMS = "sms"
     const val CALLS = "calls"
     const val STORAGE = "storage"
+    const val SCREEN = "screen"
+    const val SCREEN_CONTROL = "screen.control"
+    const val SCREEN_KEYBOARD = "screen.keyboard"
+    const val SCREEN_AUDIO = "screen.audio"
 }
 
 fun JsonObject.bool(key: String, fallback: Boolean = false): Boolean =
@@ -215,6 +219,8 @@ sealed class PcMessage {
     data class FilesListRequest(val path: String) : PcMessage()
     data class FileRequest(val path: String) : PcMessage()
     data object Pong : PcMessage()
+    data class ScreenStart(val request: ScreenRequest) : PcMessage()
+    data class ScreenStop(val sessionId: String) : PcMessage()
 
     companion object {
         /** Returns null for malformed JSON and unknown types (forward compatibility). */
@@ -222,6 +228,13 @@ sealed class PcMessage {
             val root = parseJson(json) ?: return null
             return when (root.str("type")) {
                 "pong" -> Pong
+                "screen.start" -> {
+                    val id = root.str("session")
+                    val key = Base64Url.decode(root.str("key"))
+                    if (id.isEmpty() || id.length > 64 || key?.size != 32) null
+                    else ScreenStart(ScreenRequest(id, key, root.bool("audio")))
+                }
+                "screen.stop" -> ScreenStop(root.str("session"))
                 "clipboard.set" -> Clipboard(root.str("text"), root.long("time", now))
                 "clipboard.history" -> ClipboardHistory(
                     root.objects("items").map { it.str("text") to it.long("time") }.filter { it.first.isNotEmpty() },

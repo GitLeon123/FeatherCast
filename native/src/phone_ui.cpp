@@ -84,6 +84,7 @@ enum class Action {
   Media,
   OpenSmsThread,
   RefreshSms,
+  OpenScreen,
 };
 
 struct Hit {
@@ -816,6 +817,11 @@ struct PhoneWindow::Impl {
 
     if (connected && media.active) y += DrawMediaCard(left, right, y);
 
+    Button(left, y, L"Phone Screen", Action::OpenScreen, true, kGlyphPhone);
+    Text(L"See and control your phone, with device audio",
+         {left + 168.0f, y + 6, right, y + 28}, bodyFormat.Get(), TextMuted());
+    y += 52.0f;
+
     SectionLabel(L"QUICK ACTIONS", left, right, y);
     y += 26.0f;
     float x = left;
@@ -1483,6 +1489,9 @@ struct PhoneWindow::Impl {
           callbacks.requestSmsThreads();
           ShowToast(L"Loading messages\u2026");
         }
+        break;
+      case Action::OpenScreen:
+        if (callbacks.openScreen) callbacks.openScreen();
         break;
       case Action::OpenSmsThread:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < smsThreads.size() &&

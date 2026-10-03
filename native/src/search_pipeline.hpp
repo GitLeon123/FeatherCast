@@ -6,7 +6,12 @@ namespace feathercast::search_pipeline {
 
 app::ResultsCollection ComputeResults(const app::QueryRequest& request);
 
-// True when every query word starts a word of the command name or keywords.
+// True when the query almost spells out one phrase, or every query word almost
+// spells out a word of the phrases.
+bool MatchesFeatureQuery(const std::wstring& query,
+                         const std::vector<std::wstring>& phrases);
+
+// MatchesFeatureQuery over the command name and keywords.
 bool MatchesPhoneSuggestion(const std::wstring& query,
                             const app::DisplayItem& item);
 

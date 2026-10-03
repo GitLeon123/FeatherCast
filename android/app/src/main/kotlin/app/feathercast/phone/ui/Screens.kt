@@ -37,6 +37,8 @@ import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Sms
 import androidx.compose.material.icons.outlined.Upload
+import androidx.compose.material.icons.automirrored.outlined.ScreenShare
+import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -63,6 +65,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -70,6 +74,7 @@ import androidx.compose.ui.unit.sp
 import app.feathercast.phone.LinkState
 import app.feathercast.phone.LinkStatus
 import app.feathercast.phone.R
+import app.feathercast.phone.ScreenUiState
 import android.text.format.DateUtils
 import java.text.DateFormat
 
@@ -209,9 +214,12 @@ data class Permissions(
     val sms: Boolean = false,
     val calls: Boolean = false,
     val storage: Boolean = false,
+    val remoteControl: Boolean = false,
+    val pcKeyboard: Boolean = false,
+    val deviceAudio: Boolean = false,
 )
 
-enum class Feature { Notifications, Photos, Clipboard, ReceiveFiles, Ring, Media, Sms, Calls, Storage }
+enum class Feature { Notifications, Photos, Clipboard, ReceiveFiles, Ring, Media, Sms, Calls, Storage, Screen, RemoteControl }
 
 data class Switches(
     val notifications: Boolean,
@@ -223,6 +231,8 @@ data class Switches(
     val sms: Boolean,
     val calls: Boolean,
     val storage: Boolean,
+    val screen: Boolean = false,
+    val remoteControl: Boolean = false,
 )
 
 interface HomeActions {
@@ -239,6 +249,11 @@ interface HomeActions {
     fun copyPcClip(text: String)
     fun reconnect()
     fun unpair()
+    fun openRemoteControl()
+    fun enablePcKeyboard()
+    fun selectPcKeyboard()
+    fun approveScreen()
+    fun stopScreen()
 }
 
 @Composable
@@ -247,6 +262,7 @@ fun HomeScreen(
     permissions: Permissions,
     switches: Switches,
     actions: HomeActions,
+    screen: ScreenUiState = ScreenUiState(),
 ) {
     var confirmUnpair by remember { mutableStateOf(false) }
     LazyColumn(
@@ -313,6 +329,49 @@ fun HomeScreen(
                         missing = if (permissions.notificationAccess) null else "Allow notification access",
                         onFix = actions::openNotificationAccess,
                     )
+                }
+            }
+        }
+        item { SectionTitle("Phone screen") }
+        item {
+            Column(Modifier.fillMaxWidth()) {
+                FeatureRow(
+                    Icons.AutoMirrored.Outlined.ScreenShare, "Screen sharing",
+                    "Open Phone Screen on your PC. You approve each session here before your screen is shared.",
+                    checked = switches.screen, onChecked = { actions.setFeature(Feature.Screen, it) },
+                    missing = null, onFix = {},
+                )
+                FeatureRow(
+                    Icons.Outlined.TouchApp, "Remote control",
+                    "Allow your paired PC to tap, swipe and navigate during an approved screen sharing session.",
+                    checked = switches.remoteControl, onChecked = { actions.setFeature(Feature.RemoteControl, it) },
+                    missing = if (permissions.remoteControl) null else "Enable FeatherCast Remote Control",
+                    onFix = actions::openRemoteControl,
+                )
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("PC keyboard", style = MaterialTheme.typography.titleSmall)
+                    Text(if (permissions.pcKeyboard) "FeatherCast PC Keyboard is selected. Type directly in phone apps from your PC."
+                        else "Enable FeatherCast PC Keyboard in Android settings, then select it for direct PC typing.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = actions::enablePcKeyboard) { Text("Enable keyboard") }
+                        TextButton(onClick = actions::selectPcKeyboard) { Text("Select keyboard") }
+                    }
+                    Text(if (permissions.deviceAudio) "Device audio is requested when you share. Some apps do not allow audio capture."
+                        else "This Android version supports screen sharing without device audio.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (switches.remoteControl && !permissions.remoteControl) {
+                        Text("If Android blocks the accessibility setting after installing the APK, open FeatherCast's App info and allow restricted settings first.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (screen.detail.isNotEmpty()) Text(screen.detail, style = MaterialTheme.typography.bodyMedium)
+                    if (screen.pending) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Button(onClick = actions::approveScreen) { Text("Share screen") }
+                            TextButton(onClick = actions::stopScreen) { Text("Decline") }
+                        }
+                    }
+                    if (screen.active) OutlinedButton(onClick = actions::stopScreen) { Text("Stop sharing") }
                 }
             }
         }
@@ -508,7 +567,8 @@ private fun FeatureRow(
                 Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.width(4.dp))
-            Switch(checked = checked, onCheckedChange = onChecked)
+            Switch(checked = checked, onCheckedChange = onChecked,
+                modifier = Modifier.semantics { contentDescription = "$title. $text" })
         }
         if (checked && missing != null) {
             OutlinedButton(

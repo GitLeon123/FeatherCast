@@ -45,6 +45,7 @@ struct Callbacks {
   std::function<void()> pickFilesToSend;
   std::function<void(const std::vector<std::wstring>&)> sendFiles;
   std::function<void()> requestSmsThreads;
+  std::function<void()> openScreen;
   // Opens the conversation in the launcher, where replies are typed.
   std::function<void(const phone::SmsThread&)> openSmsThread;
 };

@@ -5,6 +5,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.media.projection.MediaProjectionConfig
+import android.media.projection.MediaProjectionManager
+import android.view.inputmethod.InputMethodManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,6 +41,23 @@ class MainActivity : ComponentActivity() {
     private var pairError by mutableStateOf<String?>(null)
     private var resumeTick by mutableIntStateOf(0)
     private var toggles by mutableIntStateOf(0)
+    private var approvingScreenId = ""
+
+    private val screenConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val id = approvingScreenId
+        approvingScreenId = ""
+        val consent = result.data
+        if (result.resultCode == RESULT_OK && consent != null && ScreenBridge.pendingRequest()?.sessionId == id) {
+            try { ScreenCaptureService.start(this, id, result.resultCode, consent) }
+            catch (_: RuntimeException) { ScreenBridge.stop(this, "Android could not start screen sharing. Start a new request on your PC.", id) }
+        } else {
+            ScreenBridge.stop(this, "Screen sharing was declined or the request expired.", id)
+        }
+    }
+
+    private val screenAudioPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        launchScreenConsent()
+    }
 
     private val scanner = registerForActivityResult(ScanContract()) { result ->
         val contents = result.contents
@@ -65,6 +85,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        approvingScreenId = savedInstanceState?.getString("approvingScreenId").orEmpty()
         WindowCompat.getInsetsController(window, window.decorView).apply {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
@@ -73,6 +94,7 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContent {
             val state by link.state.collectAsStateWithLifecycle()
+            val screenState by ScreenBridge.state.collectAsStateWithLifecycle()
             val tick = resumeTick + toggles
             FeatherTheme {
                 if (state.status == LinkStatus.Unpaired) {
@@ -87,10 +109,16 @@ class MainActivity : ComponentActivity() {
                         permissions = currentPermissions(tick),
                         switches = currentSwitches(tick),
                         actions = homeActions,
+                        screen = screenState,
                     )
                 }
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("approvingScreenId", approvingScreenId)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -168,6 +196,9 @@ class MainActivity : ComponentActivity() {
         sms = SmsBridge.hasPermission(this),
         calls = CallWatcher.hasPermission(this),
         storage = StorageBridge.hasAccess(this),
+        remoteControl = RemoteControlService.instance != null,
+        pcKeyboard = PcKeyboardService.selected(this),
+        deviceAudio = Build.VERSION.SDK_INT >= 29,
     )
 
     private fun currentSwitches(@Suppress("UNUSED_PARAMETER") tick: Int) = Switches(
@@ -180,7 +211,21 @@ class MainActivity : ComponentActivity() {
         sms = store.smsAccess,
         calls = store.callAlerts,
         storage = store.storageAccess,
+        screen = store.screenSharing,
+        remoteControl = store.remoteControl,
     )
+
+    private fun launchScreenConsent() {
+        val request = ScreenBridge.pendingRequest()
+        if (request == null || request.sessionId != approvingScreenId) {
+            approvingScreenId = ""
+            return
+        }
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        val capture = if (Build.VERSION.SDK_INT >= 34) manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            else manager.createScreenCaptureIntent()
+        screenConsent.launch(capture)
+    }
 
     private fun sendFiles(uris: List<Uri>) {
         lifecycleScope.launch {
@@ -234,6 +279,14 @@ class MainActivity : ComponentActivity() {
                     store.storageAccess = enabled
                     if (enabled && !StorageBridge.hasAccess(this@MainActivity)) openStorageAccess()
                 }
+                Feature.Screen -> {
+                    store.screenSharing = enabled
+                    if (!enabled) ScreenBridge.stop(this@MainActivity)
+                }
+                Feature.RemoteControl -> {
+                    store.remoteControl = enabled
+                    if (!enabled) RemoteControlService.instance?.cancelGesture()
+                }
             }
             toggles++
             link.refreshStatus()
@@ -242,6 +295,31 @@ class MainActivity : ComponentActivity() {
         override fun requestSaveFiles() {
             featurePermissions.launch(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE))
         }
+
+        override fun openRemoteControl() {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+
+        override fun enablePcKeyboard() {
+            PcKeyboardService.rememberPrevious(this@MainActivity)
+            startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+        }
+
+        override fun selectPcKeyboard() {
+            PcKeyboardService.rememberPrevious(this@MainActivity)
+            getSystemService(InputMethodManager::class.java).showInputMethodPicker()
+        }
+
+        override fun approveScreen() {
+            if (approvingScreenId.isNotEmpty()) return
+            val request = ScreenBridge.pendingRequest() ?: return
+            approvingScreenId = request.sessionId
+            if (request.audio && Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                screenAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+            } else launchScreenConsent()
+        }
+
+        override fun stopScreen() { ScreenBridge.stop(this@MainActivity) }
 
         override fun requestSms() {
             featurePermissions.launch(SmsBridge.permissions)

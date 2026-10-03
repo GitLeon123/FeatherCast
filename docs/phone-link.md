@@ -5,6 +5,8 @@ FeatherCast can link with an Android phone over your local Wi-Fi. Once paired, t
 text messages, what is playing, and battery level. From the PC you can reply to
 notifications and texts, send files to the phone, make it ring, control its media,
 handle incoming calls, and browse its storage.
+**Phone Screen** opens a separate, resizable window for live screen sharing,
+mouse control, PC typing, and device audio.
 
 Nothing goes through the internet or a cloud service.
 
@@ -41,12 +43,51 @@ the PC again when the PC gets a new IP address.
 | Calls *(optional)* | Phone → PC | Incoming calls appear as a toast and at the top of the launcher, with **Reject** and **Silence**. |
 | Phone storage *(optional)* | Phone → PC | Browse shared storage and download files. Needs *All files access* on Android 11+. |
 | Battery | Phone → PC | Level and charging state. The PC warns once when the battery drops to 20% while not charging (toggle in the Phone window's **Devices** tab). |
+| Phone Screen *(optional)* | Both | Live H.264 screen, mouse gestures, navigation, PC keyboard, and AAC device audio. Every session requires Android approval. |
 
-The optional features are off until you turn them on under **Optional** in the phone
-app, which then asks for the Android permissions they need. Every feature can be
+The optional features are off until you turn them on in the phone app, which then
+asks for the Android permissions they need. Screen sharing and Remote control
+are under **Phone screen**; the other optional features are under **Optional**. Every feature can be
 switched off in the phone app. On the PC, **Settings → Privacy →
 Phone Connection** turns the whole feature off. The **Devices** tab in the Phone
 window unpairs a phone.
+
+## Phone Screen
+
+1. Install the updated **FeatherCast-Phone.apk** next to your PC's EXE. Older
+   companions continue to work for the existing phone features.
+2. In the Android app, turn on **Screen sharing**. For mouse control or PC typing,
+   also turn on **Remote control**. For mouse control, choose **Enable FeatherCast Remote Control** to
+   enable its Android accessibility service. If Android blocks this after
+   sideloading, open FeatherCast's **App info → Allow restricted settings** first.
+3. Choose **Enable keyboard**, enable **FeatherCast PC Keyboard** in Android's
+   keyboard settings, then use **Select keyboard** to select it. This supplies
+   Unicode text and editing keys to the currently focused phone input field.
+4. Open **Phone Screen** in the PC's Phone window or launcher. In FeatherCast on
+   the phone, tap **Share screen**, allow audio if wanted, and approve Android's
+   **Entire screen** prompt. A background request also creates a notification;
+   requests expire after 60 seconds. Declining audio still allows video.
+
+Click to tap, hold for a long press, drag to swipe, and use the mouse wheel to
+scroll. **Back**, **Home**, and **Recent apps** provide Android navigation.
+Type while the screen area is focused; **Ctrl+V** pastes up to 16 KB of text,
+**Ctrl+A** selects all, and Enter, Delete, Backspace, Tab, and arrow keys go to
+the phone. **Ctrl+Tab** focuses the PC toolbar. **F11** switches full screen;
+Escape leaves full screen, otherwise it sends Back.
+
+**Mute**, the volume slider, and **Stop** affect this session. Closing the
+window, turning off screen sharing, locking or turning off the phone screen,
+losing the connection, or Android revoking projection stops the session.
+Reconnecting never resumes sharing: start again and approve a new prompt.
+FeatherCast returns to the previous Android keyboard when sharing ends; if
+Android cannot switch back, use the keyboard picker.
+
+Video works on Android 8 and later. Playback audio needs Android 10 or later,
+the audio permission, and an app that permits playback capture. Calls,
+microphone audio, DRM-protected content, and secure screens cannot be shared
+through these APIs. Viewing remains available without remote control or the
+PC keyboard. This feature transmits live media only; it does not save video
+or audio. File transfers use the primary connection independently.
 
 ## In the launcher
 
@@ -66,6 +107,7 @@ live list that updates as new data arrives, and **Esc** goes back:
 | **Phone Files** | The phone's shared storage, folders first (Backspace goes up, F5 refreshes) | Open a folder, or download and open a file | **Save to Downloads** |
 | **Find My Phone** | – | Start or stop ringing | – |
 | **Send File to Phone** | A file picker | Send the chosen files | – |
+| **Phone Screen** | A live, separate screen window | Request Android approval | – |
 
 **Replying.** In a conversation, and after choosing *Reply* on a notification (Tab),
 the search box becomes the message: type it and press **Enter** to send, **Esc** to
@@ -84,6 +126,13 @@ is cleared when another phone connects or FeatherCast exits.
 - Each connection runs a challenge–response with fresh nonces from both sides. That
   derives separate AES-256-GCM session keys for each direction, and nonces count up
   per message.
+- Screen media and input use a second connection on the same TCP port. The
+  encrypted primary connection delivers a random 32-byte, single-use screen key.
+  Its lease is bound to that primary connection, phone, and screen session and
+  expires after 60 seconds. The second connection derives fresh directional
+  AES-GCM keys; the normal pairing key cannot authenticate it. Inputs carry the
+  session ID and display generation so rotation and stopped sessions reject
+  stale input. Media queues are bounded and recover video at a new keyframe.
 - The PC only accepts paired phones. Link keys are stored DPAPI-encrypted in
   `%APPDATA%\FeatherCast\phone-link.dat`. On the phone they are wrapped with an
   Android Keystore key.
@@ -101,6 +150,9 @@ is cleared when another phone connects or FeatherCast exits.
 - Session handshake: `hello{deviceId, nonce}` → `challenge{nonce, pcName}` →
   `auth{mac}` → `welcome{mac, pcName}`. After that every frame is
   `AES-GCM([u32 jsonLength][json][binary])`.
+- Screen sessions use `hello{deviceId, nonce, screen}` on a second socket,
+  authenticated with the single-use key delivered by `screen.start`. The
+  challenge/auth/welcome exchange and encrypted framing remain the same.
 - Phone → PC: `status{battery, charging, name, features[]}`, `ping`,
   `notification.posted{…, actions[{i, title, reply}]}` (PNG icon as binary),
   `notification.removed`, `notifications.reset`, `clipboard.set`,
@@ -117,9 +169,27 @@ is cleared when another phone connects or FeatherCast exits.
   `media.command{cmd, pos?}`, `media.volume{vol}`, `sms.threads.request`,
   `sms.messages.request{thread, limit}`, `sms.send{ref, address, body}`, `call.reject`,
   `call.silence`, `files.list.request{path}`, `file.request{path}`.
+- Primary connection, PC → phone: `screen.start{session, key, audio}` and
+  `screen.stop{session}`. Phone → PC: `screen.state{session, state, generation,
+  detail, control, keyboard, audio}`.
+- Screen connection, phone → PC: `screen.state`,
+  `screen.video.config{session, generation, width, height}` (Annex-B H.264
+  configuration), `screen.video{session, generation, pts, keyframe}` (H.264),
+  `screen.audio.config{session, generation}` (AAC AudioSpecificConfig), and
+  `screen.audio{session, generation, pts}` (AAC-LC). Timestamps are microseconds.
+- Screen connection, PC → phone: `screen.input{session, generation, action,
+  x, y, value, text}`. Coordinates are millionths of the mirrored screen;
+  UTF-8 text is limited to 16 KB. Media packets are capped at 2 MB, audio
+  packets at 64 KB, codec headers at 64 KB for video and 64 bytes for audio.
 - `status.features` lists what the phone app has turned on (`notification.actions`,
-  `files.receive`, `ring`, `media`, `sms`, `calls`, `storage`), so the PC can explain what
+  `files.receive`, `ring`, `media`, `sms`, `calls`, `storage`, `screen`,
+  `screen.control`, `screen.keyboard`, `screen.audio`), so the PC can explain what
   to enable. Both sides ignore message types they do not know, so older apps keep working.
+  Active-session input and audio readiness are reported separately in `screen.state`.
+
+Screen fixtures and queue bounds are covered by `.../ScreenTest.kt` and the native
+protocol suite. `native/tests/phone_screen_tests.cpp` adds real Windows codec
+verification and the Phone Screen development harness.
 
 Both implementations are checked against the same test vectors. The PC side is in
 `native/tests/phone_protocol_tests.cpp`, and the phone side is in

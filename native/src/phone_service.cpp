@@ -209,6 +209,7 @@ struct PhoneService::Session {
   Bytes recvKey;
   std::uint64_t sendCounter = 0;
   std::uint64_t recvCounter = 0;
+  std::string screenId;
 
   // Senders retain the session while using its socket. Close only after the
   // receive worker and all senders release it, so a reused handle stays safe.
@@ -269,6 +270,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
   running_ = true;
   acceptThread_ = std::jthread([this](std::stop_token stop) { AcceptLoop(stop); });
   beaconThread_ = std::jthread([this](std::stop_token stop) { BeaconLoop(stop); });
+  screenSendThread_ = std::jthread([this](std::stop_token stop) { ScreenSendLoop(stop); });
   return true;
 }
 
@@ -276,6 +278,8 @@ void PhoneService::Stop() {
   if (!running_.exchange(false)) return;
   acceptThread_.request_stop();
   beaconThread_.request_stop();
+  screenSendThread_.request_stop();
+  screenWake_.notify_all();
   // The accept loop checks running_ before adding workers. Join it before
   // collecting workers or closing the listener it is still using.
   if (acceptThread_.joinable()) acceptThread_.join();
@@ -291,10 +295,17 @@ void PhoneService::Stop() {
     workers_.clear();
   }
   if (beaconThread_.joinable()) beaconThread_.join();
+  if (screenSendThread_.joinable()) screenSendThread_.join();
   workers.clear();  // joins
   std::lock_guard lock(mutex_);
   sessions_.clear();
   active_.reset();
+  screen_.reset();
+  screenOwner_.reset();
+  screenId_.clear();
+  screenKey_.clear();
+  screenInputs_.clear();
+  screenCommands_.clear();
   pairingToken_.clear();
   pairingExpiresAt_ = 0;
 }
@@ -449,7 +460,7 @@ bool PhoneService::SendToSession(const std::shared_ptr<Session>& session,
       json.size() > kMaxFrameBytes - 20 - binary.size()) return false;
   {
     std::lock_guard lock(mutex_);
-    if (!running_ || active_ != session) return false;
+    if (!running_ || (active_ != session && screen_ != session)) return false;
   }
   std::lock_guard lock(session->sendMutex);
   const auto sealed = crypto::AesGcmEncrypt(
@@ -551,6 +562,105 @@ bool PhoneService::ListFiles(const std::string& remotePath) {
 
 bool PhoneService::RequestFile(const std::string& remotePath) {
   return Send(message::FileRequest(remotePath));
+}
+
+void PhoneService::EmitScreenState(std::string id, std::string state, std::string detail) {
+  ScreenPacket packet;
+  packet.sessionId = std::move(id);
+  packet.state = std::move(state);
+  packet.detail = std::move(detail);
+  if (config_.onScreenPacket) config_.onScreenPacket(std::move(packet));
+}
+
+std::string PhoneService::StartScreen(bool audio) {
+  StopScreen();
+  const auto id = HexEncode(crypto::RandomBytes(16));
+  {
+    std::lock_guard lock(mutex_);
+    if (!running_ || !active_ || screenCommands_.size() >= 8) return {};
+    screenId_ = id;
+    screenKey_ = crypto::RandomBytes(32);
+    if (screenKey_.size() != 32) { screenId_.clear(); return {}; }
+    screenOwner_ = active_;
+    screenExpiresAt_ = NowMs() + kScreenRequestLifetimeMs;
+    screenCommands_.emplace_back(active_, Json("screen.start").Str("session", id)
+        .Str("key", Base64UrlEncode(screenKey_)).Bool("audio", audio).Build());
+  }
+  EmitScreenState(id, "pending", "Open FeatherCast on your phone and approve screen sharing. The request expires in 60 seconds.");
+  screenWake_.notify_all();
+  return id;
+}
+
+void PhoneService::StopScreen(bool report) {
+  std::string id;
+  {
+    std::lock_guard lock(mutex_);
+    id = std::exchange(screenId_, {});
+    screenKey_.clear();
+    screenInputs_.clear();
+    screenOwner_.reset();
+    screenExpiresAt_ = 0;
+    if (screen_) shutdown(screen_->socket, SD_BOTH);
+    screen_.reset();
+    if (!id.empty() && active_ && screenCommands_.size() < 8) {
+      screenCommands_.emplace_back(active_, Json("screen.stop").Str("session", id).Build());
+    }
+  }
+  if (report && !id.empty()) EmitScreenState(std::move(id), "stopped", "Screen sharing stopped.");
+  screenWake_.notify_all();
+}
+
+bool PhoneService::SendScreenInput(ScreenInput input) {
+  if (!ValidScreenInput(input)) return false;
+  {
+    std::lock_guard lock(mutex_);
+    if (!screen_ || input.sessionId != screenId_ || screenOwner_.lock() != active_) return false;
+    if (input.action == "move" && !screenInputs_.empty() && screenInputs_.back().action == "move") {
+      screenInputs_.back() = std::move(input);
+    } else {
+      if (screenInputs_.size() >= 128) {
+        // Never replay stale gestures or text after a congested connection.
+        screenInputs_.clear();
+        input.action = "cancel";
+        input.text.clear();
+      }
+      screenInputs_.push_back(std::move(input));
+    }
+  }
+  screenWake_.notify_all();
+  return true;
+}
+
+void PhoneService::ScreenSendLoop(std::stop_token stop) {
+  while (!stop.stop_requested()) {
+    std::shared_ptr<Session> target;
+    std::string json, expired;
+    {
+      std::unique_lock lock(mutex_);
+      screenWake_.wait_for(lock, stop, std::chrono::milliseconds(100), [&] {
+        return !screenCommands_.empty() || !screenInputs_.empty();
+      });
+      if (stop.stop_requested()) break;
+      if (!screenId_.empty() && !screen_ && NowMs() > screenExpiresAt_) {
+        expired = std::exchange(screenId_, {});
+        screenKey_.clear();
+        screenOwner_.reset();
+        if (active_) screenCommands_.emplace_back(active_, Json("screen.stop").Str("session", expired).Build());
+      }
+      if (!screenInputs_.empty()) {
+        auto input = std::move(screenInputs_.front());
+        screenInputs_.pop_front();
+        target = screen_;
+        json = ScreenInputJson(input);
+      } else if (!screenCommands_.empty()) {
+        target = std::move(screenCommands_.front().first);
+        json = std::move(screenCommands_.front().second);
+        screenCommands_.pop_front();
+      }
+    }
+    if (!expired.empty()) EmitScreenState(expired, "stopped", "Screen sharing request expired. Start again and approve it on your phone.");
+    if (target && !SendToSession(target, json)) shutdown(target->socket, SD_BOTH);
+  }
 }
 
 // ------------------------------------------------------------------ threads
@@ -660,7 +770,8 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
     }
     while (open) {
       auto frame = decoder.Next(session->state == Session::State::Open
-                                    ? kMaxFrameBytes : kMaxHandshakeBytes);
+                                    ? (session->screenId.empty() ? kMaxFrameBytes : kMaxScreenPacketBytes + 8192 + 20)
+                                    : kMaxHandshakeBytes);
       if (!frame) {
         if (decoder.Failed()) open = false;
         break;
@@ -670,16 +781,25 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
       } else if (!HandlePlainFrame(session, *frame)) {
         open = false;
       } else if (session->state == Session::State::Open) {
-        SetTimeout(socket, kSessionIdleTimeoutMs);
+        SetTimeout(socket, session->screenId.empty() ? kSessionIdleTimeoutMs : 5000);
       }
     }
   }
 
   bool wasActive = false;
   std::string deviceName;
+  std::string endedScreen;
   {
     std::lock_guard lock(mutex_);
     std::erase(sessions_, session);
+    if (screen_ == session || (active_ == session && !screenId_.empty())) {
+      endedScreen = std::exchange(screenId_, {});
+      screenKey_.clear();
+      screenOwner_.reset();
+      screenInputs_.clear();
+      if (screen_ && screen_ != session) shutdown(screen_->socket, SD_BOTH);
+      screen_.reset();
+    }
     if (active_ == session) {
       active_.reset();
       wasActive = true;
@@ -687,6 +807,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
     }
   }
   shutdown(socket, SD_BOTH);
+  if (!endedScreen.empty() && running_) EmitScreenState(endedScreen, "stopped", "The screen connection was lost. Start a new session to reconnect.");
   if (wasActive && running_) {
     Event event;
     event.kind = EventKind::Disconnected;
@@ -784,6 +905,27 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     const std::string deviceId = JsonString(*root, "deviceId");
     const auto nonce = Base64UrlDecode(JsonString(*root, "nonce"));
     if (!nonce || nonce->size() != 16) return reject("bad-request", "Malformed hello.");
+    session->screenId = JsonString(*root, "screen");
+    if (!session->screenId.empty()) {
+      bool allowed = false;
+      {
+        std::lock_guard lock(mutex_);
+        allowed = active_ && active_->deviceId == deviceId && screenOwner_.lock() == active_ &&
+            screenId_ == session->screenId && screenKey_.size() == 32 && !screen_ &&
+            NowMs() <= screenExpiresAt_;
+        if (allowed) {
+          session->deviceId = deviceId;
+          session->deviceName = active_->deviceName;
+          session->linkKey = screenKey_;
+        }
+      }
+      if (!allowed) return reject("screen-expired", "This screen sharing request is no longer active.");
+      session->phoneNonce = *nonce;
+      session->pcNonce = crypto::RandomBytes(16);
+      session->state = Session::State::Auth;
+      return sendPlain(Json("challenge").Str("nonce", Base64UrlEncode(session->pcNonce))
+          .Str("pcName", config_.pcName).Build());
+    }
     std::optional<PairedDevice> device;
     {
       std::lock_guard lock(mutex_);
@@ -822,6 +964,22 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     session->sendKey = crypto::Hkdf(session->linkKey, salt, kPcToPhoneInfo, 32);
     const Bytes pcMac = crypto::HmacSha256(
         session->linkKey, Concat({&pcLabel, &session->phoneNonce, &session->pcNonce}));
+    if (!session->screenId.empty()) {
+      {
+        std::lock_guard lock(mutex_);
+        if (!running_ || !active_ || screenOwner_.lock() != active_ ||
+            active_->deviceId != session->deviceId || screenId_ != session->screenId ||
+            screenKey_ != session->linkKey || screen_ || NowMs() > screenExpiresAt_) return false;
+        screen_ = session;
+        screenKey_.clear();  // one authentication only, including concurrent challenges
+      }
+      std::lock_guard lock(session->sendMutex);
+      if (!sendPlain(Json("welcome").Str("mac", Base64UrlEncode(pcMac))
+          .Str("pcName", config_.pcName).Build())) return false;
+      session->state = Session::State::Open;
+      SetTimeout(session->socket, 5000);
+      return true;  // a media connection never replaces the normal phone connection
+    }
     {
       std::lock_guard lock(session->sendMutex);
       if (!sendPlain(Json("welcome")
@@ -833,6 +991,7 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
       session->state = Session::State::Open;
     }
     std::shared_ptr<Session> previous;
+    std::string endedScreen;
     {
       std::lock_guard lock(mutex_);
       const bool stillPaired = std::any_of(devices_.begin(), devices_.end(), [&](const auto& device) {
@@ -840,8 +999,17 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
       });
       if (!running_ || !stillPaired) return false;
       previous = std::exchange(active_, session);
+      if (previous && !screenId_.empty()) {
+        if (screen_) shutdown(screen_->socket, SD_BOTH);
+        screen_.reset();
+        screenOwner_.reset();
+        screenKey_.clear();
+        endedScreen = std::exchange(screenId_, {});
+        screenInputs_.clear();
+      }
     }
     if (previous && previous != session) shutdown(previous->socket, SD_BOTH);
+    if (!endedScreen.empty()) EmitScreenState(endedScreen, "stopped", "The phone connection changed. Start a new screen sharing session.");
     Event event;
     event.kind = EventKind::Connected;
     event.deviceId = session->deviceId;
@@ -857,7 +1025,10 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
                                       const Bytes& frame) {
   {
     std::lock_guard lock(mutex_);
-    if (!running_ || active_ != session ||
+    if (!session->screenId.empty()) {
+      if (!running_ || screen_ != session || screenId_ != session->screenId ||
+          !active_ || screenOwner_.lock() != active_ || active_->deviceId != session->deviceId) return;
+    } else if (!running_ || active_ != session ||
         std::none_of(devices_.begin(), devices_.end(), [&](const auto& device) {
           return device.id == session->deviceId && device.linkKey == session->linkKey;
         })) return;
@@ -870,10 +1041,30 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   }
   const auto payload = UnpackPayload(*plain);
   if (!payload) return;
+  if (!session->screenId.empty()) {
+    auto packet = ParseScreenPacket(*payload);
+    if (!packet || packet->sessionId != session->screenId) {
+      shutdown(session->socket, SD_BOTH);
+      return;
+    }
+    if (config_.onScreenPacket) config_.onScreenPacket(std::move(*packet));
+    return;
+  }
   const auto root = json::Parse(payload->json);
   if (!root || root->type != json::Value::Type::Object) return;
   if (JsonString(*root, "type") == "ping") {
     SendToSession(session, Json("pong").Int("time", NowMs()).Build());
+    return;
+  }
+  if (JsonString(*root, "type") == "screen.state") {
+    auto packet = ParseScreenPacket(*payload);
+    bool matches = false;
+    {
+      std::lock_guard lock(mutex_);
+      matches = packet && packet->sessionId == screenId_ && screenOwner_.lock() == session;
+    }
+    if (matches && (packet->state == "stopped" || packet->state == "error")) StopScreen(false);
+    if (matches && config_.onScreenPacket) config_.onScreenPacket(*packet);
     return;
   }
   auto parsed = ParseSessionMessage(*root, payload->binary, NowMs());

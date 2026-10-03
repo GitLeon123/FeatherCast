@@ -37,7 +37,7 @@ try {
   foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
     $binary = Get-ChildItem $portable -Recurse -Filter $name | Select-Object -First 1
     if (-not $binary) { throw "$name is missing from the ZIP package." }
-    $process = Start-Process $binary.FullName -ArgumentList "--self-test" -PassThru -Wait
+    $process = Start-Process $binary.FullName -WindowStyle Hidden -ArgumentList "--self-test" -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "$name ZIP self-test failed." }
   }
 
@@ -53,12 +53,17 @@ try {
   if ($SkipInstalledSmoke) { return }
 
   if (-not $InstallRoot) {
-    $InstallRoot = Join-Path $temporaryRoot (
+    $InstallRoot = Join-Path $env:ProgramFiles (
       "feathercast-package-smoke-install-" + [Guid]::NewGuid().ToString("N"))
+  }
+  $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $brokerTaskName = "FeatherCast Input Broker-$userSid"
+  if (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue) {
+    throw 'Installed package smoke must run on a machine without an existing FeatherCast broker task.'
   }
   # NSIS requires /D= to be the final argument and does not accept quotes.
   $installArguments = @("/S", ("/D=" + $InstallRoot))
-  $install = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
+  $install = Start-Process $installer.FullName -WindowStyle Hidden -ArgumentList $installArguments -PassThru -Wait
   if ($install.ExitCode -ne 0) { throw "NSIS install failed." }
   $uninstaller = Join-Path $InstallRoot "Uninstall.exe"
   if (-not (Test-Path $uninstaller)) { throw "NSIS uninstall artifact is missing." }
@@ -73,7 +78,7 @@ try {
   }
   foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
     $binary = Join-Path $installRoot "bin\$name"
-    $process = Start-Process $binary -ArgumentList "--self-test" -PassThru -Wait
+    $process = Start-Process $binary -WindowStyle Hidden -ArgumentList "--self-test" -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "$name installed self-test failed." }
   }
   if (Test-Path -LiteralPath $phoneApp) {
@@ -84,7 +89,15 @@ try {
     }
   }
 
-  $repeatInstall = Start-Process $installer.FullName -ArgumentList $installArguments -PassThru -Wait
+  $task = Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction Stop
+  if ($task.Principal.RunLevel -ne 'Highest' -or $task.Principal.LogonType -ne 'Interactive') {
+    throw 'The installed input broker task is not elevated and interactive.'
+  }
+  if ($task.Actions.Execute -ne (Join-Path $InstallRoot 'bin\InputBroker.exe')) {
+    throw 'The input broker task does not point at the installed executable.'
+  }
+
+  $repeatInstall = Start-Process $installer.FullName -WindowStyle Hidden -ArgumentList $installArguments -PassThru -Wait
   if ($repeatInstall.ExitCode -ne 0) { throw "Repeated NSIS install failed." }
   $uninstallRoots = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -109,6 +122,9 @@ try {
   $uninstallExitCode = $LASTEXITCODE
   for ($attempt = 0; $attempt -lt 20 -and (Test-Path $InstallRoot); $attempt++) {
     Start-Sleep -Milliseconds 250
+  }
+  if (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue) {
+    throw 'Uninstall left the elevated input broker task behind.'
   }
   if ($uninstallExitCode -ne 0 -or (Test-Path $InstallRoot)) {
     throw "NSIS uninstall smoke failed."

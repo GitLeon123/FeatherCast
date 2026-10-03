@@ -103,6 +103,14 @@ class LinkStore(context: Context) {
         get() = prefs.getBoolean("storageAccess", false)
         set(value) = prefs.edit().putBoolean("storageAccess", value).apply()
 
+    var screenSharing: Boolean
+        get() = prefs.getBoolean("screenSharing", false)
+        set(value) = prefs.edit().putBoolean("screenSharing", value).apply()
+
+    var remoteControl: Boolean
+        get() = prefs.getBoolean("remoteControl", false)
+        set(value) = prefs.edit().putBoolean("remoteControl", value).apply()
+
     private fun keystoreKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }

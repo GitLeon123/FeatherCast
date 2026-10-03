@@ -171,6 +171,7 @@ enum class CommandKind {
   PhoneMessages,
   PhoneFiles,
   SendFileToPhone,
+  PhoneScreen,
 };
 
 struct ConfirmationDialog {

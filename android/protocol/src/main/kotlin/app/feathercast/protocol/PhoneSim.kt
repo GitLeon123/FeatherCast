@@ -161,6 +161,8 @@ fun main(args: Array<String>) {
                 val root: JsonObject = parseJson(payload.json) ?: continue
                 println("RECV ${root.str("type")} ${payload.json.take(200)}")
                 when (val msg = PcMessage.parse(payload.json)) {
+                    is PcMessage.ScreenStart -> session.send(ScreenMessages.state(msg.request.sessionId, "error", detail = "Use the Android app to share a real phone screen."))
+                    is PcMessage.ScreenStop -> Unit
                     is PcMessage.FileSend ->
                         session.send(PhoneMessages.fileReceived(msg.id, msg.name, true))
                     is PcMessage.Ring -> session.send(PhoneMessages.ringState(msg.start))

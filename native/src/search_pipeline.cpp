@@ -40,24 +40,55 @@ std::vector<std::wstring> LowerWords(const std::wstring& text) {
 
 }  // namespace
 
+namespace {
+
+std::wstring JoinWords(const std::vector<std::wstring>& words) {
+  std::wstring joined;
+  for (const auto& word : words) {
+    if (!joined.empty()) joined.push_back(L' ');
+    joined += word;
+  }
+  return joined;
+}
+
+// The two texts share a prefix covering at least three quarters of both, so
+// "animations" still finds "Animation" while "notif" is not enough.
+bool NearlyEqual(const std::wstring& left, const std::wstring& right) {
+  const auto mismatch =
+      std::mismatch(left.begin(), left.end(), right.begin(), right.end());
+  const auto common = static_cast<std::size_t>(mismatch.first - left.begin());
+  return common * 4 >= left.size() * 3 && common * 4 >= right.size() * 3;
+}
+
+}  // namespace
+
+bool MatchesFeatureQuery(const std::wstring& query,
+                         const std::vector<std::wstring>& phrases) {
+  const auto queryWords = LowerWords(query);
+  const std::wstring joinedQuery = JoinWords(queryWords);
+  // One or two letters match too much to be worth a feature result.
+  if (joinedQuery.size() < 3) return false;
+  std::vector<std::wstring> phraseWords;
+  for (const auto& phrase : phrases) {
+    auto words = LowerWords(phrase);
+    // The whole name, keyword, or alias is (almost) spelled out.
+    if (!words.empty() && NearlyEqual(joinedQuery, JoinWords(words))) return true;
+    phraseWords.insert(phraseWords.end(), words.begin(), words.end());
+  }
+  // Several words that each (almost) spell out a word of the feature, such as
+  // "increase volume" or "adjust output".
+  return queryWords.size() > 1 &&
+         std::all_of(queryWords.begin(), queryWords.end(), [&](const auto& queryWord) {
+           return std::any_of(phraseWords.begin(), phraseWords.end(),
+                              [&](const auto& word) { return NearlyEqual(queryWord, word); });
+         });
+}
+
 bool MatchesPhoneSuggestion(const std::wstring& query,
                             const app::DisplayItem& item) {
-  const auto queryWords = LowerWords(query);
-  std::size_t letters = 0;
-  for (const auto& word : queryWords) letters += word.size();
-  // One or two letters match too much to be worth a suggestion.
-  if (queryWords.empty() || letters < 3) return false;
-  std::vector<std::wstring> tokens = LowerWords(item.commandName);
-  for (const auto& keyword : item.commandKeywords) {
-    for (auto& word : LowerWords(keyword)) tokens.push_back(std::move(word));
-  }
-  return std::all_of(queryWords.begin(), queryWords.end(),
-                     [&](const std::wstring& queryWord) {
-                       return std::any_of(tokens.begin(), tokens.end(),
-                                          [&](const std::wstring& token) {
-                                            return token.starts_with(queryWord);
-                                          });
-                     });
+  std::vector<std::wstring> phrases = item.commandKeywords;
+  phrases.push_back(item.commandName);
+  return MatchesFeatureQuery(query, phrases);
 }
 
 namespace {
@@ -189,6 +220,8 @@ bool MatchesScope(const DisplayItem& item, search_scope::Scope scope) {
     case search_scope::Scope::Commands: return item.isCommand;
     case search_scope::Scope::Clipboard: return item.isClipboard;
     case search_scope::Scope::Snippets: return item.isSnippet;
+    case search_scope::Scope::Settings:
+      return plainApp && item.app.source == L"windows-settings";
   }
   return false;
 }
@@ -203,6 +236,7 @@ std::wstring ScopeTitle(search_scope::Scope scope, bool empty) {
     case Scope::Commands: return L"Commands";
     case Scope::Clipboard: return L"Clipboard History";
     case Scope::Snippets: return L"Snippets";
+    case Scope::Settings: return L"Windows Settings";
     case Scope::All: return L"Results";
   }
   return L"Results";
@@ -451,6 +485,11 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       }();
       for (const auto index : core::Search(request.query, settingSearch)) {
         const auto& descriptor = settings_catalog::Catalog()[index];
+        if (!MatchesFeatureQuery(request.query,
+                                 {std::wstring(descriptor.label),
+                                  std::wstring(descriptor.accessibleName)})) {
+          continue;
+        }
         DisplayItem item;
         item.settingId = descriptor.stableId;
         item.commandName = descriptor.label;
@@ -472,22 +511,34 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                                                request.recentIds, options);
       std::vector<DisplayItem> hits;
       hits.reserve(order.size());
-      for (const auto index : order) hits.push_back(snapshot->pool[index]);
+      for (const auto index : order) {
+        const auto& item = snapshot->pool[index];
+        // Clipboard history stays private to its own view and scope.
+        if (item.isClipboard) continue;
+        // FeatherCast's own commands only show up for a near-complete match.
+        if (item.isCommand) {
+          const auto& searchItem = snapshot->searchItems[index].item;
+          std::vector<std::wstring> phrases = searchItem.keywords;
+          phrases.push_back(searchItem.name);
+          phrases.insert(phrases.end(), searchItem.aliases.begin(),
+                         searchItem.aliases.end());
+          if (!MatchesFeatureQuery(request.query, phrases)) continue;
+        }
+        hits.push_back(item);
+      }
       std::vector<DisplayItem> games;
       std::vector<DisplayItem> apps;
       std::vector<DisplayItem> windows;
       std::vector<DisplayItem> system;
       std::vector<DisplayItem> commands;
       std::vector<DisplayItem> snippets;
-      std::vector<DisplayItem> clipboard;
       std::vector<DisplayItem> files;
       std::vector<DisplayItem> systemFolders;
+      std::vector<DisplayItem> windowsSettings;
       std::vector<DisplayItem> other;
       for (const auto& item : hits) {
         if (item.isSnippet) {
           snippets.push_back(item);
-        } else if (item.isClipboard) {
-          clipboard.push_back(item);
         } else if (item.isCommand) {
           commands.push_back(item);
         } else if (item.isWindow) {
@@ -502,6 +553,8 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
           files.push_back(item);
         } else if (item.app.source == L"system-folder") {
           systemFolders.push_back(item);
+        } else if (item.app.source == L"windows-settings") {
+          windowsSettings.push_back(item);
         } else if (IsPlainApp(item)) {
           system.push_back(item);
         } else {
@@ -530,11 +583,11 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
         addSection(L"Best match", take({hits.front()}, 1));
       }
       if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
+      addSection(L"Windows Settings", take(windowsSettings, 40));
       addSection(L"FeatherCast Settings", take(settingMatches));
       addSection(L"Extensions", take(request.extensionItems, 20));
       addSection(L"Commands", take(commands, 20));
       addSection(L"Snippets", take(snippets, 20));
-      addSection(L"Clipboard History", take(clipboard, 20));
       addSection(L"Files & Folders", take(files, 40));
       addSection(L"System Folders", take(systemFolders, 30));
       addSection(L"Open windows", take(windows, 40));

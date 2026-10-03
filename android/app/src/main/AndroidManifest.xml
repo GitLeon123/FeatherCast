@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -55,6 +57,19 @@
         android:requestLegacyExternalStorage="true"
         android:theme="@style/Theme.FeatherCast"
         tools:targetApi="35">
+
+        <service android:name=".ScreenCaptureService" android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+        <service android:name=".RemoteControlService" android:exported="true"
+            android:label="@string/remote_control_label" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/remote_control_service" />
+        </service>
+        <service android:name=".PcKeyboardService" android:exported="true"
+            android:label="@string/pc_keyboard_label" android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter><action android:name="android.view.InputMethod" /></intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/pc_keyboard" />
+        </service>
 
         <activity
             android:name=".MainActivity"

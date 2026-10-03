@@ -1,0 +1,5 @@
+<resources>
+    <string name="remote_control_label">FeatherCast Remote Control</string>
+    <string name="remote_control_description">Allows your paired PC to tap, swipe and navigate this phone only during a screen sharing session you approve. Does not read screen text.</string>
+    <string name="pc_keyboard_label">FeatherCast PC Keyboard</string>
+</resources>

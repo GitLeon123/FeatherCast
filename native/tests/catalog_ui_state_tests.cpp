@@ -184,6 +184,7 @@ int main() {
       std::pair{CommandKind::PhoneMessages, ResultIcon::Phone},
       std::pair{CommandKind::PhoneFiles, ResultIcon::Folder},
       std::pair{CommandKind::SendFileToPhone, ResultIcon::Download},
+      std::pair{CommandKind::PhoneScreen, ResultIcon::Phone},
   };
   assert(commandIcons.size() == feathercast::commands::Catalog().size());
   for (const auto& [kind, expected] : commandIcons) {

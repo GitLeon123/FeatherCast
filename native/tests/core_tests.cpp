@@ -11,6 +11,7 @@
 #include "run_command.hpp"
 #include "settings.hpp"
 #include "shortcut.hpp"
+#include "input_broker_protocol.hpp"
 #include "snippets.hpp"
 #include "storage.hpp"
 #include "symbols.hpp"
@@ -1448,6 +1449,15 @@ int main() {
     assert(controlAltKHotKey.vk == L'K');
     assert((controlAltKHotKey.modifiers & MOD_CONTROL) != 0);
     assert((controlAltKHotKey.modifiers & MOD_ALT) != 0);
+
+    // The broker may intercept a lone Win key only for a connected launcher
+    // whose selected shortcut is the bare Windows key.
+    for (const auto* shortcutText : {L"Super", L"Super+Space", L"Alt+Space", L"none"}) {
+      const bool enabled = feathercast::shortcut::IsExclusiveWinShortcut(ParseShortcut(shortcutText));
+      assert(feathercast::input_broker::ShouldHandleWinKey(true, enabled) ==
+             (std::wstring_view(shortcutText) == L"Super"));
+      assert(!feathercast::input_broker::ShouldHandleWinKey(false, enabled));
+    }
 
     assert(!ToHotKeySpec(ParseShortcut(L"Super")).supported);
     assert(!ToHotKeySpec(ParseShortcut(L"Super+Space")).supported);

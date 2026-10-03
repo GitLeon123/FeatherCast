@@ -19,6 +19,7 @@ enum class Scope {
   Commands,
   Clipboard,
   Snippets,
+  Settings,
 };
 
 struct Descriptor {
@@ -28,11 +29,12 @@ struct Descriptor {
   std::wstring_view detail;
 };
 
-inline constexpr std::array<Descriptor, 7> kDescriptors = {{
+inline constexpr std::array<Descriptor, 8> kDescriptors = {{
     {Scope::Files, L"@files", L"Files", L"Search file names, paths, and enabled content"},
     {Scope::Apps, L"@apps", L"Apps", L"Search installed apps and quicklinks"},
     {Scope::Games, L"@games", L"Games", L"Search locally installed games"},
     {Scope::Windows, L"@windows", L"Windows", L"Search open windows"},
+    {Scope::Settings, L"@settings", L"Windows Settings", L"Search Windows settings and advanced system tools"},
     {Scope::Commands, L"@commands", L"Commands", L"Search FeatherCast commands"},
     {Scope::Clipboard, L"@clipboard", L"Clipboard", L"Search clipboard history"},
     {Scope::Snippets, L"@snippets", L"Snippets", L"Search reusable snippets"},

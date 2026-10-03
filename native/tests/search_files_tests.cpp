@@ -103,7 +103,7 @@ int main() {
     assert(scope::Token(scope::Scope::All).empty());
 
     const auto allSuggestions = scope::Suggestions(L"@");
-    assert(allSuggestions.size() == 7);
+    assert(allSuggestions.size() == 8);
     const auto fileSuggestions = scope::Suggestions(L"@fi");
     assert(fileSuggestions.size() == 1);
     assert(fileSuggestions.front()->scope == scope::Scope::Files);

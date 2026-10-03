@@ -184,8 +184,8 @@ class LinkSession private constructor(
     }
 
     /** Blocks until the next message arrives; throws on disconnect or tampering. */
-    fun receive(): Payload {
-        val frame = readFrame(dataInput)
+    fun receive(maxBytes: Int = MAX_FRAME_BYTES): Payload {
+        val frame = readFrame(dataInput, maxBytes)
         val plain = Crypto.aesGcmDecrypt(recvKey, counterNonce(recvCounter++), frame)
             ?: throw IOException("Could not decrypt a message from the PC.")
         return unpackPayload(plain) ?: throw IOException("Malformed message from the PC.")
@@ -203,7 +203,8 @@ class LinkSession private constructor(
     }
 
     companion object {
-        fun connect(host: String, port: Int, deviceId: String, linkKey: ByteArray, timeoutMs: Int = 4000): LinkSession {
+        fun connect(host: String, port: Int, deviceId: String, linkKey: ByteArray, timeoutMs: Int = 4000,
+                    screenSessionId: String = ""): LinkSession {
             val socket = openSocket(host, port, timeoutMs)
             try {
                 val input = DataInputStream(socket.getInputStream())
@@ -212,6 +213,7 @@ class LinkSession private constructor(
                 writeFrame(output, message("hello") {
                     put("deviceId", deviceId)
                     put("nonce", Base64Url.encode(phoneNonce))
+                    if (screenSessionId.isNotEmpty()) put("screen", screenSessionId)
                 }.utf8())
                 val challenge = readPlain(input)
                 val pcNonce = Base64Url.decode(challenge.str("nonce"))
