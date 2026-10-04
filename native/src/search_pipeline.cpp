@@ -515,8 +515,9 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
         const auto& item = snapshot->pool[index];
         // Clipboard history stays private to its own view and scope.
         if (item.isClipboard) continue;
-        // FeatherCast's own commands only show up for a near-complete match.
-        if (item.isCommand) {
+        // Commands and Windows settings only show up for a near-complete match.
+        // The windows-settings source includes classic/advanced settings too.
+        if (item.isCommand || item.app.source == L"windows-settings") {
           const auto& searchItem = snapshot->searchItems[index].item;
           std::vector<std::wstring> phrases = searchItem.keywords;
           phrases.push_back(searchItem.name);

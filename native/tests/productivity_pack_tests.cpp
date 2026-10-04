@@ -1223,6 +1223,55 @@ int main() {
   assert(std::any_of(nearCommandResults.flatItems.begin(), nearCommandResults.flatItems.end(),
                      [](const auto& item) { return item.isCommand; }));
 
+  // Modern and advanced Windows settings use the same near-complete name,
+  // keyword, and alias matching as FeatherCast features in general search.
+  auto windowsSettingsSnapshot =
+      std::make_shared<feathercast::app::SearchSnapshot>();
+  for (const auto& entry : feathercast::system_settings::Catalog()) {
+    feathercast::app::DisplayItem item;
+    item.app = entry;
+    feathercast::core::SearchItem searchable;
+    searchable.id = item.Key();
+    searchable.name = entry.name;
+    searchable.kind = L"app";
+    searchable.source = entry.source;
+    searchable.keywords = entry.keywords;
+    searchable.launchTarget = entry.launchTarget;
+    if (entry.id == L"windows-settings:advanced-device-manager") {
+      searchable.aliases = {L"hardware tools"};
+    }
+    windowsSettingsSnapshot->pool.push_back(std::move(item));
+    windowsSettingsSnapshot->searchItems.push_back(
+        feathercast::core::PrepareSearchItem(searchable));
+  }
+  feathercast::app::QueryRequest windowsSettingsRequest;
+  windowsSettingsRequest.limit = 200;
+  windowsSettingsRequest.snapshot = windowsSettingsSnapshot;
+  windowsSettingsRequest.expandedSections.insert(L"Windows Settings");
+  const auto findsWindowsSetting = [&](const wchar_t* query, const wchar_t* id) {
+    windowsSettingsRequest.query = query;
+    const auto results =
+        feathercast::search_pipeline::ComputeResults(windowsSettingsRequest);
+    return std::any_of(results.flatItems.begin(), results.flatItems.end(),
+                       [&](const auto& item) { return item.app.id == id; });
+  };
+  assert(!findsWindowsSetting(L"disp", L"windows-settings:display"));
+  assert(!findsWindowsSetting(L"res", L"windows-settings:display"));
+  assert(!findsWindowsSetting(L"dev man", L"windows-settings:advanced-device-manager"));
+  assert(!findsWindowsSetting(L"hard", L"windows-settings:advanced-device-manager"));
+  assert(!findsWindowsSetting(L"devmgmt.msc", L"windows-settings:advanced-device-manager"));
+  assert(findsWindowsSetting(L"display setting", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"resolution", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"device manage", L"windows-settings:advanced-device-manager"));
+  assert(findsWindowsSetting(L"hardware tool", L"windows-settings:advanced-device-manager"));
+  // Explicit settings browsing retains fuzzy matching and the full catalog.
+  windowsSettingsRequest.scope = feathercast::search_scope::Scope::Settings;
+  assert(findsWindowsSetting(L"disp", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"dev man", L"windows-settings:advanced-device-manager"));
+  windowsSettingsRequest.empty = true;
+  assert(findsWindowsSetting(L"", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"", L"windows-settings:advanced-device-manager"));
+
   // Clipboard history content never shows up in the general search, only in
   // its own view and scope.
   feathercast::app::DisplayItem copiedText;
