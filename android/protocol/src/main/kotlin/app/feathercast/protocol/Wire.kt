@@ -147,9 +147,16 @@ fun counterNonce(counter: Long): ByteArray {
 
 class Payload(val json: String, val binary: ByteArray = ByteArray(0))
 
-fun packPayload(json: String, binary: ByteArray = ByteArray(0)): ByteArray {
+/** Packs the used prefix of a reusable buffer; the returned payload owns its bytes. */
+fun packPayload(json: String, binary: ByteArray = ByteArray(0), binarySize: Int = binary.size): ByteArray {
+    require(binarySize in 0..binary.size) { "Invalid binary length" }
     val jsonBytes = json.utf8()
-    return concat(u32(jsonBytes.size), jsonBytes, binary)
+    require(jsonBytes.size <= MAX_FRAME_BYTES - 4 - binarySize) { "Payload too large" }
+    val payload = ByteArray(4 + jsonBytes.size + binarySize)
+    u32(jsonBytes.size).copyInto(payload)
+    jsonBytes.copyInto(payload, 4)
+    binary.copyInto(payload, 4 + jsonBytes.size, 0, binarySize)
+    return payload
 }
 
 fun unpackPayload(data: ByteArray): Payload? {

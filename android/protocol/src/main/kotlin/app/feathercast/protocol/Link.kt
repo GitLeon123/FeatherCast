@@ -221,9 +221,10 @@ class LinkSession private constructor(
     private var recvCounter = 0L
     private val sendLock = Any()
 
-    fun send(json: String, binary: ByteArray = ByteArray(0)) {
+    fun send(json: String, binary: ByteArray = ByteArray(0), binarySize: Int = binary.size) {
         synchronized(sendLock) {
-            val sealed = Crypto.aesGcmEncrypt(sendKey, counterNonce(sendCounter++), packPayload(json, binary))
+            val payload = packPayload(json, binary, binarySize)
+            val sealed = Crypto.aesGcmEncrypt(sendKey, counterNonce(sendCounter++), payload)
             writeFrame(output, sealed)
         }
     }

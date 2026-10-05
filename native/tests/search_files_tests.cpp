@@ -789,6 +789,52 @@ int main() {
   }
 
   {
+    std::mutex mutex;
+    std::condition_variable ready;
+    feathercast::app::ResultsCollection received;
+    feathercast::files::FileSearchService service(databasePath,
+        [&](feathercast::app::ResultsCollection result) {
+          {
+            std::lock_guard lock(mutex);
+            received = std::move(result);
+          }
+          ready.notify_one();
+        });
+    service.Start();
+    service.UpdateFiles({App(metadataMatch, 20), App(contentOnly, 10)});
+    const auto query = [&](unsigned long long generation,
+                            std::wstring terms, int limit) {
+      assert(service.Query({generation, std::move(terms), limit, true}));
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(3), [&] {
+        return received.generation == generation;
+      }));
+      return received;
+    };
+    assert(query(50, L"sharedterm", 0).flatItems.empty());
+    assert(query(51, L"sharedterm", -10).flatItems.empty());
+    const auto capped = query(52, L"sharedterm", 1);
+    assert(capped.sections.size() == 1 && capped.flatItems.size() == 1);
+    assert(!capped.flatItems.front().app.fileContentMatch);
+    assert(query(53, L"sharedterm", 20).flatItems.size() == 2);
+    // Rebinding a cached statement must not reuse a previous term, and an
+    // empty query must keep the newest-first metadata view without FTS.
+    const auto orphan = query(54, L"orphan", 20);
+    assert(orphan.sections.size() == 1 && orphan.flatItems.size() == 1);
+    assert(orphan.flatItems.front().app.fileContentMatch);
+    assert(orphan.flatItems.front().app.path == contentOnly.wstring());
+    const auto empty = query(55, L"  ", 1);
+    assert(empty.sections.front().title == L"Recently modified");
+    assert(empty.flatItems.front().app.path == metadataMatch.wstring());
+    service.Invalidate(56);
+    assert(query(57, L"sharedterm", 20).flatItems.size() == 2);
+    service.Stop();
+    service.Start();
+    assert(query(58, L"orphan", 20).flatItems.size() == 1);
+    service.Stop();
+  }
+
+  {
     feathercast::storage::Storage storage;
     assert(storage.Open(databasePath));
     assert(storage.ClearFileIndex());

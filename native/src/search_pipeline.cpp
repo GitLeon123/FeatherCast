@@ -51,21 +51,27 @@ bool NearlyEqual(const std::wstring& left, const std::wstring& right) {
   return common * 4 >= left.size() * 3 && common * 4 >= right.size() * 3;
 }
 
-}  // namespace
+struct FeatureQuery {
+  explicit FeatureQuery(const std::wstring& text)
+      : words(LowerWords(text)), joined(JoinWords(words)) {}
+  std::vector<std::wstring> words;
+  std::wstring joined;
+};
 
-bool MatchesFeatureQuery(const std::wstring& query,
+bool MatchesFeatureQuery(const FeatureQuery& query,
                          const std::vector<std::wstring>& phrases) {
-  const auto queryWords = LowerWords(query);
-  const std::wstring joinedQuery = JoinWords(queryWords);
+  const auto& queryWords = query.words;
+  const auto& joinedQuery = query.joined;
   // One or two letters match too much to be worth a feature result.
   if (joinedQuery.size() < 3) return false;
   std::vector<std::wstring> phraseWords;
   for (const auto& phrase : phrases) {
     auto words = LowerWords(phrase);
+    const auto joinedPhrase = JoinWords(words);
     // The whole name, keyword, or alias is (almost) spelled out.
     if (!words.empty() &&
-        (JoinWords(words).starts_with(joinedQuery) ||
-         NearlyEqual(joinedQuery, JoinWords(words)))) return true;
+        (joinedPhrase.starts_with(joinedQuery) ||
+         NearlyEqual(joinedQuery, joinedPhrase))) return true;
     phraseWords.insert(phraseWords.end(), words.begin(), words.end());
   }
   // Several words that each (almost) spell out a word of the feature, such as
@@ -77,11 +83,23 @@ bool MatchesFeatureQuery(const std::wstring& query,
          });
 }
 
-bool MatchesPhoneSuggestion(const std::wstring& query,
+bool MatchesPhoneSuggestion(const FeatureQuery& query,
                             const app::DisplayItem& item) {
   std::vector<std::wstring> phrases = item.commandKeywords;
   phrases.push_back(item.commandName);
   return MatchesFeatureQuery(query, phrases);
+}
+
+}  // namespace
+
+bool MatchesFeatureQuery(const std::wstring& query,
+                         const std::vector<std::wstring>& phrases) {
+  return MatchesFeatureQuery(FeatureQuery(query), phrases);
+}
+
+bool MatchesPhoneSuggestion(const std::wstring& query,
+                            const app::DisplayItem& item) {
+  return MatchesPhoneSuggestion(FeatureQuery(query), item);
 }
 
 namespace {
@@ -493,6 +511,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       // Explicit invocation remains first even when the alias resembles math,
       // a timer or a web-search keyword. Other sections still offer alternatives.
       const auto explicitQuery = core::Normalize(trimmed);
+      const FeatureQuery featureQuery(trimmed);
       std::vector<DisplayItem> aliasInvocations;
       for (std::size_t index = 0; index < snapshot->searchItems.size(); ++index) {
         if ((index & 255u) == 0 && cancelled()) return result;
@@ -546,7 +565,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       // near-complete match of the label shows up in general search.
       for (const auto* descriptorMatch : settings_catalog::Search(request.query)) {
         const auto& descriptor = *descriptorMatch;
-        if (!MatchesFeatureQuery(request.query,
+        if (!MatchesFeatureQuery(featureQuery,
                                  {std::wstring(descriptor.label),
                                   std::wstring(descriptor.accessibleName)})) {
           continue;
@@ -560,20 +579,57 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       }
 
       core::SearchOptions options;
-      // Search the whole corpus before bucketing so a lower-scoring app is
-      // still promoted ahead of a higher-scoring setting or command.
+      // Score the whole corpus before bucketing so a lower-scoring app is
+      // still promoted ahead of a higher-scoring setting or command. Rank
+      // only the selected prefixes of each section, rather than every match.
       options.limit = request.limit > 0 ? snapshot->pool.size() : 0;
       options.maxWorkers = request.maxWorkers;
       options.now = request.now;
       options.generation = request.generation;
       options.latestGeneration = request.latestGeneration;
-      const auto order = core::SearchPrepared(request.query,
-                                               snapshot->searchItems,
-                                               request.recentIds, options);
+      const auto matches = core::SearchPreparedMatches(
+          request.query, snapshot->searchItems, request.recentIds, options);
       if (cancelled()) return result;
+      const auto better = [&](std::size_t left, std::size_t right) {
+        return core::BetterPreparedMatch(matches[left], matches[right],
+                                         snapshot->searchItems);
+      };
+      const auto matchedItem = [&](std::size_t position) -> const DisplayItem& {
+        return snapshot->pool[matches[position].index];
+      };
+      const auto matchedPrepared = [&](std::size_t position)
+          -> const core::PreparedSearchItem& {
+        return snapshot->searchItems[matches[position].index];
+      };
+      const auto best = [&](const std::vector<std::size_t>& positions) {
+        return *std::min_element(positions.begin(), positions.end(), better);
+      };
+      const auto takeRanked = [&](std::vector<std::size_t>& positions,
+                                  std::size_t limit = SIZE_MAX) {
+        std::vector<DisplayItem> output;
+        output.reserve(std::min(positions.size(), limit));
+        std::size_t begin = 0;
+        while (begin < positions.size() && output.size() < limit) {
+          if (cancelled()) break;
+          const auto count = std::min(positions.size() - begin,
+                                      limit - output.size());
+          auto first = positions.begin() + begin;
+          std::partial_sort(first, first + count, positions.end(), better);
+          for (std::size_t offset = 0; offset < count; ++offset) {
+            appendUnique(matchedItem(positions[begin + offset]), output);
+          }
+          begin += count;
+          // If aliases or earlier sections consumed these keys, select the
+          // next ranked prefix too. A fixed top-N list would underfill the
+          // section when duplicate keys appear near its head.
+        }
+        return output;
+      };
       std::vector<std::size_t> hits;
-      hits.reserve(order.size());
-      for (const auto index : order) {
+      hits.reserve(matches.size());
+      for (std::size_t position = 0; position < matches.size(); ++position) {
+        if ((position & 255u) == 0 && cancelled()) return result;
+        const auto index = matches[position].index;
         const auto& item = snapshot->pool[index];
         // Clipboard history stays private to its own view and scope.
         if (item.isClipboard) continue;
@@ -590,9 +646,9 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
               std::find(prepared.normalizedAliases.begin(),
                         prepared.normalizedAliases.end(), explicitQuery) !=
               prepared.normalizedAliases.end();
-          if (!exactAlias && !MatchesFeatureQuery(request.query, phrases)) continue;
+          if (!exactAlias && !MatchesFeatureQuery(featureQuery, phrases)) continue;
         }
-        hits.push_back(index);
+        hits.push_back(position);
       }
       std::vector<std::size_t> games;
       std::vector<std::size_t> apps;
@@ -605,7 +661,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       std::vector<std::size_t> windowsSettings;
       std::vector<std::size_t> other;
       for (const auto index : hits) {
-        const auto& item = snapshot->pool[index];
+        const auto& item = matchedItem(index);
         if (item.isSnippet) {
           snippets.push_back(index);
         } else if (item.isCommand) {
@@ -636,68 +692,69 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       // the query (e.g. the Photos app) keeps the first place.
       std::vector<DisplayItem> phoneSuggestions;
       for (const auto& item : request.phoneSuggestions) {
-        if (MatchesPhoneSuggestion(request.query, item)) phoneSuggestions.push_back(item);
+        if (MatchesPhoneSuggestion(featureQuery, item)) phoneSuggestions.push_back(item);
       }
-      const auto queryWords = LowerWords(request.query);
+      const auto& queryWords = featureQuery.words;
       const bool strongAppMatch =
           !apps.empty() && !queryWords.empty() &&
-          snapshot->searchItems[apps.front()].normalizedName.starts_with(
+          matchedPrepared(best(apps)).normalizedName.starts_with(
               queryWords.front());
 
       const bool hasLaunchableApps = !apps.empty() || !games.empty();
       std::vector<std::size_t> explicitMatches;
       const auto& normalizedQuery = explicitQuery;
-      for (const auto index : order) {
-        const auto& prepared = snapshot->searchItems[index];
+      for (std::size_t index = 0; index < matches.size(); ++index) {
+        const auto& prepared = matchedPrepared(index);
         if (std::find(prepared.normalizedAliases.begin(),
                       prepared.normalizedAliases.end(), normalizedQuery) !=
             prepared.normalizedAliases.end() &&
-            !snapshot->pool[index].isClipboard) {
+            !matchedItem(index).isClipboard) {
           explicitMatches.push_back(index);
         }
       }
       if (explicitMatches.empty()) {
         for (const auto index : hits) {
-          if (snapshot->searchItems[index].normalizedName == normalizedQuery) {
+          if (matchedPrepared(index).normalizedName == normalizedQuery) {
             explicitMatches.push_back(index);
-            break;
           }
         }
+        if (!explicitMatches.empty()) explicitMatches = {best(explicitMatches)};
       }
       if (explicitMatches.empty() && !request.preferredInvocationKey.empty()) {
         for (const auto index : hits) {
-          if (snapshot->pool[index].InvocationKey() == request.preferredInvocationKey) {
+          if (matchedItem(index).InvocationKey() == request.preferredInvocationKey) {
             explicitMatches.push_back(index);
-            break;
           }
         }
+        if (!explicitMatches.empty()) explicitMatches = {best(explicitMatches)};
       }
       if (explicitMatches.empty() && !commands.empty()) {
-        const auto& name = snapshot->searchItems[commands.front()].normalizedName;
+        const auto command = best(commands);
+        const auto& name = matchedPrepared(command).normalizedName;
         if (name == normalizedQuery ||
             (!strongAppMatch && normalizedQuery.size() >= 3 && name.starts_with(normalizedQuery))) {
-          explicitMatches.push_back(commands.front());
+          explicitMatches.push_back(command);
         }
       }
-      addSection(L"Best match", takeMatches(explicitMatches));
+      addSection(L"Best match", takeRanked(explicitMatches));
       if (!strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
       if (hasLaunchableApps) {
-        addSection(L"Apps", takeMatches(apps, 80));
-        addSection(L"Games", takeMatches(games, 80));
+        addSection(L"Apps", takeRanked(apps, 80));
+        addSection(L"Games", takeRanked(games, 80));
       } else if (!hits.empty() && explicitMatches.empty()) {
-        addSection(L"Best match", takeMatches({hits.front()}, 1));
+        addSection(L"Best match", takeMatches({matches[best(hits)].index}, 1));
       }
       if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
-      addSection(L"Windows Settings", takeMatches(windowsSettings, 40));
+      addSection(L"Windows Settings", takeRanked(windowsSettings, 40));
       addSection(L"FeatherCast Settings", take(settingMatches));
       addSection(L"Extensions", take(request.extensionItems, 20));
-      addSection(L"Commands", takeMatches(commands, 20));
-      addSection(L"Snippets", takeMatches(snippets, 20));
-      addSection(L"Files & Folders", takeMatches(files, 40));
-      addSection(L"System Folders", takeMatches(systemFolders, 30));
-      addSection(L"Open windows", takeMatches(windows, 40));
-      addSection(L"System & Store apps", takeMatches(system, 80));
-      addSection(L"Other matches", takeMatches(other, 40));
+      addSection(L"Commands", takeRanked(commands, 20));
+      addSection(L"Snippets", takeRanked(snippets, 20));
+      addSection(L"Files & Folders", takeRanked(files, 40));
+      addSection(L"System Folders", takeRanked(systemFolders, 30));
+      addSection(L"Open windows", takeRanked(windows, 40));
+      addSection(L"System & Store apps", takeRanked(system, 80));
+      addSection(L"Other matches", takeRanked(other, 40));
     }
   }
 

@@ -12,7 +12,7 @@ inline std::size_t TextBytes(const std::vector<std::wstring>& values) {
   return bytes;
 }
 inline std::size_t SearchItemBytes(const core::SearchItem& item) {
-  std::size_t bytes = TextBytes(item.keywords);
+  std::size_t bytes = TextBytes(item.keywords) + TextBytes(item.aliases);
   for (const auto* value : {&item.id, &item.path, &item.kind, &item.source, &item.name,
                           &item.processName, &item.targetPath, &item.launchTarget, &item.exe}) bytes += TextBytes(*value);
   return bytes;
@@ -38,7 +38,7 @@ inline std::size_t SnapshotBytes(const app::SearchSnapshot& snapshot) {
   }
   bytes += snapshot.searchItems.capacity() * sizeof(core::PreparedSearchItem);
   for (const auto& item : snapshot.searchItems) {
-    bytes += SearchItemBytes(item.item) + TextBytes(item.normalizedName) + TextBytes(item.lowerName);
+    bytes += SearchItemBytes(item.item) + TextBytes(item.normalizedName) + TextBytes(item.lowerName) + TextBytes(item.normalizedAliases);
     bytes += item.fields.capacity() * sizeof(core::PreparedField);
     for (const auto& field : item.fields) bytes += TextBytes(field.raw) + TextBytes(field.normalized) + TextBytes(field.tokens) + TextBytes(field.acronym);
   }

@@ -81,6 +81,39 @@ std::string FtsExpression(const std::wstring& terms) {
   return out;
 }
 
+struct QueryCancellation {
+  const std::atomic<unsigned long long>& latest;
+  unsigned long long generation;
+  std::stop_token token;
+
+  bool Cancelled() const {
+    return token.stop_requested() ||
+           latest.load(std::memory_order_acquire) != generation;
+  }
+};
+
+class ScopedContentQuery {
+ public:
+  ScopedContentQuery(sqlite3* database, sqlite3_stmt* statement,
+                      QueryCancellation& cancellation)
+      : database_(database), statement_(statement) {
+    sqlite3_progress_handler(database_, 1000, [](void* context) {
+      return static_cast<QueryCancellation*>(context)->Cancelled() ? 1 : 0;
+    }, &cancellation);
+  }
+  ~ScopedContentQuery() {
+    sqlite3_progress_handler(database_, 0, nullptr, nullptr);
+    sqlite3_reset(statement_);
+    sqlite3_clear_bindings(statement_);
+  }
+  ScopedContentQuery(const ScopedContentQuery&) = delete;
+  ScopedContentQuery& operator=(const ScopedContentQuery&) = delete;
+
+ private:
+  sqlite3* database_;
+  sqlite3_stmt* statement_;
+};
+
 }  // namespace
 
 struct FileSearchService::Corpus {
@@ -120,6 +153,8 @@ void FileSearchService::Stop() {
   }
   cv_.notify_all();
   worker_.join();
+  if (contentStatement_) sqlite3_finalize(contentStatement_);
+  contentStatement_ = nullptr;
   if (database_) sqlite3_close(database_);
   database_ = nullptr;
   std::lock_guard lock(mutex_);
@@ -253,7 +288,7 @@ void FileSearchService::WorkerLoop(std::stop_token token) {
       continue;
     }
     try {
-      auto result = Compute(query);
+      auto result = Compute(query, token);
       if (!token.stop_requested() &&
           generation_.load(std::memory_order_acquire) == query.generation &&
           sink_) {
@@ -265,9 +300,14 @@ void FileSearchService::WorkerLoop(std::stop_token token) {
   }
 }
 
-app::ResultsCollection FileSearchService::Compute(const FileQuery& query) {
+app::ResultsCollection FileSearchService::Compute(const FileQuery& query,
+                                                   std::stop_token token) {
   app::ResultsCollection result;
   result.generation = query.generation;
+  const QueryCancellation cancellation{generation_, query.generation, token};
+  const auto totalLimit = static_cast<std::size_t>(std::max(0, query.limit));
+  if (totalLimit == 0 || cancellation.Cancelled()) return result;
+  const bool empty = core::Trim(query.terms).empty();
   std::shared_ptr<const Corpus> corpus;
   {
     std::lock_guard lock(mutex_);
@@ -277,16 +317,18 @@ app::ResultsCollection FileSearchService::Compute(const FileQuery& query) {
 
   std::set<std::wstring> used;
   std::vector<app::DisplayItem> metadata;
-  if (core::Trim(query.terms).empty()) {
+  metadata.reserve(std::min(corpus->files.size(), totalLimit));
+  if (empty) {
     for (std::size_t i = 0; i < corpus->files.size() &&
-                            metadata.size() < static_cast<std::size_t>(query.limit);
+                            metadata.size() < totalLimit;
          ++i) {
+      if ((i & 63u) == 0 && cancellation.Cancelled()) return result;
       metadata.push_back(Display(corpus->files[i]));
       used.insert(NormalizePath(corpus->files[i].path));
     }
   } else {
     core::SearchOptions options;
-    options.limit = static_cast<std::size_t>(query.limit);
+    options.limit = totalLimit;
     options.maxWorkers = query.maxWorkers;
     options.generation = query.generation;
     options.latestGeneration = &generation_;
@@ -296,18 +338,20 @@ app::ResultsCollection FileSearchService::Compute(const FileQuery& query) {
       used.insert(NormalizePath(corpus->files[index].path));
     }
   }
+  if (cancellation.Cancelled()) return result;
   if (!metadata.empty()) {
-    result.sections.push_back(
-        {core::Trim(query.terms).empty() ? L"Recently modified" : L"Names & paths",
-         metadata});
     result.flatItems.insert(result.flatItems.end(), metadata.begin(), metadata.end());
+    result.sections.push_back(
+        {empty ? L"Recently modified" : L"Names & paths", std::move(metadata)});
   }
 
-  if (query.contentEnabled && !core::Trim(query.terms).empty()) {
+  // Content cannot add a row once metadata filled the requested result limit.
+  // Avoid opening SQLite and ranking FTS matches that would all be discarded.
+  if (query.contentEnabled && !empty && result.flatItems.size() < totalLimit &&
+      !cancellation.Cancelled()) {
     std::vector<app::DisplayItem> content;
-    const auto totalLimit = static_cast<std::size_t>(std::max(0, query.limit));
     const auto ftsLimit = std::max<std::size_t>(40, totalLimit * 2);
-    for (const auto& path : QueryContent(query.terms, ftsLimit)) {
+    for (const auto& path : QueryContent(query, ftsLimit, token)) {
       if (result.flatItems.size() + content.size() >= totalLimit) break;
       const auto normalized = NormalizePath(path);
       if (used.contains(normalized)) continue;
@@ -317,8 +361,8 @@ app::ResultsCollection FileSearchService::Compute(const FileQuery& query) {
       content.push_back(Display(corpus->files[found->second], true));
     }
     if (!content.empty()) {
-      result.sections.push_back({L"Content matches", content});
       result.flatItems.insert(result.flatItems.end(), content.begin(), content.end());
+      result.sections.push_back({L"Content matches", std::move(content)});
     }
   }
   return result;
@@ -339,29 +383,34 @@ bool FileSearchService::EnsureDatabase() {
 }
 
 std::vector<std::wstring> FileSearchService::QueryContent(
-    const std::wstring& terms, std::size_t limit) {
+    const FileQuery& query, std::size_t limit, std::stop_token token) {
   std::vector<std::wstring> paths;
-  const std::string expression = FtsExpression(terms);
-  if (expression.empty() || !EnsureDatabase()) return paths;
-  sqlite3_stmt* statement = nullptr;
-  if (sqlite3_prepare_v2(
+  QueryCancellation cancellation{generation_, query.generation, token};
+  if (cancellation.Cancelled()) return paths;
+  const std::string expression = FtsExpression(query.terms);
+  if (expression.empty() || !EnsureDatabase() || cancellation.Cancelled()) {
+    return paths;
+  }
+  if (!contentStatement_ && sqlite3_prepare_v3(
           database_,
           "SELECT f.path FROM file_content_fts c JOIN file_index f ON f.id=c.rowid "
           "WHERE file_content_fts MATCH ? ORDER BY bm25(file_content_fts) LIMIT ?;",
-          -1, &statement, nullptr) != SQLITE_OK) {
+          -1, SQLITE_PREPARE_PERSISTENT, &contentStatement_, nullptr) != SQLITE_OK) {
     return paths;
   }
+  auto* statement = contentStatement_;
+  ScopedContentQuery reset(database_, statement, cancellation);
   sqlite3_bind_text(statement, 1, expression.c_str(),
                     static_cast<int>(expression.size()), SQLITE_TRANSIENT);
   sqlite3_bind_int64(statement, 2, static_cast<sqlite3_int64>(limit));
-  while (sqlite3_step(statement) == SQLITE_ROW) {
+  while (!cancellation.Cancelled() && sqlite3_step(statement) == SQLITE_ROW) {
     const auto* raw = static_cast<const wchar_t*>(sqlite3_column_text16(statement, 0));
     const int bytes = sqlite3_column_bytes16(statement, 0);
     if (raw && bytes > 0) {
       paths.emplace_back(raw, raw + bytes / static_cast<int>(sizeof(wchar_t)));
     }
   }
-  sqlite3_finalize(statement);
+  if (cancellation.Cancelled()) paths.clear();
   return paths;
 }
 

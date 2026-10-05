@@ -24,9 +24,18 @@ class ScreenMediaQueue {
             }
             ScreenMediaKind.AudioConfig -> packets.removeIf { it.kind == ScreenMediaKind.AudioConfig || it.kind == ScreenMediaKind.Audio }
             ScreenMediaKind.Video -> {
-                val video = packets.filter { it.kind == ScreenMediaKind.Video }
-                val overflow = video.size >= 6 || (video.firstOrNull()?.let { packet.pts - it.pts > 250_000 } == true) ||
-                    packets.sumOf { it.data.size } + packet.data.size > 4 * 1024 * 1024
+                var videoCount = 0
+                var oldestVideo = packet.pts
+                var queuedBytes = 0
+                for (queued in packets) {
+                    queuedBytes += queued.data.size
+                    if (queued.kind == ScreenMediaKind.Video) {
+                        if (videoCount == 0) oldestVideo = queued.pts
+                        videoCount++
+                    }
+                }
+                val overflow = videoCount >= 6 || packet.pts - oldestVideo > 250_000 ||
+                    queuedBytes + packet.data.size > 4 * 1024 * 1024
                 if (overflow) {
                     packets.removeIf { it.kind == ScreenMediaKind.Video }
                     waitingForKeyframe = true
@@ -61,14 +70,24 @@ class ScreenMediaQueue {
 fun screenAnnexB(data: ByteArray): ByteArray {
     if (data.size >= 4 && data[0] == 0.toByte() && data[1] == 0.toByte() &&
         (data[2] == 1.toByte() || (data[2] == 0.toByte() && data[3] == 1.toByte()))) return data
-    val output = java.io.ByteArrayOutputStream()
     var offset = 0
     while (offset + 4 <= data.size) {
         val length = readU32(data, offset)
         if (length <= 0 || length > data.size - offset - 4) break
-        output.write(byteArrayOf(0, 0, 0, 1))
-        output.write(data, offset + 4, length.toInt())
         offset += 4 + length.toInt()
     }
-    return if (offset == data.size && offset > 0) output.toByteArray() else concat(byteArrayOf(0, 0, 0, 1), data)
+    if (offset != data.size || offset == 0) return concat(byteArrayOf(0, 0, 0, 1), data)
+    // A four-byte NAL length becomes a four-byte start code. The output has
+    // exactly the input size, so one copy replaces a growing stream buffer.
+    val output = data.copyOf()
+    offset = 0
+    while (offset < data.size) {
+        val length = readU32(data, offset).toInt()
+        output[offset] = 0
+        output[offset + 1] = 0
+        output[offset + 2] = 0
+        output[offset + 3] = 1
+        offset += 4 + length
+    }
+    return output
 }

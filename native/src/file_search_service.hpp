@@ -15,6 +15,7 @@
 #include <vector>
 
 struct sqlite3;
+struct sqlite3_stmt;
 
 namespace feathercast::files {
 
@@ -65,16 +66,18 @@ class FileSearchService {
   static std::shared_ptr<Corpus> BuildCorpus(std::vector<app::AppEntry> files,
                                              std::uint64_t generation);
   void WorkerLoop(std::stop_token token);
-  app::ResultsCollection Compute(const FileQuery& query);
+  app::ResultsCollection Compute(const FileQuery& query, std::stop_token token);
   bool EnsureDatabase();
-  std::vector<std::wstring> QueryContent(const std::wstring& terms,
-                                         std::size_t limit);
+  std::vector<std::wstring> QueryContent(const FileQuery& query,
+                                         std::size_t limit,
+                                         std::stop_token token);
 
   std::filesystem::path databasePath_;
   ResultSink sink_;
   ErrorSink errors_;
   ProjectionSink projectionSink_;
   sqlite3* database_ = nullptr;
+  sqlite3_stmt* contentStatement_ = nullptr;
   std::jthread worker_;
   std::mutex mutex_;
   std::condition_variable cv_;

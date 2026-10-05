@@ -124,52 +124,57 @@ std::vector<std::wstring> NormalizedSegments(std::wstring_view value) {
 }
 
 bool MatchesSegment(std::wstring_view pattern, std::wstring_view value) {
-  std::vector<bool> previous(value.size() + 1);
-  std::vector<bool> current(value.size() + 1);
-  previous[0] = true;
-  for (const wchar_t patternCharacter : pattern) {
-    std::fill(current.begin(), current.end(), false);
-    if (patternCharacter == L'*') {
-      current[0] = previous[0];
-      for (std::size_t valueIndex = 1; valueIndex <= value.size();
-           ++valueIndex) {
-        current[valueIndex] = previous[valueIndex] || current[valueIndex - 1];
-      }
+  // Only '*' is special within a segment. Remember the most recent star
+  // and extend it on a mismatch instead of allocating two DP rows per name.
+  std::size_t patternIndex = 0;
+  std::size_t valueIndex = 0;
+  std::size_t star = std::wstring_view::npos;
+  std::size_t starEnd = 0;
+  while (valueIndex < value.size()) {
+    if (patternIndex < pattern.size() && pattern[patternIndex] == L'*') {
+      star = patternIndex++;
+      starEnd = valueIndex;
+    } else if (patternIndex < pattern.size() &&
+               pattern[patternIndex] == value[valueIndex]) {
+      ++patternIndex;
+      ++valueIndex;
+    } else if (star != std::wstring_view::npos) {
+      patternIndex = star + 1;
+      valueIndex = ++starEnd;
     } else {
-      for (std::size_t valueIndex = 1; valueIndex <= value.size();
-           ++valueIndex) {
-        current[valueIndex] = previous[valueIndex - 1] &&
-                              patternCharacter == value[valueIndex - 1];
-      }
+      return false;
     }
-    previous.swap(current);
   }
-  return previous[value.size()];
+  while (patternIndex < pattern.size() && pattern[patternIndex] == L'*') {
+    ++patternIndex;
+  }
+  return patternIndex == pattern.size();
 }
 
 bool MatchesSegments(const std::vector<std::wstring>& pattern,
                      const std::vector<std::wstring>& path) {
-  std::vector<std::vector<bool>> matches(
-      pattern.size() + 1, std::vector<bool>(path.size() + 1));
-  matches[0][0] = true;
+  std::vector<bool> previous(path.size() + 1);
+  std::vector<bool> current(path.size() + 1);
+  previous[0] = true;
   for (std::size_t patternIndex = 1; patternIndex <= pattern.size();
        ++patternIndex) {
+    std::fill(current.begin(), current.end(), false);
     if (pattern[patternIndex - 1] == L"**") {
-      matches[patternIndex][0] = matches[patternIndex - 1][0];
+      current[0] = previous[0];
       for (std::size_t pathIndex = 1; pathIndex <= path.size(); ++pathIndex) {
-        matches[patternIndex][pathIndex] =
-            matches[patternIndex - 1][pathIndex] ||
-            matches[patternIndex][pathIndex - 1];
+        current[pathIndex] = previous[pathIndex] || current[pathIndex - 1];
       }
+      previous.swap(current);
       continue;
     }
     for (std::size_t pathIndex = 1; pathIndex <= path.size(); ++pathIndex) {
-      matches[patternIndex][pathIndex] =
-          matches[patternIndex - 1][pathIndex - 1] &&
+      current[pathIndex] =
+          previous[pathIndex - 1] &&
           MatchesSegment(pattern[patternIndex - 1], path[pathIndex - 1]);
     }
+    previous.swap(current);
   }
-  return matches[pattern.size()][path.size()];
+  return previous[path.size()];
 }
 
 class RelativePathExclusionMatcher {
@@ -184,6 +189,7 @@ class RelativePathExclusionMatcher {
   }
 
   bool Matches(std::wstring_view relativePath) const {
+    if (patterns_.empty()) return false;
     const auto pathSegments = NormalizedSegments(relativePath);
     if (pathSegments.empty()) return false;
     return std::any_of(

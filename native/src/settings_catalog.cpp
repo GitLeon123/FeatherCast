@@ -263,8 +263,8 @@ std::vector<const SettingDescriptor*> Search(const std::wstring& query) {
 
   // The catalog never changes, so the search items are built once. Both the
   // Settings window and the launcher's global search use this function.
-  static const std::vector<core::SearchItem> items = [] {
-    std::vector<core::SearchItem> built;
+  static const std::vector<core::PreparedSearchItem> items = [] {
+    std::vector<core::PreparedSearchItem> built;
     built.reserve(Catalog().size());
     for (const auto& descriptor : Catalog()) {
       core::SearchItem item;
@@ -277,12 +277,12 @@ std::vector<const SettingDescriptor*> Search(const std::wstring& query) {
         item.keywords.push_back(std::wstring(category->label));
         item.keywords.push_back(std::wstring(category->accessibleName));
       }
-      built.push_back(std::move(item));
+      built.push_back(core::PrepareSearchItem(item));
     }
     return built;
   }();
 
-  const auto matches = core::Search(trimmed, items);
+  const auto matches = core::SearchPrepared(trimmed, items);
   std::vector<const SettingDescriptor*> results;
   results.reserve(matches.size());
   for (const auto index : matches) results.push_back(&Catalog()[index]);

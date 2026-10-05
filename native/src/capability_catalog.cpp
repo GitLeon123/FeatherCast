@@ -165,19 +165,22 @@ const std::vector<CapabilityDescriptor>& Catalog() {
 
 std::vector<const CapabilityDescriptor*> Search(const std::wstring& query) {
   const auto& catalog = Catalog();
-  std::vector<core::SearchItem> items;
-  items.reserve(catalog.size());
-  for (const auto& descriptor : catalog) {
-    core::SearchItem item;
-    item.id = descriptor.stableId;
-    item.name = descriptor.title;
-    item.source = descriptor.category;
-    item.keywords = descriptor.keywords;
-    item.keywords.push_back(descriptor.summary);
-    item.keywords.push_back(descriptor.example);
-    items.push_back(std::move(item));
-  }
-  const auto matches = core::Search(query, items);
+  static const std::vector<core::PreparedSearchItem> items = [] {
+    std::vector<core::PreparedSearchItem> built;
+    built.reserve(Catalog().size());
+    for (const auto& descriptor : Catalog()) {
+      core::SearchItem item;
+      item.id = descriptor.stableId;
+      item.name = descriptor.title;
+      item.source = descriptor.category;
+      item.keywords = descriptor.keywords;
+      item.keywords.push_back(descriptor.summary);
+      item.keywords.push_back(descriptor.example);
+      built.push_back(core::PrepareSearchItem(item));
+    }
+    return built;
+  }();
+  const auto matches = core::SearchPrepared(query, items);
   std::vector<const CapabilityDescriptor*> results;
   results.reserve(matches.size());
   for (const auto index : matches) results.push_back(&catalog[index]);

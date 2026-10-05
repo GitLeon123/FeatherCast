@@ -179,10 +179,10 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         return sendToSession(active, json, binary)
     }
 
-    private fun sendToSession(active: LinkSession, json: String, binary: ByteArray = ByteArray(0)): Boolean {
+    private fun sendToSession(active: LinkSession, json: String, binary: ByteArray = ByteArray(0), binarySize: Int = binary.size): Boolean {
         if (session !== active) return false
         return try {
-            active.send(json, binary)
+            active.send(json, binary, binarySize)
             true
         } catch (_: IOException) {
             active.close()
@@ -581,8 +581,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             if (transferAcks.size >= app.feathercast.protocol.MAX_STREAM_TRANSFERS) throw IOException("Up to four files can be sent at once.")
             transferAcks[id] = acknowledgment
         }
-        fun sendChecked(json: String, bytes: ByteArray = ByteArray(0)) {
-            if (session !== active || transferEpoch.get() != epoch || id in cancelledTransfers || !sendToSession(active, json, bytes)) {
+        fun sendChecked(json: String, bytes: ByteArray = ByteArray(0), binarySize: Int = bytes.size) {
+            if (session !== active || transferEpoch.get() != epoch || id in cancelledTransfers || !sendToSession(active, json, bytes, binarySize)) {
                 throw IOException("File transfer cancelled or the connection was lost.")
             }
         }
@@ -596,7 +596,9 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 val read = input.read(buffer, 0, minOf(buffer.size.toLong(), size - offset).toInt())
                 if (read < 0) throw IOException("The file changed or could not be read completely.")
                 if (read == 0) continue
-                sendChecked(message("file.chunk") { put("id", id); put("offset", offset) }, buffer.copyOf(read))
+                // Sending is synchronous and packPayload owns the used prefix
+                // before the next read reuses this buffer.
+                sendChecked(message("file.chunk") { put("id", id); put("offset", offset) }, buffer, read)
                 offset += read
                 val percent = if (size == 0L) 100 else offset * 100 / size
                 if (percent != lastPercent) {

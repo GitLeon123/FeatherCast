@@ -78,7 +78,7 @@ inline const std::vector<Symbol>& AllSymbols() {
   return kSymbols;
 }
 
-inline std::vector<feathercast::core::SearchItem>* g_SymbolsSearchItems = nullptr;
+inline std::vector<feathercast::core::PreparedSearchItem>* g_SymbolsSearchItems = nullptr;
 inline std::mutex g_SymbolsMutex;
 
 inline void FreeSymbolsMemory() {
@@ -90,6 +90,7 @@ inline void FreeSymbolsMemory() {
 }
 
 inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) {
+  if (limit == 0) return {};
   query = feathercast::core::Trim(std::move(query));
   if (!query.empty() && query.front() == L':') {
     query.erase(query.begin());
@@ -108,7 +109,7 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
 
   std::lock_guard<std::mutex> lock(g_SymbolsMutex);
   if (!g_SymbolsSearchItems) {
-    g_SymbolsSearchItems = new std::vector<feathercast::core::SearchItem>();
+    g_SymbolsSearchItems = new std::vector<feathercast::core::PreparedSearchItem>();
     g_SymbolsSearchItems->reserve(all.size());
     for (size_t i = 0; i < all.size(); ++i) {
       feathercast::core::SearchItem item;
@@ -118,11 +119,14 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
       item.name = all[i].label;
       item.keywords = all[i].keywords;
       item.keywords.push_back(all[i].value);
-      g_SymbolsSearchItems->push_back(std::move(item));
+      g_SymbolsSearchItems->push_back(feathercast::core::PrepareSearchItem(item));
     }
   }
 
-  const auto order = feathercast::core::Search(query, *g_SymbolsSearchItems);
+  feathercast::core::SearchOptions options;
+  options.limit = limit;
+  const auto order = feathercast::core::SearchPrepared(query, *g_SymbolsSearchItems, {}, options);
+  out.reserve(order.size());
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;

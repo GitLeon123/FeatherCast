@@ -1046,7 +1046,7 @@ int main() {
     };
 
     std::vector<std::wstring> shortStrings{L""};
-    for (int length = 1; length <= 4; ++length) {
+    for (int length = 1; length <= 6; ++length) {
       for (int bits = 0; bits < (1 << length); ++bits) {
         std::wstring value;
         for (int bit = 0; bit < length; ++bit) {
@@ -1058,7 +1058,7 @@ int main() {
     for (const auto& a : shortStrings) {
       for (const auto& b : shortStrings) {
         const int exact = referenceDistance(a, b);
-        for (const int maximum : {1, 2}) {
+        for (const int maximum : {0, 1, 2, 3}) {
           const int bounded = feathercast::core::DamerauLevenshteinDistance(
               a, b, maximum);
           if (bounded != std::min(exact, maximum + 1)) {
@@ -1068,6 +1068,28 @@ int main() {
                        << bounded << L"\n";
           }
           assert(bounded == std::min(exact, maximum + 1));
+        }
+      }
+    }
+    // Exercise row-buffer boundaries, edits near the band edges, and reuse
+    // after switching between stack and larger thread-local buffers.
+    for (const size_t length : {5u, 31u, 62u, 63u, 64u, 65u, 90u}) {
+      std::wstring original;
+      for (size_t i = 0; i < length; ++i) original.push_back(i % 3 == 0 ? L'b' : L'a');
+      auto swapped = original;
+      std::swap(swapped[length / 2], swapped[length / 2 + 1]);
+      auto replaced = original;
+      replaced.front() = L'c';
+      replaced.back() = L'c';
+      const std::vector<std::wstring> variants = {
+          original, swapped, replaced, original.substr(1), L"b" + original};
+      for (const auto& a : variants) {
+        for (const auto& b : variants) {
+          const int exact = referenceDistance(a, b);
+          for (const int maximum : {0, 1, 2, 3}) {
+            assert(feathercast::core::DamerauLevenshteinDistance(a, b, maximum) ==
+                   std::min(exact, maximum + 1));
+          }
         }
       }
     }

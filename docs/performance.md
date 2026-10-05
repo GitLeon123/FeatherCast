@@ -8,6 +8,14 @@ Run `FeatherCastSearchBenchmarks.exe` and `FeatherCastFileSearchBenchmarks.exe` 
 
 The search benchmark also measures full result assembly with a mixed app/file corpus, collapsed and expanded sections, and the Apps scope. It verifies repeatable result checksums and applies Release p95 budgets of 25 ms for 5,000-entry root search, 100 ms for 50,000-entry root search, and 25 ms for Apps scope over 50,000 entries. These budgets use the same CI scaling as the scoring benchmarks. See [search optimization validation](optimization-validation.md) for the measured comparison against the session baseline.
 
+`FeatherCastSearchOptimizationTests.exe` compares prepared built-in catalogs and
+section selection against the uncached, fully sorted search path. It also
+reports warm emoji-search p95 for both paths, including result materialization.
+These comparative timings have no additional machine-specific pass threshold;
+the existing search budgets remain unchanged. See the
+[optimization follow-up](optimization-followup.md) for the broader review,
+validation, and remaining measurement priorities.
+
 ## Text layout and rendering
 
 Run `FeatherCastRenderingPerformanceTests.exe` to check bounded text-layout

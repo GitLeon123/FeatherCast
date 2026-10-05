@@ -59,6 +59,24 @@ class ProtocolTest {
     }
 
     @Test
+    fun reusablePayloadBuffer() {
+        val json = "{\"type\":\"file.chunk\",\"name\":\"Grüße 🌻\"}"
+        val buffer = ByteArray(32) { it.toByte() }
+        for (size in listOf(0, 1, 7, buffer.size)) {
+            val packed = packPayload(json, buffer, size)
+            assertContentEquals(packPayload(json, buffer.copyOf(size)), packed)
+            val payload = unpackPayload(packed)!!
+            assertEquals(json, payload.json)
+            assertContentEquals(buffer.copyOf(size), payload.binary)
+        }
+        val owned = packPayload(json, buffer, 7)
+        buffer.fill(99)
+        assertContentEquals(ByteArray(7) { it.toByte() }, unpackPayload(owned)!!.binary)
+        kotlin.test.assertFailsWith<IllegalArgumentException> { packPayload(json, buffer, -1) }
+        kotlin.test.assertFailsWith<IllegalArgumentException> { packPayload(json, buffer, buffer.size + 1) }
+    }
+
+    @Test
     fun hmacAndHkdfVectors() {
         assertEquals(
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",

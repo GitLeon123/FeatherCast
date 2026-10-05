@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -235,50 +236,62 @@ inline int DamerauLevenshteinDistance(const std::wstring& a, const std::wstring&
   const int n = static_cast<int>(b.size());
   if (std::abs(m - n) > maxDistance) return maxDistance + 1;
 
-  struct ScratchRows {
-    std::vector<int> previousPrevious;
-    std::vector<int> previous;
-    std::vector<int> current;
-  };
-  thread_local ScratchRows scratch;
+  // App-name tokens usually fit here. Stack rows avoid TLS initialization
+  // and heap allocation in the short-lived parallel search workers.
+  constexpr size_t kInlineColumns = 64;
+  std::array<std::array<int, kInlineColumns>, 3> inlineRows;
+  int* previousPrevious = inlineRows[0].data();
+  int* previous = inlineRows[1].data();
+  int* current = inlineRows[2].data();
+  const size_t columns = static_cast<size_t>(n) + 1;
+  if (columns > kInlineColumns) {
+    thread_local std::vector<int> largeRows;
+    largeRows.resize(columns * 3);
+    previousPrevious = largeRows.data();
+    previous = previousPrevious + columns;
+    current = previous + columns;
+  }
   const int outsideBand = maxDistance + 1;
-  scratch.previousPrevious.assign(static_cast<size_t>(n + 1), outsideBand);
-  scratch.previous.assign(static_cast<size_t>(n + 1), outsideBand);
-  scratch.current.assign(static_cast<size_t>(n + 1), outsideBand);
+  std::fill_n(previousPrevious, columns, outsideBand);
+  std::fill_n(previous, columns, outsideBand);
+  std::fill_n(current, columns, outsideBand);
   for (int j = 0; j <= n; ++j) {
-    if (j <= maxDistance) scratch.previous[static_cast<size_t>(j)] = j;
+    if (j <= maxDistance) previous[j] = j;
   }
 
   for (int i = 1; i <= m; ++i) {
-    std::fill(scratch.current.begin(), scratch.current.end(), outsideBand);
-    if (i <= maxDistance) scratch.current[0] = i;
     int rowBest = maxDistance + 1;
     const int firstColumn = std::max(1, i - maxDistance);
     const int lastColumn = std::min(n, i + maxDistance);
+    current[0] = i <= maxDistance ? i : outsideBand;
+    // Every interior cell is overwritten below. Only the band's neighboring
+    // cells can be read by the next row; do not clear the entire token width.
+    if (firstColumn > 1) current[firstColumn - 1] = outsideBand;
+    if (lastColumn < n) current[lastColumn + 1] = outsideBand;
     for (int j = firstColumn; j <= lastColumn; ++j) {
       const int cost = a[static_cast<size_t>(i - 1)] == b[static_cast<size_t>(j - 1)] ? 0 : 1;
       int value = std::min({
-        scratch.previous[static_cast<size_t>(j)] + 1,
-        scratch.current[static_cast<size_t>(j - 1)] + 1,
-        scratch.previous[static_cast<size_t>(j - 1)] + cost,
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost,
       });
       if (i > 1 && j > 1 &&
           a[static_cast<size_t>(i - 1)] == b[static_cast<size_t>(j - 2)] &&
           a[static_cast<size_t>(i - 2)] == b[static_cast<size_t>(j - 1)]) {
         value = std::min(
             value,
-            scratch.previousPrevious[static_cast<size_t>(j - 2)] + 1);
+            previousPrevious[j - 2] + 1);
       }
       value = std::min(value, outsideBand);
-      scratch.current[static_cast<size_t>(j)] = value;
+      current[j] = value;
       rowBest = std::min(rowBest, value);
     }
     if (rowBest > maxDistance && i > maxDistance + 1) return maxDistance + 1;
-    scratch.previousPrevious.swap(scratch.previous);
-    scratch.previous.swap(scratch.current);
+    std::swap(previousPrevious, previous);
+    std::swap(previous, current);
   }
 
-  return scratch.previous[static_cast<size_t>(n)];
+  return previous[n];
 }
 
 inline double ScoreText(const std::wstring& query, const std::wstring& target) {
@@ -379,7 +392,7 @@ struct SearchOptions {
   long long now = 0;
   unsigned long long generation = 0;
   const std::atomic<unsigned long long>* latestGeneration = nullptr;
-  // Zero keeps the historical automatic choice. A caller that shares a
+  // Zero selects a bounded automatic worker count. A caller that shares a
   // machine with the UI can force a smaller cap and avoid transient worker
   // oversubscription on large corpora.
   size_t maxWorkers = 0;
@@ -414,7 +427,11 @@ inline PreparedSearchItem PrepareSearchItem(const SearchItem& item) {
   PreparedSearchItem prepared;
   prepared.item = item;
   prepared.lowerName = Lower(item.name);
-  prepared.fields.reserve(4 + item.aliases.size());
+  prepared.fields.reserve(1 + item.aliases.size() +
+                          (!item.keywords.empty() ? 1 : 0) +
+                          (!item.processName.empty() ? 1 : 0) +
+                          (!item.targetPath.empty() || !item.launchTarget.empty() ||
+                                   !item.exe.empty() ? 1 : 0));
   prepared.fields.push_back(
       PrepareField(item.name, 1.0, SearchFieldKind::Name));
   prepared.normalizedName = prepared.fields.front().normalized;
@@ -425,16 +442,22 @@ inline PreparedSearchItem PrepareSearchItem(const SearchItem& item) {
     prepared.fields.push_back(
         PrepareField(validation.value, 1.0, SearchFieldKind::Alias));
   }
-  prepared.fields.push_back(
-      PrepareField(JoinKeywords(item.keywords), 0.82,
-                   SearchFieldKind::Keywords));
-  prepared.fields.push_back(
-      PrepareField(item.processName, 0.7, SearchFieldKind::Process));
-  prepared.fields.push_back(PrepareField(
-      !item.targetPath.empty()
-          ? item.targetPath
-          : (!item.launchTarget.empty() ? item.launchTarget : item.exe),
-      0.45, SearchFieldKind::Path));
+  // Absent fields cannot match. In particular, static catalogs have no
+  // process or path; retaining those fields costs memory and scoring work.
+  const auto addField = [&](std::wstring text, double weight,
+                            SearchFieldKind kind) {
+    if (text.empty()) return;
+    auto field = PrepareField(std::move(text), weight, kind);
+    if (!field.normalized.empty()) {
+      prepared.fields.push_back(std::move(field));
+    }
+  };
+  addField(JoinKeywords(item.keywords), 0.82, SearchFieldKind::Keywords);
+  addField(item.processName, 0.7, SearchFieldKind::Process);
+  addField(!item.targetPath.empty()
+               ? item.targetPath
+               : (!item.launchTarget.empty() ? item.launchTarget : item.exe),
+           0.45, SearchFieldKind::Path);
   return prepared;
 }
 
@@ -685,10 +708,29 @@ inline double ScorePreparedItem(const std::wstring& normalizedQuery,
       .RankedValue();
 }
 
-inline std::vector<size_t> SearchPrepared(const std::wstring& query,
-                                          const std::vector<PreparedSearchItem>& items,
-                                          const std::set<std::wstring>& recentIds = {},
-                                          SearchOptions options = {}) {
+struct PreparedSearchMatch {
+  size_t index = 0;
+  ItemScore score;
+};
+
+inline bool BetterPreparedMatch(const PreparedSearchMatch& a,
+                                const PreparedSearchMatch& b,
+                                const std::vector<PreparedSearchItem>& items) {
+  if (BetterItemScore(a.score, b.score)) return true;
+  if (BetterItemScore(b.score, a.score)) return false;
+  const auto& aName = items[a.index].lowerName;
+  const auto& bName = items[b.index].lowerName;
+  if (aName != bName) return aName < bName;
+  return a.index < b.index;
+}
+
+// Score once without imposing a global sort. Callers that assemble separate
+// sections can select each section's best matches without sorting the corpus.
+// Nonblank results contain at most options.limit matches, in unspecified order.
+// Blank queries preserve eligible corpus order and carry empty scores.
+inline std::vector<PreparedSearchMatch> SearchPreparedMatches(
+    const std::wstring& query, const std::vector<PreparedSearchItem>& items,
+    const std::set<std::wstring>& recentIds = {}, SearchOptions options = {}) {
   if (options.limit == 0 ||
       (options.latestGeneration &&
        options.latestGeneration->load(std::memory_order_acquire) !=
@@ -703,36 +745,35 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
   };
   if (Trim(query).empty()) {
     const size_t count = std::min(itemCount, options.limit);
-    std::vector<size_t> all;
+    std::vector<PreparedSearchMatch> all;
     all.reserve(count);
     for (size_t i = 0; i < itemCount && all.size() < count; ++i) {
+      if ((i & 63u) == 0 && options.latestGeneration &&
+          options.latestGeneration->load(std::memory_order_acquire) !=
+              options.generation) return {};
       const size_t index = corpusIndex(i);
-      if (index < items.size()) all.push_back(index);
+      if (index < items.size()) all.push_back({index, {}});
     }
     return all;
   }
 
-  struct Scored {
-    size_t index = 0;
-    ItemScore score;
-    const std::wstring* lowerName = nullptr;
-  };
-
   const std::wstring normalizedQuery = Normalize(query);
   const std::vector<std::wstring> queryTokens =
       TokensNormalized(normalizedQuery);
-  const size_t automaticWorkers = itemCount >= 20000 && options.maxWorkers != 1
-      ? std::min<size_t>(4, std::max(1u, std::thread::hardware_concurrency()))
+  // Mid-sized corpora already exceed a frame's scoring budget for typo
+  // queries on one worker. Split them across at most two CPUs; very small
+  // catalogs avoid thread creation, and larger corpora retain the four cap.
+  const size_t automaticWorkers = itemCount >= 5000 && options.maxWorkers != 1
+      ? std::min<size_t>(itemCount < 20000 ? 2 : 4,
+                          std::max(1u, std::thread::hardware_concurrency()))
       : 1;
   const size_t workerCount = options.maxWorkers == 0
       ? automaticWorkers
       : std::clamp(options.maxWorkers, size_t{1}, automaticWorkers);
-  std::vector<std::vector<Scored>> buckets(workerCount);
-  auto better = [](const Scored& a, const Scored& b) {
-    if (BetterItemScore(a.score, b.score)) return true;
-    if (BetterItemScore(b.score, a.score)) return false;
-    if (*a.lowerName != *b.lowerName) return *a.lowerName < *b.lowerName;
-    return a.index < b.index;
+  std::vector<std::vector<PreparedSearchMatch>> buckets(workerCount);
+  auto better = [&](const PreparedSearchMatch& a,
+                    const PreparedSearchMatch& b) {
+    return BetterPreparedMatch(a, b, items);
   };
   auto scoreRange = [&](size_t worker, size_t begin, size_t end) {
     auto& bucket = buckets[worker];
@@ -752,7 +793,7 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
       ItemScore score = ScorePreparedItemDetailed(
           normalizedQuery, queryTokens, items[i], recentIds, options.now);
       if (!score.Matched()) continue;
-      Scored candidate{i, score, &items[i].lowerName};
+      PreparedSearchMatch candidate{i, score};
       if (!bounded) {
         bucket.push_back(std::move(candidate));
       } else if (bucket.size() < options.limit) {
@@ -770,13 +811,16 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
     scoreRange(0, 0, itemCount);
   } else {
     std::vector<std::jthread> workers;
-    workers.reserve(workerCount);
+    workers.reserve(workerCount - 1);
     const size_t chunk = (itemCount + workerCount - 1) / workerCount;
-    for (size_t worker = 0; worker < workerCount; ++worker) {
+    for (size_t worker = 1; worker < workerCount; ++worker) {
       const size_t begin = worker * chunk;
       const size_t end = std::min(itemCount, begin + chunk);
       workers.emplace_back([&, worker, begin, end] { scoreRange(worker, begin, end); });
     }
+    // The caller is already a search worker. Use it for one range instead of
+    // leaving it idle while creating another short-lived thread per query.
+    scoreRange(0, 0, std::min(itemCount, chunk));
     for (auto& worker : workers) worker.join();
   }
   if (options.latestGeneration &&
@@ -786,16 +830,35 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
 
   size_t totalMatches = 0;
   for (const auto& bucket : buckets) totalMatches += bucket.size();
-  std::vector<Scored> scored;
-  scored.reserve(totalMatches);
-  for (auto& bucket : buckets) {
-    scored.insert(scored.end(),
-                  std::make_move_iterator(bucket.begin()),
-                  std::make_move_iterator(bucket.end()));
+  std::vector<PreparedSearchMatch> scored;
+  if (workerCount == 1) {
+    scored = std::move(buckets.front());
+  } else {
+    scored.reserve(totalMatches);
+    for (auto& bucket : buckets) {
+      scored.insert(scored.end(),
+                    std::make_move_iterator(bucket.begin()),
+                    std::make_move_iterator(bucket.end()));
+    }
   }
 
-  std::sort(scored.begin(), scored.end(), better);
-  if (options.limit < scored.size()) scored.resize(options.limit);
+  if (options.limit < scored.size()) {
+    std::nth_element(scored.begin(), scored.begin() + options.limit,
+                     scored.end(), better);
+    scored.resize(options.limit);
+  }
+  return scored;
+}
+
+inline std::vector<size_t> SearchPrepared(
+    const std::wstring& query, const std::vector<PreparedSearchItem>& items,
+    const std::set<std::wstring>& recentIds = {}, SearchOptions options = {}) {
+  auto scored = SearchPreparedMatches(query, items, recentIds, options);
+  if (!scored.empty() && scored.front().score.Matched()) {
+    std::sort(scored.begin(), scored.end(), [&](const auto& a, const auto& b) {
+      return BetterPreparedMatch(a, b, items);
+    });
+  }
 
   std::vector<size_t> out;
   out.reserve(scored.size());

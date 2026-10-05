@@ -57,4 +57,17 @@ class ScreenTest {
         assertContentEquals(annex, screenAnnexB(byteArrayOf(0, 0, 0, 2, 0x67, 2)))
         assertContentEquals(annex, screenAnnexB(byteArrayOf(0x67, 2)))
     }
+
+    @Test fun lengthPrefixedCodecPacketsKeepAllNalsAndInput() {
+        val input = byteArrayOf(0, 0, 0, 2, 0x67, 2, 0, 0, 0, 3, 0x68, 3, 4)
+        val original = input.copyOf()
+        assertContentEquals(byteArrayOf(0, 0, 0, 1, 0x67, 2, 0, 0, 0, 1, 0x68, 3, 4), screenAnnexB(input))
+        assertContentEquals(original, input)
+        for (malformed in listOf(byteArrayOf(), byteArrayOf(0, 0), byteArrayOf(0, 0, 0, 0),
+            byteArrayOf(0, 0, 0, 2, 0x67), input + byteArrayOf(0), byteArrayOf(-1, -1, -1, -1))) {
+            assertContentEquals(concat(byteArrayOf(0, 0, 0, 1), malformed), screenAnnexB(malformed))
+        }
+        val annex = byteArrayOf(0, 0, 1, 0x67, 2)
+        kotlin.test.assertSame(annex, screenAnnexB(annex))
+    }
 }

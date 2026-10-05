@@ -1,17 +1,27 @@
 ﻿# Generates native/src/emoji.hpp from the Unicode emoji-test.txt data file.
 # Includes every fully-qualified emoji except skin-tone variants. The emitted
 # header is committed so the native build stays offline (mirrors gen-icons.ps1).
+# -ReuseData regenerates the search code offline without updating emoji data.
 param(
-  [string]$Source = "https://unicode.org/Public/emoji/latest/emoji-test.txt"
+  [string]$Source = "https://unicode.org/Public/emoji/latest/emoji-test.txt",
+  [switch]$ReuseData
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
 $outPath = Join-Path $PSScriptRoot "..\native\src\emoji.hpp"
-Write-Host "Downloading $Source ..."
-$text = (Invoke-WebRequest -Uri $Source -UseBasicParsing -TimeoutSec 60).Content
-$lines = $text -split "`r?`n"
+$preservedEntries = @()
+if ($ReuseData) {
+  $preservedEntries = @(Get-Content -LiteralPath $outPath -Encoding utf8 |
+    Where-Object { $_ -match '^    \{L"' })
+  if ($preservedEntries.Count -eq 0) { throw 'No existing emoji data to reuse.' }
+  $lines = @()
+} else {
+  Write-Host "Downloading $Source ..."
+  $text = (Invoke-WebRequest -Uri $Source -UseBasicParsing -TimeoutSec 60).Content
+  $lines = $text -split "`r?`n"
+}
 
 # Build a literal for one entry: {L"<value escapes>", L"<label>", {L"kw", ...}}.
 function Escape-Literal([string]$s) {
@@ -22,6 +32,7 @@ $group = ""
 $subgroup = ""
 $entries = New-Object System.Collections.Generic.List[string]
 $seenValues = New-Object System.Collections.Generic.HashSet[string]
+foreach ($entry in $preservedEntries) { $entries.Add($entry) }
 
 foreach ($line in $lines) {
   if ($line.StartsWith("# group:")) { $group = $line.Substring(8).Trim(); continue }
@@ -77,7 +88,7 @@ $header = @"
 namespace feathercast::emoji {
 
 inline std::vector<feathercast::symbols::Symbol>* g_EmojiList = nullptr;
-inline std::vector<feathercast::core::SearchItem>* g_EmojiSearchItems = nullptr;
+inline std::vector<feathercast::core::PreparedSearchItem>* g_EmojiSearchItems = nullptr;
 inline std::mutex g_EmojiMutex;
 
 inline const std::vector<feathercast::symbols::Symbol>& AllEmojiUnlocked();
@@ -109,6 +120,7 @@ $($entries -join "`n")
 }
 
 inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query, size_t limit = 300) {
+  if (limit == 0) return {};
   query = feathercast::core::Trim(std::move(query));
 
   std::lock_guard<std::mutex> lock(g_EmojiMutex);
@@ -123,7 +135,7 @@ inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query,
   }
 
   if (!g_EmojiSearchItems) {
-    g_EmojiSearchItems = new std::vector<feathercast::core::SearchItem>();
+    g_EmojiSearchItems = new std::vector<feathercast::core::PreparedSearchItem>();
     g_EmojiSearchItems->reserve(all.size());
     for (size_t i = 0; i < all.size(); ++i) {
       feathercast::core::SearchItem item;
@@ -132,11 +144,14 @@ inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query,
       item.source = L"emoji";
       item.name = all[i].label;
       item.keywords = all[i].keywords;
-      g_EmojiSearchItems->push_back(std::move(item));
+      g_EmojiSearchItems->push_back(feathercast::core::PrepareSearchItem(item));
     }
   }
 
-  const auto order = feathercast::core::Search(query, *g_EmojiSearchItems);
+  feathercast::core::SearchOptions options;
+  options.limit = limit;
+  const auto order = feathercast::core::SearchPrepared(query, *g_EmojiSearchItems, {}, options);
+  out.reserve(order.size());
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;
