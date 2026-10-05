@@ -133,7 +133,13 @@ void TestCodecs(const std::vector<phone::ScreenPacket>& packets) {
     assert(center[2] > 180 && center[0] < 70 && center[1] < 70);
     std::lock_guard lock(mutex); ++frames; wake.notify_all();
   };
-  callbacks.status = [&](phone::ScreenPacket packet) { std::lock_guard lock(mutex); errors.push_back(packet.detail); wake.notify_all(); };
+  callbacks.status = [&](phone::ScreenPacket packet) {
+    std::fprintf(stderr, "Screen playback status (%s): %s\n", packet.state.c_str(), packet.detail.c_str());
+    // Headless CI hosts may have no audio endpoint. Playback deliberately
+    // reports that as nonfatal and must still decode every video frame.
+    if (packet.state == "audio-error") return;
+    std::lock_guard lock(mutex); errors.push_back(packet.detail); wake.notify_all();
+  };
   phone::ScreenPlayback playback(callbacks); playback.Begin("codec-test"); playback.SetAudio(false, 0);
   // Synchronize with decoded output, so a busy CI host does not turn a codec
   // correctness test into a queue-overflow test that discards its only IDR.
