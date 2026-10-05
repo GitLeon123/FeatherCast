@@ -66,20 +66,6 @@ class ExtensionManager {
     ++latestRequestedGeneration_;
   }
 
-  void OnBackground() {
-    {
-      std::lock_guard cacheLock(cacheMutex_);
-      cache_.clear();
-    }
-    {
-      std::lock_guard pluginsLock(pluginsMutex_);
-      for (const auto& plugin : plugins_) {
-        std::lock_guard ioLock(plugin->ioMutex);
-        StopProcess(*plugin);
-      }
-    }
-  }
-
   void Shutdown() {
     {
       std::lock_guard lock(queryMutex_);
@@ -200,11 +186,10 @@ class ExtensionManager {
     }
     if (!plugin || !plugin->available.load()) return std::nullopt;
 
-    std::string response;
-    if (!SendRequest(*plugin, BuildActivateRequestJson(plugin->manifest, dataDir_, item), timeout, response)) {
-      return std::nullopt;
-    }
-    return ParseActivationResponse(response);
+    const auto response =
+        Exchange(*plugin, BuildActivateRequestJson(plugin->manifest, dataDir_, item), timeout);
+    if (!response) return std::nullopt;
+    return ParseActivationResponse(*response);
   }
 
  private:
@@ -337,16 +322,14 @@ class ExtensionManager {
               continue;
             }
 
-            std::string response;
-            if (!SendRequest(
-                    *plugin,
-                    BuildQueryRequestJson(plugin->manifest, dataDir_, query,
-                                          kDefaultQueryLimit),
-                    std::chrono::milliseconds(250), response)) {
-              continue;
-            }
+            const auto response = Exchange(
+                *plugin,
+                BuildQueryRequestJson(plugin->manifest, dataDir_, query,
+                                      kDefaultQueryLimit),
+                std::chrono::milliseconds(250));
+            if (!response) continue;
 
-            auto parsed = ParseQueryResponse(response, kDefaultQueryLimit);
+            auto parsed = ParseQueryResponse(*response, kDefaultQueryLimit);
             if (!parsed) {
               Log(plugin->manifest.id + L": invalid query response");
               continue;
@@ -400,15 +383,19 @@ class ExtensionManager {
 
     SetHandleInformation(parentStdinWrite, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(parentStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    // CreateFileW reports failure as INVALID_HANDLE_VALUE, not null. Without
+    // NUL the host simply gets no stderr; it must never share the protocol
+    // pipe, where diagnostics would corrupt the response stream.
     childStderr = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (childStderr == INVALID_HANDLE_VALUE) childStderr = nullptr;
 
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = childStdinRead;
     startup.StartupInfo.hStdOutput = childStdoutWrite;
-    startup.StartupInfo.hStdError = childStderr ? childStderr : childStdoutWrite;
+    startup.StartupInfo.hStdError = childStderr;
 
     SIZE_T attributesSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
@@ -418,11 +405,13 @@ class ExtensionManager {
     HANDLE inheritedHandles[] = {
       childStdinRead,
       childStdoutWrite,
-      startup.StartupInfo.hStdError,
+      childStderr,
     };
+    const size_t inheritedCount = childStderr ? 3 : 2;
     if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attributesSize) ||
         !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   inheritedHandles, sizeof(inheritedHandles), nullptr, nullptr)) {
+                                   inheritedHandles, inheritedCount * sizeof(HANDLE), nullptr,
+                                   nullptr)) {
       if (startup.lpAttributeList) DeleteProcThreadAttributeList(startup.lpAttributeList);
       CloseHandleIfSet(childStdinRead);
       CloseHandleIfSet(parentStdinWrite);
@@ -488,62 +477,139 @@ class ExtensionManager {
     plugin.process = process.hProcess;
     plugin.stdinWrite = parentStdinWrite;
     plugin.stdoutRead = parentStdoutRead;
-    return true;
+    return WaitForReady(plugin);
   }
 
-  bool SendRequest(Plugin& plugin, const std::string& request, std::chrono::milliseconds timeout,
-                   std::string& response) {
+  enum class ReadResult { Line, Exited, Failed, TimedOut, TooLarge, Unframed };
+
+  static const wchar_t* ReadFailureReason(ReadResult result) {
+    switch (result) {
+      case ReadResult::Exited: return L"plugin host exited unexpectedly";
+      case ReadResult::TimedOut: return L"plugin host timed out";
+      case ReadResult::TooLarge: return L"plugin host response exceeded 1 MiB";
+      case ReadResult::Unframed: return L"plugin host wrote unexpected output";
+      case ReadResult::Line:
+      case ReadResult::Failed: break;
+    }
+    return L"plugin host read failed";
+  }
+
+  // Reads exactly one protocol line. The host answers each request with one
+  // line, so bytes after the line terminator mean the stream is out of sync.
+  static ReadResult ReadLine(Plugin& plugin, std::chrono::steady_clock::time_point deadline,
+                             std::string& line) {
+    std::string buffer;
+    for (;;) {
+      DWORD available = 0;
+      if (!PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &available, nullptr)) {
+        return GetLastError() == ERROR_BROKEN_PIPE ? ReadResult::Exited : ReadResult::Failed;
+      }
+      if (available > 0) {
+        char chunk[4096];
+        const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(sizeof(chunk)));
+        DWORD read = 0;
+        if (!ReadFile(plugin.stdoutRead, chunk, toRead, &read, nullptr)) return ReadResult::Failed;
+        buffer.append(chunk, chunk + read);
+        if (const size_t newline = buffer.find('\n'); newline != std::string::npos) {
+          if (newline + 1 != buffer.size()) return ReadResult::Unframed;
+          buffer.resize(newline);
+          if (!buffer.empty() && buffer.back() == '\r') buffer.pop_back();
+          line = std::move(buffer);
+          return ReadResult::Line;
+        }
+        if (buffer.size() > kMaxResponseBytes) return ReadResult::TooLarge;
+        continue;
+      }
+      if (!ProcessRunning(plugin.process)) {
+        // Output written right before the exit is still in the pipe.
+        DWORD late = 0;
+        if (PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &late, nullptr) && late > 0) continue;
+        return ReadResult::Exited;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return ReadResult::TimedOut;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+
+  // Waits for the host's ready line. Startup failures are reported from the
+  // host's exit code: a DLL without the extension API or with an unsupported
+  // version can never work, so it is disabled right away instead of being
+  // retried until the strike limit.
+  bool WaitForReady(Plugin& plugin) {
+    std::string line;
+    const ReadResult result =
+        ReadLine(plugin, std::chrono::steady_clock::now() + kHostStartupTimeout, line);
+    if (result == ReadResult::Line) {
+      if (IsHostReadyJson(line)) return true;
+      RecordRequestFailure(plugin, L"plugin host sent an invalid ready line");
+      return false;
+    }
+    if (result == ReadResult::TimedOut) {
+      RecordRequestFailure(plugin, L"plugin host did not become ready");
+      return false;
+    }
+    if (result != ReadResult::Exited) {
+      RecordRequestFailure(plugin, ReadFailureReason(result));
+      return false;
+    }
+
+    DWORD exitCode = STILL_ACTIVE;
+    WaitForSingleObject(plugin.process, 1000);
+    if (!GetExitCodeProcess(plugin.process, &exitCode)) exitCode = STILL_ACTIVE;
+    switch (exitCode) {
+      case kHostExitMissingExports:
+        MarkUnavailable(plugin, L"plugin DLL does not export the FeatherCast extension API");
+        return false;
+      case kHostExitUnsupportedApi:
+        MarkUnavailable(plugin, L"plugin uses an unsupported extension API version");
+        return false;
+      case kHostExitLoadFailed:
+        RecordRequestFailure(plugin, L"plugin DLL could not be loaded");
+        return false;
+      default:
+        RecordRequestFailure(plugin, L"plugin host exited during startup (code " +
+                                         std::to_wstring(exitCode) + L")");
+        return false;
+    }
+  }
+
+  // Sends one request and returns the parsed response document. A line that is
+  // not valid JSON means the stream can no longer be trusted, so the host is
+  // restarted and the failure counts as a strike; later responses are never
+  // read from a desynchronized pipe.
+  std::optional<json::Value> Exchange(Plugin& plugin, const std::string& request,
+                                      std::chrono::milliseconds timeout) {
     std::lock_guard ioLock(plugin.ioMutex);
-    if (!EnsureProcess(plugin)) return false;
+    if (!EnsureProcess(plugin)) return std::nullopt;
+
+    DWORD stale = 0;
+    if (PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &stale, nullptr) && stale > 0) {
+      RecordRequestFailure(plugin, ReadFailureReason(ReadResult::Unframed));
+      return std::nullopt;
+    }
 
     const std::string line = request + "\n";
     DWORD written = 0;
     if (!WriteFile(plugin.stdinWrite, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) ||
         written != line.size()) {
       RecordRequestFailure(plugin, L"plugin host write failed");
-      return false;
+      return std::nullopt;
     }
 
-    std::string buffer;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (!ProcessRunning(plugin.process)) {
-        RecordRequestFailure(plugin, L"plugin host exited unexpectedly");
-        return false;
-      }
-
-      DWORD available = 0;
-      if (!PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &available, nullptr)) {
-        RecordRequestFailure(plugin, L"plugin host read failed");
-        return false;
-      }
-
-      if (available > 0) {
-        char chunk[4096]{};
-        const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(sizeof(chunk)));
-        DWORD read = 0;
-        if (!ReadFile(plugin.stdoutRead, chunk, toRead, &read, nullptr)) {
-          RecordRequestFailure(plugin, L"plugin host read failed");
-          return false;
-        }
-        buffer.append(chunk, chunk + read);
-        if (buffer.size() > kMaxResponseBytes) {
-          RecordRequestFailure(plugin, L"plugin host response exceeded 1 MiB");
-          return false;
-        }
-        if (const size_t newline = buffer.find('\n'); newline != std::string::npos) {
-          response = buffer.substr(0, newline);
-          if (!response.empty() && response.back() == '\r') response.pop_back();
-          RecordRequestSuccess(plugin);
-          return true;
-        }
-      } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      }
+    std::string response;
+    const ReadResult result =
+        ReadLine(plugin, std::chrono::steady_clock::now() + timeout, response);
+    if (result != ReadResult::Line) {
+      RecordRequestFailure(plugin, ReadFailureReason(result));
+      return std::nullopt;
     }
-
-    RecordRequestFailure(plugin, L"plugin host timed out");
-    return false;
+    auto document = json::Parse(response);
+    if (!document) {
+      RecordRequestFailure(plugin, L"plugin host returned invalid JSON");
+      return std::nullopt;
+    }
+    RecordRequestSuccess(plugin);
+    return document;
   }
 
   void RecordRequestSuccess(Plugin& plugin) {
@@ -625,6 +691,9 @@ class ExtensionManager {
   std::atomic<std::size_t> queryConcurrencyLimit_ = 2;
   std::atomic<ULONGLONG> lastQueryRequestTick_ = 0;
   static constexpr ULONGLONG kInteractiveQueryIdleMs = 90;
+  // Budget for starting the host and loading the plugin DLL. Request timeouts
+  // start only after the ready line, so a cold start does not eat into them.
+  static constexpr std::chrono::milliseconds kHostStartupTimeout{2000};
 };
 
 }  // namespace feathercast::extensions

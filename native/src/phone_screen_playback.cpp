@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -23,6 +24,16 @@
 namespace feathercast::phone {
 namespace {
 using Microsoft::WRL::ComPtr;
+
+// Status updates are few, but several can arrive between two worker wakeups
+// (for example "streaming" followed by "stopped"); none of them may be lost.
+constexpr std::size_t kMaxQueuedStatuses = 16;
+
+long long SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 void Check(HRESULT result) {
   if (FAILED(result)) throw std::runtime_error("Windows media operation failed.");
@@ -269,7 +280,8 @@ struct ScreenPlayback::Impl {
   std::mutex mutex;
   std::condition_variable_any wake;
   ScreenPacketBuffer packets;
-  std::optional<ScreenPacket> status;
+  KeyframeThrottle keyframes;
+  std::deque<ScreenPacket> statuses;
   std::string sessionId;
   bool reset = false;
   std::atomic<float> gain{1.0f};
@@ -298,10 +310,11 @@ struct ScreenPlayback::Impl {
     int generation = 0, width = 0, height = 0, audioGeneration = 0;
     std::string decoderSession;
     while (!stop.stop_requested()) {
-      std::optional<ScreenPacket> packet, state;
+      std::optional<ScreenPacket> packet;
+      std::deque<ScreenPacket> states;
       {
         std::unique_lock lock(mutex);
-        const auto ready = [&] { return reset || status.has_value() || packets.Size() > 0; };
+        const auto ready = [&] { return reset || !statuses.empty() || packets.Size() > 0; };
         if (output.client) wake.wait_for(lock, stop, std::chrono::milliseconds(3), ready);
         else wake.wait(lock, stop, ready);
         if (stop.stop_requested()) break;
@@ -310,13 +323,15 @@ struct ScreenPlayback::Impl {
           generation = 0; audioGeneration = 0; videoFailed = false; audioFailed = false;
           firstVideo = true; videoConfig.clear(); decoderSession = sessionId; reset = false;
         }
-        state = std::exchange(status, {});
+        states.swap(statuses);
         packet = packets.Pop();
       }
-      if (state && callbacks.status) callbacks.status(*state);
-      if (state && (state->state == "stopped" || state->state == "error")) {
-        output.Reset(); video.transform.Reset(); audio.transform.Reset();
-        videoFailed = true; audioFailed = true;
+      for (const auto& state : states) {
+        if (callbacks.status) callbacks.status(state);
+        if (state.state == "stopped" || state.state == "error") {
+          output.Reset(); video.transform.Reset(); audio.transform.Reset();
+          videoFailed = true; audioFailed = true;
+        }
       }
       if (packet && packet->sessionId == decoderSession) {
         try {
@@ -379,7 +394,8 @@ ScreenPlayback::~ScreenPlayback() = default;
 
 void ScreenPlayback::Begin(std::string sessionId) {
   std::lock_guard lock(impl_->mutex);
-  impl_->sessionId = std::move(sessionId); impl_->packets.Clear(); impl_->status.reset(); impl_->reset = true;
+  impl_->sessionId = std::move(sessionId); impl_->packets.Clear(); impl_->statuses.clear();
+  impl_->keyframes.Reset(); impl_->reset = true;
   impl_->wake.notify_all();
 }
 
@@ -392,10 +408,12 @@ void ScreenPlayback::OnPacket(ScreenPacket packet) {
     if (packet.sessionId != impl_->sessionId || impl_->sessionId.empty()) return;
     if (packet.kind == ScreenPacketKind::State) {
       if (packet.state == "stopped" || packet.state == "error") impl_->packets.Clear();
-      impl_->status = std::move(packet);
+      if (impl_->statuses.size() >= kMaxQueuedStatuses) impl_->statuses.pop_front();
+      impl_->statuses.push_back(std::move(packet));
     } else {
       recovery.sessionId = packet.sessionId; recovery.generation = packet.generation; recovery.action = "keyframe";
-      if (impl_->packets.Push(std::move(packet))) recovery.sessionId.clear();
+      // Ask for a keyframe at most every 500 ms while delta frames are dropped.
+      if (impl_->packets.Push(std::move(packet)) || !impl_->keyframes.Allow(SteadyMs())) recovery.sessionId.clear();
     }
   }
   impl_->wake.notify_all();

@@ -1,27 +1,13 @@
 #include "snippets_io.hpp"
 
-#include "extension_protocol.hpp"
-#include "json.hpp"
+#include "filesystem_semantics.hpp"
 #include "settings.hpp"
-
-#include <windows.h>
 
 #include <array>
 #include <fstream>
 #include <sstream>
 
 namespace feathercast::snippets_io {
-namespace {
-
-bool ReadString(const json::Value& object, const char* key,
-                std::wstring& output) {
-  const auto* value = object.Find(key);
-  if (!value || value->type != json::Value::Type::String) return false;
-  output = extensions::Utf8ToWide(value->str);
-  return true;
-}
-
-}  // namespace
 
 FileFingerprint Inspect(const std::filesystem::path& path) {
   FileFingerprint fingerprint;
@@ -74,35 +60,21 @@ LoadResult Load(const std::filesystem::path& path) {
     return result;
   }
 
-  const auto root = json::Parse(buffer.str());
-  const auto* items = root && root->type == json::Value::Type::Object
-                          ? root->Find("snippets")
-                          : nullptr;
-  if (!items || items->type != json::Value::Type::Array) {
-    result.status = LoadStatus::Invalid;
-    result.message = L"snippets.json is invalid. Open or reload the file before editing.";
-    return result;
-  }
-
-  for (const auto& value : items->array) {
-    snippets::Snippet snippet;
-    if (value.type != json::Value::Type::Object ||
-        !ReadString(value, "keyword", snippet.keyword) ||
-        !ReadString(value, "name", snippet.name) ||
-        !ReadString(value, "text", snippet.text) ||
-        snippets::Trim(snippet.keyword).empty() ||
-        snippets::Trim(snippet.name).empty() ||
-        snippets::Trim(snippet.text).empty()) {
-      result.snippets.clear();
+  auto parsed = snippets::ParseSnippetsDocument(buffer.str());
+  switch (parsed.status) {
+    case snippets::ParseStatus::Valid:
+      result.snippets = std::move(parsed.snippets);
+      result.status = LoadStatus::Valid;
+      break;
+    case snippets::ParseStatus::InvalidDocument:
+      result.status = LoadStatus::Invalid;
+      result.message = L"snippets.json is invalid. Open or reload the file before editing.";
+      break;
+    case snippets::ParseStatus::InvalidEntry:
       result.status = LoadStatus::Invalid;
       result.message = L"snippets.json contains an invalid entry. Editing is disabled.";
-      return result;
-    }
-    snippet.keyword = snippets::Trim(std::move(snippet.keyword));
-    snippet.name = snippets::Trim(std::move(snippet.name));
-    result.snippets.push_back(std::move(snippet));
+      break;
   }
-  result.status = LoadStatus::Valid;
   return result;
 }
 
@@ -140,24 +112,16 @@ SaveResult Save(const std::filesystem::path& path,
   if (ec) {
     return {false, expected, L"Could not create the snippets directory."};
   }
-  auto temporary = path;
-  temporary += L".tmp";
-  const std::string serialized = Serialize(snippets);
-  {
-    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-    if (!file) return {false, expected, L"Could not create snippets.json.tmp."};
-    file.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
-    file.flush();
-    if (!file) {
-      file.close();
-      std::filesystem::remove(temporary, ec);
+  using filesystem_semantics::ReplaceStatus;
+  switch (filesystem_semantics::ReplaceFileDurably(path, Serialize(snippets))) {
+    case ReplaceStatus::Replaced:
+      break;
+    case ReplaceStatus::CreateFailed:
+      return {false, expected, L"Could not create snippets.json.tmp."};
+    case ReplaceStatus::WriteFailed:
       return {false, expected, L"Could not finish writing snippets.json."};
-    }
-  }
-  if (!MoveFileExW(temporary.c_str(), path.c_str(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    std::filesystem::remove(temporary, ec);
-    return {false, expected, L"Could not replace snippets.json."};
+    case ReplaceStatus::ReplaceFailed:
+      return {false, expected, L"Could not replace snippets.json."};
   }
   return {true, Inspect(path), L"Library saved."};
 }

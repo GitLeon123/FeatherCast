@@ -185,13 +185,54 @@ inline bool IsConnector(const std::wstring& token) {
   return token == L"to" || token == L"in" || token == L"into" || token == L"as";
 }
 
+// Parses the decimal number at the start of `text` ("5", "-3,5", "1.5e3",
+// "10km") and returns its length, or 0 when there is none. A single '.' or ','
+// is the decimal separator, as in the calculator, so "1,5 km" is one and a
+// half kilometers. Unlike wcstod this never reads hex ("0x"), "inf" or "nan",
+// and a second separator ("1.000,5") rejects the number instead of silently
+// cutting it short.
+inline size_t ParseAmount(const std::wstring& text, double& value) {
+  auto digit = [&](size_t index) {
+    return index < text.size() && text[index] >= L'0' && text[index] <= L'9';
+  };
+  size_t pos = 0;
+  if (pos < text.size() && (text[pos] == L'+' || text[pos] == L'-')) ++pos;
+  bool hasDigit = false;
+  bool hasSeparator = false;
+  while (pos < text.size()) {
+    if (digit(pos)) {
+      hasDigit = true;
+      ++pos;
+    } else if ((text[pos] == L'.' || text[pos] == L',') && !hasSeparator) {
+      hasSeparator = true;
+      ++pos;
+    } else {
+      break;
+    }
+  }
+  if (!hasDigit) return 0;
+  if (pos < text.size() && (text[pos] == L'.' || text[pos] == L',')) return 0;
+  // An exponent needs digits, so "5eur" stays 5 followed by "eur".
+  if (pos < text.size() && (text[pos] == L'e' || text[pos] == L'E')) {
+    size_t exponent = pos + 1;
+    if (exponent < text.size() && (text[exponent] == L'+' || text[exponent] == L'-')) ++exponent;
+    if (digit(exponent)) {
+      while (digit(exponent)) ++exponent;
+      pos = exponent;
+    }
+  }
+  std::wstring number = text.substr(0, pos);
+  std::replace(number.begin(), number.end(), L',', L'.');
+  wchar_t* end = nullptr;
+  value = std::wcstod(number.c_str(), &end);
+  if (end != number.c_str() + number.size() || !std::isfinite(value)) return 0;
+  return pos;
+}
+
 // True when the token begins with a parseable number (e.g. "5", "-3.2", "10km").
 inline bool LeadingNumber(const std::wstring& token) {
-  if (token.empty()) return false;
-  const wchar_t* begin = token.c_str();
-  wchar_t* end = nullptr;
-  std::wcstod(begin, &end);
-  return end != begin;
+  double ignored = 0.0;
+  return ParseAmount(token, ignored) > 0;
 }
 
 // Common single-character currency symbols mapped to their ISO-4217 code. Both
@@ -263,12 +304,12 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   }
 
   // Parse the leading numeric amount.
-  const wchar_t* begin = normalized.c_str();
-  wchar_t* numberEnd = nullptr;
-  const double amount = std::wcstod(begin, &numberEnd);
-  if (numberEnd == begin || !std::isfinite(amount)) return std::nullopt;
+  normalized = Trim(std::move(normalized));
+  double amount = 0.0;
+  const size_t numberLength = ParseAmount(normalized, amount);
+  if (numberLength == 0) return std::nullopt;
 
-  std::wstring remainder = Trim(std::wstring(numberEnd));
+  std::wstring remainder = Trim(normalized.substr(numberLength));
   if (remainder.empty()) return std::nullopt;
 
   // Normalize arrow connectors into a spaced word so tokenizing is uniform.
@@ -304,16 +345,23 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   }
   if (fromToken.empty() || toToken.empty()) return std::nullopt;
 
+  const auto& table = UnitTable();
+
   // Currency conversion takes priority when both tokens are known codes.
   if (!rates.empty()) {
-    const std::wstring fromCode = Upper(fromToken);
-    const std::wstring toCode = Upper(toToken);
-    const auto fromRate = rates.find(fromCode);
-    const auto toRate = rates.find(toCode);
+    // A code that is also spelled like a unit ("cup" vs. the Cuban peso CUP)
+    // means the unit unless it is written in capitals.
+    auto currencyRate = [&](const std::wstring& token) {
+      const std::wstring code = Upper(token);
+      if (token != code && table.contains(Lower(token))) return rates.end();
+      return rates.find(code);
+    };
+    const auto fromRate = currencyRate(fromToken);
+    const auto toRate = currencyRate(toToken);
     if (fromRate != rates.end() && toRate != rates.end() && fromRate->second > 0.0) {
       const double usd = amount / fromRate->second;
       const double converted = usd * toRate->second;
-      const std::wstring display = FormatNumber(converted) + L" " + toCode;
+      const std::wstring display = FormatNumber(converted) + L" " + toRate->first;
       return Result{original, display, converted};
     }
     // If exactly one side is a currency code, it is an unresolved currency
@@ -321,7 +369,6 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
     if ((fromRate != rates.end()) != (toRate != rates.end())) return std::nullopt;
   }
 
-  const auto& table = UnitTable();
   const auto fromUnit = table.find(Lower(fromToken));
   const auto toUnit = table.find(Lower(toToken));
   if (fromUnit == table.end() || toUnit == table.end()) return std::nullopt;

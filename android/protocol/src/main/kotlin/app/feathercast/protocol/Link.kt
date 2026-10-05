@@ -1,12 +1,10 @@
 package app.feathercast.protocol
 
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.Closeable
 import java.io.DataInputStream
@@ -40,8 +38,6 @@ fun JsonObject.str(key: String): String =
 fun JsonObject.long(key: String, fallback: Long = 0): Long =
     (this[key] as? JsonPrimitive)?.content?.toLongOrNull() ?: fallback
 
-fun JsonElement.strOrEmpty(): String = (this as? JsonPrimitive)?.jsonPrimitive?.content ?: ""
-
 /** Contents of the pairing QR code shown by FeatherCast on the PC. */
 data class PairingInvite(
     val pcName: String,
@@ -72,12 +68,57 @@ data class PairingInvite(
             if (params["v"] != PROTOCOL_VERSION.toString()) return null
             val key = Base64Url.decode(params["k"] ?: return null) ?: return null
             val token = Base64Url.decode(params["t"] ?: return null) ?: return null
-            val hosts = (params["h"] ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            // Only local network addresses: a pairing link must never point the phone at the internet.
+            val hosts = (params["h"] ?: "").split(',').map { it.trim() }.filter { isLocalNetworkHost(it) }
             val port = params["p"]?.toIntOrNull() ?: DEFAULT_PORT
             if (key.size != 65 || key[0] != 4.toByte() || token.size != 16 ||
                 hosts.isEmpty() || port !in 1..65535) return null
             return PairingInvite(params["n"] ?: "PC", params["id"] ?: "", hosts, port, key, token)
         }
+    }
+}
+
+/**
+ * True for loopback, link-local and private IP literals. Host names are rejected, so this
+ * never resolves DNS.
+ */
+fun isLocalNetworkHost(host: String): Boolean {
+    ipv4Octets(host)?.let { (a, b) ->
+        return a == 10 || a == 127 || (a == 172 && b in 16..31) || (a == 192 && b == 168) || (a == 169 && b == 254)
+    }
+    val groups = ipv6Groups(host.removeSurrounding("[", "]").substringBefore('%')) ?: return false
+    return (groups.subList(0, 7).all { it == 0 } && groups[7] == 1) || // ::1
+        (groups[0] and 0xffc0) == 0xfe80 || // fe80::/10 link-local
+        (groups[0] and 0xfe00) == 0xfc00 // fc00::/7 unique local
+}
+
+/** The first two octets of a dotted-quad IPv4 literal without leading zeros. */
+private fun ipv4Octets(host: String): Pair<Int, Int>? {
+    val parts = host.split('.')
+    if (parts.size != 4) return null
+    val octets = parts.map { part ->
+        if (part.isEmpty() || part.length > 3 || !part.all { it in '0'..'9' } || (part.length > 1 && part[0] == '0')) return null
+        part.toInt().takeIf { it <= 255 } ?: return null
+    }
+    return octets[0] to octets[1]
+}
+
+/** The eight 16-bit groups of a hexadecimal IPv6 literal (no embedded IPv4 form). */
+private fun ipv6Groups(host: String): List<Int>? {
+    if (host.isEmpty() || !host.all { it == ':' || Character.digit(it, 16) >= 0 }) return null
+    fun groups(text: String): List<Int>? = if (text.isEmpty()) emptyList() else text.split(':').map {
+        if (it.isEmpty() || it.length > 4) return null
+        it.toInt(16)
+    }
+    val halves = host.split("::")
+    return when (halves.size) {
+        1 -> groups(host)?.takeIf { it.size == 8 }
+        2 -> {
+            val head = groups(halves[0]) ?: return null
+            val tail = groups(halves[1]) ?: return null
+            if (head.size + tail.size > 7) null else head + List(8 - head.size - tail.size) { 0 } + tail
+        }
+        else -> null
     }
 }
 
@@ -96,8 +137,11 @@ private fun openSocket(host: String, port: Int, timeoutMs: Int): Socket {
     }
 }
 
+/** Writes `[u32 BE length][body]` without copying the body into a second buffer. */
 private fun writeFrame(out: OutputStream, body: ByteArray) {
-    out.write(encodeFrame(body))
+    require(body.size <= MAX_FRAME_BYTES) { "Frame too large" }
+    out.write(u32(body.size))
+    out.write(body)
     out.flush()
 }
 
@@ -168,6 +212,7 @@ class LinkSession private constructor(
     private val recvKey: ByteArray,
     val pcName: String,
     val host: String,
+    val fileStreamSupported: Boolean = false,
 ) : Closeable {
     private val input: InputStream = socket.getInputStream()
     private val dataInput = DataInputStream(input)
@@ -235,6 +280,7 @@ class LinkSession private constructor(
                     Crypto.hkdf(linkKey, salt, Labels.PC_TO_PHONE, 32),
                     welcome.str("pcName").ifEmpty { challenge.str("pcName") },
                     host,
+                    (welcome["fileStream"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
                 )
             } catch (error: Exception) {
                 socket.close()

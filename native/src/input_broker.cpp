@@ -2,8 +2,12 @@
 #include <sddl.h>
 #include "input_broker_protocol.hpp"
 #include "input_broker_task.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
+#include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -29,42 +33,174 @@ struct WinState {
 
 std::wstring GetProcessIntegrityLevel(HANDLE process);
 
-std::mutex g_logMutex;
-void AppendBrokerLog(const wchar_t* text) {
-  if (!text || !text[0]) return;
-  // An elevated broker must not open log files in a user-writable directory.
-  static const auto integrity = GetProcessIntegrityLevel(GetCurrentProcess());
-  if (integrity == L"HIGH" || integrity == L"SYSTEM") {
-    OutputDebugStringW(text);
-    return;
+// Diagnostic log. The keyboard hook runs on the message-loop thread and must
+// return well inside the system hook timeout, so no caller does file I/O:
+// lines go into a bounded ring under a very short lock and a dedicated thread
+// writes them out. Overflow drops lines (and says so) instead of blocking.
+class BrokerLog {
+ public:
+  void Start() {
+    std::lock_guard lock(mutex_);
+    if (thread_.joinable()) return;
+    stop_ = false;
+    thread_ = std::thread([this] { Run(); });
   }
-  try {
-    std::lock_guard lock(g_logMutex);
-    wchar_t local[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) == 0) return;
-    std::wstring path = std::wstring(local) + L"\\FeatherCast\\broker.log";
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
-      fputws(text, f);
-      fclose(f);
+
+  // Writes everything still queued, then ends the writer thread.
+  void Stop() {
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
     }
-  } catch (...) {
+    wake_.notify_one();
+    if (thread_.joinable()) thread_.join();
   }
-  OutputDebugStringW(text);
-}
+
+  void Post(const wchar_t* text) {
+    if (!text || !text[0]) return;
+    {
+      std::lock_guard lock(mutex_);
+      Enqueue(text);
+    }
+    wake_.notify_one();
+  }
+
+  // For the keyboard hook: never waits, drops the line if the queue is busy.
+  void TryPost(const wchar_t* text) {
+    if (!text || !text[0]) return;
+    {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock()) {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      Enqueue(text);
+    }
+    wake_.notify_one();
+  }
+
+ private:
+  static constexpr std::size_t kCapacity = 256;
+  static constexpr std::size_t kLineChars = 192;
+  struct Line {
+    wchar_t text[kLineChars];
+  };
+
+  // Caller holds mutex_.
+  void Enqueue(const wchar_t* text) {
+    if (count_ == kCapacity) {
+      dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    Line& line = ring_[(head_ + count_) % kCapacity];
+    wcsncpy_s(line.text, text, _TRUNCATE);
+    ++count_;
+  }
+
+  void Run() {
+    std::vector<Line> batch;
+    batch.reserve(kCapacity);
+    for (;;) {
+      bool stopping = false;
+      {
+        std::unique_lock lock(mutex_);
+        wake_.wait(lock, [this] { return stop_ || count_ > 0; });
+        batch.clear();
+        while (count_ > 0) {
+          batch.push_back(ring_[head_]);
+          head_ = (head_ + 1) % kCapacity;
+          --count_;
+        }
+        stopping = stop_;
+      }
+      try {
+        const unsigned dropped = dropped_.exchange(0, std::memory_order_relaxed);
+        if (dropped != 0) {
+          Line note{};
+          swprintf_s(note.text, L"[Broker] %u log lines dropped\n", dropped);
+          batch.push_back(note);
+        }
+        Write(batch);
+      } catch (...) {
+      }
+      if (stopping) return;
+    }
+  }
+
+  static void Write(const std::vector<Line>& lines) {
+    if (lines.empty()) return;
+    // An elevated broker must not open log files in a user-writable directory.
+    static const auto integrity = GetProcessIntegrityLevel(GetCurrentProcess());
+    FILE* file = nullptr;
+    if (integrity != L"HIGH" && integrity != L"SYSTEM") {
+      wchar_t local[MAX_PATH]{};
+      const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+      if (length != 0 && length < MAX_PATH) {
+        const std::wstring path = std::wstring(local) + L"\\FeatherCast\\broker.log";
+        if (_wfopen_s(&file, path.c_str(), L"a, ccs=UTF-8") != 0) file = nullptr;
+      }
+    }
+    for (const Line& line : lines) {
+      if (file) fputws(line.text, file);
+      OutputDebugStringW(line.text);
+    }
+    if (file) fclose(file);
+  }
+
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::thread thread_;
+  std::array<Line, kCapacity> ring_{};
+  std::size_t head_ = 0;
+  std::size_t count_ = 0;
+  bool stop_ = false;
+  std::atomic<unsigned> dropped_{0};
+};
+
+BrokerLog g_brokerLog;
+
+// Ends the log thread (after flushing) on every exit path of wWinMain.
+struct BrokerLogScope {
+  BrokerLogScope() { g_brokerLog.Start(); }
+  ~BrokerLogScope() { g_brokerLog.Stop(); }
+  BrokerLogScope(const BrokerLogScope&) = delete;
+  BrokerLogScope& operator=(const BrokerLogScope&) = delete;
+};
+
+void AppendBrokerLog(const wchar_t* text) { g_brokerLog.Post(text); }
+void AppendBrokerLogFromHook(const wchar_t* text) { g_brokerLog.TryPost(text); }
 
 std::wstring ProcessPath(DWORD pid) {
   if (pid == 0) return {};
   HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
   if (!process) return {};
-  wchar_t buffer[MAX_PATH]{};
-  DWORD size = MAX_PATH;
-  if (QueryFullProcessImageNameW(process, 0, buffer, &size)) {
-    CloseHandle(process);
-    return std::wstring(buffer, size);
+  // Long paths do not fit MAX_PATH; grow the buffer instead of rejecting them.
+  std::wstring buffer(MAX_PATH, L'\0');
+  std::wstring result;
+  for (;;) {
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size)) {
+      buffer.resize(size);
+      result = std::move(buffer);
+      break;
+    }
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || buffer.size() >= 32768) break;
+    buffer.resize(buffer.size() * 2);
   }
   CloseHandle(process);
-  return {};
+  return result;
+}
+
+// Windows paths are case-insensitive: compare ordinally, ignoring case, so a
+// differently-cased but identical path is still recognised (and nothing
+// locale-dependent can make two different paths equal).
+bool PathsEqualIgnoreCase(const std::wstring& left, const std::wstring& right) {
+  if (left.empty() || right.empty() || left.size() > INT_MAX || right.size() > INT_MAX) {
+    return false;
+  }
+  return CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()),
+                              right.c_str(), static_cast<int>(right.size()),
+                              TRUE) == CSTR_EQUAL;
 }
 
 std::wstring ProcessName(DWORD pid) {
@@ -104,29 +240,6 @@ std::wstring GetProcessIntegrityLevel(HANDLE process) {
   if (rid < SECURITY_MANDATORY_HIGH_RID) return L"MEDIUM";
   if (rid < SECURITY_MANDATORY_SYSTEM_RID) return L"HIGH";
   return L"SYSTEM";
-}
-
-std::wstring GetVkName(UINT vk, DWORD scanCode, DWORD flags) {
-  if (vk == VK_LWIN) return L"LWIN";
-  if (vk == VK_RWIN) return L"RWIN";
-  if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return L"SHIFT";
-  if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return L"CTRL";
-  if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return L"ALT";
-  if (vk == VK_TAB) return L"TAB";
-  if (vk == VK_RETURN) return L"ENTER";
-  if (vk == VK_ESCAPE) return L"ESC";
-  if (vk == VK_SPACE) return L"SPACE";
-  if (vk >= 'A' && vk <= 'Z') return std::wstring(1, static_cast<wchar_t>(vk));
-  if (vk >= '0' && vk <= '9') return std::wstring(1, static_cast<wchar_t>(vk));
-  LONG lParam = static_cast<LONG>(scanCode << 16);
-  if (flags & LLKHF_EXTENDED) lParam |= (1 << 24);
-  wchar_t name[64]{};
-  if (GetKeyNameTextW(lParam, name, 64) > 0) {
-    return name;
-  }
-  wchar_t fallback[32]{};
-  swprintf_s(fallback, L"0x%02X", vk);
-  return fallback;
 }
 
 std::mutex g_appMutex;
@@ -232,7 +345,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       if (vk == VK_RWIN) g_win.rightDown = true;
       if (!wasAlreadyDown) g_win.hadOtherKey = false;
 
-      AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN DOWN PASS\n" : L"[Broker] LWIN DOWN PASS\n");
+      AppendBrokerLogFromHook((vk == VK_RWIN) ? L"[Broker] RWIN DOWN PASS\n" : L"[Broker] LWIN DOWN PASS\n");
       return CallNextHookEx(nullptr, nCode, wParam, lParam);
     } else {
       const bool wasLeftDown = g_win.leftDown;
@@ -244,7 +357,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (!g_win.leftDown && !g_win.rightDown) {
           g_win.hadOtherKey = false;
         }
-        AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN UP COMBO\n" : L"[Broker] LWIN UP COMBO\n");
+        AppendBrokerLogFromHook((vk == VK_RWIN) ? L"[Broker] RWIN UP COMBO\n" : L"[Broker] LWIN UP COMBO\n");
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
       } else {
         // Ignore a release whose press occurred while the shortcut was disabled.
@@ -253,7 +366,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
         // Solo Win tap!
-        AppendBrokerLog((vk == VK_RWIN) ? L"[Broker] RWIN UP SOLO -> MASK & TRIGGER\n" : L"[Broker] LWIN UP SOLO -> MASK & TRIGGER\n");
+        AppendBrokerLogFromHook((vk == VK_RWIN) ? L"[Broker] RWIN UP SOLO -> MASK & TRIGGER\n" : L"[Broker] LWIN UP SOLO -> MASK & TRIGGER\n");
 
         // 1. Send mask key (0xE8 down and up) to suppress Windows Start menu.
         // 0xE8 (VK_OEM_RESET) is unassigned in Windows keyboard layouts and is the standard
@@ -284,11 +397,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (g_win.leftDown || g_win.rightDown) {
     if (vk != VK_LWIN && vk != VK_RWIN) {
       if (!isUp) {
+        // Only the fact is logged, never which key: the hook sees everything
+        // typed while Win is held, and a key log does not belong in a file.
+        if (!g_win.hadOtherKey) {
+          AppendBrokerLogFromHook(L"[Broker] other key: YES\n");
+        }
         g_win.hadOtherKey = true;
-        const std::wstring keyName = GetVkName(vk, k->scanCode, k->flags);
-        wchar_t buf[256]{};
-        swprintf_s(buf, L"[Broker] other key: YES (%ls)\n", keyName.c_str());
-        AppendBrokerLog(buf);
       }
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -327,25 +441,47 @@ void RunPipeServer(HWND msgHwnd) {
   sa.lpSecurityDescriptor = sd;
   sa.bInheritHandle = FALSE;
 
-  while (!g_stopPipeServer.load()) {
-    HANDLE pipe = CreateNamedPipeW(
+  // The only client is the FeatherCast.exe installed next to this broker.
+  const std::wstring selfPath = ProcessPath(GetCurrentProcessId());
+  if (selfPath.empty()) {
+    AppendBrokerLog(L"[Broker] Cannot resolve the broker path. Exiting.\n");
+    LocalFree(sd);
+    PostMessageW(msgHwnd, WM_QUIT, 0, 0);
+    return;
+  }
+  const std::wstring expectedClientPath =
+      (std::filesystem::path(selfPath).parent_path() / L"FeatherCast.exe").wstring();
+
+  // The instance is created once, as the first one for this name, and kept for
+  // the life of the broker. Another process can therefore neither create the
+  // name before the broker nor take it over between two connections; if the
+  // name is already taken, this broker must not serve anyone.
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  for (int attempt = 0; attempt < 10 && !g_stopPipeServer.load(); ++attempt) {
+    pipe = CreateNamedPipeW(
         kPipeName.c_str(),
-        PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1,
         1024, 1024, 0,
         &sa);
+    if (pipe != INVALID_HANDLE_VALUE) break;
+    Sleep(200);
+  }
+  if (pipe == INVALID_HANDLE_VALUE) {
+    AppendBrokerLog(L"[Broker] Could not create the first pipe instance. Exiting.\n");
+    LocalFree(sd);
+    PostMessageW(msgHwnd, WM_QUIT, 0, 0);
+    return;
+  }
 
-    if (pipe == INVALID_HANDLE_VALUE) {
-      Sleep(500);
-      continue;
-    }
-
+  while (!g_stopPipeServer.load()) {
     AppendBrokerLog(L"[Broker] Named pipe listening for FeatherCast...\n");
 
     const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
     if (!connected) {
-      CloseHandle(pipe);
+      DisconnectNamedPipe(pipe);
+      Sleep(50);
       continue;
     }
 
@@ -357,8 +493,7 @@ void RunPipeServer(HWND msgHwnd) {
         GetNamedPipeClientProcessId(pipe, &clientPid) && clientPid == reg.pid &&
         GetWindowThreadProcessId(reinterpret_cast<HWND>(reg.hwnd), &windowPid) == reg.threadId &&
         windowPid == reg.pid &&
-        std::filesystem::path(ProcessPath(reg.pid)) ==
-            std::filesystem::path(ProcessPath(GetCurrentProcessId())).parent_path() / L"FeatherCast.exe") {
+        PathsEqualIgnoreCase(ProcessPath(reg.pid), expectedClientPath)) {
       {
         std::lock_guard lock(g_appMutex);
         g_appReg = reg;
@@ -400,6 +535,7 @@ void RunPipeServer(HWND msgHwnd) {
       AppendBrokerLog(L"[Broker] App disconnected. Exiting broker.\n");
       DisconnectNamedPipe(pipe);
       CloseHandle(pipe);
+      pipe = INVALID_HANDLE_VALUE;
 
       // When the connected app exits or disconnects, the broker exits cleanly too
       if (msgHwnd) {
@@ -408,9 +544,11 @@ void RunPipeServer(HWND msgHwnd) {
       break;
     }
 
-    CloseHandle(pipe);
+    // Not the FeatherCast next to this broker: drop the client, keep the pipe.
+    DisconnectNamedPipe(pipe);
   }
 
+  if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
   if (sd) LocalFree(sd);
 }
 
@@ -421,6 +559,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
       (GetCommandLineW() && wcsstr(GetCommandLineW(), L"--self-test"))) {
     return 0;
   }
+
+  const BrokerLogScope logScope;
 
   // Ensure single broker instance
   HANDLE mutex = CreateMutexW(nullptr, TRUE, kBrokerMutexName.c_str());

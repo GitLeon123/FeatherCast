@@ -32,14 +32,16 @@ class LinkService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val link = LinkManager.instance
-        if (PhoneApp.instance.store.load() == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        // startForegroundService() requires startForeground() before the service may stop itself.
         val type = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
         try {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(link.state.value), type)
         } catch (_: Exception) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (PhoneApp.instance.store.load() == null || !LocalNetworkAccess.allowed(this)) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }

@@ -12,6 +12,7 @@ import android.os.SystemClock
 import app.feathercast.protocol.MediaInfo
 import app.feathercast.protocol.PhoneMessages
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 
 /**
  * Follows the active media session (Spotify, YouTube, …) and reports it to the
@@ -23,8 +24,13 @@ object MediaWatcher {
     private var manager: MediaSessionManager? = null
     private var controller: MediaController? = null
     private var lastTrack = ""
-    private var lastJson = ""
+    private var sentNone = false
+    private val updates = MediaUpdateFilter()
+    private var labelPackage = ""
+    private var label = ""
     private val sendNow = Runnable { send() }
+    // Album art is scaled and compressed off the main thread; one worker keeps updates in order.
+    private val worker = Executors.newSingleThreadExecutor()
 
     private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         pick(controllers.orEmpty())
@@ -70,7 +76,9 @@ object MediaWatcher {
     fun sendSnapshot() {
         main.post {
             lastTrack = ""
-            lastJson = ""
+            sentNone = false
+            updates.reset()
+            labelPackage = ""
             if (manager != null) refresh() else start(PhoneApp.instance)
         }
     }
@@ -80,6 +88,10 @@ object MediaWatcher {
         manager = null
         controller?.unregisterCallback(callback)
         controller = null
+        updates.reset()
+        sentNone = false
+        lastTrack = ""
+        labelPackage = ""
         main.removeCallbacks(sendNow)
     }
 
@@ -115,10 +127,11 @@ object MediaWatcher {
         val active = controller
         val metadata = active?.metadata
         if (active == null || metadata == null) {
-            if (lastJson != "none") {
-                lastJson = "none"
+            if (!sentNone) {
+                sentNone = true
+                updates.reset()
                 lastTrack = ""
-                link.sendAsync(PhoneMessages.mediaNone())
+                worker.execute { link.send(PhoneMessages.mediaNone()) }
             }
             return
         }
@@ -131,13 +144,17 @@ object MediaWatcher {
             ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE).orEmpty()
         val now = System.currentTimeMillis()
         var position = state?.position ?: 0L
-        if (playing && state != null && state.lastPositionUpdateTime > 0) {
+        if (playing && state.lastPositionUpdateTime > 0) {
             position += ((SystemClock.elapsedRealtime() - state.lastPositionUpdateTime) * state.playbackSpeed).toLong()
         }
         val info = active.playbackInfo
+        if (labelPackage != active.packageName) {
+            labelPackage = active.packageName
+            label = appLabel(labelPackage)
+        }
         val media = MediaInfo(
             app = active.packageName,
-            appName = appLabel(active.packageName),
+            appName = label,
             title = title,
             artist = artist,
             playing = playing,
@@ -147,15 +164,13 @@ object MediaWatcher {
             volume = info?.currentVolume ?: -1,
             volumeMax = info?.maxVolume ?: 0,
         )
-        val json = PhoneMessages.mediaState(media)
-        // Skip repeats that only differ in the timestamp.
-        val signature = json.replace(Regex("\"(pos|posAt)\":\\d+"), "")
+        if (!updates.shouldSend(media, state?.playbackSpeed ?: 1f)) return
+        sentNone = false
         val track = "${active.packageName}|$title|$artist"
-        if (signature == lastJson && track == lastTrack) return
-        lastJson = signature
-        val art = if (track != lastTrack) artJpeg(metadata) else ByteArray(0)
+        val newTrack = track != lastTrack
         lastTrack = track
-        link.sendAsync(json, art)
+        val json = PhoneMessages.mediaState(media)
+        worker.execute { link.send(json, if (newTrack) artJpeg(metadata) else ByteArray(0)) }
     }
 
     private fun appLabel(pkg: String): String {
@@ -179,7 +194,13 @@ object MediaWatcher {
             } else {
                 bitmap
             }
-            ByteArrayOutputStream().also { scaled.compress(Bitmap.CompressFormat.JPEG, 85, it) }.toByteArray()
+            try {
+                val output = ByteArrayOutputStream()
+                if (scaled.compress(Bitmap.CompressFormat.JPEG, 85, output)) output.toByteArray() else ByteArray(0)
+            } finally {
+                // Metadata retains the original bitmap; only release our copy.
+                if (scaled !== bitmap) scaled.recycle()
+            }
         } catch (_: Exception) {
             ByteArray(0)
         }

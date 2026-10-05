@@ -12,6 +12,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace feathercast::theme {
 
@@ -24,9 +25,9 @@ struct Color {
 
 struct Theme {
   std::wstring fontFamily = L"Segoe UI Variable Text";
-  // Obsidian dark panel at ~92 % opacity over real DirectComposition transparency.
-  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.92f};
-  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.92f};
+  // Solid neutral dark grey (#191919), without desktop blur or translucency.
+  Color overlayBackground{25.0f / 255.0f, 25.0f / 255.0f, 25.0f / 255.0f, 1.0f};
+  Color settingsBackground{25.0f / 255.0f, 25.0f / 255.0f, 25.0f / 255.0f, 1.0f};
   Color border{1.0f, 1.0f, 1.0f, 0.08f};
   Color divider{1.0f, 1.0f, 1.0f, 0.08f};
   // surface: #18181B – modern Tailwind Zinc-900 slate grey.
@@ -51,6 +52,41 @@ struct Theme {
   float rowRadius = 6.0f;
   float controlRadius = 8.0f;
 };
+
+// Family used when none of the configured families is installed.
+inline constexpr wchar_t kFallbackFontFamily[] = L"Segoe UI";
+
+// Splits a CSS-style family list ("Segoe UI Variable Text, Inter, Segoe UI")
+// into trimmed, non-empty names in priority order.
+inline std::vector<std::wstring> FontFamilyCandidates(
+    const std::wstring& list) {
+  std::vector<std::wstring> names;
+  std::size_t start = 0;
+  while (start <= list.size()) {
+    const std::size_t comma = list.find(L',', start);
+    const std::size_t end = comma == std::wstring::npos ? list.size() : comma;
+    std::size_t first = start;
+    std::size_t last = end;
+    while (first < last && std::iswspace(list[first])) ++first;
+    while (last > first && std::iswspace(list[last - 1])) --last;
+    if (first < last) names.push_back(list.substr(first, last - first));
+    if (comma == std::wstring::npos) break;
+    start = comma + 1;
+  }
+  return names;
+}
+
+// First family of `list` accepted by `isInstalled`, otherwise the fallback.
+// DirectWrite and GDI both substitute a default face for an unknown name
+// instead of failing, so availability has to be checked explicitly.
+template <typename Predicate>
+std::wstring ResolveFontFamily(const std::wstring& list,
+                               Predicate&& isInstalled) {
+  for (const auto& family : FontFamilyCandidates(list)) {
+    if (isInstalled(family)) return family;
+  }
+  return kFallbackFontFamily;
+}
 
 inline Color ClampColor(Color color) noexcept {
   color.r = std::clamp(color.r, 0.0f, 1.0f);
@@ -201,6 +237,10 @@ inline std::array<Color, 7> ThemeTextSurfaces(const Theme& theme) {
 inline Theme NormalizeTheme(Theme theme) {
   theme.overlayBackground = ClampColor(theme.overlayBackground);
   theme.settingsBackground = ClampColor(theme.settingsBackground);
+  // Panel backgrounds stay opaque, including themes saved with an alpha byte.
+  // Normalize text against the same surfaces the renderer actually paints.
+  theme.overlayBackground.a = 1.0f;
+  theme.settingsBackground.a = 1.0f;
   theme.border = ClampColor(theme.border);
   theme.divider = ClampColor(theme.divider);
   theme.surface = ClampColor(theme.surface);
@@ -367,8 +407,8 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
   file <<
       "{\n"
       "  \"fontFamily\": \"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI\",\n"
-      "  \"overlayBackground\": \"#101012EB\",\n"
-      "  \"settingsBackground\": \"#101012EB\",\n"
+      "  \"overlayBackground\": \"#191919\",\n"
+      "  \"settingsBackground\": \"#191919\",\n"
       "  \"border\": \"#FFFFFF14\",\n"
       "  \"divider\": \"#FFFFFF14\",\n"
       "  \"surface\": \"#18181B\",\n"

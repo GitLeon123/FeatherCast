@@ -6,6 +6,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version 3.0
+
+# Start-Process -Wait can hang forever and a GUI exe started with & does not
+# wait at all, so every child process gets an explicit wait, timeout and
+# exit-code check.
+function Invoke-CheckedProcess {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [string]$Label,
+    [int]$TimeoutSeconds = 300
+  )
+  $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+  # Holding the handle keeps ExitCode readable after the process has exited.
+  $null = $process.Handle
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    try { $process.Kill() } catch { }
+    throw "$Label did not finish within $TimeoutSeconds seconds."
+  }
+  if ($process.ExitCode -ne 0) { throw "$Label failed with exit code $($process.ExitCode)." }
+}
+
 $repository = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $repository $BuildDirectory
 $cpackConfig = Join-Path $build "CPackConfig.cmake"
@@ -37,8 +59,7 @@ try {
   foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
     $binary = Get-ChildItem $portable -Recurse -Filter $name | Select-Object -First 1
     if (-not $binary) { throw "$name is missing from the ZIP package." }
-    $process = Start-Process $binary.FullName -WindowStyle Hidden -ArgumentList "--self-test" -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "$name ZIP self-test failed." }
+    Invoke-CheckedProcess $binary.FullName @("--self-test") "$name ZIP self-test" 120
   }
 
   $phoneApp = Join-Path $build 'FeatherCast-Phone.apk'
@@ -63,8 +84,7 @@ try {
   }
   # NSIS requires /D= to be the final argument and does not accept quotes.
   $installArguments = @("/S", ("/D=" + $InstallRoot))
-  $install = Start-Process $installer.FullName -WindowStyle Hidden -ArgumentList $installArguments -PassThru -Wait
-  if ($install.ExitCode -ne 0) { throw "NSIS install failed." }
+  Invoke-CheckedProcess $installer.FullName $installArguments "NSIS install"
   $uninstaller = Join-Path $InstallRoot "Uninstall.exe"
   if (-not (Test-Path $uninstaller)) { throw "NSIS uninstall artifact is missing." }
   $shortcutCandidates = @(
@@ -77,9 +97,8 @@ try {
     throw "The FeatherCast Start menu shortcut is missing."
   }
   foreach ($name in @("FeatherCast.exe", "FeatherCastPluginHost.exe", "InputBroker.exe")) {
-    $binary = Join-Path $installRoot "bin\$name"
-    $process = Start-Process $binary -WindowStyle Hidden -ArgumentList "--self-test" -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "$name installed self-test failed." }
+    $binary = Join-Path $InstallRoot "bin\$name"
+    Invoke-CheckedProcess $binary @("--self-test") "$name installed self-test" 120
   }
   if (Test-Path -LiteralPath $phoneApp) {
     $installedPhone = Join-Path $installRoot 'bin\FeatherCast-Phone.apk'
@@ -97,8 +116,7 @@ try {
     throw 'The input broker task does not point at the installed executable.'
   }
 
-  $repeatInstall = Start-Process $installer.FullName -WindowStyle Hidden -ArgumentList $installArguments -PassThru -Wait
-  if ($repeatInstall.ExitCode -ne 0) { throw "Repeated NSIS install failed." }
+  Invoke-CheckedProcess $installer.FullName $installArguments "Repeated NSIS install"
   $uninstallRoots = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
     "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -118,16 +136,27 @@ try {
     throw "The uninstall entry does not point at the custom install root."
   }
 
-  & $uninstaller /S
-  $uninstallExitCode = $LASTEXITCODE
+  # A plain NSIS uninstaller copies itself to %TEMP% and exits at once. Run a
+  # copy with _?= (last argument, unquoted) so it works in place and its exit
+  # code is the real result.
+  $uninstallCopy = Join-Path $temporaryRoot (
+    "feathercast-package-smoke-uninstall-" + [Guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Force -Path $uninstallCopy | Out-Null
+  try {
+    $uninstallerCopy = Join-Path $uninstallCopy "Uninstall.exe"
+    Copy-Item -LiteralPath $uninstaller -Destination $uninstallerCopy
+    Invoke-CheckedProcess $uninstallerCopy @("/S", ("_?=" + $InstallRoot)) "NSIS uninstall"
+  } finally {
+    Remove-Item -LiteralPath $uninstallCopy -Recurse -Force -ErrorAction SilentlyContinue
+  }
   for ($attempt = 0; $attempt -lt 20 -and (Test-Path $InstallRoot); $attempt++) {
     Start-Sleep -Milliseconds 250
   }
   if (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue) {
     throw 'Uninstall left the elevated input broker task behind.'
   }
-  if ($uninstallExitCode -ne 0 -or (Test-Path $InstallRoot)) {
-    throw "NSIS uninstall smoke failed."
+  if (Test-Path $InstallRoot) {
+    throw "NSIS uninstall left the installation directory behind."
   }
 } finally {
   Pop-Location

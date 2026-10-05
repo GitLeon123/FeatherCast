@@ -62,7 +62,12 @@ class HostSession {
     CloseHandleIfSet(process_.hThread);
     stdinWrite_ = parentStdinWrite;
     stdoutRead_ = parentStdoutRead;
+    // The host announces itself once the plugin DLL is loaded; requests are
+    // only answered after that line.
+    ready_ = ReadLine(std::chrono::seconds(5));
   }
+
+  [[nodiscard]] const std::string& ReadyLine() const { return ready_; }
 
   ~HostSession() {
     CloseHandleIfSet(stdinWrite_);
@@ -83,35 +88,49 @@ class HostSession {
         WriteFile(stdinWrite_, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     assert(writeSucceeded);
     assert(written == line.size());
+    return ReadLine(timeout);
+  }
 
-    std::string buffer;
+  // Bytes the host wrote beyond the lines read so far.
+  [[nodiscard]] DWORD PendingBytes() const {
+    DWORD available = 0;
+    const BOOL peekSucceeded = PeekNamedPipe(stdoutRead_, nullptr, 0, nullptr, &available, nullptr);
+    assert(peekSucceeded);
+    return available + static_cast<DWORD>(buffer_.size());
+  }
+
+ private:
+  std::string ReadLine(std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
+    for (;;) {
+      if (const size_t newline = buffer_.find('\n'); newline != std::string::npos) {
+        std::string response = buffer_.substr(0, newline);
+        buffer_.erase(0, newline + 1);
+        if (!response.empty() && response.back() == '\r') response.pop_back();
+        return response;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return "";
       DWORD available = 0;
       const BOOL peekSucceeded = PeekNamedPipe(stdoutRead_, nullptr, 0, nullptr, &available, nullptr);
       assert(peekSucceeded);
       if (available > 0) {
-        char chunk[4096]{};
+        std::string chunk(std::min<DWORD>(available, 64 * 1024), '\0');
         DWORD read = 0;
         const BOOL readSucceeded =
-            ReadFile(stdoutRead_, chunk, std::min<DWORD>(available, sizeof(chunk)), &read, nullptr);
+            ReadFile(stdoutRead_, chunk.data(), static_cast<DWORD>(chunk.size()), &read, nullptr);
         assert(readSucceeded);
-        buffer.append(chunk, chunk + read);
-        if (const size_t newline = buffer.find('\n'); newline != std::string::npos) {
-          std::string response = buffer.substr(0, newline);
-          if (!response.empty() && response.back() == '\r') response.pop_back();
-          return response;
-        }
+        buffer_.append(chunk.data(), read);
+        continue;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    return "";
   }
 
- private:
   PROCESS_INFORMATION process_{};
   HANDLE stdinWrite_ = nullptr;
   HANDLE stdoutRead_ = nullptr;
+  std::string buffer_;
+  std::string ready_;
 };
 
 DWORD RunAndWait(const std::wstring& hostPath, const std::wstring& dllPath) {
@@ -151,6 +170,18 @@ bool WaitForPluginResult(feathercast::extensions::ExtensionManager& manager,
   return false;
 }
 
+template <typename Predicate>
+bool WaitForHealth(feathercast::extensions::ExtensionManager& manager, Predicate predicate,
+                   std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto health = manager.Health();
+    if (health.size() == 1 && predicate(health[0])) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return false;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -161,7 +192,52 @@ int wmain(int argc, wchar_t** argv) {
   const std::wstring badApiPath = argv[4];
 
   {
+    using feathercast::extensions::BuildHostReadyJson;
+    using feathercast::extensions::FrameResponseLine;
+    using feathercast::extensions::IsHostReadyJson;
+    using feathercast::extensions::ParseActivationResponse;
+    using feathercast::extensions::ParseQueryResponse;
+
+    assert(IsHostReadyJson(BuildHostReadyJson(2)));
+    assert(!IsHostReadyJson("{\"ready\":false}"));
+    assert(!IsHostReadyJson("{\"items\":[]}"));
+    assert(!IsHostReadyJson("ready"));
+
+    // Line breaks between JSON tokens fold into spaces; inside a string they
+    // are invalid JSON and must not split the response into several lines.
+    assert(FrameResponseLine("{\"a\":\n1}\r\n") == std::optional<std::string>("{\"a\": 1}  "));
+    assert(FrameResponseLine("{\"a\":\"x\\\\\"}\n") ==
+           std::optional<std::string>("{\"a\":\"x\\\\\"} "));
+    assert(!FrameResponseLine("{\"a\":\"x\ny\"}"));
+    assert(!FrameResponseLine("{\"a\":\"x\\\ny\"}"));
+
+    // Keys only match on their own object, never inside nested objects or
+    // string contents, and payloads round-trip as compact JSON.
+    const auto nested = ParseQueryResponse(
+        "{\"items\":[{\"detail\":{\"title\":\"Inner\"},\"id\":\"x\",\"title\":\"Outer\","
+        "\"payload\":{\"n\":1.5,\"s\":\"a\\nb\\u00e9\",\"list\":[true,null,-2]}}]}");
+    assert(nested && nested->items.size() == 1);
+    assert(nested->items[0].title == L"Outer");
+    assert(nested->items[0].detailTitle == L"Inner");
+    assert(nested->items[0].payloadJson ==
+           "{\"n\":1.5,\"s\":\"a\\nb\xC3\xA9\",\"list\":[true,null,-2]}");
+    const auto spoofed = ParseQueryResponse(
+        "{\"items\":[{\"id\":\"x\",\"subtitle\":\"\\\"title\\\":\\\"Fake\\\"\"}]}");
+    assert(spoofed && spoofed->items.empty());
+    assert(!ParseQueryResponse("{\"items\":["));
+    assert(!ParseQueryResponse("{\"other\":{\"items\":[]}}"));
+    assert(!ParseActivationResponse("not json"));
+    assert(!ParseActivationResponse("[]"));
+    const auto nestedAction = ParseActivationResponse(
+        "{\"handled\":true,\"meta\":{\"closeOverlay\":false},\"action\":{\"type\":\"openUrl\","
+        "\"value\":\"https://example.com\"}}");
+    assert(nestedAction && nestedAction->handled && nestedAction->closeOverlay);
+    assert(nestedAction->action == feathercast::extensions::HostActionType::OpenUrl);
+  }
+
+  {
     HostSession session(hostPath, pluginPath);
+    assert(session.ReadyLine() == "{\"ready\":true,\"apiVersion\":2}");
     const auto query = session.Send("{\"apiVersion\":1,\"type\":\"query\",\"query\":\"demo\",\"limit\":20}",
                                     std::chrono::seconds(2));
     assert(query.find("\"Demo Result\"") != std::string::npos);
@@ -198,10 +274,41 @@ int wmain(int argc, wchar_t** argv) {
     const auto setQuery = session.Send("{\"apiVersion\":2,\"type\":\"activate\",\"itemId\":\"set-query\",\"payload\":{}}",
                                        std::chrono::seconds(2));
     assert(setQuery.find("\"setQuery\"") != std::string::npos);
+
+    // Console output and input of the plugin are isolated from the protocol.
+    const auto isolated = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"isolated\",\"limit\":20}",
+                                       std::chrono::seconds(2));
+    assert(isolated.find("\"Isolated\"") != std::string::npos);
+    const auto afterIsolated = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"demo\",\"limit\":20}",
+                                            std::chrono::seconds(2));
+    assert(afterIsolated.find("\"Demo Result\"") != std::string::npos);
+
+    // A response above the old 4 KiB first buffer still runs the plugin once.
+    const auto large = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"large\",\"limit\":20}",
+                                    std::chrono::seconds(2));
+    assert(large.size() > 64 * 1024 && large.find("\"Large\"") != std::string::npos);
+    const auto largeCalls = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"large-calls\",\"limit\":20}",
+                                         std::chrono::seconds(2));
+    assert(largeCalls.find("calls=1") != std::string::npos);
+
+    // Pretty-printed JSON stays one protocol line; a raw line break inside a
+    // string is rejected instead of desynchronizing later responses.
+    const auto multiline = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"multiline\",\"limit\":20}",
+                                        std::chrono::seconds(2));
+    assert(multiline.find("\"Multiline\"") != std::string::npos);
+    assert(feathercast::json::Parse(multiline));
+    const auto brokenLine = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"broken-line\",\"limit\":20}",
+                                         std::chrono::seconds(2));
+    assert(brokenLine == "{\"error\":\"invalid-response\"}");
+    const auto afterFraming = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"demo\",\"limit\":20}",
+                                           std::chrono::seconds(2));
+    assert(afterFraming.find("\"Demo Result\"") != std::string::npos);
+    assert(session.PendingBytes() == 0);
   }
 
   {
     HostSession session(hostPath, v1PluginPath);
+    assert(session.ReadyLine() == "{\"ready\":true,\"apiVersion\":1}");
     const auto v1 = session.Send("{\"apiVersion\":2,\"type\":\"query\",\"query\":\"version\",\"limit\":20}",
                                  std::chrono::seconds(2));
     assert(v1.find("\"API v1\"") != std::string::npos);
@@ -232,11 +339,19 @@ int wmain(int argc, wchar_t** argv) {
 
     feathercast::extensions::ExtensionManager manager;
     manager.Initialize(dataDir, std::filesystem::path(hostPath).parent_path(), nullptr, 0);
+    // Start every host first. The 250 ms request budget deliberately excludes
+    // host startup (see the ready handshake), so timing the cold start here
+    // would measure process creation instead of query isolation.
+    manager.RequestQuery(L"warmup", 1);
+    assert(WaitForPluginResult(manager, L"warmup", L"Demo Result", std::chrono::seconds(10)));
+    // Three of the four plugins sleep for 1 s on this query. With two query
+    // workers, enforced 250 ms timeouts finish in about half a second, while
+    // a timeout that is not enforced would take two full sleeps (2 s).
     const auto start = std::chrono::steady_clock::now();
-    manager.RequestQuery(L"parallel", 1);
-    assert(WaitForPluginResult(manager, L"parallel", L"Demo Result", std::chrono::seconds(2)));
+    manager.RequestQuery(L"parallel", 2);
+    assert(WaitForPluginResult(manager, L"parallel", L"Demo Result", std::chrono::seconds(5)));
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    assert(elapsed < std::chrono::milliseconds(700));
+    assert(elapsed < std::chrono::milliseconds(1500));
     manager.Shutdown();
     std::filesystem::remove_all(tempRoot, ec);
   }
@@ -258,8 +373,11 @@ int wmain(int argc, wchar_t** argv) {
     feathercast::extensions::ExtensionManager manager;
     manager.Initialize(dataDir, std::filesystem::path(hostPath).parent_path(), nullptr, 0);
 
+    // Host startup is not part of the 250 ms request budget, so wait for the
+    // strike instead of assuming a fixed delay.
     manager.RequestQuery(L"slow-one", 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    assert(WaitForHealth(manager, [](const auto& health) { return health.failureStrikes == 1; },
+                         std::chrono::seconds(5)));
     {
       const auto health = manager.Health();
       assert(health.size() == 1);
@@ -268,7 +386,7 @@ int wmain(int argc, wchar_t** argv) {
       assert(health[0].lastError == L"plugin host timed out");
     }
     manager.RequestQuery(L"demo-after-timeout", 2);
-    assert(WaitForPluginResult(manager, L"demo-after-timeout", L"Demo Result", std::chrono::seconds(3)));
+    assert(WaitForPluginResult(manager, L"demo-after-timeout", L"Demo Result", std::chrono::seconds(10)));
     {
       const auto health = manager.Health();
       assert(health.size() == 1);
@@ -278,11 +396,14 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     manager.RequestQuery(L"slow-disable-one", 3);
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    assert(WaitForHealth(manager, [](const auto& health) { return health.failureStrikes == 1; },
+                         std::chrono::seconds(5)));
     manager.RequestQuery(L"slow-disable-two", 4);
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    assert(WaitForHealth(manager, [](const auto& health) { return health.failureStrikes == 2; },
+                         std::chrono::seconds(5)));
     manager.RequestQuery(L"slow-disable-three", 5);
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    assert(WaitForHealth(manager, [](const auto& health) { return !health.available; },
+                         std::chrono::seconds(5)));
     manager.RequestQuery(L"demo-after-disable", 6);
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     assert(manager.CachedResultsFor(L"demo-after-disable").empty());
@@ -294,6 +415,72 @@ int wmain(int argc, wchar_t** argv) {
       assert(!health[0].lastError.empty());
     }
 
+    manager.Shutdown();
+    std::filesystem::remove_all(tempRoot, ec);
+  }
+
+  {
+    // An invalid JSON line restarts the host and counts as a strike; the next
+    // request runs against a fresh host. Activation reuses the round-tripped
+    // payload.
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastExtensionProtocolTests";
+    std::error_code ec;
+    std::filesystem::remove_all(tempRoot, ec);
+    const auto dataDir = tempRoot / L"data";
+    const auto pluginDir = dataDir / L"plugins" / L"protocol";
+    std::filesystem::create_directories(pluginDir, ec);
+    const BOOL pluginCopied = CopyFileW(pluginPath.c_str(), (pluginDir / L"protocol.dll").c_str(), FALSE);
+    assert(pluginCopied);
+    WriteUtf8(pluginDir / L"plugin.json",
+              "{\"id\":\"protocol\",\"name\":\"Protocol Test\",\"version\":\"1.0\",\"dll\":\"protocol.dll\"}");
+
+    feathercast::extensions::ExtensionManager manager;
+    manager.Initialize(dataDir, std::filesystem::path(hostPath).parent_path(), nullptr, 0);
+    manager.RequestQuery(L"malformed", 1);
+    assert(WaitForHealth(manager, [](const auto& health) { return health.failureStrikes == 1; },
+                         std::chrono::seconds(10)));
+    {
+      const auto health = manager.Health();
+      assert(health[0].available);
+      assert(health[0].lastError == L"plugin host returned invalid JSON");
+    }
+    manager.RequestQuery(L"isolated", 2);
+    assert(WaitForPluginResult(manager, L"isolated", L"Isolated", std::chrono::seconds(10)));
+    assert(manager.CachedResultsFor(L"isolated").size() == 1);
+    assert(manager.Health()[0].failureStrikes == 0);
+
+    manager.RequestQuery(L"demo", 3);
+    assert(WaitForPluginResult(manager, L"demo", L"Demo Result", std::chrono::seconds(10)));
+    const auto demo = manager.CachedResultsFor(L"demo");
+    assert(demo.size() == 1 && demo[0].payloadJson == "{\"token\":\"abc\"}");
+    const auto activation = manager.Activate(demo[0]);
+    assert(activation && activation->handled);
+    assert(activation->action == feathercast::extensions::HostActionType::CopyText);
+    assert(activation->value == L"activated");
+    manager.Shutdown();
+    std::filesystem::remove_all(tempRoot, ec);
+  }
+
+  {
+    // A DLL with an unsupported API version fails the ready handshake and is
+    // disabled after the first attempt instead of timing out three times.
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastExtensionReadyTests";
+    std::error_code ec;
+    std::filesystem::remove_all(tempRoot, ec);
+    const auto dataDir = tempRoot / L"data";
+    const auto pluginDir = dataDir / L"plugins" / L"bad-api";
+    std::filesystem::create_directories(pluginDir, ec);
+    const BOOL pluginCopied = CopyFileW(badApiPath.c_str(), (pluginDir / L"bad.dll").c_str(), FALSE);
+    assert(pluginCopied);
+    WriteUtf8(pluginDir / L"plugin.json",
+              "{\"id\":\"bad-api\",\"name\":\"Bad API\",\"version\":\"1.0\",\"dll\":\"bad.dll\"}");
+
+    feathercast::extensions::ExtensionManager manager;
+    manager.Initialize(dataDir, std::filesystem::path(hostPath).parent_path(), nullptr, 0);
+    manager.RequestQuery(L"demo", 1);
+    assert(WaitForHealth(manager, [](const auto& health) { return !health.available; },
+                         std::chrono::seconds(10)));
+    assert(manager.Health()[0].lastError == L"plugin uses an unsupported extension API version");
     manager.Shutdown();
     std::filesystem::remove_all(tempRoot, ec);
   }

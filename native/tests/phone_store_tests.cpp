@@ -219,6 +219,19 @@ void TestRemoteFiles() {
   saved.remotePath = "/Download/a.txt";
   assert(store.Apply(saved, 0).files && !store.FileDownloading("/Download/a.txt"));
 
+  // Errors only stop the download they name.
+  store.SetFileDownloading("/Download/a.txt", true);
+  store.SetFileDownloading("/Download/b.txt", true);
+  Event failed;
+  failed.kind = EventKind::Error;
+  failed.text = "Could not send a file.";
+  assert(!store.Apply(failed, 0).files && store.FileDownloading("/Download/a.txt"));
+  failed.remotePath = "/Download/b.txt";
+  failed.text = "This file is not available.";
+  assert(store.Apply(failed, 0).files && !store.FileDownloading("/Download/b.txt"));
+  assert(store.FileDownloading("/Download/a.txt"));
+  store.SetFileDownloading("/Download/a.txt", false);
+
   list.text = "No access";
   list.files.clear();
   store.OpenFolder("/Download");
@@ -330,11 +343,16 @@ void TestPhotos() {
   changes = store.Apply(saved, 0);
   assert(changes.savedPhotoId == "p2" && !store.Photos()[1].downloading);
 
-  store.SetDownloading("p0", true);
+  assert(store.SetDownloading("p0", true) && store.SetDownloading("p2", true));
   Event error;
   error.kind = EventKind::Error;
+  error.text = "Could not save a file from your phone.";
+  // An error without a photo id (another transfer) leaves downloads running.
+  assert(!store.Apply(error, 0).photos);
+  assert(store.Photos()[0].downloading && store.Photos()[1].downloading);
+  error.photo.id = "p0";
   assert(store.Apply(error, 0).photos);
-  assert(!store.Photos()[0].downloading);
+  assert(!store.Photos()[0].downloading && store.Photos()[1].downloading);
 }
 
 void TestGridMath() {
@@ -433,16 +451,16 @@ void TestPhoneSuggestions() {
                                      L"Phone Notifications", {L"notifications", L"alerts", L"messages"});
   const auto photos = command(CommandKind::PhonePhotos, L"phone-photos", L"Phone Photos",
                               {L"photos", L"pictures", L"gallery"});
-  // Only a near-complete name or keyword suggests a phone view.
+  // A whole-phrase prefix of at least three characters suggests a phone view.
   assert(MatchesPhoneSuggestion(L"notificatio", notifications));
   assert(MatchesPhoneSuggestion(L"Notifications", notifications));
   assert(MatchesPhoneSuggestion(L"phone notificat", notifications));
   assert(MatchesPhoneSuggestion(L"messag", notifications));
   assert(MatchesPhoneSuggestion(L"phone photo", photos));
-  assert(!MatchesPhoneSuggestion(L"notif", notifications));
-  assert(!MatchesPhoneSuggestion(L"phone not", notifications));
-  assert(!MatchesPhoneSuggestion(L"mess", notifications));
-  assert(!MatchesPhoneSuggestion(L"phone", photos));
+  assert(MatchesPhoneSuggestion(L"notif", notifications));
+  assert(MatchesPhoneSuggestion(L"phone not", notifications));
+  assert(MatchesPhoneSuggestion(L"mess", notifications));
+  assert(MatchesPhoneSuggestion(L"phone", photos));
   assert(!MatchesPhoneSuggestion(L"no", notifications));
   assert(!MatchesPhoneSuggestion(L"notepad", notifications));
   assert(!MatchesPhoneSuggestion(L"phone xyz", notifications));

@@ -89,6 +89,19 @@ inline std::wstring FoldDiacritics(const std::wstring& value) {
 }
 
 inline std::wstring Normalize(const std::wstring& value) {
+  // Plain ASCII can bypass the Windows Unicode calls. Windows classifies the
+  // caret and grave accent as diacritics, so those stay on the Unicode path to
+  // preserve the existing folding rules even in otherwise ASCII text.
+  if (std::all_of(value.begin(), value.end(),
+                  [](wchar_t ch) {
+                    return ch < 0x80 && ch != L'^' && ch != L'`';
+                  })) {
+    std::wstring normalized = Trim(value);
+    for (auto& ch : normalized) {
+      if (ch >= L'A' && ch <= L'Z') ch += L'a' - L'A';
+    }
+    return normalized;
+  }
   return Trim(FoldDiacritics(LowerInvariant(value)));
 }
 
@@ -188,8 +201,30 @@ inline std::wstring Acronym(const std::wstring& value) {
   return out;
 }
 
+// Case-preserved copy of `value` whose indices line up with `normalized`
+// (Normalize(value)), so BoundaryBefore can see camelCase humps at positions
+// found in the normalized text. Normalization can change the length (Hangul
+// syllables decompose into jamo, precomposed accents lose their marks), so the
+// same decomposition and mark stripping is applied without the case mapping.
+// If the lengths still disagree, the normalized text is the safe fallback: it
+// keeps every word separator, only camelCase boundaries are lost.
+inline std::wstring BoundaryText(const std::wstring& value,
+                                 const std::wstring& normalized) {
+  std::wstring trimmed = Trim(value);
+  if (trimmed.size() == normalized.size() &&
+      std::all_of(trimmed.begin(), trimmed.end(),
+                  [](wchar_t ch) { return ch < 0x80; })) {
+    // ASCII never decomposes; equal lengths mean no mark was stripped.
+    return trimmed;
+  }
+  std::wstring folded = Trim(FoldDiacritics(trimmed));
+  if (folded.size() != normalized.size()) return normalized;
+  return folded;
+}
+
 inline bool BoundaryBefore(const std::wstring& text, size_t index) {
   if (index == 0) return true;
+  if (index >= text.size()) return false;
   const wchar_t ch = text[index - 1];
   if (std::iswspace(ch) || ch == L'.' || ch == L'_' || ch == L'-' || ch == L'\\' || ch == L'/') return true;
   return std::iswlower(ch) && std::iswupper(text[index]);
@@ -250,7 +285,7 @@ inline double ScoreText(const std::wstring& query, const std::wstring& target) {
   const std::wstring q = Normalize(query);
   const std::wstring t = Normalize(target);
   // Case-preserved copy (same indices as t) so BoundaryBefore can see camelCase.
-  const std::wstring raw = Trim(target);
+  const std::wstring raw = BoundaryText(target, t);
   if (q.empty() || t.empty()) return -1;
   if (t == q) return 5000;
   if (t.rfind(q, 0) == 0) return 3200 - std::min<int>(static_cast<int>(t.size() - q.size()), 200);
@@ -322,6 +357,7 @@ enum class SearchFieldKind : unsigned char {
 };
 
 struct PreparedField {
+  // Case-preserved text indexed like `normalized` (see BoundaryText).
   std::wstring raw;
   std::wstring normalized;
   std::vector<std::wstring> tokens;
@@ -347,6 +383,9 @@ struct SearchOptions {
   // machine with the UI can force a smaller cap and avoid transient worker
   // oversubscription on large corpora.
   size_t maxWorkers = 0;
+  // Optional eligible corpus indices. The caller keeps this list alive until
+  // SearchPrepared returns; results still refer to the original corpus.
+  const std::vector<size_t>* candidateIndices = nullptr;
 };
 
 inline std::wstring AcronymFromTokens(
@@ -362,8 +401,8 @@ inline std::wstring AcronymFromTokens(
 inline PreparedField PrepareField(std::wstring text, double weight,
                                   SearchFieldKind kind) {
   PreparedField field;
-  field.raw = Trim(text);
   field.normalized = Normalize(text);
+  field.raw = BoundaryText(text, field.normalized);
   field.tokens = TokensNormalized(field.normalized);
   field.acronym = AcronymFromTokens(field.tokens);
   field.weight = weight;
@@ -374,10 +413,11 @@ inline PreparedField PrepareField(std::wstring text, double weight,
 inline PreparedSearchItem PrepareSearchItem(const SearchItem& item) {
   PreparedSearchItem prepared;
   prepared.item = item;
-  prepared.normalizedName = Normalize(item.name);
   prepared.lowerName = Lower(item.name);
+  prepared.fields.reserve(4 + item.aliases.size());
   prepared.fields.push_back(
       PrepareField(item.name, 1.0, SearchFieldKind::Name));
+  prepared.normalizedName = prepared.fields.front().normalized;
   for (const auto& alias : item.aliases) {
     const auto validation = ValidateAlias(alias);
     if (!validation.valid) continue;
@@ -499,10 +539,6 @@ inline TextMatch MatchPreparedText(const std::wstring& normalizedQuery,
           MatchClass::General};
 }
 
-inline double ScorePreparedText(const std::wstring& normalizedQuery, const PreparedField& target) {
-  return MatchPreparedText(normalizedQuery, target).score;
-}
-
 struct ItemScore {
   MatchClass matchClass = MatchClass::None;
   double text = -1.0;
@@ -524,20 +560,56 @@ inline bool BetterItemScore(const ItemScore& a, const ItemScore& b) {
   return a.text > b.text;
 }
 
+inline MatchClass MaximumFieldMatchClass(SearchFieldKind kind) {
+  switch (kind) {
+    case SearchFieldKind::Name:
+    case SearchFieldKind::Alias: return MatchClass::ExactName;
+    case SearchFieldKind::Keywords:
+    case SearchFieldKind::Process: return MatchClass::FieldPrefix;
+    case SearchFieldKind::Path: return MatchClass::General;
+  }
+  return MatchClass::ExactName;
+}
+
 inline ItemScore ScorePreparedItemDetailed(
     const std::wstring& normalizedQuery,
     const std::vector<std::wstring>& queryTokens,
     const PreparedSearchItem& prepared,
     const std::set<std::wstring>& recentIds, long long now = 0) {
-  if (queryTokens.empty()) return {MatchClass::General, 0.0, 0.0};
   double textScore = 0.0;
   MatchClass weakestClass = MatchClass::ExactName;
+  if (queryTokens.empty()) {
+    // A query without letters or digits ("." or "-") has no words to match.
+    // Only a literal occurrence in a name, alias, keyword or process name
+    // counts; nearly every path contains dots and separators.
+    if (normalizedQuery.empty()) return {};
+    TextMatch best;
+    for (const auto& field : prepared.fields) {
+      if (field.kind == SearchFieldKind::Path) continue;
+      if (MaximumFieldMatchClass(field.kind) < best.matchClass) continue;
+      TextMatch candidate = MatchPreparedText(normalizedQuery, field, false);
+      if (!candidate.Matched()) continue;
+      candidate.score *= field.weight;
+      if (!best.Matched() || candidate.matchClass > best.matchClass ||
+          (candidate.matchClass == best.matchClass &&
+           candidate.score > best.score)) {
+        best = candidate;
+      }
+    }
+    if (!best.Matched()) return {};
+    weakestClass = best.matchClass;
+    textScore = best.score;
+  }
   for (const auto& token : queryTokens) {
     TextMatch best;
     for (size_t fieldIndex = 0; fieldIndex < prepared.fields.size();
          ++fieldIndex) {
       const auto& field = prepared.fields[fieldIndex];
-      TextMatch candidate = MatchPreparedText(token, field);
+      if (MaximumFieldMatchClass(field.kind) < best.matchClass) continue;
+      // Approximate matches never outrank a field prefix or a stronger name
+      // match. Literal matches in later fields can still improve the result.
+      TextMatch candidate = MatchPreparedText(
+          token, field, best.matchClass <= MatchClass::Typo);
       if (!candidate.Matched()) continue;
       candidate.score *= field.weight;
       if (!best.Matched() || candidate.matchClass > best.matchClass ||
@@ -552,6 +624,7 @@ inline ItemScore ScorePreparedItemDetailed(
         for (size_t strongIndex = 1; strongIndex < prepared.fields.size();
              ++strongIndex) {
           const auto& strongField = prepared.fields[strongIndex];
+          if (MaximumFieldMatchClass(strongField.kind) < best.matchClass) continue;
           TextMatch strong = MatchPreparedText(token, strongField, false);
           if (!strong.Matched()) continue;
           strong.score *= strongField.weight;
@@ -616,11 +689,26 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
                                           const std::vector<PreparedSearchItem>& items,
                                           const std::set<std::wstring>& recentIds = {},
                                           SearchOptions options = {}) {
+  if (options.limit == 0 ||
+      (options.latestGeneration &&
+       options.latestGeneration->load(std::memory_order_acquire) !=
+           options.generation)) {
+    return {};
+  }
+  const auto* candidates = options.candidateIndices;
+  const size_t itemCount = candidates ? candidates->size() : items.size();
+  if (itemCount == 0) return {};
+  const auto corpusIndex = [&](size_t position) {
+    return candidates ? (*candidates)[position] : position;
+  };
   if (Trim(query).empty()) {
-    const size_t count = std::min(items.size(), options.limit);
+    const size_t count = std::min(itemCount, options.limit);
     std::vector<size_t> all;
     all.reserve(count);
-    for (size_t i = 0; i < count; ++i) all.push_back(i);
+    for (size_t i = 0; i < itemCount && all.size() < count; ++i) {
+      const size_t index = corpusIndex(i);
+      if (index < items.size()) all.push_back(index);
+    }
     return all;
   }
 
@@ -633,11 +721,8 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
   const std::wstring normalizedQuery = Normalize(query);
   const std::vector<std::wstring> queryTokens =
       TokensNormalized(normalizedQuery);
-  if (options.limit == 0) return {};
-  const unsigned hardwareThreads =
-      std::max(1u, std::thread::hardware_concurrency());
-  const size_t automaticWorkers = items.size() >= 20000
-      ? std::min<size_t>(4, hardwareThreads)
+  const size_t automaticWorkers = itemCount >= 20000 && options.maxWorkers != 1
+      ? std::min<size_t>(4, std::max(1u, std::thread::hardware_concurrency()))
       : 1;
   const size_t workerCount = options.maxWorkers == 0
       ? automaticWorkers
@@ -646,19 +731,24 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
   auto better = [](const Scored& a, const Scored& b) {
     if (BetterItemScore(a.score, b.score)) return true;
     if (BetterItemScore(b.score, a.score)) return false;
-    return *a.lowerName < *b.lowerName;
+    if (*a.lowerName != *b.lowerName) return *a.lowerName < *b.lowerName;
+    return a.index < b.index;
   };
   auto scoreRange = [&](size_t worker, size_t begin, size_t end) {
     auto& bucket = buckets[worker];
-    const bool bounded = options.limit != std::numeric_limits<size_t>::max();
+    // A range cannot produce more matches than it has items. When all of them
+    // fit, building a heap before the final sort only adds work.
+    const bool bounded = options.limit < end - begin;
     bucket.reserve(bounded ? std::min(end - begin, options.limit)
                            : end - begin);
-    for (size_t i = begin; i < end; ++i) {
-      if ((i & 63u) == 0 && options.latestGeneration &&
+    for (size_t position = begin; position < end; ++position) {
+      if ((position & 63u) == 0 && options.latestGeneration &&
           options.latestGeneration->load(std::memory_order_acquire) != options.generation) {
         bucket.clear();
         return;
       }
+      const size_t i = corpusIndex(position);
+      if (i >= items.size()) continue;
       ItemScore score = ScorePreparedItemDetailed(
           normalizedQuery, queryTokens, items[i], recentIds, options.now);
       if (!score.Matched()) continue;
@@ -677,14 +767,14 @@ inline std::vector<size_t> SearchPrepared(const std::wstring& query,
   };
 
   if (workerCount == 1) {
-    scoreRange(0, 0, items.size());
+    scoreRange(0, 0, itemCount);
   } else {
     std::vector<std::jthread> workers;
     workers.reserve(workerCount);
-    const size_t chunk = (items.size() + workerCount - 1) / workerCount;
+    const size_t chunk = (itemCount + workerCount - 1) / workerCount;
     for (size_t worker = 0; worker < workerCount; ++worker) {
       const size_t begin = worker * chunk;
-      const size_t end = std::min(items.size(), begin + chunk);
+      const size_t end = std::min(itemCount, begin + chunk);
       workers.emplace_back([&, worker, begin, end] { scoreRange(worker, begin, end); });
     }
     for (auto& worker : workers) worker.join();
@@ -784,7 +874,8 @@ inline std::vector<size_t> Search(const std::wstring& query, const std::vector<S
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (BetterItemScore(a.score, b.score)) return true;
     if (BetterItemScore(b.score, a.score)) return false;
-    return a.lowerName < b.lowerName;
+    if (a.lowerName != b.lowerName) return a.lowerName < b.lowerName;
+    return a.index < b.index;
   });
 
   std::vector<size_t> out;

@@ -16,6 +16,9 @@ import android.provider.Settings
 import app.feathercast.protocol.BEACON_PORT
 import app.feathercast.protocol.Beacon
 import app.feathercast.protocol.Features
+import app.feathercast.protocol.FileStart
+import app.feathercast.protocol.FILE_CHUNK_BYTES
+import app.feathercast.protocol.MAX_STREAM_BYTES
 import app.feathercast.protocol.LinkException
 import app.feathercast.protocol.LinkSession
 import app.feathercast.protocol.MAX_FRAME_BYTES
@@ -27,6 +30,7 @@ import app.feathercast.protocol.PhoneMessages
 import app.feathercast.protocol.message
 import app.feathercast.protocol.readAtMost
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -44,6 +48,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import java.io.IOException
@@ -62,6 +68,8 @@ data class LinkState(
     val host: String = "",
     val detail: String = "",
     val pcClipboard: List<PcClip> = emptyList(),
+    val transferStatus: String = "",
+    val transferActive: Boolean = false,
 )
 
 /**
@@ -77,8 +85,15 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     val state: StateFlow<LinkState> = _state.asStateFlow()
 
     @Volatile private var session: LinkSession? = null
+    @Volatile private var incomingTransfers: IncomingTransfers? = null
+    private val transferEpoch = java.util.concurrent.atomic.AtomicLong()
+    private val transferAcks = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<String?>>()
+    private val cancelledTransfers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var loop: Job? = null
-    @Volatile private var lastClipboardFromPc: String? = null
+
+    // Bulk replies (photo lists, file reads and writes, SMS scans) run one at a time off
+    // the receive loop, so control messages such as ring, media and screen stay responsive.
+    private val bulk = Dispatchers.IO.limitedParallelism(1)
 
     val deviceName: String
         get() = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
@@ -95,6 +110,10 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     /** Starts the reconnect loop; called by [LinkService]. */
     @Synchronized
     fun start() {
+        if (!LocalNetworkAccess.allowed(context)) {
+            _state.update { it.copy(status = LinkStatus.Offline, detail = "Allow local network access to connect to your PC.") }
+            return
+        }
         if (loop?.isActive == true) {
             wake.trySend(Unit)
             return
@@ -122,6 +141,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     suspend fun pair(uri: String): Result<String> = withContext(Dispatchers.IO) {
+        if (!LocalNetworkAccess.allowed(context)) return@withContext Result.failure(IOException("Allow local network access to pair with your PC."))
         val invite = PairingInvite.parse(uri.trim())
             ?: return@withContext Result.failure(IOException("This is not a FeatherCast pairing code."))
         try {
@@ -159,7 +179,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         return sendToSession(active, json, binary)
     }
 
-    private fun sendToSession(active: LinkSession, json: String, binary: ByteArray): Boolean {
+    private fun sendToSession(active: LinkSession, json: String, binary: ByteArray = ByteArray(0)): Boolean {
         if (session !== active) return false
         return try {
             active.send(json, binary)
@@ -192,11 +212,46 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 if (!it.isNull(1)) size = it.getLong(1)
             }
         }
+        if (active.fileStreamSupported) {
+            val preparationEpoch = transferEpoch.get()
+            var staged: java.io.File? = null
+            try {
+                if (size < 0) {
+                    val preparation = java.io.File.createTempFile("fc-send-", ".part", context.cacheDir)
+                    staged = preparation
+                    _state.update { it.copy(transferStatus = "Preparing $name…", transferActive = true) }
+                    var count = 0L
+                    resolver.openInputStream(uri)?.use { input ->
+                        preparation.outputStream().use { output ->
+                            val buffer = ByteArray(FILE_CHUNK_BYTES)
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException("File transfer cancelled.")
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                count += read
+                                if (count > MAX_STREAM_BYTES) throw IOException("Files must be 8 GB or smaller.")
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    } ?: throw IOException("Could not read $name.")
+                    size = count
+                }
+                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException("File transfer cancelled.")
+                val input = staged?.inputStream() ?: resolver.openInputStream(uri) ?: throw IOException("Could not read $name.")
+                input.use { sendStream(active, name, size, "file", "", it) }
+                return@withContext Result.success(name)
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+                return@withContext Result.failure(error)
+            } finally { staged?.delete() }
+        }
         if (size > MAX_SEND_BYTES) {
             return@withContext Result.failure(IOException("$name is too large (max 40 MB)."))
         }
         val bytes = try {
-            resolver.openInputStream(uri)?.use { it.readAtMost(MAX_SEND_BYTES.toInt()) }
+            resolver.openInputStream(uri)?.use { it.readAtMost(MAX_SEND_BYTES.toInt(), sizeHint = size) }
         } catch (_: IOException) {
             null
         } catch (_: SecurityException) {
@@ -215,7 +270,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     /** Sends the newest photo list now, e.g. right after the permission was granted. */
     fun sharePhotosNow() {
-        scope.launch { if (store.sendPhotos && session != null) sendPhotoList(60) }
+        val active = session ?: return
+        scope.launch(bulk) { if (store.sendPhotos && session === active) sendPhotoList(active, 60) }
     }
 
     fun clearPhotosOnPc() {
@@ -230,20 +286,34 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     private suspend fun runLoop() {
         var backoff = 2_000L
+        // An address from a beacon is only a candidate until a session authenticates there.
+        var candidate: Pair<String, Int>? = null
         while (currentCoroutineContext().isActive) {
+            if (!LocalNetworkAccess.allowed(context)) {
+                _state.update { it.copy(status = LinkStatus.Offline, detail = "Allow local network access to connect to your PC.") }
+                return
+            }
             val pc = store.load() ?: run {
                 _state.value = LinkState()
                 return
             }
-            _state.update { it.copy(status = LinkStatus.Connecting, pcName = pc.pcName, host = pc.host, detail = "") }
+            val target = candidate ?: (pc.host to pc.port)
+            val fromBeacon = candidate != null
+            candidate = null
+            _state.update { it.copy(status = LinkStatus.Connecting, pcName = pc.pcName, host = target.first, detail = "") }
             val connected = try {
-                connect(pc)
+                connect(target.first, target.second, pc.linkKey)
             } catch (error: LinkException) {
-                if (error.code == "unpaired" || error.code == "bad-auth") {
-                    store.clear()
-                    _state.value = LinkState(detail = "The PC no longer knows this phone. Pair again.")
-                    LinkService.stop(context)
-                    return
+                currentCoroutineContext().ensureActive()
+                // The plaintext refusal is unauthenticated, so never wipe the pairing because of it.
+                // Only the last authenticated address may report it, and the user decides what to do.
+                if (error.code == "unpaired" && !fromBeacon && store.load()?.linkKey?.contentEquals(pc.linkKey) == true) {
+                    _state.update {
+                        it.copy(status = LinkStatus.Offline, detail = "The PC no longer knows this phone. If you removed it on the PC, disconnect below and pair again.")
+                    }
+                    // Retry when the app opens again or the network changes.
+                    wake.receive()
+                    continue
                 }
                 null
             } catch (_: IOException) {
@@ -253,6 +323,10 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 backoff = 2_000L
                 try {
                     currentCoroutineContext().ensureActive()
+                    // The PC authenticated at the beacon address, so it becomes the stored address.
+                    if (fromBeacon && store.load()?.linkKey?.contentEquals(pc.linkKey) == true) {
+                        store.updateAddress(target.first, target.second)
+                    }
                     runSession(connected)
                 } finally {
                     ScreenBridge.disconnected(context, connected)
@@ -268,16 +342,16 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             // Wait for a beacon from the PC, a nudge, or the backoff to pass.
             val found = withTimeoutOrNull(backoff) { awaitBeaconOrWake(pc.pcId) }
             if (found != null && found.first.isNotEmpty()) {
-                store.updateAddress(found.first, found.second)
+                candidate = found
                 continue
             }
             if (found == null) backoff = (backoff * 2).coerceAtMost(30_000L) else backoff = 2_000L
         }
     }
 
-    private fun connect(pc: PairedPc): LinkSession? {
-        if (pc.host.isEmpty() || pc.port == 0) return null
-        return LinkSession.connect(pc.host, pc.port, store.deviceId, pc.linkKey)
+    private fun connect(host: String, port: Int, linkKey: ByteArray): LinkSession? {
+        if (host.isEmpty() || port == 0) return null
+        return LinkSession.connect(host, port, store.deviceId, linkKey)
     }
 
     /** Returns (host, port) of the PC's beacon, or ("", 0) when woken by [nudge]. */
@@ -340,6 +414,9 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     private suspend fun runSession(active: LinkSession) = coroutineScope {
+        val bulkJobs = SupervisorJob()
+        val incoming = IncomingTransfers(context)
+        incomingTransfers = incoming
         session = active
         store.updatePcName(active.pcName)
         _state.update {
@@ -353,6 +430,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         val pinger = launch {
             while (isActive) {
                 delay(PING_INTERVAL_MS)
+                if (!LocalNetworkAccess.allowed(context)) { active.close(); break }
                 if (!send(message("ping"))) break
                 sendStatus()
             }
@@ -367,11 +445,17 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 } catch (_: IOException) {
                     break
                 }
-                handle(payload)
+                handle(payload, active, bulkJobs, incoming)
             }
         } finally {
             pinger.cancel()
+            bulkJobs.cancel()
             active.close()
+            incoming.close()
+            if (incomingTransfers === incoming) incomingTransfers = null
+            transferEpoch.incrementAndGet()
+            transferAcks.values.forEach { it.complete("The phone connection was lost.") }
+            _state.update { it.copy(transferStatus = "", transferActive = false) }
             Ringer.stop(context)
             ScreenBridge.disconnected(context, active)
         }
@@ -387,48 +471,173 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     // ---- Incoming -------------------------------------------------------------
 
-    private fun handle(payload: Payload) {
+    private suspend fun handle(payload: Payload, active: LinkSession, bulkJobs: Job, incoming: IncomingTransfers) {
+        // Runs [work] on the serialized bulk worker while [active] is still the current session.
+        fun inBackground(work: () -> Unit) {
+            scope.launch(bulk + bulkJobs) { if (session === active) work() }
+        }
+        val transferJson = runCatching {
+            kotlinx.serialization.json.Json.parseToJsonElement(payload.json) as? kotlinx.serialization.json.JsonObject
+        }.getOrNull() ?: return
+        fun text(key: String) = (transferJson[key] as? JsonPrimitive)?.content.orEmpty()
+        val type = text("type")
+        val transferId = text("id")
+        if (type == "file.received") {
+            transferAcks[transferId]?.complete(if (text("ok") == "true") null else text("error").ifEmpty { "The PC could not save the file." })
+            return
+        }
+        if (type == "file.cancel") {
+            if (transferId.isEmpty()) transferEpoch.incrementAndGet()
+            else if (transferAcks.containsKey(transferId)) cancelledTransfers.add(transferId)
+            incoming.cancel(transferId)
+            if (transferId.isEmpty()) transferAcks.values.forEach { it.complete("File transfer cancelled.") }
+            else transferAcks[transferId]?.complete("File transfer cancelled.")
+            _state.update { it.copy(transferStatus = "File transfer cancelled.", transferActive = false) }
+            return
+        }
+        if (type == "file.begin" || type == "file.chunk" || type == "file.end") {
+            try {
+                // Backpressure: at most one received chunk is awaiting a disk write.
+                withContext(bulk + bulkJobs) {
+                    when (type) {
+                        "file.begin" -> {
+                            val start = FileStart.parse(transferJson) ?: throw IOException("Invalid file transfer.")
+                            incoming.begin(start)
+                            _state.update { it.copy(transferStatus = "Receiving ${start.name}…", transferActive = true) }
+                        }
+                        "file.chunk" -> {
+                            if (!store.receiveFiles) throw IOException("Receiving files is turned off.")
+                            val offset = (transferJson["offset"] as? JsonPrimitive)?.longOrNull ?: -1
+                            val (start, received) = incoming.chunk(transferId, offset, payload.binary)
+                            val percent = if (start.size == 0L) 100 else received * 100 / start.size
+                            _state.update { it.copy(transferStatus = "Receiving ${start.name}: $percent%", transferActive = true) }
+                        }
+                        else -> {
+                            val start = incoming.finish(transferId)
+                            sendToSession(active, PhoneMessages.fileReceived(transferId, start.name, true, ""))
+                            _state.update { it.copy(transferStatus = "Saved ${start.name} to Downloads/FeatherCast.", transferActive = false) }
+                        }
+                    }
+                }
+            } catch (error: Exception) {
+                incoming.cancel(transferId)
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                sendToSession(active, PhoneMessages.fileReceived(transferId, "", false, error.message.orEmpty()))
+                sendToSession(active, message("file.cancel") { put("id", transferId) })
+                _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+            }
+            return
+        }
         when (val msg = PcMessage.parse(payload.json) ?: return) {
             is PcMessage.Clipboard -> onPcClipboard(msg.text, msg.time)
             is PcMessage.ClipboardHistory -> onPcHistory(msg.items)
-            is PcMessage.PhotosRequest -> if (store.sendPhotos) sendPhotoList(msg.limit)
-            is PcMessage.PhotoRequest -> if (store.sendPhotos) sendFullPhoto(msg.id)
+            is PcMessage.PhotosRequest -> if (store.sendPhotos) inBackground { sendPhotoList(active, msg.limit) }
+            is PcMessage.PhotoRequest -> if (store.sendPhotos) inBackground { sendFullPhoto(active, msg.id) }
             is PcMessage.NotificationDismiss -> NotifyListener.dismiss(msg.key)
             is PcMessage.NotificationAction -> NotifyListener.performAction(msg.key, msg.index, msg.text)
-            is PcMessage.FileSend -> onFileFromPc(msg.id, msg.name, payload.binary)
+            is PcMessage.FileSend -> inBackground { onFileFromPc(active, msg.id, msg.name, payload.binary) }
             is PcMessage.Ring -> when {
                 !msg.start -> Ringer.stop(context)
                 store.allowRing -> Ringer.start(context)
             }
             is PcMessage.MediaCommand -> if (store.mediaControl) MediaWatcher.command(msg.command, msg.position)
             is PcMessage.MediaVolume -> if (store.mediaControl) MediaWatcher.setVolume(msg.volume)
-            PcMessage.SmsThreadsRequest ->
-                send(PhoneMessages.smsThreads(if (SmsBridge.active) SmsBridge.threads(context) else emptyList()))
-            is PcMessage.SmsMessagesRequest -> if (SmsBridge.active) {
-                send(PhoneMessages.smsMessages(msg.thread, SmsBridge.messages(context, msg.thread, msg.limit)))
+            PcMessage.SmsThreadsRequest -> inBackground {
+                sendToSession(active, PhoneMessages.smsThreads(if (SmsBridge.active) SmsBridge.threads(context) else emptyList()))
+            }
+            is PcMessage.SmsMessagesRequest -> if (SmsBridge.active) inBackground {
+                sendToSession(active, PhoneMessages.smsMessages(msg.thread, SmsBridge.messages(context, msg.thread, msg.limit)))
             }
             is PcMessage.SmsSend -> SmsBridge.send(context, msg.ref, msg.address, msg.body)
             PcMessage.CallReject -> if (CallWatcher.active) CallWatcher.reject(context)
             PcMessage.CallSilence -> if (CallWatcher.active) CallWatcher.silence(context)
-            is PcMessage.FilesListRequest -> send(StorageBridge.list(msg.path))
-            is PcMessage.FileRequest -> StorageBridge.read(msg.path).let { (json, bytes) -> send(json, bytes) }
+            is PcMessage.FilesListRequest -> inBackground { sendToSession(active, StorageBridge.list(msg.path)) }
+            is PcMessage.FileRequest -> inBackground {
+                if (active.fileStreamSupported) {
+                    scope.launch(bulk + bulkJobs) {
+                        try {
+                            val file = StorageBridge.streamFile(msg.path) ?: throw IOException("Allow phone storage access or choose an available file.")
+                            file.inputStream().use { sendStream(active, file.name, file.length(), "storage", msg.path, it) }
+                        } catch (error: Exception) {
+                            if (error is kotlinx.coroutines.CancellationException) throw error
+                            sendToSession(active, PhoneMessages.fileData(msg.path, "", error.message ?: "Could not read the file."))
+                        }
+                    }
+                } else StorageBridge.read(msg.path).let { (json, bytes) -> sendToSession(active, json, bytes) }
+            }
             PcMessage.Pong -> Unit
-            is PcMessage.ScreenStart -> session?.let { ScreenBridge.request(context, msg.request, it) }
+            is PcMessage.ScreenStart -> ScreenBridge.request(context, msg.request, active)
             is PcMessage.ScreenStop -> ScreenBridge.stop(context, id = msg.sessionId)
         }
     }
 
-    private fun onFileFromPc(id: String, name: String, bytes: ByteArray) {
+    private suspend fun sendStream(active: LinkSession, name: String, size: Long,
+                                   purpose: String, reference: String, input: java.io.InputStream) {
+        if (size !in 0..MAX_STREAM_BYTES) throw IOException("Files must be 8 GB or smaller.")
+        val id = java.util.UUID.randomUUID().toString()
+        val epoch = transferEpoch.get()
+        val acknowledgment = CompletableDeferred<String?>()
+        synchronized(transferAcks) {
+            if (transferAcks.size >= app.feathercast.protocol.MAX_STREAM_TRANSFERS) throw IOException("Up to four files can be sent at once.")
+            transferAcks[id] = acknowledgment
+        }
+        fun sendChecked(json: String, bytes: ByteArray = ByteArray(0)) {
+            if (session !== active || transferEpoch.get() != epoch || id in cancelledTransfers || !sendToSession(active, json, bytes)) {
+                throw IOException("File transfer cancelled or the connection was lost.")
+            }
+        }
+        try {
+            sendChecked(FileStart(id, name, size, purpose, reference).message())
+            val buffer = ByteArray(FILE_CHUNK_BYTES)
+            var offset = 0L
+            var lastPercent = -1L
+            while (offset < size) {
+                currentCoroutineContext().ensureActive()
+                val read = input.read(buffer, 0, minOf(buffer.size.toLong(), size - offset).toInt())
+                if (read < 0) throw IOException("The file changed or could not be read completely.")
+                if (read == 0) continue
+                sendChecked(message("file.chunk") { put("id", id); put("offset", offset) }, buffer.copyOf(read))
+                offset += read
+                val percent = if (size == 0L) 100 else offset * 100 / size
+                if (percent != lastPercent) {
+                    lastPercent = percent
+                    _state.update { it.copy(transferStatus = "Sending $name: $percent%", transferActive = true) }
+                }
+            }
+            sendChecked(message("file.end") { put("id", id) })
+            val result = withTimeoutOrNull(30_000) { acknowledgment.await() to true }
+                ?: throw IOException("The PC did not confirm the saved file.")
+            result.first?.let { throw IOException(it) }
+            _state.update { it.copy(transferStatus = "Saved $name on your PC.", transferActive = false) }
+        } catch (error: Exception) {
+            sendToSession(active, message("file.cancel") { put("id", id) })
+            _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+            throw error
+        } finally { transferAcks.remove(id); cancelledTransfers.remove(id) }
+    }
+
+    fun cancelTransfers() {
+        transferEpoch.incrementAndGet()
+        // Disk cleanup stays off the UI thread; publication checks the cancellation flag.
+        val receiver = incomingTransfers
+        scope.launch { receiver?.cancel() }
+        sendAsync(message("file.cancel") { put("id", "") })
+        transferAcks.values.forEach { it.complete("File transfer cancelled.") }
+        _state.update { it.copy(transferStatus = "File transfers cancelled.", transferActive = false) }
+    }
+
+    private fun onFileFromPc(active: LinkSession, id: String, name: String, bytes: ByteArray) {
         val error = when {
             !store.receiveFiles -> "Receiving files is turned off on the phone."
             IncomingFiles.needsPermission(context) -> "Allow FeatherCast to save files on the phone."
             else -> IncomingFiles.save(context, name, bytes)
         }
-        send(PhoneMessages.fileReceived(id, name, error == null, error.orEmpty()))
+        sendToSession(active, PhoneMessages.fileReceived(id, name, error == null, error.orEmpty()))
     }
 
     /** The features this phone can serve right now, so the PC hides the rest. */
     private fun features(): List<String> = buildList {
+        add("file.stream.v1")
         if (NotifyListener.hasAccess(context)) add(Features.NOTIFICATION_ACTIONS)
         if (store.receiveFiles && !IncomingFiles.needsPermission(context)) add(Features.RECEIVE_FILES)
         if (store.allowRing) add(Features.RING)
@@ -455,7 +664,6 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             current.copy(pcClipboard = (listOf(PcClip(text, time)) + rest).take(MAX_CLIPS))
         }
         if (!store.clipboardSync) return
-        lastClipboardFromPc = text
         main.post { copyToPhone(text, announce = false) }
     }
 
@@ -466,18 +674,16 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     /** Copies text to the phone clipboard (used for PC clipboard entries). */
     fun copyToPhone(text: String, announce: Boolean = true) {
-        lastClipboardFromPc = text
         val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return
         clipboard.setPrimaryClip(ClipData.newPlainText(if (announce) "FeatherCast" else "From PC", text))
     }
 
-    /** True when the text was just received from the PC, so it is not echoed back. */
-    fun isFromPc(text: String): Boolean = text == lastClipboardFromPc
-
-    private fun sendPhotoList(limit: Int) {
-        if (!PhotoSource.hasPermission(context)) return
-        val photos = PhotoSource.latest(context, limit.coerceIn(1, 120))
-        send(message("photos.list") {
+    private fun sendPhotoList(active: LinkSession, limit: Int) {
+        val access = PhotoSource.access(context)
+        val photos = if (access != PhotoAccess.Denied) PhotoSource.latest(context, limit.coerceIn(1, 120)) else emptyList()
+        sendToSession(active, message("photos.list") {
+            put("access", access.name.lowercase())
+            if (access == PhotoAccess.Denied) put("error", "Allow photo access in FeatherCast on your phone.")
             putJsonArray("items") {
                 for (photo in photos) {
                     addJsonObject {
@@ -491,16 +697,16 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             }
         })
         for (photo in photos) {
-            if (session == null) return
+            if (session !== active) return
             val thumb = PhotoSource.thumbnail(context, photo) ?: continue
-            send(message("photo.thumb") { put("id", photo.id.toString()) }, thumb)
+            sendToSession(active, message("photo.thumb") { put("id", photo.id.toString()) }, thumb)
         }
     }
 
-    private fun sendFullPhoto(id: String) {
+    private fun sendFullPhoto(active: LinkSession, id: String) {
         val photo = id.toLongOrNull()?.let { PhotoSource.find(context, it) } ?: return
         val bytes = PhotoSource.fullBytes(context, photo, MAX_SEND_BYTES) ?: return
-        send(message("photo.full") {
+        sendToSession(active, message("photo.full") {
             put("id", id)
             put("name", photo.name)
         }, bytes)

@@ -18,7 +18,15 @@ may mutate live window state.
 - `DiscoveryService` coalesces refreshes and suppresses stale generations.
 - `FileIndexService` owns recursive fixed-local-root crawling, one asynchronous
   `ReadDirectoryChangesW` watcher per root, burst coalescing, reconciliation,
-  cancellation, and bounded retries. It emits typed batches/status only.
+  cancellation, and capped retries. It emits typed batches/status only. The
+  watcher ignores hidden, system, reparse, generated, excluded, and
+  FeatherCast's own data paths, so the index's own writes never trigger a scan.
+  A scan that finds unavailable roots is retried with full rescans only a few
+  times; after that a cheap probe checks the missing roots and a full rescan
+  runs only once one of them is back. Files that keep their size and write
+  time are carried forward from the previous scan instead of being read again;
+  storage keeps their full-text row only while the stored row still describes
+  that file version.
 - `FileSearchService` owns the read-only WAL SQLite connection used for
   generation-safe `@files` FTS queries. Root search never calls FTS.
 - `PreviewService` reads bounded metadata/text/image payloads on demand and
@@ -39,11 +47,25 @@ may mutate live window state.
 - Command and setting descriptor catalogs provide stable IDs, labels,
   availability metadata, focus order, and confirmation policy.
 - The Library model owns snippet/quicklink validation and ordering. Snippet I/O
-  preserves the existing JSON format, performs atomic replacement, and detects
-  external file changes. The native manager/editor UI lives outside the Win32
+  preserves the existing JSON format, performs durable atomic replacement, and
+  detects external file changes. One shared parser reads the file (a UTF-8 BOM
+  is tolerated) and rejects the whole file when any entry is invalid. The native manager/editor UI lives outside the Win32
   composition root and reports successful mutations back as typed operations.
 - The capability catalog describes built-in feature discovery, examples, and
   typed guide actions without changing search-provider or plugin contracts.
+- `search_preferences.hpp` owns bounded opt-in query choices and per-item resets;
+  explicit aliases/names are resolved before learned preferences in the search pipeline.
+- `automation.hpp` validates scripts, workspaces and command shortcut chords;
+  `automation_win32.hpp` adapts launch targets to Windows shell execution.
+  `command_hotkeys.hpp` owns transactional native registration and releases its IDs.
+- `library_controller.inl` groups the app's Library persistence, reload and editor
+  coordination methods. It is included inside `FeatherCastApp` to preserve UI-thread
+  ownership and existing private queues; this is source separation, rather than a
+  fully independent controller object.
+- `file_transfer.hpp` owns bounded, ordered incoming chunks, temporary files,
+  atomic publication and cancellation. A receiving instance belongs to its
+  authenticated phone session. C++ and Kotlin share negotiation and framing;
+  each transfer uses chunks of at most 256 KiB rather than whole-file buffers.
 - Result actions carry a typed app, window, or text payload. Window geometry,
   local clock answers, UUID formatting, and Windows Settings targets stay in
   narrow deterministic helpers outside the Win32 composition root.
@@ -99,9 +121,11 @@ window.
 - `%APPDATA%\FeatherCast`: settings, snippets, themes, and user plugins.
 - `%LOCALAPPDATA%\FeatherCast`: SQLite operational data, icon cache, updates,
   currency cache, and diagnostics.
-- Settings JSON writes `"schemaVersion": 2`. A missing version is version 0.
+- Settings JSON writes `"schemaVersion": 3`. A missing version is version 0.
   Files newer than the supported version are preserved and automatic saving is
-  blocked.
+  blocked. Settings and snippets are saved through a sibling `.tmp` file that
+  is flushed to disk before it replaces the target, so a power loss cannot
+  leave an empty or zero-filled file behind.
 - SQLite schema v4 adds clipboard pins and saved timer/stopwatch state, with a
   transactional migration and a `.pre-v4.bak` backup. Schema v3 gives indexed files stable IDs and uses an FTS5
   `contentless_delete` table whose row IDs match file IDs. Migration creates a

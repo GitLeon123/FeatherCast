@@ -1,5 +1,6 @@
 #include "phone_screen_ui.hpp"
 #include "phone_screen_playback.hpp"
+#include "ui_renderer.hpp"
 #include <commctrl.h>
 #include <d2d1.h>
 #include <dwmapi.h>
@@ -8,6 +9,7 @@
 #include <windowsx.h>
 #include <wrl/client.h>
 #include <array>
+#include <deque>
 #include <mutex>
 
 namespace feathercast::phone_ui {
@@ -30,6 +32,21 @@ std::string Utf8(std::wstring_view text) {
 }
 D2D1_COLOR_F Color(theme::Color c) { return D2D1::ColorF(c.r, c.g, c.b, 1); }
 COLORREF GdiColor(theme::Color c) { return RGB(static_cast<BYTE>(c.r * 255), static_cast<BYTE>(c.g * 255), static_cast<BYTE>(c.b * 255)); }
+// State shared with the playback worker and the service thread. Their
+// callbacks hold it by shared_ptr, never the window, so a late frame, status or
+// keyframe request after the window is gone only lands here.
+struct ScreenMailbox {
+  std::mutex mutex;
+  HWND notifyWindow = nullptr;
+  bool notified = false;
+  std::string session;
+  std::shared_ptr<const phone::ScreenFrame> frame;
+  std::deque<phone::ScreenPacket> statuses;  // in order; a "stopped" never hides behind "streaming"
+  std::function<bool(phone::ScreenInput)> input;
+  void NotifyLocked() {
+    if (!notified && notifyWindow) { notified = true; PostMessageW(notifyWindow, kUpdated, 0, 0); }
+  }
+};
 bool Caption(HWND window, const std::wstring& text) {
   const int length = GetWindowTextLengthW(window);
   std::wstring old(static_cast<std::size_t>(length) + 1, 0);
@@ -63,42 +80,49 @@ struct PhoneScreenWindow::Impl {
   ComPtr<ID2D1SolidColorBrush> brush;
   ComPtr<ID2D1Bitmap> bitmap;
   std::shared_ptr<const phone::ScreenFrame> shownFrame;
-  // Only the newest decoded frame and status are marshalled to the UI.
-  std::mutex mutex;
-  HWND notifyWindow = nullptr;
-  bool notified = false;
-  std::string mailboxSession;
-  std::shared_ptr<const phone::ScreenFrame> latestFrame;
-  std::optional<phone::ScreenPacket> latestStatus;
-  std::shared_ptr<phone::ScreenPlayback> playback;
+  // Only the newest decoded frame and every status are marshalled to the UI.
+  std::shared_ptr<ScreenMailbox> mailbox = std::make_shared<ScreenMailbox>();
+  std::shared_ptr<phone::ScreenPlayback> playback;  // written on the UI thread under mailbox->mutex
 
   ~Impl() {
     Close();
-    { std::lock_guard lock(mutex); notifyWindow = nullptr; }
-    playback.reset();
+    std::shared_ptr<phone::ScreenPlayback> ended;
+    {
+      std::lock_guard lock(mailbox->mutex);
+      mailbox->notifyWindow = nullptr; mailbox->input = nullptr; mailbox->session.clear();
+      ended = std::move(playback);
+    }
+    // Joins the decoder worker unless the service thread still holds it for a
+    // moment; either way its callbacks only reach the shared mailbox.
+    ended.reset();
     if (hwnd) DestroyWindow(hwnd);
     if (font) DeleteObject(font);
     if (titleFont) DeleteObject(titleFont);
     if (background) DeleteObject(background);
     if (canvasBackground) DeleteObject(canvasBackground);
   }
-  void NotifyLocked() {
-    if (!notified && notifyWindow) { notified = true; PostMessageW(notifyWindow, kUpdated, 0, 0); }
-  }
   void EnsurePlayback() {
-    std::lock_guard lock(mutex);
     if (playback) return;
     phone::ScreenPlaybackCallbacks cb;
-    cb.frame = [this](std::shared_ptr<const phone::ScreenFrame> frame) {
-      std::lock_guard guard(mutex);
-      if (frame->sessionId == mailboxSession) { latestFrame = std::move(frame); NotifyLocked(); }
+    cb.frame = [box = mailbox](std::shared_ptr<const phone::ScreenFrame> frame) {
+      std::lock_guard guard(box->mutex);
+      if (frame->sessionId == box->session) { box->frame = std::move(frame); box->NotifyLocked(); }
     };
-    cb.status = [this](phone::ScreenPacket packet) {
-      std::lock_guard guard(mutex);
-      if (packet.sessionId == mailboxSession) { latestStatus = std::move(packet); NotifyLocked(); }
+    cb.status = [box = mailbox](phone::ScreenPacket packet) {
+      std::lock_guard guard(box->mutex);
+      if (packet.sessionId != box->session) return;
+      if (box->statuses.size() >= 16) box->statuses.pop_front();
+      box->statuses.push_back(std::move(packet));
+      box->NotifyLocked();
     };
-    cb.input = [this](phone::ScreenInput input) { if (callbacks.input) callbacks.input(std::move(input)); };
-    playback = std::make_shared<phone::ScreenPlayback>(std::move(cb));
+    cb.input = [box = mailbox](phone::ScreenInput input) {
+      std::function<bool(phone::ScreenInput)> send;
+      { std::lock_guard guard(box->mutex); if (input.sessionId == box->session) send = box->input; }
+      if (send) send(std::move(input));
+    };
+    auto created = std::make_shared<phone::ScreenPlayback>(std::move(cb));
+    std::lock_guard lock(mailbox->mutex);
+    playback = std::move(created);
   }
   void Input(std::string action, int value = 0, std::string text = {}) {
     if (!sessionId.empty() && generation > 0 && callbacks.input)
@@ -116,7 +140,7 @@ struct PhoneScreenWindow::Impl {
     if (id.empty()) { detail = L"Reconnect your phone and try again."; Update(); return; }
     sessionId = id; generation = 0; controlReady = keyboardReady = audioReady = false;
     audioDetail.clear(); shownFrame.reset(); bitmap.Reset();
-    { std::lock_guard lock(mutex); mailboxSession = id; latestFrame.reset(); latestStatus.reset(); }
+    { std::lock_guard lock(mailbox->mutex); mailbox->session = id; mailbox->frame.reset(); mailbox->statuses.clear(); }
     playback->Begin(id);
     playback->SetAudio(sound, static_cast<float>(SendMessageW(controls[Volume], TBM_GETPOS, 0, 0)) / 100);
     phase = L"Waiting for your phone";
@@ -127,7 +151,7 @@ struct PhoneScreenWindow::Impl {
     CancelInput();
     if (notify && !sessionId.empty() && callbacks.stop) callbacks.stop();
     sessionId.clear(); generation = 0; controlReady = keyboardReady = audioReady = false;
-    { std::lock_guard lock(mutex); mailboxSession.clear(); latestFrame.reset(); latestStatus.reset(); }
+    { std::lock_guard lock(mailbox->mutex); mailbox->session.clear(); mailbox->frame.reset(); mailbox->statuses.clear(); }
     if (playback) playback->End();
     shownFrame.reset(); bitmap.Reset(); Update();
   }
@@ -162,20 +186,24 @@ struct PhoneScreenWindow::Impl {
     InvalidateRect(hwnd, nullptr, FALSE);
   }
   void Mailbox() {
-    std::optional<phone::ScreenPacket> state;
+    std::deque<phone::ScreenPacket> states;
     std::shared_ptr<const phone::ScreenFrame> frame;
-    { std::lock_guard lock(mutex); state = std::exchange(latestStatus, {}); frame = std::move(latestFrame); notified = false; }
-    if (state && state->sessionId == sessionId) {
-      if (state->state == "audio-error") audioDetail = Widen(state->detail);
-      else if (state->state == "streaming") {
-        if (state->generation < generation) { Update(); return; }
-        if (state->generation != generation) { CancelInput(); shownFrame.reset(); bitmap.Reset(); imageRect = {}; }
-        generation = state->generation; controlReady = state->control; keyboardReady = state->keyboard;
-        audioReady = state->audio; phase = L"Screen shared"; detail = Widen(state->detail);
-      } else if (state->state == "stopped" || state->state == "error") {
-        detail = Widen(state->detail); phase = state->state == "error" ? L"Screen sharing unavailable" : L"Screen sharing stopped";
-        EndSession(state->state == "error");
-      } else if (state->state == "pending") detail = Widen(state->detail);
+    {
+      std::lock_guard lock(mailbox->mutex);
+      states.swap(mailbox->statuses); frame = std::move(mailbox->frame); mailbox->notified = false;
+    }
+    for (const auto& state : states) {
+      if (state.sessionId != sessionId) continue;  // also after EndSession below
+      if (state.state == "audio-error") audioDetail = Widen(state.detail);
+      else if (state.state == "streaming") {
+        if (state.generation < generation) continue;
+        if (state.generation != generation) { CancelInput(); shownFrame.reset(); bitmap.Reset(); imageRect = {}; }
+        generation = state.generation; controlReady = state.control; keyboardReady = state.keyboard;
+        audioReady = state.audio; phase = L"Screen shared"; detail = Widen(state.detail);
+      } else if (state.state == "stopped" || state.state == "error") {
+        detail = Widen(state.detail); phase = state.state == "error" ? L"Screen sharing unavailable" : L"Screen sharing stopped";
+        EndSession(state.state == "error");
+      } else if (state.state == "pending") detail = Widen(state.detail);
     }
     if (frame && frame->sessionId == sessionId && frame->generation >= generation) {
       if (frame->generation != generation) { CancelInput(); imageRect = {}; }
@@ -207,12 +235,15 @@ struct PhoneScreenWindow::Impl {
     if (!hwnd) return;
     if (font) DeleteObject(font);
     if (titleFont) DeleteObject(titleFont);
+    // The theme stores a comma-separated fallback list; GDI and DirectWrite
+    // both need a single installed family name.
+    const std::wstring family = ui::ResolveInstalledFontFamily(theme.fontFamily, dwrite.Get());
     font = CreateFontW(-static_cast<int>(MulDiv(14, GetDpiForWindow(hwnd), 96) * textScale), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, theme.fontFamily.c_str());
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, family.c_str());
     if (background) DeleteObject(background);
     background = CreateSolidBrush(GdiColor(theme.surface));
     titleFont = CreateFontW(-static_cast<int>(MulDiv(20, GetDpiForWindow(hwnd), 96) * textScale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, theme.fontFamily.c_str());
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, family.c_str());
     if (canvasBackground) DeleteObject(canvasBackground);
     canvasBackground = CreateSolidBrush(GdiColor(theme::CompositeOver(theme.overlayBackground, theme.surface)));
     HIGHCONTRASTW contrast{sizeof(HIGHCONTRASTW)}; SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
@@ -221,8 +252,8 @@ struct PhoneScreenWindow::Impl {
     SendMessageW(controls[EmptyTitle], WM_SETFONT, reinterpret_cast<WPARAM>(titleFont), TRUE);
     if (dwrite) {
       body.Reset(); heading.Reset();
-      dwrite->CreateTextFormat(theme.fontFamily.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14, L"en-us", &body);
-      dwrite->CreateTextFormat(theme.fontFamily.c_str(), nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20, L"en-us", &heading);
+      dwrite->CreateTextFormat(family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14, L"en-us", &body);
+      dwrite->CreateTextFormat(family.c_str(), nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20, L"en-us", &heading);
     }
     BOOL dark = !highContrast; DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark)); Update();
   }
@@ -282,10 +313,20 @@ struct PhoneScreenWindow::Impl {
     const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
     const wchar_t* text = handle ? static_cast<const wchar_t*>(GlobalLock(handle)) : nullptr;
     std::string utf8;
-    if (text) { const auto count = wcsnlen(text, 16385); if (count <= 16384) utf8 = Utf8(std::wstring_view(text, count)); GlobalUnlock(handle); }
+    bool tooLong = false;
+    if (text) {
+      const auto count = wcsnlen(text, phone::kMaxScreenTextBytes + 1);
+      if (count <= phone::kMaxScreenTextBytes) utf8 = Utf8(std::wstring_view(text, count));
+      else tooLong = true;
+      GlobalUnlock(handle);
+    }
     CloseClipboard();
-    if (!utf8.empty() && utf8.size() <= 16384) Input("text", 0, std::move(utf8));
-    else { detail = L"Paste supports up to 16 KB of text at a time."; Update(); }
+    // The limit applies to the UTF-8 text and to its escaped JSON form, which
+    // grows with quotes, backslashes and control characters.
+    if (!utf8.empty() && !sessionId.empty() && generation > 0 &&
+        !phone::ValidScreenInput({sessionId, generation, "text", lastX, lastY, 0, utf8})) tooLong = true;
+    if (tooLong) { detail = L"Paste supports up to 16 KB of plain text at a time."; Update(); return; }
+    if (!utf8.empty()) Input("text", 0, std::move(utf8));
   }
   void Character(wchar_t ch) {
     if (!keyboardReady || ch < 32 || ch == 127) return;
@@ -394,7 +435,7 @@ struct PhoneScreenWindow::Impl {
       cls.lpszClassName = kClass; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hIcon = LoadIconW(cls.hInstance, MAKEINTRESOURCEW(101)); RegisterClassExW(&cls);
       if (!CreateWindowExW(0, kClass, L"Phone Screen — FeatherCast", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
           CW_USEDEFAULT, CW_USEDEFAULT, 760, 960, nullptr, nullptr, cls.hInstance, this)) return;
-      { std::lock_guard lock(mutex); notifyWindow = hwnd; }
+      { std::lock_guard lock(mailbox->mutex); mailbox->notifyWindow = hwnd; }
       INITCOMMONCONTROLSEX common{sizeof(common), ICC_BAR_CLASSES}; InitCommonControlsEx(&common);
       const auto button = [&](int id, const wchar_t* label) {
         controls[id] = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -429,7 +470,11 @@ struct PhoneScreenWindow::Impl {
 
 PhoneScreenWindow::PhoneScreenWindow() : impl_(std::make_unique<Impl>()) {}
 PhoneScreenWindow::~PhoneScreenWindow() = default;
-void PhoneScreenWindow::SetCallbacks(ScreenCallbacks cb) { impl_->callbacks = std::move(cb); }
+void PhoneScreenWindow::SetCallbacks(ScreenCallbacks cb) {
+  impl_->callbacks = std::move(cb);
+  std::lock_guard lock(impl_->mailbox->mutex);
+  impl_->mailbox->input = impl_->callbacks.input;
+}
 void PhoneScreenWindow::SetTheme(const theme::Theme& theme, theme::Color) { impl_->theme = theme; impl_->Style(); }
 void PhoneScreenWindow::SetTextScale(float scale) {
   impl_->textScale = std::clamp(scale, 0.9f, 2.0f); impl_->Style(); impl_->Layout();
@@ -452,7 +497,7 @@ void PhoneScreenWindow::Show() { impl_->Show(); }
 void PhoneScreenWindow::Close() { impl_->Close(); }
 void PhoneScreenWindow::OnPacket(phone::ScreenPacket packet) {
   std::shared_ptr<phone::ScreenPlayback> playback;
-  { std::lock_guard lock(impl_->mutex); playback = impl_->playback; }
+  { std::lock_guard lock(impl_->mailbox->mutex); playback = impl_->playback; }
   if (playback) playback->OnPacket(std::move(packet));
 }
 bool PhoneScreenWindow::HandleMessage(MSG& msg) {

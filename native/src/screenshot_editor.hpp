@@ -420,6 +420,10 @@ struct Draft {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::uint32_t stride = 0;
+  // Physical pixels per DIP of the captured monitors (the largest one when
+  // the capture spans several). Blur and pixelate strength scale with it so
+  // redaction stays as strong on high-DPI displays as at 100%.
+  float pixelScale = 1.0f;
   std::shared_ptr<const std::vector<std::uint8_t>> pixels;
 
   [[nodiscard]] bool Valid() const noexcept {

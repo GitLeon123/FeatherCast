@@ -49,7 +49,7 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
   Event event;
   if (type == "status") {
     event.kind = EventKind::Status;
-    event.battery = static_cast<int>(JsonInt(root, "battery", -1));
+    event.battery = JsonInt32(root, "battery", -1);
     event.charging = JsonBool(root, "charging");
     event.deviceName = JsonString(root, "name");
     if (const auto* features = JsonArray(root, "features")) {
@@ -69,7 +69,7 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     if (const auto* actions = JsonArray(root, "actions")) {
       for (const auto& item : actions->array) {
         NotificationAction action;
-        action.index = static_cast<int>(JsonInt(item, "i", -1));
+        action.index = JsonInt32(item, "i", -1);
         action.title = JsonString(item, "title");
         action.reply = JsonBool(item, "reply");
         if (action.index >= 0 && !action.title.empty()) info.actions.push_back(std::move(action));
@@ -88,14 +88,16 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     event.kind = EventKind::ClipboardHistoryRequested;
   } else if (type == "photos.list") {
     event.kind = EventKind::PhotoList;
+    event.text = JsonString(root, "error");
+    event.id = JsonString(root, "access");
     if (const auto* items = JsonArray(root, "items")) {
       for (const auto& item : items->array) {
         PhotoInfo photo;
         photo.id = JsonString(item, "id");
         photo.name = JsonString(item, "name");
         photo.time = JsonInt(item, "time");
-        photo.width = static_cast<int>(JsonInt(item, "w"));
-        photo.height = static_cast<int>(JsonInt(item, "h"));
+        photo.width = JsonInt32(item, "w");
+        photo.height = JsonInt32(item, "h");
         if (!photo.id.empty()) event.photos.push_back(std::move(photo));
       }
     }
@@ -128,8 +130,8 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     media.position = JsonInt(root, "pos");
     media.duration = JsonInt(root, "dur");
     media.positionAt = JsonInt(root, "posAt", nowMs);
-    media.volume = static_cast<int>(JsonInt(root, "vol", -1));
-    media.volumeMax = static_cast<int>(JsonInt(root, "volMax"));
+    media.volume = JsonInt32(root, "vol", -1);
+    media.volumeMax = JsonInt32(root, "volMax");
     media.artJpeg = binary;
   } else if (type == "media.none") {
     event.kind = EventKind::MediaState;
@@ -303,6 +305,148 @@ inline std::string RemotePathParent(std::string_view path) {
   const auto slash = out.find_last_of('/');
   if (slash == std::string::npos || slash == 0) return "/";
   return out.substr(0, slash);
+}
+
+// ------------------------------------------------------------- saved files
+
+inline constexpr std::size_t kMaxSavedNameBytes = 120;
+
+// Turns a name chosen by the phone into one safe file name for the downloads
+// folder. Path separators, characters Windows rejects, control characters,
+// invalid UTF-8, and bidirectional overrides (which can disguise "exe.jpg" as
+// "gpj.exe") become '_'. Leading dots and spaces, trailing dots and spaces,
+// and reserved device names (CON, NUL, COM1, ...) are neutralized, and long
+// names are shortened at a character boundary, keeping the extension.
+inline std::string SanitizeFileName(std::string_view name,
+                                    std::string_view fallback = "phone-file") {
+  static constexpr std::string_view kInvalid = "<>:\"/\\|?*";
+  std::string out;
+  out.reserve(name.size());
+  for (std::size_t i = 0; i < name.size();) {
+    const auto lead = static_cast<unsigned char>(name[i]);
+    std::size_t length = lead < 0x80 ? 1
+                         : (lead & 0xE0) == 0xC0 ? 2
+                         : (lead & 0xF0) == 0xE0 ? 3
+                         : (lead & 0xF8) == 0xF0 ? 4
+                                                 : 0;
+    std::uint32_t cp = length == 1 ? lead
+                       : length == 2 ? (lead & 0x1Fu)
+                       : length == 3 ? (lead & 0x0Fu)
+                                     : (lead & 0x07u);
+    bool valid = length > 0 && i + length <= name.size();
+    for (std::size_t k = 1; valid && k < length; ++k) {
+      const auto next = static_cast<unsigned char>(name[i + k]);
+      valid = (next & 0xC0) == 0x80;
+      cp = (cp << 6) | (next & 0x3Fu);
+    }
+    if (valid && ((length == 2 && cp < 0x80) || (length == 3 && cp < 0x800) ||
+                  (length == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ||
+                  (cp >= 0xD800 && cp <= 0xDFFF))) {
+      valid = false;  // overlong, out of range, or a surrogate
+    }
+    if (!valid) {
+      out.push_back('_');
+      ++i;
+      continue;
+    }
+    const bool unsafe = cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F) ||
+                        cp == 0x061C || cp == 0x200E || cp == 0x200F ||
+                        (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2066 && cp <= 0x2069) ||
+                        (cp < 0x80 && kInvalid.find(static_cast<char>(cp)) != std::string_view::npos);
+    if (unsafe) {
+      out.push_back('_');
+    } else {
+      out.append(name.substr(i, length));
+    }
+    i += length;
+  }
+  const auto trim = [](std::string& text) {
+    while (!text.empty() && (text.back() == '.' || text.back() == ' ')) text.pop_back();
+    std::size_t start = 0;
+    while (start < text.size() && (text[start] == '.' || text[start] == ' ')) ++start;
+    text.erase(0, start);
+  };
+  trim(out);
+  if (out.size() > kMaxSavedNameBytes) {
+    const auto dot = out.find_last_of('.');
+    const std::string extension =
+        dot != std::string::npos && dot > 0 && out.size() - dot <= 16 ? out.substr(dot) : std::string{};
+    std::size_t keep = kMaxSavedNameBytes - extension.size();
+    // Never cut a multi-byte UTF-8 sequence in half.
+    while (keep > 0 && (static_cast<unsigned char>(out[keep]) & 0xC0) == 0x80) --keep;
+    out = out.substr(0, keep) + extension;
+    trim(out);
+  }
+  if (out.empty()) out = std::string(fallback);
+  // Windows maps these names to devices, with or without an extension.
+  std::string stem = out.substr(0, out.find('.'));
+  while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+  for (char& ch : stem) {
+    if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+  }
+  bool reserved = stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" ||
+                  stem == "CONIN$" || stem == "CONOUT$" || stem == "CLOCK$";
+  if (!reserved && (stem.starts_with("COM") || stem.starts_with("LPT"))) {
+    const std::string_view number = std::string_view(stem).substr(3);
+    reserved = (number.size() == 1 && number[0] >= '0' && number[0] <= '9') ||
+               number == "\xC2\xB9" || number == "\xC2\xB2" || number == "\xC2\xB3";
+  }
+  if (reserved) out.insert(out.begin(), '_');
+  return out;
+}
+
+// File name for a file fetched from phone storage: the last segment of the
+// requested path, never a separate name the phone reports.
+inline std::string RemoteFileName(std::string_view remotePath) {
+  while (!remotePath.empty() && remotePath.back() == '/') remotePath.remove_suffix(1);
+  const auto slash = remotePath.find_last_of('/');
+  return SanitizeFileName(slash == std::string_view::npos ? remotePath
+                                                          : remotePath.substr(slash + 1));
+}
+
+// Canonical extension for image bytes, or empty when the format is unknown.
+inline std::string_view DetectImageExtension(const Bytes& data) {
+  const auto at = [&](std::size_t offset, std::string_view magic) {
+    if (data.size() < offset + magic.size()) return false;
+    for (std::size_t i = 0; i < magic.size(); ++i) {
+      if (data[offset + i] != static_cast<std::uint8_t>(magic[i])) return false;
+    }
+    return true;
+  };
+  if (at(0, "\xFF\xD8\xFF")) return ".jpg";
+  if (at(0, "\x89" "PNG\r\n\x1A\n")) return ".png";
+  if (at(0, "GIF87a") || at(0, "GIF89a")) return ".gif";
+  if (at(0, "RIFF") && at(8, "WEBP")) return ".webp";
+  if (at(0, std::string_view("II*\0", 4)) || at(0, std::string_view("MM\0*", 4))) return ".tif";
+  if (at(0, "BM")) return ".bmp";
+  if (at(4, "ftyp")) {
+    if (at(8, "avif") || at(8, "avis")) return ".avif";
+    for (const std::string_view brand : {"heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1"}) {
+      if (at(8, brand)) return ".heic";
+    }
+  }
+  return {};
+}
+
+// Saved photo name whose extension matches the image bytes, so a photo named
+// "invoice.pdf.exe" by the phone can only be saved and opened as an image.
+// Unknown formats are saved as ".bin" and therefore never run when opened.
+inline std::string PhotoFileName(std::string_view name, const Bytes& data) {
+  std::string safe = SanitizeFileName(name, "phone-photo");
+  const std::string_view detected = DetectImageExtension(data);
+  const std::string_view wanted = detected.empty() ? std::string_view(".bin") : detected;
+  const auto dot = safe.find_last_of('.');
+  const bool hasExtension = dot != std::string::npos && dot > 0;
+  std::string extension = hasExtension ? safe.substr(dot) : std::string{};
+  for (char& ch : extension) {
+    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+  }
+  const bool matches = extension == wanted ||
+                       (wanted == ".jpg" && (extension == ".jpeg" || extension == ".jpe")) ||
+                       (wanted == ".tif" && (extension == ".tiff" || extension == ".dng")) ||
+                       (wanted == ".heic" && extension == ".heif");
+  if (matches) return safe;
+  return (hasExtension ? safe.substr(0, dot) : safe) + std::string(wanted);
 }
 
 }  // namespace feathercast::phone

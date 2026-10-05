@@ -1,5 +1,9 @@
 # Manual Regression Checklist
 
+For the search, automation, transfer and Android permission improvements, see
+[improvement-validation.md](improvement-validation.md) for current evidence and
+unperformed hardware/accessibility checks.
+
 For the 0.9.0 candidate's measured results and remaining publication checks, see
 [release-0.9.0.md](release-0.9.0.md).
 
@@ -107,6 +111,9 @@ and then with pointer input.
 - Deep trees, create/write/rename/delete bursts, unavailable roots, permission
   failures, watcher overflow reconciliation, Sleep/Resume, and shutdown converge
   to the correct index without following hidden/system/reparse entries.
+- A root that stays offline is rescanned only a few times, then probed cheaply
+  until it returns; files that did not change keep their full-text content
+  after a rescan, and edited files are found by their new content.
 - Opening `@files` for the first time stays responsive while the persisted
   index loads. Taking one configured root offline preserves its stored entries;
   removing a root deliberately removes them. UNC/network folders are rejected

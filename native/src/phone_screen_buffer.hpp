@@ -3,6 +3,7 @@
 #include "phone_screen_protocol.hpp"
 
 #include <deque>
+#include <optional>
 
 namespace feathercast::phone {
 
@@ -59,6 +60,23 @@ class ScreenPacketBuffer {
  private:
   std::deque<ScreenPacket> packets_;
   bool waitingForKeyframe_ = true;
+};
+
+// Limits keyframe recovery requests. While the buffer waits for an IDR it
+// drops every delta frame, and each drop would otherwise ask the phone again.
+class KeyframeThrottle {
+ public:
+  static constexpr long long kIntervalMs = 500;
+
+  bool Allow(long long nowMs) {
+    if (last_ && nowMs - *last_ < kIntervalMs) return false;
+    last_ = nowMs;
+    return true;
+  }
+  void Reset() { last_.reset(); }
+
+ private:
+  std::optional<long long> last_;
 };
 
 }  // namespace feathercast::phone

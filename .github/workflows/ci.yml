@@ -53,9 +53,16 @@ jobs:
         run: ctest --test-dir build-native -C Release --output-on-failure
 
       - name: Verify search performance
+        shell: pwsh
         run: |
-          build-native\Release\FeatherCastSearchBenchmarks.exe
-          build-native\Release\FeatherCastFileSearchBenchmarks.exe
+          # pwsh only fails a step on the last native exit code; check each one.
+          foreach ($benchmark in @(
+            "build-native\Release\FeatherCastSearchBenchmarks.exe",
+            "build-native\Release\FeatherCastFileSearchBenchmarks.exe"
+          )) {
+            & $benchmark
+            if ($LASTEXITCODE -ne 0) { throw "$benchmark failed with exit code $LASTEXITCODE." }
+          }
 
       - name: Verify self-contained runtime and startup
         shell: pwsh
@@ -99,13 +106,15 @@ jobs:
       - name: Validate tag version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           $cmake = Get-Content CMakeLists.txt -Raw
           if ($cmake -notmatch 'project\(FeatherCastNative VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
             throw "Unable to read the CMake project version."
           }
           $projectVersion = $Matches[1]
-          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $tagVersion = $env:REF_NAME.TrimStart('v')
           if ($projectVersion -ne $tagVersion) {
             throw "Tag version $tagVersion does not match CMake project version $projectVersion."
           }
@@ -159,7 +168,9 @@ jobs:
           )) {
             signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
               /f $certificate /p $env:CERTIFICATE_PASSWORD $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $file with exit code $LASTEXITCODE." }
             signtool verify /pa /v $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $file with exit code $LASTEXITCODE." }
           }
 
       - name: Verify signed application identities
@@ -193,6 +204,16 @@ jobs:
               [Security.Cryptography.SHA256]::HashData($signature.SignerCertificate.RawData)
             ).ToLowerInvariant()
             if ($pin -notin $pins) { throw "$file signer certificate is not pinned." }
+          }
+
+      - name: Check release symbols
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # upload-artifact only fails when every path is missing; require each PDB.
+          foreach ($name in @('FeatherCast', 'FeatherCastPluginHost', 'InputBroker')) {
+            $pdb = "build-native\Release\$name.pdb"
+            if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw "Release symbols are missing: $pdb" }
           }
 
       - name: Retain release symbols
@@ -247,9 +268,19 @@ jobs:
         run: |
           $certificate = "$env:RUNNER_TEMP\feathercast-signing.pfx"
           $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer was not generated." }
           signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
             /f $certificate /p $env:CERTIFICATE_PASSWORD $installer.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for the installer with exit code $LASTEXITCODE." }
           signtool verify /pa /v $installer.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for the installer with exit code $LASTEXITCODE." }
+
+      - name: Remove signing certificate
+        if: always() && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $certificate = "$env:RUNNER_TEMP\feathercast-signing.pfx"
+          if (Test-Path -LiteralPath $certificate) { Remove-Item -LiteralPath $certificate -Force }
 
       - name: Verify signed installer identity
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
@@ -279,9 +310,11 @@ jobs:
 
       - name: Smoke-test installer
         if: startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 20
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           function Invoke-SelfTest([string]$Path, [string]$Label) {
             $selfTest = Start-Process $Path -ArgumentList '--self-test' -PassThru -Wait
@@ -293,10 +326,12 @@ jobs:
           $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
           if (-not $installer) { throw "NSIS installer was not generated." }
 
-          $installRoot = Join-Path $env:RUNNER_TEMP 'feathercast-upgrade-root'
-          if (Test-Path $installRoot) {
-            Remove-Item -LiteralPath $installRoot -Recurse -Force
-          }
+          # The installer only registers the elevated input broker inside a
+          # protected Program Files folder; anywhere else it fails on purpose.
+          $installRoot = Join-Path $env:ProgramFiles (
+            'feathercast-upgrade-smoke-' + [Guid]::NewGuid().ToString('N'))
+          $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $brokerTaskName = "FeatherCast Input Broker-$userSid"
           # NSIS requires /D= to be the final argument and does not accept quotes.
           $installArguments = @('/S', ('/D=' + $installRoot))
 
@@ -311,7 +346,7 @@ jobs:
             $releaseRecords = ConvertFrom-Json -InputObject (
               $releaseJson -join [Environment]::NewLine)
             $previousTag = $releaseRecords |
-              Where-Object { $_.tagName -and $_.tagName -ne '${{ github.ref_name }}' } |
+              Where-Object { $_.tagName -and $_.tagName -ne $env:REF_NAME } |
               Select-Object -ExpandProperty tagName -First 1
           } catch {
             Write-Warning "Unable to list previous releases; running a clean-install smoke test. $($_.Exception.Message)"
@@ -370,6 +405,9 @@ jobs:
           $uninstaller = Join-Path $installRoot 'Uninstall.exe'
           if (-not (Test-Path $app)) { throw "Installed FeatherCast.exe was not found." }
           if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found." }
+          if (-not (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue)) {
+            throw "The installer did not register the input broker task."
+          }
           foreach ($preservedFile in $preservedFiles) {
             if (-not (Test-Path $preservedFile)) {
               throw "Upgrade removed user data: $preservedFile"
@@ -421,9 +459,20 @@ jobs:
             throw "The uninstall entry does not point at the custom install root."
           }
 
-          $uninstall = Start-Process $uninstaller -ArgumentList '/S' -PassThru -Wait
+          # A plain NSIS uninstaller re-launches itself from %TEMP%, so its exit
+          # code says nothing. Run a copy with _?= (last, unquoted) in place.
+          $uninstallCopy = Join-Path $env:RUNNER_TEMP (
+            'feathercast-uninstall-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force $uninstallCopy | Out-Null
+          $uninstallerCopy = Join-Path $uninstallCopy 'Uninstall.exe'
+          Copy-Item -LiteralPath $uninstaller -Destination $uninstallerCopy
+          $uninstall = Start-Process $uninstallerCopy -ArgumentList @('/S', ('_?=' + $installRoot)) -PassThru -Wait
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
+          Remove-Item -LiteralPath $uninstallCopy -Recurse -Force
           if (Test-Path $installRoot) { throw "Installation directory remains after uninstall." }
+          if (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue) {
+            throw "Uninstall left the elevated input broker task behind."
+          }
           foreach ($preservedFile in $preservedFiles) {
             if (-not (Test-Path $preservedFile)) {
               throw "Uninstall removed user data: $preservedFile"
@@ -505,12 +554,25 @@ jobs:
             export ORG_GRADLE_PROJECT_fcKeyAlias=feathercast
             export ORG_GRADLE_PROJECT_fcKeyPassword="$PHONE_KEYSTORE_PASSWORD"
           fi
-          ./gradlew --no-daemon :protocol:test :app:lintRelease :app:assembleRelease
+          ./gradlew --no-daemon :protocol:test :app:testReleaseUnitTest :app:lintRelease :app:assembleRelease
           cp app/build/outputs/apk/release/app-release.apk FeatherCast-Phone.apk
 
       - name: Remove temporary signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/phone-release.jks"
+
+      - name: Verify phone app signature
+        working-directory: android
+        shell: bash
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs \
+            FeatherCast-Phone.apk | tee "$RUNNER_TEMP/apksigner.txt"
+          # Phones only accept updates signed with the same key, so a release
+          # must never ship the debug key.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && grep -q 'CN=Android Debug' "$RUNNER_TEMP/apksigner.txt"; then
+            echo "Release tags must not ship a debug-signed phone app."
+            exit 1
+          fi
 
       - name: Retain phone app
         uses: actions/upload-artifact@v4
@@ -539,14 +601,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
           $assets = @(Get-ChildItem release-assets -File)
           $assetPaths = @($assets | ForEach-Object FullName)
-          $tag = '${{ github.ref_name }}'
-          $releaseJson = gh api "repos/$env:GH_REPO/releases?per_page=100"
+          $tag = $env:TAG
+          # Walk every page; one compact JSON object per line.
+          $releaseLines = gh api --paginate "repos/$env:GH_REPO/releases?per_page=100" `
+            --jq '.[] | {id, tag_name, draft} | @json'
           if ($LASTEXITCODE -ne 0) { throw "Unable to inspect existing GitHub releases." }
-          $matchingReleases = @($releaseJson |
-            ConvertFrom-Json |
+          $matchingReleases = @($releaseLines |
+            Where-Object { $_ } |
+            ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object tag_name -eq $tag)
 
           if ($matchingReleases.Count -gt 1) {
@@ -554,6 +620,9 @@ jobs:
             throw "Multiple releases already use tag $tag (IDs: $($ids -join ', ')). Remove the duplicate drafts and rerun this job."
           }
           if ($matchingReleases.Count -eq 1) {
+            if (-not $matchingReleases[0].draft) {
+              throw "Release $tag is already published. Its assets are not replaced; publish a new tag instead."
+            }
             gh release upload $tag @assetPaths --clobber
             if ($LASTEXITCODE -ne 0) { throw "Unable to update the existing draft release for $tag." }
           } else {

@@ -390,21 +390,26 @@ int main(int argc, char** argv) {
   }
 
   const auto inputLatency = probe.firstInputLatencyMicros.load();
+  // Wall-clock budgets: widened on noisy CI runners (see TimingBudgetScale).
+  const double budgetScale = feathercast::test::TimingBudgetScale();
+  const auto inputLatencyBudget =
+      static_cast<std::uint64_t>(100'000 * budgetScale);
+  const auto pumpBudget = static_cast<std::uint64_t>(33'000 * budgetScale);
+  // Print before checking so a failed budget shows the measured values.
+  std::printf(
+      "performance_self_test input_latency_us=%llu max_pump_us=%llu "
+      "peak_queue=%zu max_batch=%zu events=%llu budget_scale=%.2f\n",
+      static_cast<unsigned long long>(inputLatency),
+      static_cast<unsigned long long>(maxPumpMicros), maxQueueDepth, maxBatch,
+      static_cast<unsigned long long>(nextSequence.load()), budgetScale);
   assert(probe.inputMessages.load() == kInputMessages);
   assert(probe.animationMessages.load() == kInputMessages);
   assert(probe.pluginNotifications.load() >= kPluginQueries);
   assert(inputLatency != std::numeric_limits<std::uint64_t>::max());
-  assert(inputLatency <= 100'000);
+  assert(inputLatency <= inputLatencyBudget);
   assert(maxBatch <= 24);
-  assert(maxPumpMicros <= 33'000);
+  assert(maxPumpMicros <= pumpBudget);
   for (const auto& count : received) assert(count.load() > 0);
-
-  std::printf(
-      "performance_self_test input_latency_us=%llu max_pump_us=%llu "
-      "peak_queue=%zu max_batch=%zu events=%llu\n",
-      static_cast<unsigned long long>(inputLatency),
-      static_cast<unsigned long long>(maxPumpMicros), maxQueueDepth, maxBatch,
-      static_cast<unsigned long long>(nextSequence.load()));
 
   extensions.Shutdown();
   icons.Stop();

@@ -35,34 +35,19 @@ inline bool SaveSettingsFile(
     return false;
   }
 
-  std::filesystem::path temporaryPath = settingsPath;
-  temporaryPath += L".tmp";
-  {
-    std::ofstream file(temporaryPath, std::ios::binary | std::ios::trunc);
-    if (!file) {
-      if (errorMessage) *errorMessage = L"Could not open the temporary settings file.";
-      return false;
-    }
-    const auto serialized =
-        feathercast::settings::SerializeSettings(settings);
-    file.write(serialized.data(),
-               static_cast<std::streamsize>(serialized.size()));
-    file.flush();
-    if (!file) {
-      file.close();
-      std::filesystem::remove(temporaryPath, ec);
-      if (errorMessage) *errorMessage = L"Could not finish writing settings.";
-      return false;
-    }
+  using feathercast::filesystem_semantics::ReplaceStatus;
+  const auto status = feathercast::filesystem_semantics::ReplaceFileDurably(
+      settingsPath, feathercast::settings::SerializeSettings(settings));
+  if (status == ReplaceStatus::Replaced) return true;
+  if (errorMessage) {
+    *errorMessage =
+        status == ReplaceStatus::CreateFailed
+            ? L"Could not open the temporary settings file."
+        : status == ReplaceStatus::WriteFailed
+            ? L"Could not finish writing settings."
+            : L"Could not replace settings.json.";
   }
-
-  if (!MoveFileExW(temporaryPath.c_str(), settingsPath.c_str(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    std::filesystem::remove(temporaryPath, ec);
-    if (errorMessage) *errorMessage = L"Could not replace settings.json.";
-    return false;
-  }
-  return true;
+  return false;
 }
 
 inline std::filesystem::path InvalidBackupPath(

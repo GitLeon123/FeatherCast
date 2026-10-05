@@ -5,6 +5,9 @@ import kotlinx.serialization.json.put
 const val MAX_SCREEN_PACKET_BYTES = 2 * 1024 * 1024
 const val SCREEN_REQUEST_LIFETIME_MS = 60_000L
 const val SCREEN_COORDINATE_SCALE = 1_000_000
+const val MAX_SCREEN_TEXT_BYTES = 16 * 1024
+/** Covers [MAX_SCREEN_TEXT_BYTES] of text escaped up to 6x (`\u00XX`) in JSON, plus the other fields. */
+const val MAX_SCREEN_INPUT_BYTES = 128 * 1024
 
 data class ScreenRequest(val sessionId: String, val key: ByteArray, val audio: Boolean)
 
@@ -18,7 +21,7 @@ data class ScreenInput(
     val text: String = "",
 ) {
     fun valid(): Boolean {
-        if (sessionId.isEmpty() || sessionId.length > 64 || generation <= 0 || text.utf8().size > 16 * 1024) return false
+        if (sessionId.isEmpty() || sessionId.length > 64 || generation <= 0 || text.utf8().size > MAX_SCREEN_TEXT_BYTES) return false
         return when (action) {
             "down", "move", "up", "scroll" -> x in 0..SCREEN_COORDINATE_SCALE && y in 0..SCREEN_COORDINATE_SCALE &&
                 (action != "scroll" || value in -10..10)
@@ -30,7 +33,7 @@ data class ScreenInput(
 
     companion object {
         fun parse(json: String): ScreenInput? {
-            if (json.length > 32 * 1024) return null
+            if (json.length > MAX_SCREEN_INPUT_BYTES) return null
             val root = parseJson(json) ?: return null
             if (root.str("type") != "screen.input") return null
             val numeric = listOf("generation", "x", "y", "value").map { root.long(it) }

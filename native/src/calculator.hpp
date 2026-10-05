@@ -64,7 +64,33 @@ class Parser {
     bool percent = false;
   };
 
+  // Grammar, loosest binding first:
+  //   expression := term (('+' | '-') term)*
+  //   term       := unary (('*' | 'x' | '/' | ':') unary)*
+  //   unary      := ('+' | '-')* power
+  //   power      := postfix [('^' | '**') unary]        (right associative)
+  //   postfix    := primary '%'*
+  //   primary    := number | hex | constant | function '(' expression ')'
+  //               | '(' expression ')'
+  // A sign binds looser than a power, so -2^2 is -4 while 2^-2 is 0.25 and
+  // 2*-3 is -6. Function names need parentheses: "sin 30" or a bare "sqrt"
+  // is not a calculation. Hex needs at least one digit after "0x".
   static constexpr double kPi = 3.14159265358979323846;
+  // Bounds parentheses and power chains so pasted text cannot exhaust the
+  // search worker's stack.
+  static constexpr int kMaxDepth = 64;
+  static constexpr size_t kMaxHexDigits = 16;
+
+  class Nesting {
+   public:
+    explicit Nesting(int& depth) : depth_(depth) { ++depth_; }
+    ~Nesting() { --depth_; }
+    Nesting(const Nesting&) = delete;
+    Nesting& operator=(const Nesting&) = delete;
+
+   private:
+    int& depth_;
+  };
 
   bool ParseExpression(Parsed& value) {
     if (!ParseTerm(value)) return false;
@@ -91,19 +117,19 @@ class Parser {
   }
 
   bool ParseTerm(Parsed& value) {
-    if (!ParsePower(value)) return false;
+    if (!ParseUnary(value)) return false;
     while (true) {
       SkipSpaces();
       if ((!Peek(L"**") && Match(L'*')) || Match(L'x') || Match(L'X')) {
         sawCalculationSyntax_ = true;
         Parsed rhs;
-        if (!ParsePower(rhs)) return false;
+        if (!ParseUnary(rhs)) return false;
         value.value *= rhs.value;
         value.percent = false;
       } else if (Match(L'/') || Match(L':')) {
         sawCalculationSyntax_ = true;
         Parsed rhs;
-        if (!ParsePower(rhs) || std::fabs(rhs.value) < 0.0000000001) return false;
+        if (!ParseUnary(rhs) || std::fabs(rhs.value) < 0.0000000001) return false;
         value.value /= rhs.value;
         value.percent = false;
       } else {
@@ -112,13 +138,30 @@ class Parser {
     }
   }
 
+  // A sign alone is not calculation syntax: "-3" and "--3" are just numbers,
+  // while "1--3" is 4.
+  bool ParseUnary(Parsed& value) {
+    const Nesting nesting(depth_);
+    if (depth_ > kMaxDepth) return false;
+    bool negate = false;
+    while (true) {
+      SkipSpaces();
+      if (Match(L'+')) continue;
+      if (!Match(L'-')) break;
+      negate = !negate;
+    }
+    if (!ParsePower(value)) return false;
+    if (negate) value.value = -value.value;
+    return true;
+  }
+
   bool ParsePower(Parsed& value) {
-    if (!ParseFactor(value)) return false;
+    if (!ParsePostfix(value)) return false;
     SkipSpaces();
     if (Match(L"**") || Match(L'^')) {
       sawCalculationSyntax_ = true;
       Parsed rhs;
-      if (!ParsePower(rhs)) return false;
+      if (!ParseUnary(rhs)) return false;
       value.value = std::pow(value.value, rhs.value);
       value.percent = false;
       return std::isfinite(value.value);
@@ -126,24 +169,8 @@ class Parser {
     return true;
   }
 
-  bool ParseFactor(Parsed& value) {
-    SkipSpaces();
-    if (Match(L'+')) return ParseFactor(value);
-    if (Match(L'-')) {
-      if (!ParseFactor(value)) return false;
-      value.value = -value.value;
-      return true;
-    }
-
-    if (Match(L'(')) {
-      sawCalculationSyntax_ = true;
-      if (!ParseExpression(value)) return false;
-      SkipSpaces();
-      if (!Match(L')')) return false;
-    } else if (!ParseFunctionOrConstant(value) && !ParseNumber(value)) {
-      return false;
-    }
-
+  bool ParsePostfix(Parsed& value) {
+    if (!ParsePrimary(value)) return false;
     while (true) {
       SkipSpaces();
       if (!Match(L'%')) return true;
@@ -153,8 +180,24 @@ class Parser {
     }
   }
 
-  bool ParseFunctionOrConstant(Parsed& value) {
+  bool ParsePrimary(Parsed& value) {
     SkipSpaces();
+    if (Match(L'(')) {
+      sawCalculationSyntax_ = true;
+      if (!ParseExpression(value)) return false;
+      SkipSpaces();
+      return Match(L')');
+    }
+    // Letters always name a function or constant. A number never starts with
+    // one, so an unknown word fails here instead of being skipped over.
+    if (pos_ < text_.size() && std::iswalpha(text_[pos_])) {
+      return ParseFunctionOrConstant(value);
+    }
+    if (Peek(L"0x") || Peek(L"0X")) return ParseHex(value);
+    return ParseNumber(value);
+  }
+
+  bool ParseFunctionOrConstant(Parsed& value) {
     const size_t start = pos_;
     while (pos_ < text_.size() && std::iswalpha(text_[pos_])) ++pos_;
     if (start == pos_) return false;
@@ -174,6 +217,9 @@ class Parser {
       sawValue_ = true;
       return true;
     }
+    if (name != L"sin" && name != L"cos" && name != L"tan" && name != L"sqrt") {
+      return false;
+    }
 
     SkipSpaces();
     if (!Match(L'(')) return false;
@@ -183,31 +229,50 @@ class Parser {
     SkipSpaces();
     if (!Match(L')')) return false;
 
-    if (name == L"sin" || name == L"cos" || name == L"tan") {
-      const double radians = argument.value * kPi / 180.0;
-      if (name == L"sin") value.value = std::sin(radians);
-      else if (name == L"cos") value.value = std::cos(radians);
-      else value.value = std::tan(radians);
-      value.percent = false;
-      return std::isfinite(value.value);
-    }
     if (name == L"sqrt") {
       if (argument.value < 0.0) return false;
       value = Parsed{std::sqrt(argument.value), false};
       return true;
     }
+    const double radians = argument.value * kPi / 180.0;
+    if (name == L"sin") value.value = std::sin(radians);
+    else if (name == L"cos") value.value = std::cos(radians);
+    else value.value = std::tan(radians);
+    value.percent = false;
+    return std::isfinite(value.value);
+  }
 
-    return false;
+  // "0xff" is 255. A bare "0x" is rejected rather than read as 0 times
+  // something, and so is a digit run too long to hold exactly.
+  bool ParseHex(Parsed& value) {
+    pos_ += 2;
+    double parsed = 0.0;
+    size_t digits = 0;
+    while (pos_ < text_.size()) {
+      const wchar_t ch = text_[pos_];
+      int digit = -1;
+      if (ch >= L'0' && ch <= L'9') digit = ch - L'0';
+      else if (ch >= L'a' && ch <= L'f') digit = ch - L'a' + 10;
+      else if (ch >= L'A' && ch <= L'F') digit = ch - L'A' + 10;
+      if (digit < 0) break;
+      parsed = parsed * 16.0 + digit;
+      ++digits;
+      ++pos_;
+    }
+    if (digits == 0 || digits > kMaxHexDigits) return false;
+    sawValue_ = true;
+    sawCalculationSyntax_ = true;
+    value = Parsed{parsed, false};
+    return true;
   }
 
   bool ParseNumber(Parsed& value) {
-    SkipSpaces();
     const size_t start = pos_;
     bool hasDigit = false;
     bool hasSeparator = false;
     while (pos_ < text_.size()) {
       const wchar_t ch = text_[pos_];
-      if (std::iswdigit(ch)) {
+      if (ch >= L'0' && ch <= L'9') {
         hasDigit = true;
         ++pos_;
       } else if ((ch == L'.' || ch == L',') && !hasSeparator) {
@@ -251,6 +316,7 @@ class Parser {
 
   std::wstring text_;
   size_t pos_ = 0;
+  int depth_ = 0;
   bool sawValue_ = false;
   bool sawCalculationSyntax_ = false;
 };

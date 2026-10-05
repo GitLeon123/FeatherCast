@@ -270,58 +270,154 @@ inline std::optional<std::string> ExtractSha256Hex(std::string_view text) {
   return std::nullopt;
 }
 
+// Incremental SHA-256 on top of CryptoAPI, shared by the path and handle
+// variants below so both hash exactly the same way.
+class Sha256Hasher {
+ public:
+  Sha256Hasher() {
+    if (!CryptAcquireContextW(&provider_, nullptr, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        !CryptAcquireContextW(&provider_, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+      provider_ = 0;
+      return;
+    }
+    if (!CryptCreateHash(provider_, CALG_SHA_256, 0, 0, &hash_)) hash_ = 0;
+  }
+
+  ~Sha256Hasher() {
+    if (hash_) CryptDestroyHash(hash_);
+    if (provider_) CryptReleaseContext(provider_, 0);
+  }
+
+  Sha256Hasher(const Sha256Hasher&) = delete;
+  Sha256Hasher& operator=(const Sha256Hasher&) = delete;
+
+  bool Ok() const { return hash_ != 0; }
+
+  bool Update(const void* data, size_t size) {
+    if (!hash_) return false;
+    const auto* bytes = static_cast<const BYTE*>(data);
+    while (size > 0) {
+      const DWORD chunk = static_cast<DWORD>((std::min<size_t>)(size, size_t{1} << 30));
+      if (!CryptHashData(hash_, bytes, chunk, 0)) return false;
+      bytes += chunk;
+      size -= chunk;
+    }
+    return true;
+  }
+
+  std::optional<std::string> FinishHex() {
+    if (!hash_) return std::nullopt;
+    BYTE bytes[32]{};
+    DWORD size = static_cast<DWORD>(sizeof(bytes));
+    if (!CryptGetHashParam(hash_, HP_HASHVAL, bytes, &size, 0) || size != sizeof(bytes)) {
+      return std::nullopt;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(bytes) * 2);
+    for (const BYTE byte : bytes) {
+      out.push_back(kHex[(byte >> 4) & 0x0F]);
+      out.push_back(kHex[byte & 0x0F]);
+    }
+    return out;
+  }
+
+ private:
+  HCRYPTPROV provider_ = 0;
+  HCRYPTHASH hash_ = 0;
+};
+
 inline std::optional<std::string> Sha256FileHex(const std::filesystem::path& path) {
   std::ifstream file(path, std::ios::binary);
   if (!file) return std::nullopt;
 
-  HCRYPTPROV provider = 0;
-  if (!CryptAcquireContextW(&provider, nullptr, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
-      !CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-    return std::nullopt;
-  }
-
-  HCRYPTHASH hash = 0;
-  if (!CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
-    CryptReleaseContext(provider, 0);
-    return std::nullopt;
-  }
+  Sha256Hasher hasher;
+  if (!hasher.Ok()) return std::nullopt;
 
   std::array<char, 64 * 1024> buffer{};
   while (file) {
     file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
     const std::streamsize read = file.gcount();
-    if (read > 0 && !CryptHashData(hash, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(read), 0)) {
-      CryptDestroyHash(hash);
-      CryptReleaseContext(provider, 0);
-      return std::nullopt;
-    }
+    if (read > 0 && !hasher.Update(buffer.data(), static_cast<size_t>(read))) return std::nullopt;
   }
-
-  BYTE bytes[32]{};
-  DWORD size = static_cast<DWORD>(sizeof(bytes));
-  if (!CryptGetHashParam(hash, HP_HASHVAL, bytes, &size, 0) || size != sizeof(bytes)) {
-    CryptDestroyHash(hash);
-    CryptReleaseContext(provider, 0);
-    return std::nullopt;
-  }
-
-  CryptDestroyHash(hash);
-  CryptReleaseContext(provider, 0);
-
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(sizeof(bytes) * 2);
-  for (const BYTE byte : bytes) {
-    out.push_back(kHex[(byte >> 4) & 0x0F]);
-    out.push_back(kHex[byte & 0x0F]);
-  }
-  return out;
+  // A read that stopped for any reason other than end-of-file must not yield a
+  // digest of a truncated file.
+  if (!file.eof()) return std::nullopt;
+  return hasher.FinishHex();
 }
 
 inline bool VerifyFileSha256(const std::filesystem::path& path, std::string_view expectedText) {
   const auto expected = ExtractSha256Hex(expectedText);
   const auto actual = Sha256FileHex(path);
   return expected && actual && *expected == *actual;
+}
+
+// SHA-256 of an already opened file, read from offset 0 to end of file through
+// the handle itself. Lets a caller that holds the installer open (for example
+// with FILE_SHARE_READ so nobody can write or replace it) hash the very bytes
+// it will later run, instead of re-resolving the path. The handle must be
+// opened for synchronous reads (no FILE_FLAG_OVERLAPPED) with GENERIC_READ;
+// the file pointer is moved and reset to 0 on success.
+inline std::optional<std::string> Sha256HandleHex(HANDLE file) {
+  if (file == nullptr || file == INVALID_HANDLE_VALUE) return std::nullopt;
+  const LARGE_INTEGER zero{};
+  if (!SetFilePointerEx(file, zero, nullptr, FILE_BEGIN)) return std::nullopt;
+
+  Sha256Hasher hasher;
+  if (!hasher.Ok()) return std::nullopt;
+
+  std::vector<BYTE> buffer(64 * 1024);
+  for (;;) {
+    DWORD read = 0;
+    if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) {
+      return std::nullopt;
+    }
+    if (read == 0) break;
+    if (!hasher.Update(buffer.data(), read)) return std::nullopt;
+  }
+  auto digest = hasher.FinishHex();
+  SetFilePointerEx(file, zero, nullptr, FILE_BEGIN);
+  return digest;
+}
+
+// Handle counterpart of VerifyFileSha256(path, ...). Named differently on
+// purpose: HANDLE is void*, so an overload would silently capture wchar_t*.
+inline bool VerifyHandleSha256(HANDLE file, std::string_view expectedText) {
+  const auto expected = ExtractSha256Hex(expectedText);
+  const auto actual = Sha256HandleHex(file);
+  return expected && actual && *expected == *actual;
+}
+
+// Simple display name (usually the organization) of a certificate.
+inline std::optional<std::wstring> CertificatePublisher(PCCERT_CONTEXT certificate) {
+  if (!certificate) return std::nullopt;
+  const DWORD chars = CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+  if (chars <= 1) return std::nullopt;
+  std::wstring publisher(chars, L'\0');
+  CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, publisher.data(), chars);
+  if (!publisher.empty() && publisher.back() == L'\0') publisher.pop_back();
+  if (publisher.empty()) return std::nullopt;
+  return publisher;
+}
+
+// Lowercase hex SHA-256 of the DER-encoded certificate.
+inline std::optional<std::wstring> CertificateSha256(PCCERT_CONTEXT certificate) {
+  if (!certificate) return std::nullopt;
+  BYTE hash[32]{};
+  DWORD hashSize = static_cast<DWORD>(sizeof(hash));
+  if (!CryptHashCertificate(0, CALG_SHA_256, 0, certificate->pbCertEncoded,
+                            certificate->cbCertEncoded, hash, &hashSize) ||
+      hashSize != sizeof(hash)) {
+    return std::nullopt;
+  }
+  static constexpr wchar_t kHex[] = L"0123456789abcdef";
+  std::wstring out;
+  out.reserve(hashSize * 2);
+  for (DWORD i = 0; i < hashSize; ++i) {
+    out.push_back(kHex[(hash[i] >> 4) & 0x0F]);
+    out.push_back(kHex[hash[i] & 0x0F]);
+  }
+  return out;
 }
 
 inline std::optional<std::wstring> AuthenticodePublisher(const std::filesystem::path& path) {
@@ -362,17 +458,9 @@ inline std::optional<std::wstring> AuthenticodePublisher(const std::filesystem::
     return std::nullopt;
   }
 
-  const DWORD chars = CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
-  std::wstring publisher;
-  if (chars > 1) {
-    publisher.resize(chars);
-    CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
-                       publisher.data(), chars);
-    if (!publisher.empty() && publisher.back() == L'\0') publisher.pop_back();
-  }
+  auto publisher = CertificatePublisher(certificate);
   CertFreeCertificateContext(certificate);
   close();
-  if (publisher.empty()) return std::nullopt;
   return publisher;
 }
 
@@ -418,23 +506,10 @@ inline std::optional<std::wstring> AuthenticodeSignerSha256(
     return std::nullopt;
   }
 
-  BYTE hash[32]{};
-  DWORD hashSize = static_cast<DWORD>(sizeof(hash));
-  const bool hashed =
-      CryptHashCertificate(0, CALG_SHA_256, 0, certificate->pbCertEncoded,
-                           certificate->cbCertEncoded, hash, &hashSize) != FALSE;
+  auto thumbprint = CertificateSha256(certificate);
   CertFreeCertificateContext(certificate);
   close();
-  if (!hashed || hashSize != sizeof(hash)) return std::nullopt;
-
-  static constexpr wchar_t kHex[] = L"0123456789abcdef";
-  std::wstring out;
-  out.reserve(hashSize * 2);
-  for (DWORD i = 0; i < hashSize; ++i) {
-    out.push_back(kHex[(hash[i] >> 4) & 0x0F]);
-    out.push_back(kHex[hash[i] & 0x0F]);
-  }
-  return out;
+  return thumbprint;
 }
 
 inline std::vector<std::wstring> ParseSignerThumbprints(
@@ -493,6 +568,79 @@ inline bool VerifyAuthenticodeSigner(
   const auto thumbprint = AuthenticodeSignerSha256(path);
   return thumbprint &&
          std::find(pins.begin(), pins.end(), LowerWide(*thumbprint)) != pins.end();
+}
+
+// Identity of the certificate that signed a file, as seen by WinVerifyTrust.
+struct AuthenticodeSigner {
+  std::wstring publisher;           // simple display name of the signing certificate
+  std::wstring certificateSha256;   // lowercase hex SHA-256 of the DER signing certificate
+};
+
+// Runs the Authenticode policy (same flags as VerifyAuthenticodePublisher) on
+// an already opened file and, on success, returns the signer taken from that
+// same WinVerifyTrust run. The trust decision and the signer identity are
+// therefore about the same bytes, and there is no second open of the path that
+// could race with a replacement. `file` needs GENERIC_READ; `displayPath` is
+// only the name WinVerifyTrust reports and uses for catalog lookups, the bytes
+// always come from the handle.
+inline std::optional<AuthenticodeSigner> VerifyHandleAuthenticode(
+    HANDLE file, const std::filesystem::path& displayPath) {
+  if (file == nullptr || file == INVALID_HANDLE_VALUE) return std::nullopt;
+
+  WINTRUST_FILE_INFO fileInfo{};
+  fileInfo.cbStruct = sizeof(fileInfo);
+  fileInfo.pcwszFilePath = displayPath.c_str();
+  fileInfo.hFile = file;
+
+  WINTRUST_DATA trustData{};
+  trustData.cbStruct = sizeof(trustData);
+  trustData.dwUIChoice = WTD_UI_NONE;
+  trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+  trustData.dwUnionChoice = WTD_CHOICE_FILE;
+  trustData.pFile = &fileInfo;
+  trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+  trustData.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+  GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  const LONG status = WinVerifyTrust(nullptr, &policy, &trustData);
+
+  std::optional<AuthenticodeSigner> signer;
+  if (status == ERROR_SUCCESS && trustData.hWVTStateData != nullptr) {
+    CRYPT_PROVIDER_DATA* provider = WTHelperProvDataFromStateData(trustData.hWVTStateData);
+    CRYPT_PROVIDER_SGNR* primary =
+        provider ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : nullptr;
+    // Chain element 0 is the end-entity (signing) certificate.
+    CRYPT_PROVIDER_CERT* leaf = primary ? WTHelperGetProvCertFromChain(primary, 0) : nullptr;
+    if (leaf && leaf->pCert) {
+      auto publisher = CertificatePublisher(leaf->pCert);
+      auto thumbprint = CertificateSha256(leaf->pCert);
+      if (publisher && thumbprint) {
+        signer = AuthenticodeSigner{std::move(*publisher), std::move(*thumbprint)};
+      }
+    }
+  }
+
+  trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust(nullptr, &policy, &trustData);
+  return signer;
+}
+
+// Handle counterpart of VerifyAuthenticodeSigner(path, ...): the signature must
+// verify, the publisher must match (when one is configured) and the signing
+// certificate must be one of the pinned SHA-256 thumbprints. Everything is
+// evaluated on the opened file; see VerifyHandleAuthenticode.
+inline bool VerifyHandleAuthenticodeSigner(
+    HANDLE file, const std::filesystem::path& displayPath,
+    const std::wstring& expectedPublisher, const std::wstring& allowedThumbprints) {
+  const auto pins = ParseSignerThumbprints(allowedThumbprints);
+  if (pins.empty()) return false;
+  const auto signer = VerifyHandleAuthenticode(file, displayPath);
+  if (!signer) return false;
+  if (!expectedPublisher.empty() &&
+      LowerWide(signer->publisher) != LowerWide(expectedPublisher)) {
+    return false;
+  }
+  return std::find(pins.begin(), pins.end(), LowerWide(signer->certificateSha256)) != pins.end();
 }
 
 }  // namespace feathercast::updater

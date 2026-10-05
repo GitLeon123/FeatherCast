@@ -16,7 +16,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -39,7 +41,7 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
                        const std::wstring& expectedValue) {
   const auto actions = feathercast::commands::BuildActions(
       item, feathercast::app::Settings{});
-  assert(actions.size() == (item.isClipboard ? 3 : (item.isSnippet ? 4 : 2)));
+  assert(actions.size() == (item.isClipboard ? 3 : (item.isSnippet ? 5 : 2)));
   assert(actions[0].action == feathercast::app::ActionKind::CopyText);
   assert(actions[1].action == feathercast::app::ActionKind::PasteText);
   for (const auto& action : actions) {
@@ -48,6 +50,7 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
       continue;
     }
     if (action.action == feathercast::app::ActionKind::EditAlias ||
+        action.action == feathercast::app::ActionKind::ResetRanking ||
         action.action == feathercast::app::ActionKind::PinInvocation) {
       const auto* target =
           std::get_if<feathercast::app::AliasTarget>(&action.actionTarget);
@@ -119,6 +122,10 @@ int main() {
   assert(!CaptureUiController::Pause(capture));
   assert(CaptureUiController::RecordingStarted(capture));
   assert(CaptureUiController::RecordingStarted(capture));
+  // Starting a recording must not take the keyboard from the recorded app.
+  assert(!CaptureUiController::RecordingControlsEnabled(capture));
+  assert(CaptureUiController::RecordingControlsAvailable(capture));
+  capture.controlFocusActive = true;
   assert(CaptureUiController::RecordingControlsEnabled(capture));
   assert(CaptureUiController::NextControlFocus(0) == 1);
   assert(CaptureUiController::NextControlFocus(1) == 0);
@@ -260,6 +267,79 @@ int main() {
          feathercast::capture::RecordingTimestamp(30));
   assert(feathercast::capture::RecordingTimestamp(60) ==
          std::chrono::seconds(2));
+  {
+    // Sample times follow the capture clock relative to the start and skip
+    // paused intervals; they never repeat or go backwards.
+    feathercast::capture::RecordingClock clock(1000);  // 1 tick = 1 ms
+    assert(clock.SampleTime(5000) == 0);
+    assert(clock.Elapsed(5000) == std::chrono::nanoseconds::zero());
+    clock.Start(1000);
+    assert(clock.SampleTime(1000) == 0);
+    assert(clock.SampleTime(1000) == 1);
+    assert(clock.SampleTime(1100) == 1'000'000);
+    clock.Pause(1200);
+    assert(clock.Paused());
+    assert(clock.Elapsed(1700) == std::chrono::milliseconds(200));
+    clock.Pause(1300);  // a second pause keeps the original start
+    clock.Resume(1700);
+    assert(!clock.Paused());
+    assert(clock.SampleTime(1800) == 3'000'000);
+    assert(clock.Elapsed(1800) == std::chrono::milliseconds(300));
+    clock.Resume(1900);  // resuming twice has no effect
+    assert(clock.SampleTime(1700) == 3'000'001);
+    assert(clock.SampleTime(2000) == 5'000'000);
+    feathercast::capture::RecordingClock coarse(3);
+    coarse.Start(0);
+    assert(coarse.SampleTime(1) == 3'333'333);
+    assert(coarse.SampleTime(3) == 10'000'000);
+  }
+  {
+    // Stop() while the screenshot editor owns the draft must cancel it
+    // instead of leaving the service in Stopping with no worker to finish.
+    using namespace feathercast::capture;
+    std::mutex eventsMutex;
+    std::condition_variable eventsChanged;
+    std::vector<CaptureEventKind> events;
+    CaptureService service([&](CaptureEvent event) {
+      std::lock_guard lock(eventsMutex);
+      events.push_back(event.kind);
+      eventsChanged.notify_all();
+    });
+    const auto waitForPreparation = [&] {
+      std::unique_lock lock(eventsMutex);
+      eventsChanged.wait_for(lock, std::chrono::seconds(10), [&] {
+        return std::any_of(events.begin(), events.end(), [](auto kind) {
+          return kind == CaptureEventKind::ScreenshotReady ||
+                 kind == CaptureEventKind::Failed;
+        });
+      });
+    };
+    assert(service.PrepareScreenshot({0, 0, 32, 32}));
+    waitForPreparation();
+    // Desktop capture can be unavailable on headless agents; the state
+    // machine checks only apply when a draft was produced.
+    if (service.State() == CaptureState::ScreenshotEditing) {
+      assert(service.Stop());
+      assert(service.State() == CaptureState::Idle);
+      assert(!service.Stop());
+      {
+        std::lock_guard lock(eventsMutex);
+        assert(events.size() >= 2);
+        assert(events[events.size() - 2] == CaptureEventKind::Stopping);
+        assert(events.back() == CaptureEventKind::Completed);
+        events.clear();
+      }
+      assert(service.PrepareScreenshot({0, 0, 32, 32}));
+      waitForPreparation();
+      if (service.State() == CaptureState::ScreenshotEditing) {
+        assert(service.CancelScreenshot());
+        assert(service.State() == CaptureState::Idle);
+        assert(!service.CancelScreenshot());
+      }
+    }
+    service.Shutdown();
+    assert(service.State() == CaptureState::Idle);
+  }
 
   SYSTEMTIME captureTime{};
   captureTime.wYear = 2026;
@@ -419,6 +499,46 @@ int main() {
   assert(blurred && blurred->pixels != rendered->pixels);
   for (std::size_t index = 3; index < blurred->pixels.size(); index += 4) {
     assert(blurred->pixels[index] == 255);
+  }
+  {
+    // A remainder narrower than a pixelate block joins the previous block,
+    // so no thin, nearly original sliver survives at the right edge.
+    const feathercast::screenshot::Rect fullCrop = draft.sourceBounds;
+    Annotation wide;
+    wide.tool = Tool::Pixelate;
+    wide.bounds = fullCrop;  // 18 px wide: blocks [0, 8) and [8, 18)
+    const auto pixelatedWide = Render(draft, fullCrop, {wide});
+    assert(pixelatedWide);
+    const auto pixelAt = [](const RenderedImage& image, int x, int y) {
+      return image.pixels.data() + static_cast<std::size_t>(y) * image.stride +
+             static_cast<std::size_t>(x) * 4;
+    };
+    assert(std::equal(pixelAt(*pixelatedWide, 8, 0),
+                      pixelAt(*pixelatedWide, 8, 0) + 4,
+                      pixelAt(*pixelatedWide, 17, 0)));
+    assert(!std::equal(pixelAt(*pixelatedWide, 0, 0),
+                       pixelAt(*pixelatedWide, 0, 0) + 4,
+                       pixelAt(*pixelatedWide, 17, 0)));
+
+    // Effect strength scales with the capture DPI: at 200% the block is
+    // 16 px, so the whole 18 px row collapses into a single block.
+    Draft scaledDraft = draft;
+    scaledDraft.pixelScale = 2.0f;
+    const auto pixelatedScaled = Render(scaledDraft, fullCrop, {wide});
+    assert(pixelatedScaled);
+    assert(std::equal(pixelAt(*pixelatedScaled, 0, 0),
+                      pixelAt(*pixelatedScaled, 0, 0) + 4,
+                      pixelAt(*pixelatedScaled, 17, 0)));
+    Annotation wideBlur = wide;
+    wideBlur.tool = Tool::Blur;
+    const auto blurredNormal = Render(draft, fullCrop, {wideBlur});
+    const auto blurredScaled = Render(scaledDraft, fullCrop, {wideBlur});
+    assert(blurredNormal && blurredScaled &&
+           blurredNormal->pixels != blurredScaled->pixels);
+    // Invalid scales fall back to the 100% strength.
+    scaledDraft.pixelScale = 0.0f;
+    const auto blurredFallback = Render(scaledDraft, fullCrop, {wideBlur});
+    assert(blurredFallback && blurredFallback->pixels == blurredNormal->pixels);
   }
   }
 
@@ -1199,9 +1319,9 @@ int main() {
   assert(appsSection != typedResults.sections.end());
   assert(gamesSection != typedResults.sections.end());
   assert(appsSection < gamesSection);
-  // FeatherCast's own settings and commands need a near-complete match.
+  // Whole-phrase command prefixes are offered after strong app matches.
   assert(settingsSection == typedResults.sections.end());
-  assert(std::none_of(typedResults.flatItems.begin(), typedResults.flatItems.end(),
+  assert(std::any_of(typedResults.flatItems.begin(), typedResults.flatItems.end(),
                       [](const auto& item) { return item.isCommand; }));
   assert(std::any_of(appsSection->items.begin(), appsSection->items.end(),
                      [](const auto& item) {
@@ -1223,7 +1343,7 @@ int main() {
   assert(std::any_of(nearCommandResults.flatItems.begin(), nearCommandResults.flatItems.end(),
                      [](const auto& item) { return item.isCommand; }));
 
-  // Modern and advanced Windows settings use the same near-complete name,
+  // Modern and advanced Windows settings use the same prefix and near-complete name,
   // keyword, and alias matching as FeatherCast features in general search.
   auto windowsSettingsSnapshot =
       std::make_shared<feathercast::app::SearchSnapshot>();
@@ -1255,10 +1375,10 @@ int main() {
     return std::any_of(results.flatItems.begin(), results.flatItems.end(),
                        [&](const auto& item) { return item.app.id == id; });
   };
-  assert(!findsWindowsSetting(L"disp", L"windows-settings:display"));
-  assert(!findsWindowsSetting(L"res", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"disp", L"windows-settings:display"));
+  assert(findsWindowsSetting(L"res", L"windows-settings:display"));
   assert(!findsWindowsSetting(L"dev man", L"windows-settings:advanced-device-manager"));
-  assert(!findsWindowsSetting(L"hard", L"windows-settings:advanced-device-manager"));
+  assert(findsWindowsSetting(L"hard", L"windows-settings:advanced-device-manager"));
   assert(!findsWindowsSetting(L"devmgmt.msc", L"windows-settings:advanced-device-manager"));
   assert(findsWindowsSetting(L"display setting", L"windows-settings:display"));
   assert(findsWindowsSetting(L"resolution", L"windows-settings:display"));

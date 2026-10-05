@@ -1,3 +1,6 @@
+#include "dpapi_scope.hpp"
+#include "file_content.hpp"
+#include "filesystem_semantics.hpp"
 #include "persistence_service.hpp"
 #include "test_framework.hpp"
 
@@ -7,8 +10,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -25,6 +31,8 @@ std::filesystem::path TestRoot() {
 }  // namespace
 
 int main() {
+  // This test account may have no user DPAPI master key.
+  feathercast::dpapi::AllowMachineScopeFallbackForTests();
   namespace persistence = feathercast::persistence;
 
   const auto root = TestRoot();
@@ -142,6 +150,47 @@ int main() {
   assert(service.SaveSettingsAndWait(settings, &blockingError));
   assert(blockingError.empty());
 
+  {
+    // A file the scanner skipped as unchanged has no stored text in this
+    // database, so the merge reads it again before it stores the entry.
+    const auto mergeRoot = root / L"merge-root";
+    std::filesystem::create_directories(mergeRoot);
+    const auto mergeFile = mergeRoot / L"carried.txt";
+    {
+      std::ofstream output(mergeFile, std::ios::binary);
+      output << "carried content";
+    }
+    feathercast::storage::FileIndexEntry carried;
+    carried.path = mergeFile.wstring();
+    carried.name = L"carried.txt";
+    carried.root = mergeRoot.wstring();
+    carried.lastWriteTime = 5;
+    carried.size = 15;
+    carried.indexedAt = 1000;
+    carried.contentState =
+        static_cast<int>(feathercast::file_content::State::Indexed);
+    carried.contentBytes = 15;
+    carried.contentUnchanged = true;
+    assert(service.MergeFileIndex({carried}, {mergeRoot.wstring()},
+                                  {mergeRoot.wstring()}, 100, 91, {}));
+    const auto mergedEvent = [&]() -> const persistence::FileIndexMerged* {
+      for (const auto& event : events) {
+        if (const auto* merged =
+                std::get_if<persistence::FileIndexMerged>(&event)) {
+          if (merged->generation == 91) return merged;
+        }
+      }
+      return nullptr;
+    };
+    std::unique_lock lock(mutex);
+    assert(cv.wait_for(lock, std::chrono::seconds(5),
+                       [&] { return mergedEvent() != nullptr; }));
+    const auto* merged = mergedEvent();
+    assert(merged->succeeded && merged->entries.size() == 1);
+    assert(merged->entries.front().contentText == L"carried content");
+    assert(!merged->entries.front().contentUnchanged);
+  }
+
   service.Stop(true);
   const auto loaded =
       feathercast::settings_io::LoadSettingsFile(root / L"settings.json");
@@ -149,6 +198,33 @@ int main() {
   assert(loaded.value.shortcut == L"Ctrl+Shift+Space");
   assert(loaded.value.quicklinks.size() == 1);
   assert(loaded.value.quicklinks[0].keyword == L"docs");
+
+  {
+    // Durable replacement: the data is flushed, the temp file never lingers,
+    // and each failure mode reports its own status.
+    using feathercast::filesystem_semantics::ReplaceFileDurably;
+    using feathercast::filesystem_semantics::ReplaceStatus;
+    const auto target = root / L"durable.txt";
+    assert(ReplaceFileDurably(target, "first") == ReplaceStatus::Replaced);
+    assert(ReplaceFileDurably(target, "second, longer") ==
+           ReplaceStatus::Replaced);
+    std::ifstream input(target, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    input.close();
+    assert(contents == "second, longer");
+    assert(!std::filesystem::exists(target.wstring() + L".tmp"));
+    assert(ReplaceFileDurably(target, "") == ReplaceStatus::Replaced);
+    assert(std::filesystem::file_size(target) == 0);
+
+    const auto blocked = root / L"blocked";
+    std::filesystem::create_directories(blocked);
+    assert(ReplaceFileDurably(blocked, "x") == ReplaceStatus::ReplaceFailed);
+    assert(std::filesystem::is_directory(blocked));
+    assert(!std::filesystem::exists(blocked.wstring() + L".tmp"));
+    assert(ReplaceFileDurably(root / L"no-such-dir" / L"file", "x") ==
+           ReplaceStatus::CreateFailed);
+  }
 
   std::filesystem::remove_all(root, ec);
   assert(!ec);

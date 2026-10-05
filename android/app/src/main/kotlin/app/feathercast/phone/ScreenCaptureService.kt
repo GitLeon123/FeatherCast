@@ -19,6 +19,7 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -34,6 +35,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import app.feathercast.protocol.LinkSession
+import app.feathercast.protocol.MAX_SCREEN_INPUT_BYTES
 import app.feathercast.protocol.MAX_SCREEN_PACKET_BYTES
 import app.feathercast.protocol.ScreenInput
 import app.feathercast.protocol.ScreenMediaKind
@@ -90,7 +92,18 @@ class ScreenCaptureService : Service() {
         if (intent?.action == STOP) { finish("Screen sharing stopped on your phone."); return START_NOT_STICKY }
         if (sessionId.isNotEmpty()) return START_NOT_STICKY
         val id = intent?.getStringExtra("session").orEmpty()
-        val accepted = ScreenBridge.begin(id) ?: run { stopSelf(); return START_NOT_STICKY }
+        val type = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0
+        val accepted = ScreenBridge.begin(id) ?: run {
+            // startForegroundService() requires startForeground() even when the request is gone.
+            try {
+                ScreenBridge.createChannel(this)
+                ServiceCompat.startForeground(this, 21, NotificationCompat.Builder(this, ScreenBridge.CHANNEL)
+                    .setSmallIcon(R.drawable.ic_stat_feathercast).setContentTitle("Screen sharing ended").build(), type)
+            } catch (_: RuntimeException) { }
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         sessionId = id
         val stop = PendingIntent.getService(this, 21, Intent(this, ScreenCaptureService::class.java).setAction(STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -100,8 +113,7 @@ class ScreenCaptureService : Service() {
             .setContentText("Your PC can see this screen. Tap Stop to end sharing.").setOngoing(true)
             .setContentIntent(open).addAction(0, "Stop", stop).build()
         try {
-            ServiceCompat.startForeground(this, 21, notification,
-                if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0)
+            ServiceCompat.startForeground(this, 21, notification, type)
             @Suppress("DEPRECATION")
             val consent = if (Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("consent", Intent::class.java)
                 else intent?.getParcelableExtra<Intent>("consent")
@@ -138,7 +150,7 @@ class ScreenCaptureService : Service() {
                     launch { captureAudio() }
                 }
                 while (isActive && !stopped.get()) {
-                    val payload = connection.receive(32 * 1024)
+                    val payload = connection.receive(MAX_SCREEN_INPUT_BYTES)
                     val input = ScreenInput.parse(payload.json) ?: continue
                     if (!ScreenBridge.accepts(input.sessionId, input.generation)) continue
                     when (input.action) {
@@ -180,8 +192,7 @@ class ScreenCaptureService : Service() {
             RemoteControlService.instance?.let { android.os.Handler(mainLooper).post { it.cancelGesture() } }
             ScreenBridge.setGeometry(sessionId, current, realSize.widthPixels, realSize.heightPixels)
             val scale = minOf(1f, 1280f / maxOf(width, height))
-            val encodedWidth = ((width * scale).toInt() / 2 * 2).coerceAtLeast(2)
-            val encodedHeight = ((height * scale).toInt() / 2 * 2).coerceAtLeast(2)
+            val (codecName, encodedWidth, encodedHeight) = videoEncoder((width * scale).toInt(), (height * scale).toInt())
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodedWidth, encodedHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, 3_000_000)
@@ -191,7 +202,7 @@ class ScreenCaptureService : Service() {
                 setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
                 if (Build.VERSION.SDK_INT >= 29) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
-            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val codec = codecName?.let { MediaCodec.createByCodecName(it) } ?: MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             video = codec
             codec.setCallback(object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(codec: MediaCodec, index: Int) = Unit
@@ -237,6 +248,31 @@ class ScreenCaptureService : Service() {
         } catch (_: RuntimeException) {
             finish("Screen capture could not be configured on this phone. Start a new session and try again.")
         }
+    }
+
+    /** Picks the AVC encoder and the largest aligned size it supports up to [width]x[height], keeping the aspect ratio. */
+    private fun videoEncoder(width: Int, height: Int): Triple<String?, Int, Int> {
+        val evenWidth = (width / 2 * 2).coerceAtLeast(2)
+        val evenHeight = (height / 2 * 2).coerceAtLeast(2)
+        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val avc = MediaFormat.MIMETYPE_VIDEO_AVC
+        val name = codecs.findEncoderForFormat(MediaFormat.createVideoFormat(avc, evenWidth, evenHeight))
+            ?: codecs.codecInfos.firstOrNull { info -> info.isEncoder && info.supportedTypes.any { it.equals(avc, ignoreCase = true) } }?.name
+            ?: return Triple(null, evenWidth, evenHeight)
+        val video = try {
+            codecs.codecInfos.first { it.name == name }.getCapabilitiesForType(avc).videoCapabilities
+        } catch (_: RuntimeException) {
+            null
+        } ?: return Triple(name, evenWidth, evenHeight)
+        fun align(value: Int, alignment: Int) = (value / alignment * alignment).coerceAtLeast(alignment)
+        var scale = 1f
+        repeat(24) {
+            val w = align((width * scale).toInt(), video.widthAlignment).coerceAtLeast(video.supportedWidths.lower)
+            val h = align((height * scale).toInt(), video.heightAlignment).coerceAtLeast(video.supportedHeights.lower)
+            if (video.isSizeSupported(w, h)) return Triple(name, w, h)
+            scale *= 0.9f
+        }
+        return Triple(name, evenWidth, evenHeight)
     }
 
     private fun requestKeyframe() {
@@ -381,7 +417,7 @@ class ScreenCaptureService : Service() {
             packets.clear()
             codecThread.quitSafely()
         }
-        ScreenBridge.stop(this, id = sessionId)
+        if (sessionId.isNotEmpty()) ScreenBridge.stop(this, id = sessionId)
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

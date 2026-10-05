@@ -77,10 +77,27 @@ fun encodeFrame(body: ByteArray): ByteArray {
     return concat(u32(body.size), body)
 }
 
-/** Reads at most [maxBytes], rejecting streams whose reported size was wrong. */
-fun InputStream.readAtMost(maxBytes: Int): ByteArray? {
+/**
+ * Reads at most [maxBytes], rejecting streams whose reported size was wrong. With the
+ * reported size as [sizeHint], a correct report fills one array without further copies.
+ */
+fun InputStream.readAtMost(maxBytes: Int, sizeHint: Long = -1): ByteArray? {
     require(maxBytes >= 0)
     val out = ByteArrayOutputStream(minOf(maxBytes, 8192))
+    if (sizeHint in 0..maxBytes.toLong()) {
+        val exact = ByteArray(sizeHint.toInt())
+        var filled = 0
+        while (filled < exact.size) {
+            val count = read(exact, filled, exact.size - filled)
+            if (count < 0) return exact.copyOf(filled)
+            filled += count
+        }
+        val next = read()
+        if (next < 0) return exact
+        if (exact.size >= maxBytes) return null
+        out.write(exact)
+        out.write(next)
+    }
     val buffer = ByteArray(8192)
     while (true) {
         val count = read(buffer, 0, minOf(buffer.size.toLong(), maxBytes.toLong() - out.size() + 1).toInt())

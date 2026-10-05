@@ -28,7 +28,6 @@ struct DefaultOutputState {
 };
 
 std::optional<DefaultOutputState> ReadDefaultOutputState();
-std::optional<int> ReadDefaultOutputVolumePercent();
 bool SetDefaultOutputVolumePercent(int percent);
 bool StepDefaultOutputVolume(bool increase);
 bool SetDefaultOutputMute(bool muted);

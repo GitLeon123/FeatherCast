@@ -184,6 +184,8 @@ int main() {
       std::pair{CommandKind::PhoneMessages, ResultIcon::Phone},
       std::pair{CommandKind::PhoneFiles, ResultIcon::Folder},
       std::pair{CommandKind::SendFileToPhone, ResultIcon::Download},
+      std::pair{CommandKind::CancelPhoneTransfers, ResultIcon::Close},
+      std::pair{CommandKind::ManageAutomation, ResultIcon::Terminal},
       std::pair{CommandKind::PhoneScreen, ResultIcon::Phone},
   };
   assert(commandIcons.size() == feathercast::commands::Catalog().size());
@@ -208,6 +210,8 @@ int main() {
       std::pair{ActionKind::PinInvocation, ResultIcon::Pin},
       std::pair{ActionKind::UnpinInvocation, ResultIcon::PinOff},
       std::pair{ActionKind::EditAlias, ResultIcon::Edit},
+      std::pair{ActionKind::ResetRanking, ResultIcon::HistoryOff},
+      std::pair{ActionKind::ConfigureCommandShortcut, ResultIcon::Keyboard},
       std::pair{ActionKind::Hide, ResultIcon::EyeOff},
       std::pair{ActionKind::Unhide, ResultIcon::Eye},
       std::pair{ActionKind::Switch, ResultIcon::Windows},
@@ -631,5 +635,51 @@ int main() {
       ProjectLiveStatus(false, false, L"", true, true, std::nullopt);
   assert(previewStatus.kind == LiveStatusKind::Preview &&
          previewStatus.value == L"Preview ready");
+
+  {
+    // Caret moves and length clipping never split a surrogate pair.
+    using feathercast::ui::OverlayController;
+    feathercast::ui::OverlayState emoji;
+    OverlayController::SetQuery(emoji, L"a\U0001F600b");
+    OverlayController::MoveCaret(emoji, 2, false);
+    assert(emoji.caret == 1);
+    OverlayController::MoveCaret(emoji, 2, true);
+    assert(emoji.caret == 1 && emoji.selectionAnchor &&
+           *emoji.selectionAnchor == 1);
+    OverlayController::MoveCaret(emoji, 99, true);
+    assert(emoji.caret == emoji.query.size() && *emoji.selectionAnchor == 1);
+    emoji.caret = 2;
+    emoji.selectionAnchor = 2;
+    OverlayController::ClampCaret(emoji);
+    assert(emoji.caret == 1 && *emoji.selectionAnchor == 1);
+
+    feathercast::ui::OverlayState clipped;
+    OverlayController::SetQuery(clipped, L"abc");
+    OverlayController::InsertText(clipped, L"x\U0001F600", 5);
+    assert(clipped.query == L"abcx" && clipped.caret == 4);
+    OverlayController::InsertText(clipped, L"\U0001F600", 6);
+    assert(clipped.query == L"abcx\U0001F600" && clipped.caret == 6);
+  }
+
+  {
+    // A font family list resolves to its first installed family, otherwise
+    // to Segoe UI; unknown names must not be passed through.
+    using namespace feathercast::theme;
+    const auto names = FontFamilyCandidates(L" A ,, B,C  ,");
+    assert(names.size() == 3 && names[0] == L"A" && names[1] == L"B" &&
+           names[2] == L"C");
+    assert(FontFamilyCandidates(L"").empty());
+    const auto installed = [](const std::wstring& family) {
+      return family == L"B" || family == L"C";
+    };
+    assert(ResolveFontFamily(L"A, B, C", installed) == L"B");
+    assert(ResolveFontFamily(L"A, X", installed) == L"Segoe UI");
+    assert(ResolveFontFamily(L"", installed) == L"Segoe UI");
+    assert(feathercast::ui::ResolveInstalledFontFamily(
+               L"No Such Family 9F2A, Segoe UI") == L"Segoe UI");
+    assert(feathercast::ui::ResolveInstalledFontFamily(
+               L"No Such Family 9F2A") == L"Segoe UI");
+    assert(feathercast::ui::ResolveInstalledFontFamily(L"") == L"Segoe UI");
+  }
   return 0;
 }

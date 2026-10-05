@@ -149,6 +149,8 @@ class PhoneStore {
         }
         break;
       case EventKind::PhotoList: {
+        photosError_ = event.text;
+        photosAccess_ = event.id;
         std::vector<StoredPhoto> next;
         next.reserve(event.photos.size());
         for (const auto& info : event.photos) {
@@ -182,12 +184,17 @@ class PhoneStore {
         changes.savedPhotoId = event.photo.id;
         break;
       case EventKind::Error:
-        for (auto& photo : photos_) {
-          if (photo.downloading) changes.photos = true;
-          photo.downloading = false;
+        // Only the request the error belongs to stops; an unrelated failure
+        // (another transfer, a settings save) leaves other downloads running.
+        if (!event.photo.id.empty()) {
+          if (auto* photo = FindPhoto(event.photo.id); photo && photo->downloading) {
+            photo->downloading = false;
+            changes.photos = true;
+          }
         }
-        if (!downloadingFiles_.empty()) changes.files = true;
-        downloadingFiles_.clear();
+        if (!event.remotePath.empty() && downloadingFiles_.erase(event.remotePath) > 0) {
+          changes.files = true;
+        }
         break;
       case EventKind::RingState:
         changes.ring = ringing_ != event.ok;
@@ -310,6 +317,8 @@ class PhoneStore {
     photos_.clear();
     clips_.clear();
     photosFetchedAt_ = 0;
+    photosError_.clear();
+    photosAccess_.clear();
     media_ = {};
     mediaArt_.reset();
     smsThreads_.clear();
@@ -417,7 +426,6 @@ class PhoneStore {
   long long MediaReceivedAt() const { return mediaReceivedAt_; }
   const std::vector<SmsThread>& SmsThreads() const { return smsThreads_; }
   const std::vector<StoredSms>& SmsMessages() const { return smsMessages_; }
-  const std::string& SmsThreadId() const { return smsThread_; }
   bool SmsMessagesLoaded() const { return smsMessagesLoaded_; }
   long long SmsFetchedAt() const { return smsFetchedAt_; }
   const CallInfo& Call() const { return call_; }
@@ -431,6 +439,8 @@ class PhoneStore {
   bool Connected() const { return connected_; }
   const std::string& DeviceName() const { return deviceName_; }
   long long PhotosFetchedAt() const { return photosFetchedAt_; }
+  const std::string& PhotosError() const { return photosError_; }
+  const std::string& PhotosAccess() const { return photosAccess_; }
 
  private:
   // Small set of strings; a vector keeps the header dependency-free.
@@ -482,6 +492,8 @@ class PhoneStore {
   std::string deviceName_;
   bool connected_ = false;
   long long photosFetchedAt_ = 0;
+  std::string photosError_;
+  std::string photosAccess_;
   std::vector<std::string> features_;
   int battery_ = -1;
   bool charging_ = false;

@@ -1,11 +1,15 @@
 #include "library_ui.hpp"
 
 #include "command_catalog.hpp"
+#include "automation.hpp"
+#include "ui_renderer.hpp"
 
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <initguid.h>
 #include <oleacc.h>
+#include <UIAutomationCore.h>
+#include <UIAutomationCoreApi.h>
 
 #include <algorithm>
 #include <cwchar>
@@ -18,6 +22,14 @@ namespace {
 
 constexpr wchar_t kManagerClass[] = L"FeatherCastLibraryManager";
 constexpr wchar_t kEditorClass[] = L"FeatherCastLibraryEditor";
+
+bool IsLaunchItem(library::ItemKind kind) {
+  return kind == library::ItemKind::Quicklink || kind == library::ItemKind::Script || kind == library::ItemKind::Workspace;
+}
+
+bool IsCommandItem(library::ItemKind kind) {
+  return kind == library::ItemKind::CommandAlias || kind == library::ItemKind::CommandShortcut;
+}
 
 enum ControlId : int {
   IdTabs = 100,
@@ -32,6 +44,10 @@ enum ControlId : int {
   IdKeyword,
   IdValue,
 };
+
+// Posted by the manager to itself so the initial editor opens after window
+// creation has finished instead of running a nested modal loop in WM_CREATE.
+constexpr UINT kMsgOpenInitialEditor = WM_APP + 1;
 
 constexpr UINT kBaseDpi = 96;
 constexpr int kWorkAreaInset = 24;
@@ -166,21 +182,37 @@ SIZE FitWindowSize(HWND reference, int logicalWidth, int logicalHeight) {
       std::min(std::max(1, ScaleForDpi(logicalHeight, dpi)), maxHeight)};
 }
 
+// Message font for the window's own DPI (not the process-wide system DPI), in
+// the first installed family of the theme's font list.
 HFONT CreateDialogFont(HWND window, const theme::Theme& theme) {
-  NONCLIENTMETRICSW metrics{sizeof(metrics)};
-  if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
-                             &metrics, 0)) {
-    return nullptr;
-  }
-  LOGFONTW font = metrics.lfMessageFont;
-  const UINT systemDpi = SystemDpi();
   const UINT targetDpi = std::max(kBaseDpi, DpiForWindow(window));
-  font.lfHeight = MulDiv(font.lfHeight, static_cast<int>(targetDpi),
-                         static_cast<int>(std::max(kBaseDpi, systemDpi)));
-  if (!theme.fontFamily.empty()) {
-    wcsncpy_s(font.lfFaceName, LF_FACESIZE, theme.fontFamily.c_str(),
-              _TRUNCATE);
+  NONCLIENTMETRICSW metrics{sizeof(metrics)};
+  using SystemParametersInfoForDpiProc =
+      BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+  bool haveMetrics = false;
+  if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+    if (auto proc = reinterpret_cast<SystemParametersInfoForDpiProc>(
+            GetProcAddress(user32, "SystemParametersInfoForDpi"))) {
+      haveMetrics = proc(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+                         targetDpi) != FALSE;
+    }
   }
+  LOGFONTW font{};
+  if (haveMetrics) {
+    font = metrics.lfMessageFont;
+  } else {
+    metrics = NONCLIENTMETRICSW{sizeof(metrics)};
+    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
+                               &metrics, 0)) {
+      return nullptr;
+    }
+    font = metrics.lfMessageFont;
+    font.lfHeight = MulDiv(font.lfHeight, static_cast<int>(targetDpi),
+                           static_cast<int>(std::max(kBaseDpi, SystemDpi())));
+  }
+  const std::wstring family =
+      ui::ResolveInstalledFontFamily(theme.fontFamily);
+  wcsncpy_s(font.lfFaceName, LF_FACESIZE, family.c_str(), _TRUNCATE);
   return CreateFontIndirectW(&font);
 }
 
@@ -201,6 +233,34 @@ void SetAccessibleName(HWND control, const wchar_t* name) {
                              PROPID_ACC_NAME, name);
     services->Release();
   }
+}
+
+// Marks a static status control as a UIA live region (1 = polite, 2 =
+// assertive) so assistive technology announces its text when it changes.
+void SetLiveSetting(HWND control, int setting) {
+  IAccPropServices* services = nullptr;
+  if (SUCCEEDED(CoCreateInstance(CLSID_AccPropServices, nullptr,
+                                 CLSCTX_INPROC_SERVER,
+                                 IID_PPV_ARGS(&services)))) {
+    VARIANT value{};
+    value.vt = VT_I4;
+    value.lVal = setting;
+    services->SetHwndProp(control, static_cast<DWORD>(OBJID_CLIENT),
+                          CHILDID_SELF, LiveSetting_Property_GUID, value);
+    services->Release();
+  }
+}
+
+// The status text is the control's accessible name, so a change is a name
+// change plus a live-region change on the control's own window. (The old
+// VALUECHANGE on the parent with the control id as child id matched no
+// accessible object.)
+void AnnounceStatus(HWND status, bool error) {
+  if (!status) return;
+  SetLiveSetting(status, error ? 2 : 1);
+  NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, status, OBJID_CLIENT, CHILDID_SELF);
+  NotifyWinEvent(EVENT_OBJECT_LIVEREGIONCHANGED, status, OBJID_CLIENT,
+                 CHILDID_SELF);
 }
 
 std::wstring ControlText(HWND control) {
@@ -237,6 +297,38 @@ void CenterOwnedWindow(HWND window, HWND owner) {
                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// Pumps messages until `dialog` is destroyed. Dialog keyboard handling only
+// applies to messages for the dialog or its children; other windows of the
+// thread keep their normal dispatch. `consumeKey` may swallow a message that
+// belongs to the dialog before IsDialogMessage sees it. When the thread gets
+// WM_QUIT (or GetMessage fails) the dialog is closed through `closeDialog` and
+// the quit is re-posted so outer loops terminate too.
+template <typename ConsumeKey, typename CloseDialog>
+void RunDialogLoop(HWND dialog, ConsumeKey&& consumeKey,
+                   CloseDialog&& closeDialog) {
+  MSG message{};
+  while (IsWindow(dialog)) {
+    const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+    if (got <= 0) {
+      closeDialog();
+      if (got == 0) PostQuitMessage(static_cast<int>(message.wParam));
+      return;
+    }
+    if (message.hwnd == dialog || IsChild(dialog, message.hwnd)) {
+      if (consumeKey(message) || IsDialogMessageW(dialog, &message)) continue;
+    }
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+}
+
+// Re-enables the owner before the dialog goes away so activation returns to
+// it instead of an arbitrary window, then destroys the dialog.
+void CloseModalDialog(HWND dialog, HWND owner) {
+  if (owner && IsWindow(owner)) EnableWindow(owner, TRUE);
+  if (dialog && IsWindow(dialog)) DestroyWindow(dialog);
+}
+
 class EditorWindow {
  public:
   EditorWindow(HWND owner, library::ItemKind kind,
@@ -264,11 +356,11 @@ class EditorWindow {
     if (editingIndex_) {
       if (kind_ == library::ItemKind::Snippet) {
         snippet_ = snippets_.at(*editingIndex_);
-      } else if (kind_ == library::ItemKind::Quicklink) {
+      } else if (IsLaunchItem(kind_)) {
         quicklink_ = quicklinks_.at(*editingIndex_);
       } else if (kind_ == library::ItemKind::AppAlias) {
         alias_ = aliases_.at(*editingIndex_);
-      } else if (kind_ == library::ItemKind::CommandAlias) {
+      } else if (IsCommandItem(kind_)) {
         commandAlias_ = commandAliases_.at(*editingIndex_);
       } else {
         webSearch_ = searches_.at(*editingIndex_);
@@ -290,17 +382,20 @@ class EditorWindow {
     const wchar_t* title = L"Edit Library Item";
     if (kind_ == library::ItemKind::Snippet) {
       title = editingIndex_ ? L"Edit Snippet" : L"Add Snippet";
-    } else if (kind_ == library::ItemKind::Quicklink) {
-      title = editingIndex_ ? L"Edit Quicklink" : L"Add Quicklink";
+    } else if (IsLaunchItem(kind_)) {
+      title = kind_ == library::ItemKind::Script ? (editingIndex_ ? L"Edit Script" : L"Add Script") :
+          kind_ == library::ItemKind::Workspace ? (editingIndex_ ? L"Edit Workspace" : L"Add Workspace") :
+          (editingIndex_ ? L"Edit Quicklink" : L"Add Quicklink");
     } else if (kind_ == library::ItemKind::AppAlias) {
       title = editingIndex_ ? L"Edit App Alias" : L"Add App Alias";
-    } else if (kind_ == library::ItemKind::CommandAlias) {
-      title = editingIndex_ ? L"Edit Command Alias" : L"Add Command Alias";
+    } else if (IsCommandItem(kind_)) {
+      title = kind_ == library::ItemKind::CommandShortcut ? L"Command Shortcut" :
+          (editingIndex_ ? L"Edit Command Alias" : L"Add Command Alias");
     } else {
       title = editingIndex_ ? L"Edit Web Search" : L"Add Web Search";
     }
     const SIZE windowSize = FitWindowSize(
-        owner_, 570, kind_ == library::ItemKind::Snippet ? 430 : 285);
+        owner_, 570, (kind_ == library::ItemKind::Snippet || kind_ == library::ItemKind::Workspace) ? 430 : 320);
     hwnd_ = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kEditorClass, title,
         WS_CAPTION | WS_SYSMENU | WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -312,25 +407,26 @@ class EditorWindow {
     EnableWindow(owner_, FALSE);
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
-    MSG message{};
-    while (IsWindow(hwnd_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-      if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
-        SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
-        continue;
-      }
-      if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN &&
-          (kind_ != library::ItemKind::Snippet || GetFocus() != value_ ||
-           (GetKeyState(VK_CONTROL) & 0x8000) != 0)) {
-        SendMessageW(hwnd_, WM_COMMAND, IDOK, 0);
-        continue;
-      }
-      if (!IsDialogMessageW(hwnd_, &message)) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-      }
-    }
-    EnableWindow(owner_, TRUE);
-    SetActiveWindow(owner_);
+    RunDialogLoop(
+        hwnd_,
+        [this](const MSG& message) {
+          if (message.message != WM_KEYDOWN) return false;
+          if (message.wParam == VK_ESCAPE) {
+            SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
+            return true;
+          }
+          if (message.wParam == VK_RETURN &&
+              ((kind_ != library::ItemKind::Snippet && kind_ != library::ItemKind::Workspace) || GetFocus() != value_ ||
+               (GetKeyState(VK_CONTROL) & 0x8000) != 0)) {
+            SendMessageW(hwnd_, WM_COMMAND, IDOK, 0);
+            return true;
+          }
+          return false;
+        },
+        [this] { Close(); });
+    // The owner was re-enabled before the dialog was destroyed; this only
+    // matters if the loop ended some other way.
+    if (owner_ && IsWindow(owner_)) EnableWindow(owner_, TRUE);
     return accepted_;
   }
 
@@ -406,11 +502,13 @@ class EditorWindow {
     surfaceBrush_ = CreateSolidBrush(surface);
   }
 
+  void Close() { CloseModalDialog(hwnd_, owner_); }
+
   void SetStatus(std::wstring text, bool error) {
     statusError_ = error;
     SetWindowTextW(status_, text.c_str());
     InvalidateRect(status_, nullptr, TRUE);
-    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, IdStatus);
+    AnnounceStatus(status_, error);
   }
 
   LRESULT ColorControl(UINT message, WPARAM wParam, LPARAM lParam) const {
@@ -450,7 +548,7 @@ class EditorWindow {
 
   void CreateControls() {
     const bool appAlias = kind_ == library::ItemKind::AppAlias;
-    const bool commandAlias = kind_ == library::ItemKind::CommandAlias;
+    const bool commandAlias = IsCommandItem(kind_);
     const bool alias = appAlias || commandAlias;
     const bool webSearch = kind_ == library::ItemKind::WebSearch;
     const wchar_t* nameLabel = appAlias
@@ -464,17 +562,19 @@ class EditorWindow {
                        WS_TABSTOP | (alias ? CBS_DROPDOWNLIST | WS_VSCROLL
                                            : ES_AUTOHSCROLL),
                        IdName);
-    keywordLabel_ = AddControl(WC_STATICW, alias ? L"Alias" : L"Keyword",
+    keywordLabel_ = AddControl(WC_STATICW, kind_ == library::ItemKind::CommandShortcut ? L"Global shortcut (e.g. Ctrl+Alt+V)" : (alias ? L"Alias" : L"Keyword"),
                                SS_LEFT, 0);
     keyword_ =
         AddControl(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, IdKeyword);
     valueLabel_ = AddControl(
         WC_STATICW,
         kind_ == library::ItemKind::Snippet ? L"Text" :
-        (webSearch ? L"URL template (use %s for the query)" : L"Target"),
+        (webSearch ? L"URL template (use %s for the query)" :
+         kind_ == library::ItemKind::Script ? L"PowerShell file (.ps1); runs under your Windows policy" :
+         kind_ == library::ItemKind::Workspace ? L"Apps, files, folders or URLs (one per line, up to 16)" : L"Target"),
         SS_LEFT, 0);
     DWORD valueStyle = WS_TABSTOP;
-    if (kind_ == library::ItemKind::Snippet) {
+    if (kind_ == library::ItemKind::Snippet || kind_ == library::ItemKind::Workspace) {
       valueStyle |= ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL;
     } else {
       valueStyle |= ES_AUTOHSCROLL;
@@ -483,28 +583,33 @@ class EditorWindow {
     save_ = AddControl(WC_BUTTONW, L"Save",
                        WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
     cancel_ = AddControl(WC_BUTTONW, L"Cancel", WS_TABSTOP, IDCANCEL);
+    // No fixed accessible name: the status text itself is the name, so
+    // screen readers read the validation message.
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
-    SetAccessibleName(status_, L"Validation status");
+    SetLiveSetting(status_, 2);
     const wchar_t* accessibleName = appAlias
         ? L"App"
         : (commandAlias
                ? L"Command"
                : (kind_ == library::ItemKind::Snippet
                       ? L"Snippet name"
+                      : kind_ == library::ItemKind::Script ? L"Script name (optional)"
+                      : kind_ == library::ItemKind::Workspace ? L"Workspace name (optional)"
                       : L"Quicklink name (optional)"));
     SetAccessibleName(name_, accessibleName);
     SetAccessibleName(keyword_, appAlias ? L"App alias" :
-                                  (commandAlias ? L"Command alias"
-                                                : L"Keyword"));
+                                  (commandAlias ? (kind_ == library::ItemKind::CommandShortcut ? L"Global command shortcut" : L"Command alias") : L"Keyword"));
     SetAccessibleName(value_, webSearch ? L"Web search URL template" :
         (kind_ == library::ItemKind::Snippet ? L"Snippet text"
+         : kind_ == library::ItemKind::Script ? L"PowerShell file path"
+         : kind_ == library::ItemKind::Workspace ? L"Workspace targets, one per line"
                                              : L"Quicklink target"));
 
     if (kind_ == library::ItemKind::Snippet) {
       SetWindowTextW(name_, snippet_.name.c_str());
       SetWindowTextW(keyword_, snippet_.keyword.c_str());
       SetWindowTextW(value_, snippet_.text.c_str());
-    } else if (kind_ == library::ItemKind::Quicklink) {
+    } else if (IsLaunchItem(kind_)) {
       SetWindowTextW(name_, quicklink_.name.c_str());
       SetWindowTextW(keyword_, quicklink_.keyword.c_str());
       SetWindowTextW(value_, quicklink_.target.c_str());
@@ -588,7 +693,7 @@ class EditorWindow {
       y += labelHeight;
       MoveWindow(name_, margin, y, contentWidth,
                  (kind_ == library::ItemKind::AppAlias ||
-                  kind_ == library::ItemKind::CommandAlias)
+                  IsCommandItem(kind_))
                      ? px(240)
                      : editHeight,
                  TRUE);
@@ -599,7 +704,7 @@ class EditorWindow {
     MoveWindow(keyword_, margin, y, contentWidth, editHeight, TRUE);
     y += editHeight + gap;
     if (kind_ == library::ItemKind::AppAlias ||
-        kind_ == library::ItemKind::CommandAlias) {
+        IsCommandItem(kind_)) {
       const int buttonWidth = px(90);
       const int buttonHeight = px(30);
       const int buttonsTop = std::max(y, height - margin - buttonHeight);
@@ -641,12 +746,22 @@ class EditorWindow {
         SetFocus(name_);
         return;
       }
-    } else if (kind_ == library::ItemKind::Quicklink) {
+    } else if (IsLaunchItem(kind_)) {
       quicklink_.name = snippets::Trim(ControlText(name_));
       quicklink_.keyword = snippets::Trim(ControlText(keyword_));
       quicklink_.target = snippets::Trim(ControlText(value_));
-      if (const auto error = library::ValidateQuicklink(
-              quicklink_, quicklinks_, editingIndex_)) {
+      const auto validation = kind_ == library::ItemKind::Quicklink
+          ? library::ValidateQuicklink(quicklink_, quicklinks_, editingIndex_)
+          : automation::Validate(kind_ == library::ItemKind::Script ? automation::Kind::Script : automation::Kind::Workspace, quicklink_);
+      if (validation) {
+        SetStatus(*validation, true);
+        SetFocus(value_);
+        return;
+      }
+      for (std::size_t index = 0; index < quicklinks_.size(); ++index) {
+        if (editingIndex_ == index) continue;
+        if (library::NormalizeKeyword(quicklinks_[index].keyword) != library::NormalizeKeyword(quicklink_.keyword)) continue;
+        const auto error = std::optional<std::wstring>(L"That keyword is already used.");
         SetStatus(*error, true);
         SetFocus(name_);
         return;
@@ -668,7 +783,7 @@ class EditorWindow {
         SetFocus(keyword_);
         return;
       }
-    } else if (kind_ == library::ItemKind::CommandAlias) {
+    } else if (IsCommandItem(kind_)) {
       const int selected =
           static_cast<int>(SendMessageW(name_, CB_GETCURSEL, 0, 0));
       if (selected >= 0) {
@@ -680,9 +795,10 @@ class EditorWindow {
         }
       }
       commandAlias_.alias = snippets::Trim(ControlText(keyword_));
-      if (const auto error = library::ValidateCommandAlias(
-              commandAlias_, commandAliases_, aliases_, snippets_,
-              quicklinks_, editingIndex_)) {
+      const auto validation = kind_ == library::ItemKind::CommandShortcut
+          ? (commandAlias_.stableId.empty() ? std::optional<std::wstring>(L"Choose a command.") : automation::ValidateShortcut(commandAlias_.alias))
+          : library::ValidateCommandAlias(commandAlias_, commandAliases_, aliases_, snippets_, quicklinks_, editingIndex_);
+      if (const auto error = validation) {
         SetStatus(*error, true);
         SetFocus(keyword_);
         return;
@@ -698,7 +814,7 @@ class EditorWindow {
       }
     }
     accepted_ = true;
-    DestroyWindow(hwnd_);
+    Close();
   }
 
   LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -742,12 +858,12 @@ class EditorWindow {
           return 0;
         }
         if (LOWORD(wParam) == IDCANCEL) {
-          DestroyWindow(hwnd_);
+          Close();
           return 0;
         }
         break;
       case WM_CLOSE:
-        DestroyWindow(hwnd_);
+        Close();
         return 0;
     }
     return DefWindowProcW(hwnd_, message, wParam, lParam);
@@ -826,19 +942,17 @@ class ManagerWindow {
     EnableWindow(owner_, FALSE);
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
-    MSG message{};
-    while (IsWindow(hwnd_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-      if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
-        SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
-        continue;
-      }
-      if (!IsDialogMessageW(hwnd_, &message)) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-      }
-    }
-    EnableWindow(owner_, TRUE);
-    SetActiveWindow(owner_);
+    RunDialogLoop(
+        hwnd_,
+        [this](const MSG& message) {
+          if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
+            return true;
+          }
+          return false;
+        },
+        [this] { Close(); });
+    if (owner_ && IsWindow(owner_)) EnableWindow(owner_, TRUE);
   }
 
  private:
@@ -920,12 +1034,14 @@ class ManagerWindow {
     }
   }
 
+  void Close() { CloseModalDialog(hwnd_, owner_); }
+
   void SetStatus(std::wstring text, bool error) {
     operationStatus_ = std::move(text);
     operationStatusError_ = error;
     if (status_) SetWindowTextW(status_, operationStatus_.c_str());
     if (status_) InvalidateRect(status_, nullptr, TRUE);
-    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, IdStatus);
+    AnnounceStatus(status_, error);
   }
 
   LRESULT ColorControl(UINT message, WPARAM wParam, LPARAM lParam) const {
@@ -964,7 +1080,7 @@ class ManagerWindow {
   }
 
   void CreateControls() {
-    tabs_ = AddControl(WC_TABCONTROLW, L"", WS_TABSTOP, IdTabs);
+    tabs_ = AddControl(WC_TABCONTROLW, L"", WS_TABSTOP | TCS_MULTILINE, IdTabs);
     TCITEMW tab{TCIF_TEXT};
     tab.pszText = const_cast<wchar_t*>(L"Snippets");
     TabCtrl_InsertItem(tabs_, 0, &tab);
@@ -976,6 +1092,12 @@ class ManagerWindow {
     TabCtrl_InsertItem(tabs_, 3, &tab);
     tab.pszText = const_cast<wchar_t*>(L"Web Searches");
     TabCtrl_InsertItem(tabs_, 4, &tab);
+    tab.pszText = const_cast<wchar_t*>(L"Scripts");
+    TabCtrl_InsertItem(tabs_, 5, &tab);
+    tab.pszText = const_cast<wchar_t*>(L"Workspaces");
+    TabCtrl_InsertItem(tabs_, 6, &tab);
+    tab.pszText = const_cast<wchar_t*>(L"Command Shortcuts");
+    TabCtrl_InsertItem(tabs_, 7, &tab);
     TabCtrl_SetCurSel(tabs_, static_cast<int>(kind_));
 
     list_ = AddControl(WC_LISTVIEWW, L"",
@@ -1007,10 +1129,21 @@ class ManagerWindow {
     close_ = AddControl(WC_BUTTONW, L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON,
                         IDCANCEL);
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
+    SetLiveSetting(status_, 1);
     RefreshFont();
     Refresh();
+    // Opening the editor runs a nested modal loop, which does not belong in
+    // WM_CREATE; do it once creation has completed.
     if ((kind_ == library::ItemKind::AppAlias ||
-         kind_ == library::ItemKind::CommandAlias) &&
+         IsCommandItem(kind_) || IsLaunchItem(kind_)) &&
+        !initialAppId_.empty()) {
+      PostMessageW(hwnd_, kMsgOpenInitialEditor, 0, 0);
+    }
+  }
+
+  void OpenInitialEditor() {
+    if ((kind_ == library::ItemKind::AppAlias ||
+         IsCommandItem(kind_) || IsLaunchItem(kind_)) &&
         !initialAppId_.empty()) {
       std::optional<std::size_t> sourceIndex;
       if (kind_ == library::ItemKind::AppAlias) {
@@ -1021,29 +1154,23 @@ class ManagerWindow {
           sourceIndex = static_cast<std::size_t>(
               std::distance(data_.appAliases.begin(), alias));
         }
+      } else if (IsLaunchItem(kind_)) {
+        const auto item = std::find_if(LaunchItems().begin(), LaunchItems().end(),
+            [&](const auto& entry) { return entry.keyword == initialAppId_; });
+        if (item != LaunchItems().end()) sourceIndex = static_cast<std::size_t>(std::distance(LaunchItems().begin(), item));
       } else {
         const auto alias = std::find_if(
-            data_.commandAliases.begin(), data_.commandAliases.end(),
+            CommandItems().begin(), CommandItems().end(),
             [&](const auto& item) { return item.stableId == initialAppId_; });
-        if (alias != data_.commandAliases.end()) {
+        if (alias != CommandItems().end()) {
           sourceIndex = static_cast<std::size_t>(
-              std::distance(data_.commandAliases.begin(), alias));
+              std::distance(CommandItems().begin(), alias));
         }
       }
       if (!sourceIndex) {
         AddItem();
       } else {
-        for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
-          LVITEMW item{LVIF_PARAM};
-          item.iItem = row;
-          if (ListView_GetItem(list_, &item) &&
-              item.lParam == static_cast<LPARAM>(*sourceIndex)) {
-            ListView_SetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED,
-                                  LVIS_SELECTED | LVIS_FOCUSED);
-            EditItem();
-            break;
-          }
-        }
+        if (SelectSourceIndex(*sourceIndex)) EditItem();
       }
       initialAppId_.clear();
     }
@@ -1055,7 +1182,7 @@ class ManagerWindow {
       return ScaleForDpi(logicalPixels, dpi);
     };
     const int margin = px(14);
-    const int tabHeight = px(30);
+    const int tabHeight = px(58);
     const int buttonHeight = px(30);
     const int gap = px(8);
     const int contentWidth = std::max(1, width - 2 * margin);
@@ -1089,12 +1216,25 @@ class ManagerWindow {
     MoveWindow(close_, closeX, buttonsTop, closeWidth, buttonHeight, TRUE);
   }
 
+  std::vector<settings::Quicklink>& LaunchItems() {
+    return kind_ == library::ItemKind::Script ? data_.scripts : kind_ == library::ItemKind::Workspace ? data_.workspaces : data_.quicklinks;
+  }
+  std::vector<library::CommandAlias>& CommandItems() {
+    return kind_ == library::ItemKind::CommandShortcut ? data_.commandShortcuts : data_.commandAliases;
+  }
+  const auto& SaveLaunchItems() const {
+    return kind_ == library::ItemKind::Script ? callbacks_.saveScripts : kind_ == library::ItemKind::Workspace ? callbacks_.saveWorkspaces : callbacks_.saveQuicklinks;
+  }
+  const auto& SaveCommandItems() const {
+    return kind_ == library::ItemKind::CommandShortcut ? callbacks_.saveCommandShortcuts : callbacks_.saveCommandAliases;
+  }
+
   bool Writable() const {
     if (kind_ == library::ItemKind::Snippet) return data_.snippetsWritable;
-    if (kind_ == library::ItemKind::Quicklink) return data_.quicklinksWritable;
-    if (kind_ == library::ItemKind::CommandAlias) {
+    if (IsLaunchItem(kind_)) return kind_ == library::ItemKind::Quicklink ? data_.quicklinksWritable : data_.settingsWritable;
+    if (IsCommandItem(kind_)) {
       return data_.settingsWritable &&
-             static_cast<bool>(callbacks_.saveCommandAliases);
+             static_cast<bool>(SaveCommandItems());
     }
     return data_.settingsWritable;
   }
@@ -1121,7 +1261,27 @@ class ManagerWindow {
                          const_cast<wchar_t*>(detail.c_str()));
   }
 
-  void Refresh() {
+  // Selects the row showing `sourceIndex` (an index into the underlying
+  // vector, not a row: the list is sorted, so rows move after an edit).
+  bool SelectSourceIndex(std::size_t sourceIndex) {
+    const int count = ListView_GetItemCount(list_);
+    for (int row = 0; row < count; ++row) {
+      LVITEMW item{LVIF_PARAM};
+      item.iItem = row;
+      if (ListView_GetItem(list_, &item) &&
+          item.lParam == static_cast<LPARAM>(sourceIndex)) {
+        ListView_SetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(list_, row, FALSE);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Rebuilds the list. `select`, when set, is the source index of the item to
+  // leave selected afterwards (the edited or newly added one).
+  void Refresh(std::optional<std::size_t> select = std::nullopt) {
     ListView_DeleteAllItems(list_);
     if (kind_ == library::ItemKind::Snippet) {
       int row = 0;
@@ -1139,15 +1299,17 @@ class ManagerWindow {
         InsertRow(row++, index, data_.snippets[index].name,
                   data_.snippets[index].keyword, preview);
       }
-    } else if (kind_ == library::ItemKind::Quicklink) {
+    } else if (IsLaunchItem(kind_)) {
       int row = 0;
       for (const auto index :
-           library::SortedQuicklinkIndices(data_.quicklinks)) {
-        const auto& link = data_.quicklinks[index];
+           library::SortedQuicklinkIndices(LaunchItems())) {
+        const auto& link = LaunchItems()[index];
         std::wstring detail = link.target;
+        std::replace(detail.begin(), detail.end(), L'\n', L' ');
+        std::replace(detail.begin(), detail.end(), L'\r', L' ');
         const auto keyword = library::NormalizeKeyword(link.keyword);
         const auto duplicates = std::count_if(
-            data_.quicklinks.begin(), data_.quicklinks.end(),
+            LaunchItems().begin(), LaunchItems().end(),
             [&](const auto& item) {
               return library::NormalizeKeyword(item.keyword) == keyword;
             });
@@ -1164,11 +1326,11 @@ class ManagerWindow {
                   alias.appName.empty() ? L"Missing app" : alias.appName,
                   alias.alias, alias.appId);
       }
-    } else if (kind_ == library::ItemKind::CommandAlias) {
+    } else if (IsCommandItem(kind_)) {
       int row = 0;
       for (const auto index :
-           library::SortedCommandAliasIndices(data_.commandAliases)) {
-        const auto& alias = data_.commandAliases[index];
+           library::SortedCommandAliasIndices(CommandItems())) {
+        const auto& alias = CommandItems()[index];
         InsertRow(row++, index,
                   alias.commandName.empty() ? L"Missing command"
                                             : alias.commandName,
@@ -1183,10 +1345,11 @@ class ManagerWindow {
                   search.urlTemplate);
       }
     }
+    if (select) SelectSourceIndex(*select);
     const auto selected = SelectedIndex();
     const bool canAdd = Writable() &&
-                        (kind_ != library::ItemKind::CommandAlias ||
-                         data_.commandAliases.size() < commands::Catalog().size());
+                        (!IsCommandItem(kind_) ||
+                         CommandItems().size() < commands::Catalog().size());
     EnableWindow(add_, canAdd);
     EnableWindow(edit_, Writable() && selected.has_value());
     EnableWindow(remove_, Writable() && selected.has_value());
@@ -1197,11 +1360,11 @@ class ManagerWindow {
                                   ? L"Restore Defaults" : L"Open File");
     const std::wstring message = kind_ == library::ItemKind::Snippet
         ? data_.snippetsMessage
-        : (kind_ == library::ItemKind::Quicklink ? data_.quicklinksMessage
+        : (IsLaunchItem(kind_) ? data_.quicklinksMessage
                                                   : data_.settingsMessage);
     const bool integrationMissing =
-        kind_ == library::ItemKind::CommandAlias &&
-        !callbacks_.saveCommandAliases;
+        IsCommandItem(kind_) &&
+        !SaveCommandItems();
     if (operationStatus_.empty()) {
       operationStatus_ =
           integrationMissing
@@ -1224,98 +1387,101 @@ class ManagerWindow {
               !result.succeeded);
   }
 
+  // Saves `candidate`. On success it becomes the stored list; on failure the
+  // stored data is reloaded so the view matches what is on disk.
+  template <typename Item, typename Save>
+  bool Commit(std::vector<Item>& stored, std::vector<Item> candidate,
+              const Save& save) {
+    const auto result = save(candidate);
+    ShowResult(result);
+    if (result.succeeded) {
+      stored = std::move(candidate);
+    } else if (callbacks_.reload) {
+      data_ = callbacks_.reload();
+    }
+    return result.succeeded;
+  }
+
   void AddItem() {
     if (!Writable()) return;
-    EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
-                        data_.appAliases, data_.commandAliases,
+    EditorWindow editor(hwnd_, kind_, data_.snippets, LaunchItems(),
+                        data_.appAliases, CommandItems(),
                         data_.availableApps,
                         data_.webSearches, std::nullopt, initialAppId_, theme_,
                         highContrast_);
     if (!editor.Run()) return;
+    bool saved = false;
+    std::size_t added = 0;
     if (kind_ == library::ItemKind::Snippet) {
       auto candidate = data_.snippets;
       candidate.push_back(editor.Snippet());
-      const auto result = callbacks_.saveSnippets(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.snippets = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::Quicklink) {
-      auto candidate = data_.quicklinks;
+      added = candidate.size() - 1;
+      saved = Commit(data_.snippets, std::move(candidate),
+                     callbacks_.saveSnippets);
+    } else if (IsLaunchItem(kind_)) {
+      auto candidate = LaunchItems();
       candidate.push_back(editor.Quicklink());
-      const auto result = callbacks_.saveQuicklinks(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.quicklinks = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      added = candidate.size() - 1;
+      saved = Commit(LaunchItems(), std::move(candidate),
+                     SaveLaunchItems());
     } else if (kind_ == library::ItemKind::AppAlias) {
       auto candidate = data_.appAliases;
       candidate.push_back(editor.Alias());
-      const auto result = callbacks_.saveAppAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.appAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::CommandAlias) {
-      auto candidate = data_.commandAliases;
+      added = candidate.size() - 1;
+      saved = Commit(data_.appAliases, std::move(candidate),
+                     callbacks_.saveAppAliases);
+    } else if (IsCommandItem(kind_)) {
+      auto candidate = CommandItems();
       candidate.push_back(editor.CommandAlias());
-      const auto result = callbacks_.saveCommandAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.commandAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      added = candidate.size() - 1;
+      saved = Commit(CommandItems(), std::move(candidate),
+                     SaveCommandItems());
     } else {
       auto candidate = data_.webSearches;
       candidate.push_back(editor.WebSearch());
-      const auto result = callbacks_.saveWebSearches(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.webSearches = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      added = candidate.size() - 1;
+      saved = Commit(data_.webSearches, std::move(candidate),
+                     callbacks_.saveWebSearches);
     }
-    Refresh();
+    Refresh(saved ? std::optional<std::size_t>(added) : std::nullopt);
   }
 
   void EditItem() {
     const auto selected = SelectedIndex();
     if (!selected || !Writable()) return;
-    EditorWindow editor(hwnd_, kind_, data_.snippets, data_.quicklinks,
-                        data_.appAliases, data_.commandAliases,
+    EditorWindow editor(hwnd_, kind_, data_.snippets, LaunchItems(),
+                        data_.appAliases, CommandItems(),
                         data_.availableApps,
                         data_.webSearches, selected, {}, theme_, highContrast_);
     if (!editor.Run()) return;
     if (kind_ == library::ItemKind::Snippet) {
       auto candidate = data_.snippets;
       candidate[*selected] = editor.Snippet();
-      const auto result = callbacks_.saveSnippets(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.snippets = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::Quicklink) {
-      auto candidate = data_.quicklinks;
+      Commit(data_.snippets, std::move(candidate), callbacks_.saveSnippets);
+    } else if (IsLaunchItem(kind_)) {
+      auto candidate = LaunchItems();
       candidate[*selected] = editor.Quicklink();
-      const auto result = callbacks_.saveQuicklinks(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.quicklinks = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      Commit(LaunchItems(), std::move(candidate),
+             SaveLaunchItems());
     } else if (kind_ == library::ItemKind::AppAlias) {
       auto candidate = data_.appAliases;
       candidate[*selected] = editor.Alias();
-      const auto result = callbacks_.saveAppAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.appAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::CommandAlias) {
-      auto candidate = data_.commandAliases;
+      Commit(data_.appAliases, std::move(candidate),
+             callbacks_.saveAppAliases);
+    } else if (IsCommandItem(kind_)) {
+      auto candidate = CommandItems();
       candidate[*selected] = editor.CommandAlias();
-      const auto result = callbacks_.saveCommandAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.commandAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      Commit(CommandItems(), std::move(candidate),
+             SaveCommandItems());
     } else {
       auto candidate = data_.webSearches;
       candidate[*selected] = editor.WebSearch();
-      const auto result = callbacks_.saveWebSearches(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.webSearches = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      Commit(data_.webSearches, std::move(candidate),
+             callbacks_.saveWebSearches);
     }
-    Refresh();
+    // The list is sorted, so the edited row can move; keep the selection on
+    // the edited item itself.
+    Refresh(*selected);
   }
 
   void DeleteItem() {
@@ -1326,42 +1492,31 @@ class ManagerWindow {
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
       return;
     }
+    const auto position = static_cast<std::ptrdiff_t>(*selected);
     if (kind_ == library::ItemKind::Snippet) {
       auto candidate = data_.snippets;
-      candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(*selected));
-      const auto result = callbacks_.saveSnippets(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.snippets = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::Quicklink) {
-      auto candidate = data_.quicklinks;
-      candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(*selected));
-      const auto result = callbacks_.saveQuicklinks(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.quicklinks = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      candidate.erase(candidate.begin() + position);
+      Commit(data_.snippets, std::move(candidate), callbacks_.saveSnippets);
+    } else if (IsLaunchItem(kind_)) {
+      auto candidate = LaunchItems();
+      candidate.erase(candidate.begin() + position);
+      Commit(LaunchItems(), std::move(candidate),
+             SaveLaunchItems());
     } else if (kind_ == library::ItemKind::AppAlias) {
       auto candidate = data_.appAliases;
-      candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(*selected));
-      const auto result = callbacks_.saveAppAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.appAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
-    } else if (kind_ == library::ItemKind::CommandAlias) {
-      auto candidate = data_.commandAliases;
-      candidate.erase(candidate.begin() +
-                      static_cast<std::ptrdiff_t>(*selected));
-      const auto result = callbacks_.saveCommandAliases(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.commandAliases = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      candidate.erase(candidate.begin() + position);
+      Commit(data_.appAliases, std::move(candidate),
+             callbacks_.saveAppAliases);
+    } else if (IsCommandItem(kind_)) {
+      auto candidate = CommandItems();
+      candidate.erase(candidate.begin() + position);
+      Commit(CommandItems(), std::move(candidate),
+             SaveCommandItems());
     } else {
       auto candidate = data_.webSearches;
-      candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(*selected));
-      const auto result = callbacks_.saveWebSearches(candidate);
-      ShowResult(result);
-      if (result.succeeded) data_.webSearches = std::move(candidate);
-      else if (callbacks_.reload) data_ = callbacks_.reload();
+      candidate.erase(candidate.begin() + position);
+      Commit(data_.webSearches, std::move(candidate),
+             callbacks_.saveWebSearches);
     }
     Refresh();
   }
@@ -1371,6 +1526,9 @@ class ManagerWindow {
       case WM_CREATE:
         RefreshBrushes();
         CreateControls();
+        return 0;
+      case kMsgOpenInitialEditor:
+        OpenInitialEditor();
         return 0;
       case WM_ERASEBKGND:
         return 1;
@@ -1467,6 +1625,15 @@ class ManagerWindow {
           case IdOpenFile:
             if (kind_ == library::ItemKind::WebSearch &&
                 callbacks_.restoreDefaultWebSearches) {
+              // Replaces every web search, including custom ones.
+              if (MessageBoxW(
+                      hwnd_,
+                      L"Replace all web searches with the defaults? Custom "
+                      L"web searches will be lost.",
+                      L"FeatherCast Library",
+                      MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                return 0;
+              }
               const auto result = callbacks_.restoreDefaultWebSearches();
               ShowResult(result);
               if (callbacks_.reload) data_ = callbacks_.reload();
@@ -1476,12 +1643,12 @@ class ManagerWindow {
             }
             return 0;
           case IDCANCEL:
-            DestroyWindow(hwnd_);
+            Close();
             return 0;
         }
         break;
       case WM_CLOSE:
-        DestroyWindow(hwnd_);
+        Close();
         return 0;
     }
     return DefWindowProcW(hwnd_, message, wParam, lParam);

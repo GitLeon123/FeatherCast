@@ -262,6 +262,31 @@ int main() {
              entry.path.find(L"drop.txt") != std::wstring::npos;
     }));
 
+    // Roots in another spelling (slashes, case, trailing separator) still
+    // identify the same folders: the offline folder keeps its entries and the
+    // online folder drops its stale ones.
+    const auto respelled = feathercast::files::MergeFileIndexEntries(
+        {oldOnline, oldOffline, removed}, {newOnline},
+        {L"c:/online/", L"C:/OFFLINE"}, {L"C:\\ONLINE\\"}, 100);
+    assert(respelled.size() == 2);
+    assert(std::any_of(respelled.begin(), respelled.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Online\\new.txt";
+    }));
+    assert(std::any_of(respelled.begin(), respelled.end(), [](const auto& entry) {
+      return entry.path == L"C:\\Offline\\keep.txt";
+    }));
+
+    {
+      using feathercast::filesystem_semantics::PathKey;
+      using feathercast::filesystem_semantics::SamePath;
+      assert(SamePath(L"D:/Notes/./", L"d:\\notes"));
+      assert(SamePath(L"D:\\NOTES\\", L"d:/notes"));
+      assert(SamePath(L"C:\\Gr\u00dc\u00dfe", L"c:\\gr\u00fc\u00dfe"));
+      assert(!SamePath(L"D:\\Notes", L"D:\\Notes2"));
+      assert(PathKey(L"C:\\") == L"c:\\");
+      assert(PathKey(L"C:/Users//x/../y/") == L"c:\\users\\y");
+    }
+
     const auto cleanupDatabase = root / L"exclusion-cleanup.db";
     feathercast::storage::Storage cleanupStorage;
     assert(cleanupStorage.Open(cleanupDatabase));
@@ -418,6 +443,83 @@ int main() {
   }
 
   {
+    // A follow-up scan reuses what the last scan learned about files that kept
+    // their size and write time, and reads changed files again.
+    const auto carryRoot = root / L"carry-root";
+    std::filesystem::create_directories(carryRoot, error);
+    assert(!error);
+    const auto stableFile = carryRoot / L"stable.txt";
+    const std::string stableText = "stable text content";
+    WriteBytes(stableFile, {stableText.begin(), stableText.end()});
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    feathercast::files::IndexStatus latest;
+    feathercast::files::FileIndexService index(
+        [&](feathercast::files::IndexStatus status) {
+          {
+            std::lock_guard lock(mutex);
+            latest = std::move(status);
+          }
+          ready.notify_all();
+        });
+    const auto find = [&](const std::filesystem::path& path)
+        -> const feathercast::storage::FileIndexEntry* {
+      for (const auto& entry : latest.entries) {
+        if (std::filesystem::path(entry.path) == path) return &entry;
+      }
+      return nullptr;
+    };
+    constexpr int kIndexed = static_cast<int>(content::State::Indexed);
+    index.Start();
+    assert(index.Reconfigure({60, {carryRoot.wstring()}, 100, true}));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return find(stableFile) != nullptr; }));
+      const auto* stable = find(stableFile);
+      assert(stable->contentState == kIndexed);
+      assert(stable->contentText == L"stable text content");
+      assert(!stable->contentUnchanged);
+    }
+
+    // The watcher may not be armed yet when the first scan has just been
+    // delivered, so a change is repeated until a scan reports it.
+    const auto changeUntil = [&](const auto& write, const auto& reported) {
+      for (int attempt = 0; attempt < 5; ++attempt) {
+        write();
+        std::unique_lock lock(mutex);
+        if (ready.wait_for(lock, std::chrono::seconds(2), reported)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const auto addedFile = carryRoot / L"added.txt";
+    assert(changeUntil(
+        [&] { WriteBytes(addedFile, {'a', 'd', 'd', 'e', 'd'}); },
+        [&] {
+          const auto* stable = find(stableFile);
+          return find(addedFile) != nullptr && stable != nullptr &&
+                 stable->contentUnchanged && stable->contentState == kIndexed &&
+                 stable->contentBytes ==
+                     static_cast<long long>(stableText.size()) &&
+                 stable->contentText.empty();
+        }));
+
+    const std::string changedText = "changed stable text content, longer";
+    assert(changeUntil(
+        [&] { WriteBytes(stableFile, {changedText.begin(), changedText.end()}); },
+        [&] {
+          const auto* stable = find(stableFile);
+          return stable != nullptr && !stable->contentUnchanged &&
+                 stable->contentText == L"changed stable text content, longer";
+        }));
+    index.Stop();
+  }
+
+  {
     const auto previewPath = root / L"preview.txt";
     std::vector<unsigned char> previewBytes(18000, 'x');
     constexpr std::string_view marker = "needle";
@@ -508,6 +610,77 @@ int main() {
     assert(!future.Open(futurePath));
     assert(sqlite3_open16(futurePath.c_str(), &database) == SQLITE_OK);
     assert(Scalar(database, "PRAGMA user_version;") == 5);
+    sqlite3_close(database);
+  }
+
+  {
+    // Entries the scanner did not read again keep their stored full-text row,
+    // but only while that row still describes the same file version.
+    const auto carryDatabase = root / L"carry-forward.db";
+    const auto keptPath = root / L"carry-kept.txt";
+    const auto stalePath = root / L"carry-stale.txt";
+    const auto neverPath = root / L"carry-never.txt";
+    feathercast::storage::Storage storage;
+    assert(storage.Open(carryDatabase));
+    const auto keptFirst = Entry(keptPath, L"keptterm alpha", 100, 20);
+    const auto staleFirst = Entry(stalePath, L"staleterm beta", 100, 10);
+    assert(storage.UpdateFileIndex({keptFirst, staleFirst}));
+
+    auto keptCarried = keptFirst;
+    keptCarried.indexedAt = 200;
+    keptCarried.contentText.clear();
+    keptCarried.contentUnchanged = true;
+    auto staleCarried = staleFirst;
+    staleCarried.indexedAt = 200;
+    staleCarried.lastWriteTime += 1;
+    staleCarried.contentText.clear();
+    staleCarried.contentUnchanged = true;
+    auto neverCarried = Entry(neverPath, L"", 200, 5);
+    neverCarried.contentBytes = 3;
+    neverCarried.contentUnchanged = true;
+    const auto rescanned =
+        Entry(root / L"carry-new.txt", L"newterm gamma", 200, 30);
+    const std::vector<feathercast::storage::FileIndexEntry> next = {
+        keptCarried, staleCarried, neverCarried, rescanned};
+    assert((storage.EntriesWithoutStoredContent(next) ==
+            std::vector<std::size_t>{1, 2}));
+    assert(storage.UpdateFileIndex(next));
+    storage.Close();
+
+    constexpr int kIndexed = static_cast<int>(content::State::Indexed);
+    sqlite3* database = nullptr;
+    assert(sqlite3_open16(carryDatabase.c_str(), &database) == SQLITE_OK);
+    assert(Scalar(database, "SELECT count(*) FROM file_index;") == 4);
+    assert(Scalar(database,
+                  "SELECT count(*) FROM file_content_fts WHERE "
+                  "file_content_fts MATCH 'alpha';") == 1);
+    assert(Scalar(database,
+                  "SELECT count(*) FROM file_content_fts WHERE "
+                  "file_content_fts MATCH 'beta';") == 0);
+    assert(Scalar(database,
+                  "SELECT count(*) FROM file_content_fts WHERE "
+                  "file_content_fts MATCH 'gamma';") == 1);
+    assert(Scalar(database,
+                  "SELECT content_state FROM file_index "
+                  "WHERE name='carry-kept.txt';") == kIndexed);
+    assert(Scalar(database,
+                  "SELECT content_bytes FROM file_index "
+                  "WHERE name='carry-kept.txt';") ==
+           static_cast<int>(keptFirst.contentBytes));
+    // No matching stored row: the entry does not claim content it lacks.
+    assert(Scalar(database,
+                  "SELECT content_state FROM file_index "
+                  "WHERE name='carry-stale.txt';") == 0);
+    assert(Scalar(database,
+                  "SELECT content_state FROM file_index "
+                  "WHERE name='carry-never.txt';") == 0);
+    assert(Scalar(database,
+                  "SELECT content_bytes FROM file_index "
+                  "WHERE name='carry-never.txt';") == 0);
+    assert(Scalar(database,
+                  "SELECT count(*) FROM file_content_fts WHERE rowid="
+                  "(SELECT id FROM file_index WHERE name='carry-never.txt');") ==
+           0);
     sqlite3_close(database);
   }
 

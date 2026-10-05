@@ -87,14 +87,6 @@ class SingleOperationService {
     return true;
   }
 
-  bool RunTask(std::function<void(std::stop_token)> task) {
-    return Run([task = std::move(task)](std::stop_token token)
-                   -> std::optional<Result> {
-      task(token);
-      return std::nullopt;
-    });
-  }
-
   void Cancel() {
     std::lock_guard lock(mutex_);
     if (worker_.joinable()) worker_.request_stop();

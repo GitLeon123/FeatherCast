@@ -266,6 +266,35 @@ inline std::wstring CanonicalPathKey(const std::wstring& rawPath) {
   return value;
 }
 
+inline bool IsFileSystemPath(const std::wstring& value) {
+  return (value.size() >= 3 && value[1] == L':' &&
+          (value[2] == L'\\' || value[2] == L'/')) ||
+         value.starts_with(L"\\\\") || value.starts_with(L"//");
+}
+
+// Whether `other` starts an executable inside the install folder of `game`.
+inline bool StartsInsideInstall(const app::AppEntry& game, const app::AppEntry& other) {
+  if (!game.isGame || game.path.empty() || other.isGame ||
+      !IsFileSystemPath(other.targetPath)) {
+    return false;
+  }
+  const std::wstring install = CanonicalPathKey(game.path);
+  const std::wstring target = CanonicalPathKey(other.targetPath);
+  if (install.empty() || target.size() <= install.size() ||
+      !target.starts_with(install)) {
+    return false;
+  }
+  return install.back() == L'\\' || install.back() == L'/' ||
+         target[install.size()] == L'\\' || target[install.size()] == L'/';
+}
+
+// A file target that is the app itself rather than a script host or a
+// launcher invoked with arguments.
+inline bool StartsOwnExecutable(const app::AppEntry& entry) {
+  return IsFileSystemPath(entry.targetPath) &&
+         !IsHostExecutable(entry.targetPath) && entry.args.empty();
+}
+
 inline bool ShouldMergeApps(const app::AppEntry& existing, const app::AppEntry& incoming) {
   if (existing.id.empty() || incoming.id.empty()) return false;
 
@@ -277,8 +306,10 @@ inline bool ShouldMergeApps(const app::AppEntry& existing, const app::AppEntry& 
     if (Lower(existing.appUserModelId) == Lower(incoming.appUserModelId)) return true;
   }
 
-  // 3. Launch target match
-  if (!existing.launchTarget.empty() && !incoming.launchTarget.empty()) {
+  // 3. Launch target match. Launchers start many games through one
+  // executable (steam.exe, Battle.net.exe), so the arguments must match too.
+  if (!existing.launchTarget.empty() && !incoming.launchTarget.empty() &&
+      existing.args == incoming.args) {
     if (CanonicalPathKey(existing.launchTarget) == CanonicalPathKey(incoming.launchTarget)) return true;
   }
 
@@ -300,14 +331,30 @@ inline bool ShouldMergeApps(const app::AppEntry& existing, const app::AppEntry& 
   // 6. Name match
   if (!existing.name.empty() && !incoming.name.empty() &&
       NameKey(existing.name) == NameKey(incoming.name)) {
+    // A provider knows the install folder while a shortcut knows the
+    // executable, which may be a launcher inside that folder.
+    if (StartsInsideInstall(existing, incoming) ||
+        StartsInsideInstall(incoming, existing)) {
+      return true;
+    }
+    // Two games installed in different folders are separate copies; equal
+    // folders already matched above.
+    if (existing.isGame && incoming.isGame && !existing.path.empty() &&
+        !incoming.path.empty()) {
+      return false;
+    }
     // If both specify different concrete target executables, they are distinct apps (unless host)
     if (!existing.targetPath.empty() && !incoming.targetPath.empty() &&
         !IsHostExecutable(existing.targetPath) && !IsHostExecutable(incoming.targetPath)) {
       return CanonicalPathKey(existing.targetPath) == CanonicalPathKey(incoming.targetPath);
     }
-    // If one is a game and other is not, game correlation handles it if paths match
+    // An ordinary app that starts its own executable from outside a game's
+    // install folder only shares the game's name. Shortcuts that pass
+    // arguments to a launcher, or carry no file target, still merge.
     if (existing.isGame != incoming.isGame) {
-      return true;
+      const auto& game = existing.isGame ? existing : incoming;
+      const auto& other = existing.isGame ? incoming : existing;
+      if (!game.path.empty() && StartsOwnExecutable(other)) return false;
     }
     // At least one lacks an explicit targetPath (e.g. shell:AppsFolder entry vs shortcut)
     return true;

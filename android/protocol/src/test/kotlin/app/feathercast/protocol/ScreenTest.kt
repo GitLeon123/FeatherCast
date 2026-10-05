@@ -16,6 +16,12 @@ class ScreenTest {
         assertNull(ScreenInput.parse(fixture.replace("\"generation\":2", "\"generation\":4294967298")))
         assertNull(ScreenInput.parse(fixture.replace("\"action\":\"text\"", "\"action\":\"shell\"")))
         assertNull(ScreenInput.parse("""{"type":"screen.input","session":"s1","generation":1,"action":"down","x":-1}"""))
+        // The largest allowed text still fits after worst-case JSON escaping; one more byte does not.
+        val control = "\u0001".repeat(MAX_SCREEN_TEXT_BYTES)
+        val escaped = fixture.replace("Grüße 🌻", control.map { "\\u%04x".format(it.code) }.joinToString(""))
+        assertTrue(escaped.length > 6 * MAX_SCREEN_TEXT_BYTES && escaped.length <= MAX_SCREEN_INPUT_BYTES)
+        assertEquals(control, ScreenInput.parse(escaped)?.text)
+        assertNull(ScreenInput.parse(fixture.replace("Grüße 🌻", "a".repeat(MAX_SCREEN_TEXT_BYTES + 1))))
         val request = PcMessage.parse("""{"type":"screen.start","session":"s1","key":"${Base64Url.encode(ByteArray(32))}","audio":true}""")
         assertNotNull(request as? PcMessage.ScreenStart)
         assertTrue(request.request.audio)

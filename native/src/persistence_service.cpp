@@ -1,7 +1,10 @@
 #include "persistence_service.hpp"
 
+#include "file_content.hpp"
 #include "file_index_service.hpp"
+#include "filesystem_semantics.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <future>
 #include <utility>
@@ -49,25 +52,6 @@ StorageStartupState PersistenceService::LoadStorageForStartup(
   }
   state.clipboard = storage_.LoadClipboardHistory(clipboardLimit);
   return state;
-}
-
-std::vector<storage::FileIndexEntry> PersistenceService::LoadFileIndex(
-    std::size_t limit) {
-  // Serialize the lazy read with queued index writes.  Directly reading the
-  // shared Storage instance from the UI thread could race the persistence
-  // executor while a live scan is committing its previous batch.
-  auto result = std::make_shared<std::promise<std::vector<storage::FileIndexEntry>>>();
-  auto ready = result->get_future();
-  if (!executor_.Submit([this, limit, result](std::stop_token token) {
-        if (token.stop_requested() || !EnsureStorageOpen()) {
-          result->set_value({});
-          return;
-        }
-        result->set_value(storage_.LoadFileIndex(limit));
-      })) {
-    return {};
-  }
-  return ready.get();
 }
 
 bool PersistenceService::LoadFileIndexAsync(std::size_t limit,
@@ -187,32 +171,6 @@ bool PersistenceService::SaveTimers(timers::State state, std::vector<std::wstrin
   });
 }
 
-bool PersistenceService::ReplaceFileIndex(
-    std::vector<storage::FileIndexEntry> entries) {
-  return executor_.Submit(
-      [this, entries = std::move(entries)](std::stop_token token) {
-        if (token.stop_requested()) return;
-        const bool succeeded =
-            EnsureStorageOpen() && storage_.ReplaceFileIndex(entries);
-        Emit(FileIndexWriteCompleted{
-            succeeded,
-            succeeded ? storage::StorageError{} : storage_.LastError()});
-      });
-}
-
-bool PersistenceService::UpdateFileIndex(
-    std::vector<storage::FileIndexEntry> entries) {
-  return executor_.Submit(
-      [this, entries = std::move(entries)](std::stop_token token) {
-        if (token.stop_requested()) return;
-        const bool succeeded =
-            EnsureStorageOpen() && storage_.UpdateFileIndex(entries);
-        Emit(FileIndexWriteCompleted{
-            succeeded,
-            succeeded ? storage::StorageError{} : storage_.LastError()});
-      });
-}
-
 bool PersistenceService::MergeFileIndex(
     std::vector<storage::FileIndexEntry> entries,
     std::vector<std::wstring> configuredRoots,
@@ -234,12 +192,30 @@ bool PersistenceService::MergeFileIndex(
         auto merged = files::MergeFileIndexEntries(
             storage_.LoadFileIndex(limit), std::move(entries), configuredRoots,
             availableRoots, limit, exclusionPatterns);
+        // The scanner skips files that kept their size and write time and
+        // relies on the stored text. Read the few whose text the database
+        // does not hold, so they are not stored without content.
+        for (const auto index : storage_.EntriesWithoutStoredContent(merged)) {
+          if (token.stop_requested()) return;
+          auto& entry = merged[index];
+          auto extraction = file_content::Extract(
+              entry.path, file_content::kMaxIndexedBytes, token);
+          entry.contentUnchanged = false;
+          entry.contentState = static_cast<int>(extraction.state);
+          entry.contentBytes =
+              extraction.state == file_content::State::Indexed
+                  ? static_cast<long long>(extraction.sourceBytes)
+                  : 0;
+          entry.contentText = std::move(extraction.text);
+        }
+        // Available roots arrive lexically normalized while configured roots
+        // keep the user's spelling ("D:/Notes", "d:\notes\"), so compare keys.
         std::vector<std::wstring> preserveRoots;
         for (const auto& configured : configuredRoots) {
           const bool available = std::any_of(
               availableRoots.begin(), availableRoots.end(),
               [&](const std::wstring& root) {
-                return _wcsicmp(root.c_str(), configured.c_str()) == 0;
+                return filesystem_semantics::SamePath(root, configured);
               });
           if (!available) {
             preserveRoots.push_back(

@@ -49,7 +49,6 @@ class PerformanceGovernor {
                     : QualityTier::Full,
                 std::memory_order_release);
     goodSamples_.store(0, std::memory_order_release);
-    pressureSamples_.store(0, std::memory_order_release);
   }
 
   WorkPolicy Policy() const noexcept {
@@ -104,6 +103,12 @@ class PerformanceGovernor {
   // Called once after an event-pump/render turn. Durations are in microseconds
   // so callers can use either QPC or steady_clock without a platform-specific
   // dependency in this policy object.
+  //
+  // Degrading is immediate, recovering is not: a tier only steps up after a
+  // run of consecutive samples that stay clearly below the limits which caused
+  // the downgrade. Samples inside that hysteresis band neither degrade nor
+  // count toward recovery; they restart the streak, so a workload hovering
+  // around a threshold cannot make the tier oscillate.
   QualityTier ObserveUiTurn(std::uint64_t frameMicros,
                             std::uint64_t pumpMicros,
                             std::size_t pendingEvents,
@@ -117,32 +122,36 @@ class PerformanceGovernor {
                                  presentBackpressured;
     QualityTier current = tier_.load(std::memory_order_acquire);
     if (criticalPressure) {
-      pressureSamples_.store(0, std::memory_order_release);
       goodSamples_.store(0, std::memory_order_release);
       current = QualityTier::Critical;
       tier_.store(current, std::memory_order_release);
       return current;
     }
-    if (reducedPressure) {
-      pressureSamples_.fetch_add(1, std::memory_order_acq_rel);
-      goodSamples_.store(0, std::memory_order_release);
-      if (current == QualityTier::Full ||
-          pressureSamples_.load(std::memory_order_acquire) >= 2) {
+    if (current == QualityTier::Full) {
+      if (reducedPressure) {
+        goodSamples_.store(0, std::memory_order_release);
         current = QualityTier::Reduced;
         tier_.store(current, std::memory_order_release);
       }
       return current;
     }
 
-    pressureSamples_.store(0, std::memory_order_release);
+    // Critical recovers once samples stay well clear of the critical limits;
+    // Reduced recovers only once they stay well clear of the reduced limits.
+    const bool calm = current == QualityTier::Critical
+                          ? frameMicros < 25'000 && pumpMicros < 5'000 &&
+                                pendingEvents < 128
+                          : frameMicros < 16'000 && pumpMicros < 1'500 &&
+                                pendingEvents < 32 && !presentBackpressured;
+    if (!calm) {
+      goodSamples_.store(0, std::memory_order_release);
+      return current;
+    }
     const unsigned good = goodSamples_.fetch_add(1, std::memory_order_acq_rel) + 1;
     const unsigned recoverySamples = current == QualityTier::Critical ? 30 : 60;
     if (good >= recoverySamples) {
-      if (current == QualityTier::Critical) {
-        current = QualityTier::Reduced;
-      } else if (current == QualityTier::Reduced) {
-        current = QualityTier::Full;
-      }
+      current = current == QualityTier::Critical ? QualityTier::Reduced
+                                                 : QualityTier::Full;
       goodSamples_.store(0, std::memory_order_release);
       tier_.store(current, std::memory_order_release);
     }
@@ -161,7 +170,6 @@ class PerformanceGovernor {
   std::atomic<bool> lowEnd_{false};
   std::atomic<bool> interactive_{false};
   std::atomic<unsigned> goodSamples_{0};
-  std::atomic<unsigned> pressureSamples_{0};
 };
 
 }  // namespace feathercast::performance

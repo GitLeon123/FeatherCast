@@ -8,10 +8,12 @@
 // AES-256-GCM ciphertext whose plaintext is a Payload:
 //   [u32 big-endian JSON length][JSON header][optional binary attachment]
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -322,12 +324,28 @@ inline std::string JsonString(const json::Value& root, std::string_view key) {
                                                             : std::string{};
 }
 
+// Integral JSON numbers only: fractions, NaN/infinity and values outside the
+// target range yield the fallback instead of an undefined conversion.
 inline long long JsonInt(const json::Value& root, std::string_view key,
                          long long fallback = 0) {
   const json::Value* value = root.Find(key);
-  return value && value->type == json::Value::Type::Number
-             ? static_cast<long long>(value->number)
-             : fallback;
+  if (!value || value->type != json::Value::Type::Number) return fallback;
+  const double number = value->number;
+  // 2^63 is exactly representable; the valid range is [-2^63, 2^63).
+  if (!std::isfinite(number) || std::trunc(number) != number ||
+      number < -9223372036854775808.0 || number >= 9223372036854775808.0) {
+    return fallback;
+  }
+  return static_cast<long long>(number);
+}
+
+inline int JsonInt32(const json::Value& root, std::string_view key,
+                     int fallback = 0) {
+  const long long value = JsonInt(root, key, fallback);
+  return value < std::numeric_limits<int>::min() ||
+                 value > std::numeric_limits<int>::max()
+             ? fallback
+             : static_cast<int>(value);
 }
 
 inline bool JsonBool(const json::Value& root, std::string_view key,

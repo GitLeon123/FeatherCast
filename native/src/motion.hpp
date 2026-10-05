@@ -393,8 +393,9 @@ class PendingNavigation {
     absolute_ = AbsoluteNavigation::None;
   }
 
+  // A delta queued after Home/End is applied relative to that absolute
+  // target, so "End, Up" lands on the second-to-last item.
   void Move(int delta) {
-    if (absolute_ != AbsoluteNavigation::None) absolute_ = AbsoluteNavigation::None;
     relative_ = std::clamp(relative_ + delta, -1000, 1000);
   }
 
@@ -410,9 +411,10 @@ class PendingNavigation {
 
   int Apply(int current, int itemCount) const {
     if (itemCount <= 0) return 0;
-    if (absolute_ == AbsoluteNavigation::Home) return 0;
-    if (absolute_ == AbsoluteNavigation::End) return itemCount - 1;
-    return std::clamp(current + relative_, 0, itemCount - 1);
+    int base = current;
+    if (absolute_ == AbsoluteNavigation::Home) base = 0;
+    if (absolute_ == AbsoluteNavigation::End) base = itemCount - 1;
+    return std::clamp(base + relative_, 0, itemCount - 1);
   }
 
  private:

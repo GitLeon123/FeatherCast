@@ -187,6 +187,24 @@ fun ConnectScreen(busy: Boolean, error: String?, onScan: () -> Unit) {
     }
 }
 
+/** Confirms a pairing link that was opened from outside the app, such as a browser. */
+@Composable
+fun PairConfirmDialog(pcName: String, hosts: List<String>, replaces: String?, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pair with $pcName?", maxLines = 2, overflow = TextOverflow.Ellipsis) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("This phone will connect to “$pcName” at ${hosts.joinToString(", ")}.", maxLines = 6, overflow = TextOverflow.Ellipsis)
+                if (replaces != null) Text("This replaces the pairing with $replaces.")
+                Text("Only continue if you opened the pairing code that FeatherCast shows on your own PC.")
+            }
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Pair") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
 @Composable
 private fun Step(number: Int, title: String, text: String) {
     Row(verticalAlignment = Alignment.Top) {
@@ -208,7 +226,7 @@ private fun Step(number: Int, title: String, text: String) {
 
 data class Permissions(
     val notificationAccess: Boolean,
-    val photos: Boolean,
+    val photos: app.feathercast.phone.PhotoAccess,
     val postNotifications: Boolean,
     val saveFiles: Boolean = true,
     val sms: Boolean = false,
@@ -217,6 +235,7 @@ data class Permissions(
     val remoteControl: Boolean = false,
     val pcKeyboard: Boolean = false,
     val deviceAudio: Boolean = false,
+    val localNetwork: Boolean = true,
 )
 
 enum class Feature { Notifications, Photos, Clipboard, ReceiveFiles, Ring, Media, Sms, Calls, Storage, Screen, RemoteControl }
@@ -254,6 +273,8 @@ interface HomeActions {
     fun selectPcKeyboard()
     fun approveScreen()
     fun stopScreen()
+    fun cancelTransfers()
+    fun requestLocalNetwork()
 }
 
 @Composable
@@ -270,6 +291,15 @@ fun HomeScreen(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        if (state.transferStatus.isNotEmpty()) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(state.transferStatus, modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium)
+                    if (state.transferActive) TextButton(onClick = actions::cancelTransfers) { Text("Cancel") }
+                }
+            }
+        }
         item {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 2.dp, bottom = 4.dp)) {
                 Icon(painterResource(R.drawable.ic_stat_feathercast), null, tint = Accent, modifier = Modifier.size(24.dp))
@@ -278,6 +308,14 @@ fun HomeScreen(
             }
         }
         item { StatusCard(state, actions) }
+        if (!permissions.localNetwork) item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Local network access is needed to connect to your PC.")
+                    TextButton(onClick = actions::requestLocalNetwork) { Text("Allow local network access") }
+                }
+            }
+        }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                 QuickAction(Icons.Outlined.ContentPaste, "Send clipboard", Modifier.weight(1f), actions::sendClipboard)
@@ -298,9 +336,15 @@ fun HomeScreen(
                     )
                     FeatureRow(
                         Icons.Outlined.Image, "Photos",
-                        "Your newest photos can be opened on the PC.",
+                        if (permissions.photos == app.feathercast.phone.PhotoAccess.Selected)
+                            "Only your selected photos are shared. You can change the selection."
+                        else "Your newest photos can be opened on the PC.",
                         checked = switches.photos, onChecked = { actions.setFeature(Feature.Photos, it) },
-                        missing = if (permissions.photos) null else "Allow photo access",
+                        missing = when (permissions.photos) {
+                            app.feathercast.phone.PhotoAccess.Full -> null
+                            app.feathercast.phone.PhotoAccess.Selected -> "Choose photos"
+                            app.feathercast.phone.PhotoAccess.Denied -> "Allow photo access"
+                        },
                         onFix = actions::requestPhotos,
                     )
                     FeatureRow(
@@ -410,7 +454,7 @@ fun HomeScreen(
                     modifier = Modifier.fillMaxWidth().border(1.dp, Border, PanelShape)) {
                     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            "Allow FeatherCast to show its status notification so the connection keeps running.",
+                            "Allow notifications to see connection status in the notification drawer. Connecting does not require this permission.",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.weight(1f),
                         )

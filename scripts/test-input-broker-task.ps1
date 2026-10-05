@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 3.0
 . (Join-Path $PSScriptRoot 'input-broker-task.ps1')
 
 function Assert-Equal($Actual, $Expected, [string]$Message) {

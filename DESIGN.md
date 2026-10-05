@@ -18,11 +18,12 @@ area animation setting, reduced-motion expectations, and High Contrast mode.
 
 The default theme is defined by `native/src/theme.hpp` and may be overridden by
 `%APPDATA%\\FeatherCast\\theme.json`. Theme colors are normalized after load.
-Translucent roles are compared after compositing over the same opaque canvas.
+Panel backgrounds are opaque, including when a custom theme specifies alpha.
+Translucent control roles are compared after compositing over their panel.
 
 | Role | Default | Use |
 | --- | --- | --- |
-| Overlay/settings background | `#101012EB` | Obsidian glass panel |
+| Overlay/settings background | `#191919` | Solid neutral dark grey panel |
 | Surface | `#18181B` | Rows and controls |
 | Surface hover | white at 12% alpha | Pointer/keyboard hover feedback |
 | Selected base | `#1C1C21` | Selection pill under the system accent |
@@ -70,6 +71,9 @@ The launcher, settings, volume, and recording surfaces draw rounded silhouettes
 with Direct2D. Rounded-corner `WM_NCHITTEST` handling returns
 `HTTRANSPARENT` outside the silhouette. No persistent window region is applied
 because it conflicts with the DirectComposition alpha surface.
+Panel interiors are opaque. DirectComposition alpha is retained for rounded
+edges, capture selection, and reveal/dismiss motion. Desktop blur and its
+separate backing windows are not used.
 
 ## Component states
 

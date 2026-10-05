@@ -29,11 +29,6 @@ struct SettingsSaveCompleted {
   std::wstring error;
 };
 
-struct FileIndexWriteCompleted {
-  bool succeeded = false;
-  storage::StorageError error;
-};
-
 struct FileIndexLoaded {
   std::uint64_t generation = 0;
   std::vector<storage::FileIndexEntry> entries;
@@ -84,8 +79,7 @@ struct WorkerFailed {
 };
 
 using Event =
-    std::variant<SettingsSaveCompleted, FileIndexWriteCompleted,
-                 FileIndexLoaded, FileIndexMerged,
+    std::variant<SettingsSaveCompleted, FileIndexLoaded, FileIndexMerged,
                  ClipboardStored, ClipboardLoaded, ClipboardPruned,
                  StorageClearCompleted, WorkerFailed, TimersLoaded, TimersSaved>;
 
@@ -108,10 +102,8 @@ class PersistenceService {
                                             std::size_t clipboardLimit,
                                             bool loadFiles = true,
                                             std::size_t clipboardRetentionDays = 0);
-  // Loads the persisted file index on demand.  This keeps startup cheap when
-  // the Files scope is not used while preserving the existing synchronous API
-  // used by the UI thread for a small, bounded result set.
-  std::vector<storage::FileIndexEntry> LoadFileIndex(std::size_t limit);
+  // Loads the persisted file index on demand, which keeps startup cheap when
+  // the Files scope is not used. The result arrives as FileIndexLoaded.
   bool LoadFileIndexAsync(std::size_t limit, std::uint64_t generation);
 
   void Start();
@@ -125,8 +117,6 @@ class PersistenceService {
                     std::size_t retentionDays = 0);
   bool LoadTimers();
   bool SaveTimers(timers::State state, std::vector<std::wstring> expiredNames = {});
-  bool ReplaceFileIndex(std::vector<storage::FileIndexEntry> entries);
-  bool UpdateFileIndex(std::vector<storage::FileIndexEntry> entries);
   bool MergeFileIndex(std::vector<storage::FileIndexEntry> entries,
                       std::vector<std::wstring> configuredRoots,
                       std::vector<std::wstring> availableRoots,

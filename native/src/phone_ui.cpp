@@ -4,6 +4,7 @@
 #include <dwmapi.h>
 #include <dwrite.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shlwapi.h>
 #include <wincodec.h>
 #include <windowsx.h>
@@ -14,10 +15,13 @@
 #include <cmath>
 #include <ctime>
 #include <deque>
+#include <filesystem>
 #include <iterator>
 #include <map>
+#include <set>
 
 #include "motion.hpp"
+#include "text_layout_cache.hpp"
 #include "qrcodegen.hpp"
 
 namespace feathercast::phone_ui {
@@ -37,6 +41,12 @@ constexpr size_t kMaxNotifications = 100;
 constexpr size_t kMaxNotificationIcons = 30;
 constexpr size_t kMaxClips = 50;
 constexpr long long kQrRefreshMs = 4 * 60 * 1000 + 30 * 1000;
+// How often the pairing screen checks that the PC's addresses are unchanged, and
+// how soon it looks again after finding no network.
+constexpr long long kNetworkRecheckMs = 3 * 1000;
+// The service reports an unanswered photo after two minutes; this only covers a
+// request that never reached it.
+constexpr long long kPhotoTimeoutMs = 150 * 1000;
 
 // Segoe MDL2 Assets glyphs.
 constexpr wchar_t kGlyphPhone[] = L"";
@@ -105,6 +115,7 @@ struct PhotoItem {
   ComPtr<ID2D1Bitmap> thumb;
   bool thumbFailed = false;
   bool downloading = false;
+  long long downloadingSince = 0;
 };
 
 struct ClipItem {
@@ -134,8 +145,8 @@ std::wstring FormatTime(long long ms) {
   const std::time_t now = std::time(nullptr);
   std::tm value{};
   std::tm today{};
-  localtime_s(&value, &seconds);
-  localtime_s(&today, &now);
+  // Phone timestamps are untrusted; out-of-range values get no time label.
+  if (localtime_s(&value, &seconds) != 0 || localtime_s(&today, &now) != 0) return {};
   wchar_t buffer[64]{};
   if (value.tm_year == today.tm_year && value.tm_yday == today.tm_yday) {
     wcsftime(buffer, std::size(buffer), L"%H:%M", &value);
@@ -192,6 +203,7 @@ struct PhoneWindow::Impl {
   int battery = -1;
   bool charging = false;
   std::deque<NotificationItem> notifications;
+  std::set<std::string> activeTransfers;
   std::vector<PhotoItem> photos;
   std::deque<ClipItem> clips;
   bool photosRequested = false;
@@ -209,6 +221,10 @@ struct PhoneWindow::Impl {
   bool pairing = false;
   std::string pairingUri;
   long long pairingCreatedAt = 0;
+  bool pairingUnavailable = false;  // the last attempt found no network address
+  std::string apkUrl;               // install URL, rebuilt when the addresses change
+  std::string networkKey;           // install URL and every local address
+  long long networkCheckedAt = 0;
   std::map<Tab, float> scroll;
   float contentHeight = 0.0f;
   float viewportHeight = 0.0f;
@@ -252,6 +268,7 @@ struct PhoneWindow::Impl {
   ComPtr<IDWriteTextFormat> iconLargeFormat;
   ComPtr<IDWriteTextFormat> stepFormat;
   ComPtr<IDWriteTextFormat> statFormat;
+  ui::TextLayoutCache textLayouts{128, 16 * 1024};
 
   Impl() {
     windowOpacity.Snap(1.0);
@@ -335,6 +352,7 @@ struct PhoneWindow::Impl {
   // next time the window opens; notification icons are decoded again from their PNG bytes.
   void ReleaseWindowResources() {
     DiscardDeviceResources();
+    textLayouts.Clear();
     ComPtr<IDWriteTextFormat>* formats[] = {
         &titleFormat, &headingFormat, &bodyFormat, &bodyWrapFormat, &smallFormat,
         &smallCenterFormat, &iconFormat, &iconLargeFormat, &stepFormat, &statFormat};
@@ -347,7 +365,7 @@ struct PhoneWindow::Impl {
     photosRequested = false;
     hits.clear();
     hits.shrink_to_fit();
-    pairingUri.clear();
+    ResetPairing();
     toast.clear();
   }
 
@@ -429,14 +447,21 @@ struct PhoneWindow::Impl {
             D2D1_COLOR_F color) {
     if (text.empty() || !format || rect.right <= rect.left) return;
     brush->SetColor(color);
+    auto layout = textLayouts.Get(dwrite.Get(), text, format,
+                                  rect.right - rect.left, rect.bottom - rect.top);
+    if (layout) {
+      target->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(),
+                              brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+      return;
+    }
     target->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, rect,
                       brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
   }
 
   float MeasureWidth(const std::wstring& text, IDWriteTextFormat* format) {
-    ComPtr<IDWriteTextLayout> layout;
-    if (FAILED(dwrite->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
-                                        format, 4000.0f, 100.0f, layout.GetAddressOf()))) {
+    auto layout = textLayouts.Get(dwrite.Get(), text, format, 4000.0f, 100.0f,
+                                  {ui::TextLayoutStyle::MeasureSingleLine});
+    if (!layout) {
       return 0.0f;
     }
     DWRITE_TEXT_METRICS metrics{};
@@ -655,11 +680,15 @@ struct PhoneWindow::Impl {
            smallCenterFormat.Get(), TextMuted());
     };
 
-    const std::string apkUrl = callbacks.apkUrl ? callbacks.apkUrl() : std::string{};
+    const std::wstring noNetwork =
+        L"No network connection found. Connect this PC to Wi-Fi or a LAN to pair your phone.";
+    const bool installReady = state.apkAvailable && !apkUrl.empty();
     const std::wstring installCaption =
-        state.apkAvailable
+        installReady
             ? L"Scan with the phone camera, download and install FeatherCast Phone.\n" +
                   Widen(apkUrl)
+        : state.apkAvailable
+            ? noNetwork
             : L"The app file (FeatherCast-Phone.apk) was not found next to FeatherCast.exe. "
               L"Copy it to your phone and install it.";
     const float x1 = kPad;
@@ -667,10 +696,12 @@ struct PhoneWindow::Impl {
     const float x2 = stacked ? kPad : kPad + cardWidth + gap;
     const float y2 = stacked ? cardTop + cardHeight + gap : cardTop;
     drawStep(1, x1, y1, L"Install the app", installCaption,
-             state.apkAvailable ? apkUrl : std::string{});
+             installReady ? apkUrl : std::string{});
     drawStep(2, x2, y2, L"Scan this pairing code",
-             L"Open FeatherCast Phone and tap “Scan QR code”. "
-             L"The code renews itself every few minutes.",
+             pairingUri.empty() && pairingUnavailable
+                 ? noNetwork
+                 : L"Open FeatherCast Phone and tap “Scan QR code”. "
+                   L"The code renews itself every few minutes.",
              pairingUri);
 
     const float footer = (stacked ? y2 : y1) + cardHeight + 18.0f;
@@ -826,7 +857,8 @@ struct PhoneWindow::Impl {
     y += 26.0f;
     float x = left;
     x += Button(x, y, L"Send PC clipboard to phone", Action::SendPcClipboard, true, kGlyphSend) + 10;
-    x += Button(x, y, L"Send files\u2026", Action::SendFiles, false, kGlyphUpload) + 10;
+    x += Button(x, y, activeTransfers.empty() ? L"Send files\u2026" : L"Cancel transfers",
+                Action::SendFiles, false, kGlyphUpload) + 10;
     x += Button(x, y, ringing ? L"Stop ringing" : L"Find my phone", Action::FindPhone, false,
                 kGlyphRing) + 10;
     if (x + 180.0f < right) {
@@ -1204,10 +1236,41 @@ struct PhoneWindow::Impl {
     RequestFrame();
   }
 
+  // Forgets the cached install URL and pairing code; the next paint rebuilds them.
+  void ResetPairing() {
+    pairingUri.clear();
+    pairingUnavailable = false;
+    apkUrl.clear();
+    networkKey.clear();
+    networkCheckedAt = 0;
+  }
+
+  // Reads the PC's addresses and port again. True when they changed, which makes
+  // the cached install URL and pairing code point at an address that is gone.
+  bool RefreshNetwork() {
+    networkCheckedAt = NowMs();
+    std::string url = callbacks.apkUrl ? callbacks.apkUrl() : std::string{};
+    std::string key = url;
+    for (const auto& address : phone::LocalNetworkAddresses()) key += "|" + address;
+    if (key == networkKey) return false;
+    networkKey = std::move(key);
+    apkUrl = std::move(url);
+    pairingUri.clear();
+    pairingUnavailable = false;
+    return true;
+  }
+
   void EnsurePairingUri() {
-    if (!pairingUri.empty() && NowMs() - pairingCreatedAt < kQrRefreshMs) return;
+    if (networkCheckedAt == 0) RefreshNetwork();
+    const long long now = NowMs();
+    if (!pairingUri.empty() && now - pairingCreatedAt < kQrRefreshMs) return;
+    // Without a network address there is no code to make; look again shortly.
+    if (pairingUri.empty() && pairingUnavailable && now - pairingCreatedAt < kNetworkRecheckMs) {
+      return;
+    }
     pairingUri = callbacks.createPairingUri ? callbacks.createPairingUri() : std::string{};
-    pairingCreatedAt = NowMs();
+    pairingCreatedAt = now;
+    pairingUnavailable = pairingUri.empty();
   }
 
   void Invalidate() {
@@ -1391,7 +1454,7 @@ struct PhoneWindow::Impl {
         break;
       case Action::PairNew:
         pairing = true;
-        pairingUri.clear();
+        ResetPairing();
         AnimateContentChange();
         break;
       case Action::CancelPairing:
@@ -1418,6 +1481,7 @@ struct PhoneWindow::Impl {
             ShowToast(L"Connect your phone to download photos");
           } else if (!photo.downloading && callbacks.requestPhoto) {
             photo.downloading = true;
+            photo.downloadingSince = NowMs();
             callbacks.requestPhoto(photo.info.id);
           }
         }
@@ -1472,7 +1536,11 @@ struct PhoneWindow::Impl {
         }
         break;
       case Action::SendFiles:
-        if (callbacks.pickFilesToSend) callbacks.pickFilesToSend();
+        if (!activeTransfers.empty()) {
+          if (callbacks.cancelTransfers) callbacks.cancelTransfers();
+          activeTransfers.clear();
+          ShowToast(L"File transfers cancelled");
+        } else if (callbacks.pickFilesToSend) callbacks.pickFilesToSend();
         break;
       case Action::Media:
         if (!connected) {
@@ -1506,6 +1574,7 @@ struct PhoneWindow::Impl {
   }
 
   void ClearPhoneData() {
+    textLayouts.Clear();
     notifications.clear();
     photos.clear();
     clips.clear();
@@ -1667,7 +1736,21 @@ struct PhoneWindow::Impl {
         } else if (wParam == kTickTimer) {
           const bool pairingVisible = state.enabled && state.running &&
                                       (pairing || state.devices.empty());
-          if (pairingVisible && NowMs() - pairingCreatedAt >= kQrRefreshMs) Invalidate();
+          if (pairingVisible && IsWindowVisible(hwnd)) {
+            const long long now = NowMs();
+            if (now - networkCheckedAt >= kNetworkRecheckMs && RefreshNetwork()) Invalidate();
+            if (now - pairingCreatedAt >=
+                (pairingUri.empty() ? kNetworkRecheckMs : kQrRefreshMs)) {
+              Invalidate();
+            }
+          }
+          for (auto& photo : photos) {
+            if (photo.downloading && NowMs() - photo.downloadingSince >= kPhotoTimeoutMs) {
+              photo.downloading = false;
+              ShowToast(L"Your phone did not send the photo in time.");
+              Invalidate();
+            }
+          }
           if (!toast.empty() && NowMs() >= toastUntil) {
             if (fadeMotion) {
               toastOpacity.Retarget(0.0, 0.16, true, motion::Easing::InCubic);
@@ -1778,6 +1861,7 @@ struct PhoneWindow::Impl {
   // ---------------------------------------------------------------- model
 
   void OnEvent(const phone::Event& event) {
+    textLayouts.Clear();
     using phone::EventKind;
     switch (event.kind) {
       case EventKind::Connected:
@@ -1789,6 +1873,7 @@ struct PhoneWindow::Impl {
         photosRequested = false;
         break;
       case EventKind::Disconnected:
+        activeTransfers.clear();
         connected = false;
         connectedId.clear();
         battery = -1;
@@ -1800,7 +1885,7 @@ struct PhoneWindow::Impl {
         break;
       case EventKind::Paired:
         pairing = false;
-        pairingUri.clear();
+        ResetPairing();
         tab = Tab::Overview;
         sidebarY.Retarget(kHeaderHeight + 16.0f, spatialMotion);
         AnimateContentChange();
@@ -1840,7 +1925,13 @@ struct PhoneWindow::Impl {
           smsThreads.insert(smsThreads.begin(), std::move(item));
         }
         break;
+      case EventKind::TransferProgress:
+        activeTransfers.insert(event.id);
+        ShowToast(L"Transferring " + Widen(event.photo.name) + L": " +
+            std::to_wstring(event.totalBytes == 0 ? 100 : event.transferredBytes * 100 / event.totalBytes) + L"%");
+        break;
       case EventKind::FileDelivered:
+        activeTransfers.erase(event.id);
         ShowToast(event.ok ? L"Sent " + Widen(event.photo.name) + L" to your phone"
                            : Widen(event.text.empty() ? "The phone could not save the file"
                                                       : event.text));
@@ -1901,6 +1992,7 @@ struct PhoneWindow::Impl {
         }
         break;
       case EventKind::PhotoSaved: {
+        activeTransfers.erase(event.id);
         // Only open photos this window asked for; the launcher opens its own.
         bool requested = false;
         for (auto& photo : photos) {
@@ -1909,16 +2001,23 @@ struct PhoneWindow::Impl {
             photo.downloading = false;
           }
         }
-        if (requested) {
-          ShellExecuteW(hwnd, L"open", event.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        }
+        if (requested) OpenReceivedFileSafely(hwnd, event.path);
         break;
       }
       case EventKind::FileSaved:
+      case EventKind::RemoteFileSaved:
+        activeTransfers.erase(event.id);
         ShowToast(L"Saved to Downloads\\FeatherCast");
         break;
       case EventKind::Error:
-        for (auto& photo : photos) photo.downloading = false;
+        if (event.id == "*") activeTransfers.clear();
+        else activeTransfers.erase(event.id);
+        // Only the failed photo stops downloading; other requests are still pending.
+        if (!event.photo.id.empty()) {
+          for (auto& photo : photos) {
+            if (photo.info.id == event.photo.id) photo.downloading = false;
+          }
+        }
         if (!event.text.empty()) ShowToast(Widen(event.text));
         break;
       case EventKind::ClipboardHistoryRequested:
@@ -1955,7 +2054,7 @@ void PhoneWindow::SetState(State state) {
     impl_->connectedId.clear();
     impl_->ClearPhoneData();
   }
-  if (!wasEnabled) impl_->pairingUri.clear();
+  if (!wasEnabled) impl_->ResetPairing();  // the service may listen on another port now
   impl_->Invalidate();
 }
 
@@ -1965,8 +2064,9 @@ void PhoneWindow::Show(HWND owner, bool pairing) {
   if (!impl_->hwnd && !impl_->Create(owner)) return;
   if (pairing) {
     impl_->pairing = true;
-    impl_->pairingUri.clear();
+    impl_->ResetPairing();
   }
+  impl_->networkCheckedAt = 0;  // look at the addresses again on the first paint
   if (impl_->connected && impl_->photos.empty() && !impl_->photosRequested &&
       impl_->callbacks.requestPhotos) {
     impl_->photosRequested = true;
@@ -1984,5 +2084,27 @@ bool PhoneWindow::Visible() const {
 }
 
 HWND PhoneWindow::Hwnd() const { return impl_->hwnd; }
+
+void OpenReceivedFileSafely(HWND owner, const std::wstring& path) {
+  if (path.empty()) return;
+  const std::filesystem::path file(path);
+  const std::wstring extension = file.extension().wstring();
+  if (!extension.empty() && !AssocIsDangerous(extension.c_str()) &&
+      reinterpret_cast<INT_PTR>(
+          ShellExecuteW(owner, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32) {
+    return;
+  }
+  if (PIDLIST_ABSOLUTE item = ILCreateFromPathW(path.c_str())) {
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const HRESULT shown = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+    if (SUCCEEDED(initialized)) CoUninitialize();
+    ILFree(item);
+    if (SUCCEEDED(shown)) return;
+  }
+  const std::wstring folder = file.parent_path().wstring();
+  if (!folder.empty()) {
+    ShellExecuteW(owner, L"explore", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  }
+}
 
 }  // namespace feathercast::phone_ui

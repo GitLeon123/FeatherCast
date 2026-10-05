@@ -8,8 +8,8 @@
 #include <wrl/client.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cwctype>
+#include <iterator>
 #include <sstream>
 
 using Microsoft::WRL::ComPtr;
@@ -24,14 +24,39 @@ constexpr std::size_t kMaxTextExcerptBytes = 16 * 1024;
 constexpr std::size_t kMaxTextExcerptChars =
     kMaxTextExcerptBytes / sizeof(wchar_t);
 
+// Formats a file time in the user's locale and local time zone (including the
+// daylight saving rules that applied on that date). Returns an empty string
+// for missing or unrepresentable times.
+std::wstring FormatLocalFileTime(const FILETIME& fileTime) {
+  if (fileTime.dwLowDateTime == 0 && fileTime.dwHighDateTime == 0) return {};
+  SYSTEMTIME utc{};
+  SYSTEMTIME local{};
+  if (!FileTimeToSystemTime(&fileTime, &utc) ||
+      !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) {
+    return {};
+  }
+  wchar_t date[128]{};
+  wchar_t time[128]{};
+  if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local,
+                      nullptr, date, static_cast<int>(std::size(date)),
+                      nullptr) == 0 ||
+      GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local,
+                      nullptr, time, static_cast<int>(std::size(time))) == 0) {
+    return {};
+  }
+  return std::wstring(date) + L" " + time;
+}
+
 std::wstring MetadataDetail(const std::filesystem::path& path,
-                            std::uintmax_t bytes,
-                            std::filesystem::file_time_type writeTime) {
-  const auto ticks = std::chrono::duration_cast<std::chrono::seconds>(
-                         writeTime.time_since_epoch())
-                         .count();
+                            std::uintmax_t bytes) {
+  std::wstring modified;
+  WIN32_FILE_ATTRIBUTE_DATA attributes{};
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+    modified = FormatLocalFileTime(attributes.ftLastWriteTime);
+  }
   std::wostringstream out;
-  out << path.wstring() << L"\n" << bytes << L" bytes\nModified " << ticks;
+  out << path.wstring() << L"\n" << bytes << L" bytes\nModified "
+      << (modified.empty() ? std::wstring(L"unknown") : modified);
   return out.str();
 }
 
@@ -192,8 +217,7 @@ Result PreviewService::Build(const Request& request,
     result.detail = L"The selected file is no longer available.";
     return result;
   }
-  const auto writeTime = std::filesystem::last_write_time(request.path, ec);
-  result.detail = MetadataDetail(request.path, bytes, writeTime);
+  result.detail = MetadataDetail(request.path, bytes);
   if (std::filesystem::is_directory(request.path, ec)) return result;
   if (token.stop_requested()) return result;
 

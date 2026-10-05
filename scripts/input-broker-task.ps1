@@ -65,11 +65,13 @@ function Assert-ProtectedBrokerPath([string]$Path) {
     throw 'The elevated input broker must be installed inside Program Files.'
   }
   $trustedOwners = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
-  $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
+  # GENERIC_ALL (0x10000000) and GENERIC_WRITE (0x40000000) are not named
+  # FileSystemRights values but still grant write access when set on an ACE.
+  $writeRights = [long]([Security.AccessControl.FileSystemRights]::Write -bor
     [Security.AccessControl.FileSystemRights]::Delete -bor
     [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
     [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-    [Security.AccessControl.FileSystemRights]::TakeOwnership
+    [Security.AccessControl.FileSystemRights]::TakeOwnership) -bor 0x10000000 -bor 0x40000000
   $entry = Get-Item -LiteralPath $fullPath
   while ($entry) {
     if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The broker path cannot contain links.' }
@@ -80,7 +82,7 @@ function Assert-ProtectedBrokerPath([string]$Path) {
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
       if ($rule.AccessControlType -eq 'Allow' -and
           -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
-          $rule.IdentityReference.Value -notin $trustedOwners -and ($rule.FileSystemRights -band $writeRights)) {
+          $rule.IdentityReference.Value -notin $trustedOwners -and ([long]$rule.FileSystemRights -band $writeRights)) {
         throw 'The broker path must not be writable without administrator rights.'
       }
     }
@@ -90,13 +92,15 @@ function Assert-ProtectedBrokerPath([string]$Path) {
 }
 
 function Invoke-BrokerTaskSetup {
-  $userSid = Get-InteractiveUserSid
-  $taskName = "FeatherCast Input Broker-$userSid"
   $path = [IO.Path]::GetFullPath($BrokerPath)
   $scheduler = New-Object -ComObject 'Schedule.Service'
   $scheduler.Connect()
   $root = $scheduler.GetFolder('\')
   if ($Mode -eq 'Install' -or $Mode -eq 'Validate') {
+    # Only registration needs the signed-in user. Stop/Uninstall also have to
+    # work without an interactive session, e.g. a silent uninstall as SYSTEM.
+    $userSid = Get-InteractiveUserSid
+    $taskName = "FeatherCast Input Broker-$userSid"
     $xml = New-BrokerTaskXml $path $userSid
     if ($Mode -eq 'Validate') {
       $root.RegisterTask($taskName, $xml, 1, $null, $null, 3, $null) | Out-Null

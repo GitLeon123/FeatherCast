@@ -9,7 +9,6 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.os.Bundle
-import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationManagerCompat
@@ -49,8 +48,11 @@ class NotifyListener : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         if (!forwardingEnabled() || !shouldForward(sbn)) return
-        actions.remove(sbn.key)
-        worker.execute { LinkManager.instance.send(message("notification.removed") { put("key", sbn.key) }) }
+        // On the same worker as post(), so a queued post cannot re-add the key afterwards.
+        worker.execute {
+            actions.remove(sbn.key)
+            LinkManager.instance.send(message("notification.removed") { put("key", sbn.key) })
+        }
     }
 
     private fun forwardingEnabled(): Boolean =
@@ -153,8 +155,6 @@ class NotifyListener : NotificationListenerService() {
 
         fun hasAccess(context: Context): Boolean =
             NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
-
-        fun settingsIntentAction(): String = Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS
 
         fun component(context: Context) = ComponentName(context, NotifyListener::class.java)
 

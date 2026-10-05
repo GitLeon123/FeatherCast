@@ -30,14 +30,26 @@ namespace fs = std::filesystem;
 
 constexpr std::uintmax_t kMaxMetadataBytes = 8 * 1024 * 1024;
 
+// Reads launcher metadata up to kMaxMetadataBytes. The size check skips
+// oversized files cheaply; the bounded read also covers a file that grows
+// after the check.
 std::optional<std::string> ReadText(const fs::path& path) {
   std::error_code ec;
   const auto size = fs::file_size(path, ec);
   if (ec || size > kMaxMetadataBytes) return std::nullopt;
   std::ifstream input(path, std::ios::binary);
   if (!input) return std::nullopt;
-  return std::string(std::istreambuf_iterator<char>(input),
-                     std::istreambuf_iterator<char>());
+  std::string text;
+  text.reserve(static_cast<std::size_t>(size));
+  std::array<char, 64 * 1024> buffer{};
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const auto count = static_cast<std::size_t>(input.gcount());
+    if (text.size() + count > kMaxMetadataBytes) return std::nullopt;
+    text.append(buffer.data(), count);
+  }
+  if (input.bad()) return std::nullopt;
+  return text;
 }
 
 bool IsDirectory(const fs::path& path) {
@@ -546,12 +558,10 @@ void DiscoverBattleNet(const DiscoverySources& sources,
                   record.displayName, record.installLocation);
   }
 
-  std::ifstream input(sources.battleNetProductDb, std::ios::binary);
-  if (!input || token.stop_requested()) return;
-  const std::vector<char> rawBytes{std::istreambuf_iterator<char>(input),
-                                   std::istreambuf_iterator<char>()};
-  const std::vector<unsigned char> bytes(rawBytes.begin(), rawBytes.end());
-  if (bytes.size() > kMaxMetadataBytes) return;
+  if (token.stop_requested()) return;
+  const auto database = ReadText(sources.battleNetProductDb);
+  if (!database) return;
+  const std::vector<unsigned char> bytes(database->begin(), database->end());
   for (const auto& wrapper : LengthFields(bytes)) {
     if (token.stop_requested()) return;
     std::wstring uid;
@@ -751,11 +761,10 @@ std::vector<fs::path> XboxRoots() {
     const fs::path conventional = drive / L"XboxGames";
     if (IsDirectory(conventional)) roots.push_back(conventional);
 
-    std::ifstream file(drive / L".GamingRoot", std::ios::binary);
-    if (!file) continue;
-    const std::vector<char> rawBytes{std::istreambuf_iterator<char>(file),
-                                     std::istreambuf_iterator<char>()};
-    const std::vector<unsigned char> bytes(rawBytes.begin(), rawBytes.end());
+    const auto gamingRoot = ReadText(drive / L".GamingRoot");
+    if (!gamingRoot) continue;
+    const std::vector<unsigned char> bytes(gamingRoot->begin(),
+                                           gamingRoot->end());
     for (size_t offset : {size_t{6}, size_t{8}}) {
       if (offset >= bytes.size()) continue;
       std::wstring folder;

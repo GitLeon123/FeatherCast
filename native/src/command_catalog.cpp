@@ -87,8 +87,8 @@ std::optional<app::AliasTarget> InvocationTarget(
   } else if (item.isSnippet) {
     target.stableId = item.snippet.keyword;
     target.currentAlias = item.snippet.keyword;
-  } else if (item.app.source == L"quicklink") {
-    constexpr std::wstring_view prefix = L"quicklink:";
+  } else if (item.app.source == L"quicklink" || item.app.source == L"script" || item.app.source == L"workspace") {
+    const auto prefix = item.app.source + L":";
     target.stableId = item.app.id.rfind(prefix, 0) == 0
         ? item.app.id.substr(prefix.size())
         : (!item.app.keywords.empty() ? item.app.keywords.front()
@@ -106,8 +106,12 @@ void AppendInvocationActions(std::vector<app::DisplayItem>& actions,
   auto target = InvocationTarget(item, settings);
   if (!target) return;
 
+  if (item.isCommand) actions.push_back(InvocationActionItem(
+      app::ActionKind::ConfigureCommandShortcut, L"Set Global Shortcut",
+      L"Run this command from a keyboard shortcut", *target));
+
   const bool canonicalKeyword = item.isSnippet ||
-                                item.app.source == L"quicklink";
+                                item.app.source == L"quicklink" || item.app.source == L"script" || item.app.source == L"workspace";
   actions.push_back(InvocationActionItem(
       app::ActionKind::EditAlias,
       canonicalKeyword ? L"Edit Keyword"
@@ -122,6 +126,9 @@ void AppendInvocationActions(std::vector<app::DisplayItem>& actions,
                                 settings.pinnedItems.end(),
                                 target->invocationKey) !=
                       settings.pinnedItems.end();
+  actions.push_back(InvocationActionItem(
+      app::ActionKind::ResetRanking, L"Reset Ranking",
+      L"Forget learned choices and recent usage for this item", *target));
   actions.push_back(InvocationActionItem(
       pinned ? app::ActionKind::UnpinInvocation
              : app::ActionKind::PinInvocation,
@@ -183,6 +190,12 @@ const std::vector<CommandDescriptor>& Catalog() {
        L"Browse your phone's storage and download files",
        {L"files", L"storage", L"folders", L"download", L"browse", L"phone",
         L"android"}},
+      {L"cancel-phone-transfers", app::CommandKind::CancelPhoneTransfers,
+       L"Cancel Phone Transfers", L"Cancel active file transfers and remove incomplete files",
+       {L"cancel transfers", L"stop transfer", L"phone transfers"}},
+      {L"manage-automation", app::CommandKind::ManageAutomation,
+       L"Manage Automation", L"Manage PowerShell scripts, workspaces and command shortcuts",
+       {L"scripts", L"powershell", L"workspace", L"automation", L"command shortcuts", L"hotkeys"}},
       {L"send-file-to-phone", app::CommandKind::SendFileToPhone,
        L"Send File to Phone", L"Send files from this PC to your phone",
        {L"send", L"file", L"transfer", L"share", L"upload", L"phone",
@@ -459,6 +472,12 @@ std::vector<app::DisplayItem> BuildActions(
     }
     return actions;
   }
+  if (target.app.source == L"script" || target.app.source == L"workspace") {
+    actions.push_back(ActionItem(app::ActionKind::Open, L"Open",
+                                 target.app.source == L"script" ? L"Run this PowerShell file" : L"Open this workspace", target));
+    AppendInvocationActions(actions, target, settings);
+    return actions;
+  }
   if (target.app.source == L"file") {
     actions.push_back(ActionItem(app::ActionKind::Preview, L"Preview",
                                  L"Show text, image, or metadata preview",
@@ -472,6 +491,12 @@ std::vector<app::DisplayItem> BuildActions(
   }
   actions.push_back(ActionItem(app::ActionKind::Open, L"Open",
                                L"Launch " + target.app.name, target));
+  if (target.app.source != L"file" && target.app.source != L"quicklink") {
+    actions.push_back(ActionItem(app::ActionKind::ResetRanking,
+                                L"Reset Ranking",
+                                L"Forget learned choices and recent usage for this app",
+                                target));
+  }
   if (discovery::AdminRouteFor(target.app) !=
       discovery::AdminLaunchRoute::Unsupported) {
     actions.push_back(ActionItem(app::ActionKind::RunAsAdmin,
@@ -517,7 +542,7 @@ std::vector<app::DisplayItem> BuildActions(
 bool IsPersonalizableInvocation(const app::DisplayItem& item) {
   return !item.InvocationKey().empty() &&
          (item.isCommand || item.isSnippet ||
-          item.app.source == L"quicklink");
+          item.app.source == L"quicklink" || item.app.source == L"script" || item.app.source == L"workspace");
 }
 
 bool RecordsRecentActivation(const app::DisplayItem& item) {

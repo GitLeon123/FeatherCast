@@ -34,8 +34,8 @@ the PC again when the PC gets a new IP address.
 | Notifications | Phone → PC | Every app's notifications (not ongoing ones such as music players). Dismissing one on the PC dismisses it on the phone. Optional toasts on the PC. |
 | Photos | Phone → PC | The newest 60 pictures as thumbnails; clicking one saves the full picture to `Downloads\FeatherCast` and opens it. |
 | Clipboard | Both | Text copied on the PC is copied on the phone (**Clipboard sync**). Android only lets the visible app read the clipboard, so use **Send clipboard** in the app, its notification, or the *Clipboard to PC* quick-settings tile. |
-| Files | Phone → PC | **Share → Send to PC** from any app, or **Send photo or file** in the app. Saved to `Downloads\FeatherCast` (max. 40 MB per file). |
-| Files | PC → Phone | **Send File to Phone** in the launcher, **Send to Phone** on a file result (Tab), Explorer's **Send to → FeatherCast Phone**, dropping files on the Phone window, or `FeatherCast.exe --send-to-phone <files>`. Saved to `Download/FeatherCast` on the phone (max. 40 MB per file). |
+| Files | Phone → PC | **Share → Send to PC** from any app, or **Send photo or file** in the app. Saved to `Downloads\FeatherCast`. Updated peers stream files up to 8 GiB; older peers retain the 40 MiB limit. |
+| Files | PC → Phone | **Send File to Phone** in the launcher, **Send to Phone** on a file result (Tab), Explorer's **Send to → FeatherCast Phone**, dropping files on the Phone window, or `FeatherCast.exe --send-to-phone <files>`. Saved to `Download/FeatherCast` on the phone. Updated peers stream files up to 8 GiB; older peers retain the 40 MiB limit. |
 | Notification actions | PC → Phone | Buttons such as *Mark as read* and inline replies (*Reply*) of phone notifications. |
 | Find my phone | PC → Phone | Rings at full alarm volume even in silent mode, for up to 60 seconds. Stop it on the phone or run **Find My Phone** again. |
 | Media | Both | Title, artist, and cover of the playing app; play/pause, next, previous, and volume. Uses the notification access grant. |
@@ -140,6 +140,20 @@ is cleared when another phone connects or FeatherCast exits.
 
 ## Protocol reference
 
+### Streamed file transfers
+
+Android 14+ photo access is reported as Full, Selected or Denied. Selected access shares only the photos chosen in Android; use **Choose photos** to revise the selection. Notification permission affects the visibility of connection/file notifications and does not gate pairing. Local-network permission guards are prepared for Android 17 with target SDK 37; the current target SDK 35 does not request that permission. See the [Android local-network permission documentation](https://developer.android.com/privacy-and-security/local-network-permission).
+
+The PC advertises `fileStream: true` in `welcome`; the phone advertises `file.stream.v1` in `status.features`. Each sender uses streaming only when its peer advertises support. Otherwise, the legacy single-frame messages remain available, limited to 40 MiB.
+
+Both directions use `file.begin{id,name,size,purpose,ref?}`, followed by `file.chunk{id,offset}` with at most 256 KiB of binary data and `file.end{id}`. Purpose is `file`, `storage` or `photo`; storage transfers reference the requested path. Receivers validate exact offsets, declared lengths (0–8 GiB), transfer IDs and up to four concurrent incoming transfers. The sender waits for `file.received{id,name,ok,error?}` for confirmation.
+
+Windows writes temporary files in the destination folder and publishes the completed file without overwriting an existing download. Android stages in app cache, then saves through pending MediaStore downloads (or the legacy downloads path before Android 10). Android needs enough free storage for both staging and the final copy. Errors, cancellation and disconnect delete active partial data. Windows also expires inactive receiving transfers after five minutes, checked on incoming traffic.
+
+`file.cancel{id}` cancels one transfer; an empty ID cancels all active streamed transfers. Use **Cancel Phone Transfers** in Windows search, the Phone window's cancel button, or **Cancel** beside the Android progress message. Older peers use the legacy protocol and cannot cancel a file already in a single-frame socket write. Full-photo browsing continues to use the bounded legacy photo message; sharing a photo as a file uses streaming.
+
+### Framing and feature messages
+
 - TCP port **47800**. Frames are `[u32 big-endian length][body]`, with a maximum of 48 MB.
   The same port answers `GET /app.apk` with the phone app when the file
   `FeatherCast-Phone.apk` sits next to `FeatherCast.exe`.
@@ -148,7 +162,7 @@ is cleared when another phone connects or FeatherCast exits.
 - Pairing (plain JSON frames): `pair{deviceId, name, pub, proof}` → `paired{proof, pcName, pcId}`
   or `error{code}`.
 - Session handshake: `hello{deviceId, nonce}` → `challenge{nonce, pcName}` →
-  `auth{mac}` → `welcome{mac, pcName}`. After that every frame is
+  `auth{mac}` → `welcome{mac, pcName, fileStream?}`. After that every frame is
   `AES-GCM([u32 jsonLength][json][binary])`.
 - Screen sessions use `hello{deviceId, nonce, screen}` on a second socket,
   authenticated with the single-use key delivered by `screen.start`. The

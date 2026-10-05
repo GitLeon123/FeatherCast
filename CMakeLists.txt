@@ -201,18 +201,46 @@ target_link_libraries(FeatherCast PRIVATE
   crypt32
 )
 
+# Shipped executables keep full PDBs in Release (CI archives them for crash
+# analysis). /DEBUG switches the linker to /OPT:NOREF,NOICF, so restore both.
+function(feathercast_enable_release_symbols target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(${target} PRIVATE
+      "$<$<CONFIG:Release>:/DEBUG:FULL>"
+      "$<$<CONFIG:Release>:/OPT:REF>"
+      "$<$<CONFIG:Release>:/OPT:ICF>"
+    )
+  endif()
+endfunction()
+
+# Version metadata for the helper executables (FeatherCast.rc covers the app).
+function(feathercast_add_version_resource target description)
+  set(FEATHERCAST_FILE_DESCRIPTION "${description}")
+  set(FEATHERCAST_INTERNAL_NAME "${target}")
+  set(FEATHERCAST_ORIGINAL_FILENAME "${target}.exe")
+  set(version_rc "${CMAKE_CURRENT_BINARY_DIR}/native/${target}.version.rc")
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/native/version.rc.in" "${version_rc}" @ONLY)
+  target_sources(${target} PRIVATE "${version_rc}")
+endfunction()
+
 if(MSVC)
-  target_compile_options(FeatherCast PRIVATE /bigobj "$<$<CONFIG:Release>:/Zi>")
-  target_compile_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/Zi>")
-  target_link_options(FeatherCast PRIVATE
-    "$<$<CONFIG:Release>:/DEBUG:FULL>"
-  )
-  target_link_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
+  target_compile_options(FeatherCast PRIVATE /bigobj)
 endif()
+feathercast_enable_release_symbols(FeatherCast)
+feathercast_enable_release_symbols(FeatherCastPluginHost)
+feathercast_enable_release_symbols(InputBroker)
+feathercast_add_version_resource(FeatherCastPluginHost "FeatherCast plugin host")
+feathercast_add_version_resource(InputBroker "FeatherCast input broker")
 
 add_executable(FeatherCastCoreTests
   native/tests/core_tests.cpp
 )
+
+add_executable(FeatherCastImprovementTests native/tests/improvement_tests.cpp)
+target_link_libraries(FeatherCastImprovementTests PRIVATE FeatherCastRuntime)
+feathercast_apply_project_warnings(FeatherCastImprovementTests)
+add_test(NAME FeatherCastImprovementTests COMMAND FeatherCastImprovementTests)
 
 add_library(FeatherCastTestExtension SHARED
   native/tests/test_extension.cpp
@@ -362,7 +390,7 @@ target_link_libraries(FeatherCastLibraryTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchFilesTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastGameDiscoveryTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastPerformanceSelfTest PRIVATE FeatherCastRuntime)
-target_link_libraries(FeatherCastSearchBenchmarks PRIVATE normaliz)
+target_link_libraries(FeatherCastSearchBenchmarks PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastFileSearchBenchmarks PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastStorageTrustTests PRIVATE FeatherCastSQLite advapi32 crypt32)
 
@@ -451,8 +479,7 @@ target_compile_definitions(FeatherCastPhoneProtocolTests PRIVATE UNICODE _UNICOD
 target_link_libraries(FeatherCastPhoneProtocolTests PRIVATE FeatherCastRuntime ws2_32 bcrypt)
 feathercast_apply_project_warnings(FeatherCastPhoneProtocolTests)
 add_test(NAME FeatherCastPhoneProtocolTests COMMAND FeatherCastPhoneProtocolTests)
-set_tests_properties(FeatherCastPhoneProtocolTests PROPERTIES TIMEOUT 60
-  ENVIRONMENT "FEATHERCAST_TEST_DPAPI_FALLBACK=1")
+set_tests_properties(FeatherCastPhoneProtocolTests PROPERTIES TIMEOUT 60)
 add_executable(FeatherCastPhoneStoreTests native/tests/phone_store_tests.cpp)
 target_include_directories(FeatherCastPhoneStoreTests PRIVATE native/src)
 target_compile_definitions(FeatherCastPhoneStoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -463,7 +490,16 @@ add_executable(FeatherCastPhoneScreenTests native/tests/phone_screen_tests.cpp)
 target_link_libraries(FeatherCastPhoneScreenTests PRIVATE FeatherCastUi mfreadwrite)
 feathercast_apply_project_warnings(FeatherCastPhoneScreenTests)
 add_test(NAME FeatherCastPhoneScreenTests COMMAND FeatherCastPhoneScreenTests)
+
+add_executable(FeatherCastRenderingPerformanceTests native/tests/rendering_performance_tests.cpp)
+target_include_directories(FeatherCastRenderingPerformanceTests PRIVATE native/src)
+target_compile_definitions(FeatherCastRenderingPerformanceTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FeatherCastRenderingPerformanceTests PRIVATE d2d1 dwrite windowscodecs ole32)
+feathercast_apply_project_warnings(FeatherCastRenderingPerformanceTests)
+add_test(NAME FeatherCastRenderingPerformanceTests COMMAND FeatherCastRenderingPerformanceTests)
+set_tests_properties(FeatherCastRenderingPerformanceTests PROPERTIES TIMEOUT 30)
 set_tests_properties(FeatherCastPhoneScreenTests PROPERTIES TIMEOUT 30)
+set_tests_properties(FeatherCastInputBrokerTaskTests PROPERTIES TIMEOUT 60)
 
 set_tests_properties(
   FeatherCastCoreTests
@@ -482,6 +518,8 @@ set_tests_properties(
   FeatherCastLibraryTests
   FeatherCastGameDiscoveryTests
   FeatherCastAccessibilitySmokeTests
+  FeatherCastProductivityBehaviorTests
+  FeatherCastPhoneStoreTests
   PROPERTIES TIMEOUT 30
 )
 set_tests_properties(
@@ -491,16 +529,12 @@ set_tests_properties(
   FeatherCastSilentLifecycleTests
   PROPERTIES TIMEOUT 120
 )
-set_tests_properties(
-  FeatherCastCoreTests
-  FeatherCastProductivityBehaviorTests
-  FeatherCastStorageTrustTests
-  FeatherCastPersistenceServiceTests
-  PROPERTIES ENVIRONMENT "FEATHERCAST_TEST_DPAPI_FALLBACK=1"
-)
 
 install(TARGETS FeatherCast FeatherCastPluginHost InputBroker RUNTIME DESTINATION bin)
 install(FILES scripts/input-broker-task.ps1 DESTINATION bin)
+install(FILES LICENSE DESTINATION . RENAME LICENSE.txt)
+install(FILES third_party/qrcodegen/README.md DESTINATION licenses RENAME qrcodegen.md)
+install(FILES third_party/sqlite/README.md DESTINATION licenses RENAME sqlite.md)
 # The phone app is built separately (scripts/build-android.ps1); FeatherCast serves it
 # to phones from next to its exe, so ship it when it has been built.
 install(FILES "${CMAKE_BINARY_DIR}/FeatherCast-Phone.apk" DESTINATION bin OPTIONAL)
@@ -518,8 +552,15 @@ set(CPACK_NSIS_PACKAGE_NAME "FeatherCast")
 set(CPACK_PACKAGE_EXECUTABLES "FeatherCast" "FeatherCast")
 set(CPACK_NSIS_MUI_ICON "${FEATHERCAST_ICON}")
 set(CPACK_NSIS_MUI_UNIICON "${FEATHERCAST_ICON}")
-set(CPACK_NSIS_MUI_FINISHPAGE_RUN "FeatherCast.exe")
-set(CPACK_NSIS_EXTRA_DEFINES [=[!define MUI_FINISHPAGE_RUN_PARAMETERS "--show"]=])
+# The installer runs elevated. Launch through the desktop shell so FeatherCast
+# starts with the signed-in user's normal token, not the installer's admin one.
+set(CPACK_NSIS_INSTALLER_MUI_FINISHPAGE_RUN_CODE [=[
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION FeatherCastFinishRun
+Function FeatherCastFinishRun
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\bin\FeatherCast.exe"'
+FunctionEnd
+]=])
 # NSIS already requests administrator rights; task setup reuses that approval.
 set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS [=[
   IfFileExists "$INSTDIR\bin\input-broker-task.ps1" 0 +3

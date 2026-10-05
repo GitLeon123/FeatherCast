@@ -184,7 +184,7 @@ int LiveHarness(const std::filesystem::path& directory) {
   cb.frame = [&](auto frame) { ++frames; width = frame->width; height = frame->height; generation = frame->generation; };
   cb.status = [&](phone::ScreenPacket packet) { std::lock_guard lock(logMutex); log << packet.state << ": " << packet.detail << std::endl; };
   phone::ScreenPlayback diagnostics(cb);
-  phone::ServiceConfig config; config.pcName = "Screen Test PC"; config.port = 47970;
+  phone::ServiceConfig config; config.pcName = "Screen Test PC"; config.port = 0;  // free port; pairing.txt carries it
   config.stateFile = (directory / L"phone-link.dat").wstring(); config.downloadsDir = (directory / L"downloads").wstring();
   config.onEvent = [&](phone::Event event) { events.Push(std::move(event)); };
   config.onScreenPacket = [&](phone::ScreenPacket packet) {

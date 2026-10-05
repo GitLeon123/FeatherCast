@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace feathercast::files {
@@ -32,6 +33,9 @@ struct IndexStatus {
   std::size_t indexedContentFiles = 0;
   long long indexedContentBytes = 0;
   std::size_t unavailableRoots = 0;
+  std::size_t discoveredEntries = 0;
+  std::size_t entryLimit = 0;
+  bool limitReached = false;
   std::vector<std::wstring> configuredRoots;
   std::vector<std::wstring> availableRoots;
   bool live = false;
@@ -73,11 +77,29 @@ class FileIndexService {
 
  private:
   struct Watcher;
+  // What the last delivered scan learned about one file's content. The next
+  // scan reuses it while the file keeps its size and write time, instead of
+  // reading and decoding the file again.
+  struct ContentRecord {
+    long long lastWriteTime = 0;
+    long long size = 0;
+    int contentState = 0;
+    long long contentBytes = 0;
+  };
+  using ContentRecords = std::unordered_map<std::wstring, ContentRecord>;
+
   void WorkerLoop(std::stop_token token);
-  IndexStatus Scan(const IndexRequest& request, std::stop_token token) const;
-  void RestartWatchers(const std::vector<std::wstring>& roots);
+  IndexStatus Scan(const IndexRequest& request, std::stop_token token,
+                   const ContentRecords& previous,
+                   ContentRecords& current) const;
+  void RestartWatchers(const IndexRequest& request);
   void StopWatchers();
   void ScheduleWatchRefresh(bool restartWatchers = false);
+  // Requires mutex_. Drops the content records, also for a scan in flight,
+  // so the next scan reads every file again.
+  void ForgetContentRecords();
+  // Requires mutex_. Explicit requests start a fresh retry budget.
+  void ResetRetries();
 
   ResultSink sink_;
   ErrorSink errors_;
@@ -95,6 +117,17 @@ class FileIndexService {
   bool restartWatchersPending_ = false;
   std::chrono::steady_clock::time_point rebuildAfter_{};
   std::chrono::seconds retryDelay_{2};
+  // A scan that finds unavailable roots is retried with full rescans only a
+  // few times. After that the pending rebuild is a probe: it checks the roots
+  // the last scan missed and rescans only once one of them is back.
+  std::size_t retryAttempts_ = 0;
+  bool probeOnly_ = false;
+  std::vector<std::wstring> unavailableRoots_;
+  // Content results of the last delivered scan, keyed by path. The epoch
+  // changes whenever they are dropped, so a scan that was running at that
+  // moment does not store its results.
+  ContentRecords contentRecords_;
+  std::uint64_t contentEpoch_ = 0;
 };
 
 }  // namespace feathercast::files

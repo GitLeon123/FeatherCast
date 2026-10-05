@@ -13,6 +13,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version 3.0
 $repository = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $repository $BuildDirectory
 $configuredBuild = Join-Path $build $Configuration
@@ -61,10 +62,30 @@ function Assert-AuthenticodeIdentity([string]$Path, [string]$Label) {
   return $resolved
 }
 
+# The broker is elevated only through its scheduled task. Its own manifest
+# must never request elevation or UI access.
+function Assert-BrokerManifest([string]$Path, [string]$Label) {
+  $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
+  $levels = @([regex]::Matches($text, '<requestedExecutionLevel\b[^>]*>') | ForEach-Object Value)
+  $unexpected = @($levels | Where-Object {
+    $_ -notmatch "\blevel=['""]asInvoker['""]" -or $_ -notmatch "\buiAccess=['""]false['""]"
+  })
+  if ($levels.Count -eq 0 -or $unexpected.Count -ne 0) {
+    throw "$Label must embed requestedExecutionLevel asInvoker with uiAccess false."
+  }
+  Write-Host "Verified $Label manifest (asInvoker, uiAccess false)."
+}
+
 function Invoke-SelfTest([string]$Path, [string]$Label) {
   if ($SkipSelfTests) { return }
   $process = Start-Process -FilePath $Path -ArgumentList '--self-test' `
-    -PassThru -Wait -WindowStyle Hidden
+    -PassThru -WindowStyle Hidden
+  # Holding the handle keeps ExitCode readable after the process has exited.
+  $null = $process.Handle
+  if (-not $process.WaitForExit(120000)) {
+    try { $process.Kill() } catch { }
+    throw "$Label self-test did not finish within 120 seconds."
+  }
   if ($process.ExitCode -ne 0) {
     throw "$Label self-test failed with exit code $($process.ExitCode)."
   }
@@ -94,6 +115,9 @@ function Test-PackageContents(
         Where-Object Name -eq $name | Select-Object -First 1
       if (-not $binary) { throw "$Label does not contain $name." }
       $verified = Assert-AuthenticodeIdentity $binary.FullName "$Label $name"
+      if ($name -eq 'InputBroker.exe') {
+        Assert-BrokerManifest $verified "$Label $name"
+      }
       if ($RunPayloadSelfTests) {
         Invoke-SelfTest $verified "$Label $name"
       }
@@ -110,8 +134,12 @@ $application = Assert-AuthenticodeIdentity `
   (Join-Path $configuredBuild 'FeatherCast.exe') 'FeatherCast.exe'
 $pluginHost = Assert-AuthenticodeIdentity `
   (Join-Path $configuredBuild 'FeatherCastPluginHost.exe') 'FeatherCastPluginHost.exe'
+$broker = Assert-AuthenticodeIdentity `
+  (Join-Path $configuredBuild 'InputBroker.exe') 'InputBroker.exe'
+Assert-BrokerManifest $broker 'InputBroker.exe'
 Invoke-SelfTest $application 'FeatherCast.exe'
 Invoke-SelfTest $pluginHost 'FeatherCastPluginHost.exe'
+Invoke-SelfTest $broker 'InputBroker.exe'
 
 if ($PortableZipPath) {
   Test-PackageContents $PortableZipPath 'portable ZIP' -RunPayloadSelfTests

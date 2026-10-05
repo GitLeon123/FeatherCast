@@ -16,6 +16,16 @@ class ProtocolTest {
         assertNull(byteArrayOf(1, 2, 3, 4).inputStream().readAtMost(3))
         assertContentEquals(ByteArray(0), ByteArray(0).inputStream().readAtMost(0))
         assertNull(byteArrayOf(1).inputStream().readAtMost(0))
+        // A reported size only presizes the buffer; wrong reports still read the real stream.
+        assertContentEquals(byteArrayOf(1, 2, 3), byteArrayOf(1, 2, 3).inputStream().readAtMost(3, sizeHint = 3))
+        assertContentEquals(byteArrayOf(1, 2), byteArrayOf(1, 2).inputStream().readAtMost(3, sizeHint = 3))
+        assertContentEquals(byteArrayOf(1, 2, 3), byteArrayOf(1, 2, 3).inputStream().readAtMost(3, sizeHint = 1))
+        assertContentEquals(byteArrayOf(1, 2), byteArrayOf(1, 2).inputStream().readAtMost(3, sizeHint = 0))
+        assertNull(byteArrayOf(1, 2, 3, 4).inputStream().readAtMost(3, sizeHint = 3))
+        assertNull(byteArrayOf(1, 2, 3, 4).inputStream().readAtMost(3, sizeHint = 2))
+        val large = ByteArray(20_000) { it.toByte() }
+        assertContentEquals(large, large.inputStream().readAtMost(30_000, sizeHint = 10_000))
+        assertNull(large.inputStream().readAtMost(19_999, sizeHint = 19_999))
     }
 
     @Test
@@ -111,6 +121,28 @@ class ProtocolTest {
             "&k=${Base64Url.encode(key)}&t=${Base64Url.encode(token)}"
         assertNull(PairingInvite.parse(uri.replace("p=47800", "p=65536")))
         assertNull(PairingInvite.parse(uri.replace("My%20PC", "My%xxPC")))
+
+        // Pairing links may only point at local network addresses, never host names or the internet.
+        assertNull(PairingInvite.parse(uri.replace("h=192.168.1.5", "h=8.8.8.8")))
+        assertNull(PairingInvite.parse(uri.replace("h=192.168.1.5", "h=example.com")))
+        assertNull(PairingInvite.parse(uri.replace("h=192.168.1.5", "h=192.168.1.5.example.com")))
+        assertEquals(
+            listOf("172.16.0.9", "169.254.3.4"),
+            PairingInvite.parse(uri.replace("h=192.168.1.5", "h=1.2.3.4%2C172.16.0.9%2Cevil.test%2C169.254.3.4"))?.hosts,
+        )
+    }
+
+    @Test
+    fun localNetworkHosts() {
+        for (host in listOf("10.0.0.1", "127.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.0.1", "169.254.1.1",
+            "::1", "fe80::1", "[fe80::1]", "fe80::1%wlan0", "fd12:3456::1", "fc00::")) {
+            assertTrue(isLocalNetworkHost(host), host)
+        }
+        for (host in listOf("", "8.8.8.8", "172.32.0.1", "172.15.0.1", "192.169.0.1", "11.0.0.1", "0.0.0.0",
+            "010.0.0.1", "10.0.0", "10.0.0.256", "10.0.0.1.2", "localhost", "router.local", "2001:db8::1",
+            "::", "::ffff:192.168.0.1", "fe80::1::2", "fe80:0:0:0:0:0:0:0:1", "fe80::12345")) {
+            assertTrue(!isLocalNetworkHost(host), host)
+        }
     }
 
     @Test

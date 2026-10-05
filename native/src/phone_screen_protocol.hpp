@@ -12,6 +12,9 @@ namespace feathercast::phone {
 inline constexpr std::size_t kMaxScreenPacketBytes = 2 * 1024 * 1024;
 inline constexpr long long kScreenRequestLifetimeMs = 60'000;
 inline constexpr int kScreenCoordinateScale = 1'000'000;
+inline constexpr std::size_t kMaxScreenTextBytes = 16 * 1024;
+// Earlier phone app builds read sealed screen input frames of at most 32 KB.
+inline constexpr std::size_t kMaxScreenInputFrameBytes = 32 * 1024;
 
 enum class ScreenPacketKind { State, VideoConfig, Video, AudioConfig, Audio };
 
@@ -42,9 +45,20 @@ struct ScreenInput {
   std::string text;
 };
 
+inline std::string ScreenInputJson(const ScreenInput& input) {
+  return Json("screen.input").Str("session", input.sessionId)
+      .Int("generation", input.generation).Str("action", input.action)
+      .Int("x", input.x).Int("y", input.y).Int("value", input.value)
+      .Str("text", input.text).Build();
+}
+
 inline bool ValidScreenInput(const ScreenInput& input) {
   if (input.sessionId.empty() || input.sessionId.size() > 64 ||
-      input.generation <= 0 || input.text.size() > 16 * 1024) return false;
+      input.generation <= 0 || input.text.size() > kMaxScreenTextBytes) return false;
+  // Quotes, backslashes and control characters grow when escaped; the sealed
+  // frame ([u32 length][JSON] + 16-byte tag) must still fit the phone's limit.
+  if (!input.text.empty() &&
+      ScreenInputJson(input).size() + 4 + 16 > kMaxScreenInputFrameBytes) return false;
   if (input.action == "down" || input.action == "move" || input.action == "up" ||
       input.action == "scroll") {
     return input.x >= 0 && input.x <= kScreenCoordinateScale &&
@@ -59,13 +73,6 @@ inline bool ValidScreenInput(const ScreenInput& input) {
   }
   return input.action == "text" || input.action == "back" || input.action == "home" ||
          input.action == "recents" || input.action == "cancel" || input.action == "keyframe";
-}
-
-inline std::string ScreenInputJson(const ScreenInput& input) {
-  return Json("screen.input").Str("session", input.sessionId)
-      .Int("generation", input.generation).Str("action", input.action)
-      .Int("x", input.x).Int("y", input.y).Int("value", input.value)
-      .Str("text", input.text).Build();
 }
 
 inline std::optional<ScreenPacket> ParseScreenPacket(const Payload& payload) {

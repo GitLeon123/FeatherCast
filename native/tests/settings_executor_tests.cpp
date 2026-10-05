@@ -11,9 +11,11 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 int main() {
   namespace settings = feathercast::settings;
@@ -186,6 +188,125 @@ int main() {
            std::future_status::ready);
     executor.Shutdown(true);
     assert(errorCount.load() == 1);
+  }
+
+  {
+    // Shutdown is idempotent, rejects later submissions, and allows a restart.
+    feathercast::background::Executor executor;
+    executor.Shutdown();
+    executor.Start(2);
+    executor.Shutdown();
+    executor.Shutdown(true);
+    assert(!executor.Submit([](std::stop_token) {}));
+    executor.Start(1);
+    std::promise<void> ran;
+    auto ranFuture = ran.get_future();
+    assert(executor.Submit([&](std::stop_token) { ran.set_value(); }));
+    assert(ranFuture.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    executor.Shutdown();
+  }
+
+  {
+    // A draining shutdown runs everything queued before it and rejects work
+    // submitted while it is in progress.
+    feathercast::background::Executor executor;
+    executor.Start(1);
+    std::promise<void> release;
+    auto releaseFuture = release.get_future().share();
+    std::atomic<int> drained = 0;
+    std::atomic<int> lateRan = 0;
+    int lateAccepted = 0;
+    assert(executor.Submit([releaseFuture](std::stop_token) {
+      releaseFuture.wait_for(std::chrono::seconds(5));
+    }));
+    for (int i = 0; i < 3; ++i) {
+      assert(executor.Submit([&](std::stop_token) { ++drained; }));
+    }
+    std::thread stopper([&] { executor.Shutdown(true); });
+    bool rejected = false;
+    for (int attempt = 0; attempt < 500 && !rejected; ++attempt) {
+      rejected = !executor.Submit([&](std::stop_token) { ++lateRan; });
+      if (!rejected) {
+        ++lateAccepted;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
+    release.set_value();
+    stopper.join();
+    assert(rejected);
+    assert(drained.load() == 3);
+    // Tasks accepted before the shutdown began are drained too; the rejected
+    // one never runs.
+    assert(lateRan.load() == lateAccepted);
+  }
+
+  {
+    // A non-draining shutdown escalates a draining one that is in progress:
+    // queued work is dropped, the running task sees the stop request, and
+    // both callers return.
+    feathercast::background::Executor executor;
+    executor.Start(1);
+    std::atomic<bool> sawStop = false;
+    std::atomic<bool> queuedRan = false;
+    std::promise<void> started;
+    auto startedFuture = started.get_future();
+    assert(executor.Submit([&](std::stop_token stopToken) {
+      started.set_value();
+      for (int i = 0; i < 500 && !stopToken.stop_requested(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      sawStop = stopToken.stop_requested();
+    }));
+    assert(executor.Submit([&](std::stop_token) { queuedRan = true; }));
+    assert(startedFuture.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    std::thread drainer([&] { executor.Shutdown(true); });
+    for (int attempt = 0; attempt < 500; ++attempt) {
+      if (!executor.Submit([](std::stop_token) {})) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    executor.Shutdown();
+    drainer.join();
+    assert(sawStop.load());
+    assert(!queuedRan.load());
+  }
+
+  {
+    // A worker may shut down its own executor without joining itself.
+    feathercast::background::Executor executor;
+    executor.Start(2);
+    std::promise<bool> done;
+    auto doneFuture = done.get_future();
+    assert(executor.Submit([&](std::stop_token) {
+      bool ok = true;
+      try {
+        executor.Shutdown();
+      } catch (...) {
+        ok = false;
+      }
+      done.set_value(ok);
+    }));
+    assert(doneFuture.wait_for(std::chrono::seconds(5)) ==
+           std::future_status::ready);
+    assert(doneFuture.get());
+    assert(!executor.Submit([](std::stop_token) {}));
+    executor.Shutdown();
+  }
+
+  {
+    // A worker may even destroy the executor that owns it.
+    auto executor = std::make_unique<feathercast::background::Executor>();
+    executor->Start(1);
+    std::promise<void> destroyed;
+    auto destroyedFuture = destroyed.get_future();
+    assert(executor->Submit([&](std::stop_token) {
+      executor.reset();
+      destroyed.set_value();
+    }));
+    assert(destroyedFuture.wait_for(std::chrono::seconds(5)) ==
+           std::future_status::ready);
+    assert(!executor);
   }
 
   return 0;

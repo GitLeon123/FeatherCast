@@ -16,7 +16,6 @@
   <a href="https://github.com/GitLeon123/FeatherCast"><img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-0078D6?logo=windows&logoColor=white" alt="Platform: Windows 10 | 11" /></a>
   <a href="https://en.cppreference.com/w/cpp/23"><img src="https://img.shields.io/badge/Standard-C%2B%2B23-00599C?logo=c%2B%2B&logoColor=white" alt="C++23" /></a>
   <a href="#"><img src="https://img.shields.io/badge/UI-Direct2D%20%2F%20DirectWrite-7928CA" alt="Direct2D & DirectWrite" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Memory%20Idle-~40%20MB-success" alt="Memory Idle ~40 MB" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
 </p>
 
@@ -30,7 +29,7 @@
   - [Instant App & Game Discovery](#instant-app--game-discovery)
   - [Window Management & Multitasking](#window-management--multitasking)
   - [Scoped Search & Instant File Previews](#scoped-search--instant-file-previews)
-  - [DPAPI-Encrypted Clipboard & Snippets](#dpapi-encrypted-clipboard--snippets)
+- [Clipboard History & Snippets](#clipboard-history--snippets)
   - [Productivity Utilities & Quick Calculations](#productivity-utilities--quick-calculations)
   - [Screen Capture & Silent Screen Recording](#screen-capture--silent-screen-recording)
   - [Accessibility, Typography & Theming](#accessibility-typography--theming)
@@ -50,23 +49,23 @@
 
 **FeatherCast** brings the speed and elegance of modern keyboard-first launchers (such as Raycast or macOS Spotlight) natively to Windows. Open the centered search overlay with a single keystroke (`Alt+Space` by default or custom `Win` key combinations), immediately launch apps and games, jump between open windows, inspect local files, capture annotated screenshots, or compute conversions in real time.
 
-Unlike launchers wrapped in Electron or web runtimes that consume hundreds of megabytes of memory and background CPU cycles, FeatherCast is hand-crafted in pure **modern C++23** with **Direct2D** hardware acceleration, **DirectWrite** typography, and native Win32 APIs.
+FeatherCast uses **C++23**, **Direct2D** hardware acceleration, **DirectWrite** typography, and native Win32 APIs.
 
 > [!NOTE]
-> **Privacy-First & Local Architecture**: FeatherCast operates entirely offline on your device with zero telemetry, zero background polling, and no mandatory cloud accounts. Everything runs locally on your machine for maximum responsiveness and privacy.
+> **Local Architecture**: Search runs locally, with no telemetry or mandatory cloud account. Optional update checks, currency rates, and phone connections use the network; their behavior is described below.
 
 ---
 
 ## ⚡ Why FeatherCast?
 
-| Metric / Attribute | Typical Electron Launchers | FeatherCast (Native C++23) |
-| :--- | :--- | :--- |
-| **Idle Memory Usage** | 150 MB – 500+ MB | **~40 MB RAM** |
-| **Active Search CPU** | 5% – 25% CPU spikes | **~1% CPU**, responsive 60 FPS |
-| **Start / Hotkey Latency** | Noticeable delay (50–300 ms) | **Instant (< 16 ms / sub-frame)** |
-| **UI Framework** | Chromium / V8 / Node.js runtime | **Direct2D & DirectWrite (Win32)** |
-| **Telemetry & Accounts** | Often requires accounts or telemetry | **Zero tracking, 100% offline-first** |
-| **Background Footprint** | Active process polling & timers | **Suspends inactive work; zero CPU when hidden** |
+| Attribute | FeatherCast |
+| :--- | :--- |
+| **UI framework** | Direct2D, DirectWrite and Win32 |
+| **Search** | Local fuzzy search with separate, reproducible search benchmarks |
+| **Background work** | Inactive rendering is suspended; enabled features can still perform work |
+| **Privacy** | No telemetry or mandatory accounts; clipboard history, file indexing and query learning are opt-in |
+
+Memory, CPU and latency depend on hardware, indexed data and enabled features. See the [performance measurement procedure](docs/performance.md) for separate search, idle, startup and shortcut measurements.
 
 ---
 
@@ -91,13 +90,16 @@ Unlike launchers wrapped in Electron or web runtimes that consume hundreds of me
   - `@clipboard` — Secure clipboard history entries
   - `@snippets` — User-defined text expansions
 - **Recursive Local File Indexer**: Explicit opt-in indexing for selected local directories (defaults to Desktop, Documents, Downloads). Ignores system, hidden, and reparse points to keep disk I/O low.
+- **Visible index coverage**: The default limit retains the newest 5,000 eligible entries. Settings reports when that limit is reached; an empty `@files` search offers the relevant indexing settings.
 - **Privacy-Safe Full-Text Search (FTS5)**: Fast content matching for text and source code (up to 2 MiB per file, capped at 256 MiB total token database). Stores only search tokens, never raw file contents or text excerpts.
 - **Instant Preview Pane (`Ctrl+Space`)**: Inspect file metadata, highlighted source code, or images (BMP, GIF, ICO, JPEG, PNG, TIFF up to 25 MiB and 40 MP) without launching external programs.
 
-### 📋 DPAPI-Encrypted Clipboard & Snippets
-- **Hardware-Protected History**: Optional clipboard manager backed by Windows Data Protection API (DPAPI). Your clipboard contents are encrypted at rest using your Windows user credentials.
+### 📋 Clipboard History & Snippets
+- **Encrypted history**: Optional clipboard history uses user-scoped Windows DPAPI encryption at rest. DPAPI protection is tied to the Windows user account; hardware-backed protection is not guaranteed. User-authored snippets remain readable JSON.
 - **Favorites & Pinning**: Pin up to 100 frequent snippets or credentials. Pinned items stay at the top and survive automatic history cleanup.
 - **Custom Snippets & Quicklinks**: Manage text expansions and custom URL shortcuts in the native Library manager (**Settings > Library**) or edit `%APPDATA%\FeatherCast\snippets.json`.
+- **Search preferences**: Exact aliases and exact names take priority. Optional local query learning remembers up to 256 choices; **Reset Ranking** forgets an item's learned choices and recent usage.
+- **Scripts, workspaces and command shortcuts**: Search **Manage Automation** to add PowerShell files, groups of launch targets, or global command shortcuts. See [automation](docs/automation.md).
 
 ### ⚡ Productivity Utilities & Quick Calculations
 - **Natural Language Calculator & Conversions**: Real-time math evaluation, unit conversion, and cached currency conversion (rates fetched from `open.er-api.com`). When reopening the search overlay, your last expression is preserved and pre-selected.
@@ -193,7 +195,7 @@ Type `@` in the search bar or use any of the dedicated scope tokens to filter yo
 
 ### Option 1: Official GitHub Release (Recommended)
 Download the latest verified release from the [FeatherCast Releases page](https://github.com/GitLeon123/FeatherCast/releases/latest):
-- **Standard Installer**: `FeatherCast-<version>-win64.exe` (NSIS installer with Start Menu integration and automatic updater support).
+- **Standard Installer**: `FeatherCast-<version>-win64.exe` (NSIS installer with Start Menu integration). In-app update installation requires a signed installer and matching signer pins compiled into FeatherCast. Unsigned builds can open the release page for manual updates.
 - **Portable ZIP**: `FeatherCast-<version>-win64.zip` (Extract anywhere and run `FeatherCast.exe` without installation).
 
 ### System Requirements
@@ -264,7 +266,7 @@ FeatherCast stores all data locally under your Windows user profile following na
 - `updates/` — Downloaded and Authenticode-verified release installers.
 
 ### Privacy Guarantees
-- **No Cloud Tracking**: FeatherCast never dials home. It connects to the internet strictly for two opt-in actions:
+- **No telemetry**: FeatherCast uses the internet for update checks and currency conversion:
   1. Checking GitHub Releases for app updates (verified via Authenticode certificate thumbprint pinning).
   2. Fetching public foreign exchange conversion rates from `open.er-api.com`.
 - **Phone Connection stays in your network**: When enabled, FeatherCast listens on TCP port 47800 in your local network and only talks to phones you paired.

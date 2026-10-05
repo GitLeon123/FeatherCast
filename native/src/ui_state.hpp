@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app_types.hpp"
+#include "text_edit.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -366,8 +367,9 @@ class CaptureUiController {
   static bool RecordingStarted(CaptureUiState& state) {
     if (state.phase == CapturePhase::Recording) return true;
     if (state.phase != CapturePhase::StartingRecording) return false;
+    // The bar is shown without activation, so the user's keyboard stays with
+    // the app being recorded until the bar explicitly takes focus.
     state.phase = CapturePhase::Recording;
-    state.controlFocusActive = true;
     return true;
   }
 
@@ -428,10 +430,15 @@ class CaptureUiController {
     return reverse ? (current == 0 ? 1 : 0) : (current == 1 ? 0 : 1);
   }
 
+  // Pause and Stop can be used with the mouse or assistive technology.
+  static bool RecordingControlsAvailable(const CaptureUiState& state) {
+    return state.phase == CapturePhase::Recording ||
+           state.phase == CapturePhase::Paused;
+  }
+
+  // The bar owns Tab, Enter, Space, and Escape only while it has focus.
   static bool RecordingControlsEnabled(const CaptureUiState& state) {
-    return state.controlFocusActive &&
-           (state.phase == CapturePhase::Recording ||
-            state.phase == CapturePhase::Paused);
+    return state.controlFocusActive && RecordingControlsAvailable(state);
   }
 
   static void SetControlHover(CaptureUiState& state, int hover) {
@@ -525,11 +532,13 @@ class OverlayController {
     return Effect(UiEffect::Invalidate);
   }
 
+  // Keeps the caret and selection anchor inside the query and off the middle
+  // of a surrogate pair.
   static void ClampCaret(OverlayState& state) {
-    state.caret = std::min(state.caret, state.query.size());
+    state.caret = text_edit::SnapToCodePoint(state.query, state.caret);
     if (state.selectionAnchor) {
       *state.selectionAnchor =
-          std::min(*state.selectionAnchor, state.query.size());
+          text_edit::SnapToCodePoint(state.query, *state.selectionAnchor);
     }
   }
 
@@ -543,7 +552,8 @@ class OverlayController {
 
   static UiEffects MoveCaret(OverlayState& state, std::size_t next,
                              bool extendSelection) {
-    next = std::min(next, state.query.size());
+    ClampCaret(state);
+    next = text_edit::SnapToCodePoint(state.query, next);
     if (extendSelection) {
       if (!state.selectionAnchor) state.selectionAnchor = state.caret;
     } else {
@@ -582,10 +592,6 @@ class OverlayController {
     state.queryRedo.pop_back();
     RestoreSnapshot(state, snapshot);
     return UiEffect::RequestSearch | UiEffect::Invalidate;
-  }
-
-  static bool CanUndoQueryEdit(const OverlayState& state) {
-    return !state.queryUndo.empty();
   }
 
   static bool CanRedoQueryEdit(const OverlayState& state) {
@@ -642,7 +648,8 @@ class OverlayController {
     const std::size_t room = state.query.size() < maxCharacters
                                  ? maxCharacters - state.query.size()
                                  : 0;
-    const std::wstring clipped = text.substr(0, room);
+    const std::wstring clipped =
+        text.substr(0, text_edit::ClipToCodePoints(text, room));
     state.query.insert(state.caret, clipped);
     state.caret += clipped.size();
     state.selectionAnchor.reset();

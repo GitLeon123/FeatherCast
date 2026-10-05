@@ -23,7 +23,6 @@ object CallWatcher {
 
     private var state = CallState.Idle
     private var number = ""
-    private var silencedFrom: Int? = null
 
     fun hasPermission(context: Context): Boolean =
         context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
@@ -43,7 +42,7 @@ object CallWatcher {
         if (next == state && nextNumber == number) return
         state = next
         number = nextNumber
-        if (next == CallState.Idle) restoreRinger(context)
+        if (next != CallState.Ringing) restoreRinger(context)
         if (!active) return
         val name = SmsBridge.contactName(context, nextNumber)
         LinkManager.instance.sendAsync(PhoneMessages.callState(next, nextNumber, name))
@@ -71,27 +70,43 @@ object CallWatcher {
         }
     }
 
+    /** Silences the ringing call only; a late request must not mute the next call. */
     @Synchronized
     fun silence(context: Context) {
+        if (state != CallState.Ringing) return
+        val store = PhoneApp.instance.store
         val audio = context.getSystemService(AudioManager::class.java) ?: return
-        if (silencedFrom != null) return
+        if (store.silencedRingerMode >= 0) return
         val mode = audio.ringerMode
         try {
             audio.adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_MUTE, 0)
-            silencedFrom = mode
+            store.silencedRingerMode = mode
         } catch (_: SecurityException) {
             // Muting may count as a Do Not Disturb change; vibrate-only is always allowed.
             try {
                 audio.ringerMode = AudioManager.RINGER_MODE_VIBRATE
-                silencedFrom = mode
+                store.silencedRingerMode = mode
             } catch (_: SecurityException) {
             }
         }
     }
 
+    /** Restores a ringer that an earlier process silenced, unless a call is ringing right now. */
+    @Synchronized
+    fun restoreAfterRestart(context: Context) {
+        val ringing = try {
+            @Suppress("DEPRECATION")
+            context.getSystemService(TelephonyManager::class.java)?.callState == TelephonyManager.CALL_STATE_RINGING
+        } catch (_: SecurityException) {
+            false
+        }
+        if (!ringing) restoreRinger(context)
+    }
+
     private fun restoreRinger(context: Context) {
-        val mode = silencedFrom ?: return
-        silencedFrom = null
+        val store = PhoneApp.instance.store
+        val mode = store.silencedRingerMode.takeIf { it >= 0 } ?: return
+        store.silencedRingerMode = -1
         val audio = context.getSystemService(AudioManager::class.java) ?: return
         try {
             audio.adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_UNMUTE, 0)

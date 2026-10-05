@@ -337,5 +337,31 @@ int main() {
     assert(feathercast::motion::WheelDeltaPixels(30) == 18.0);
   }
 
+  {
+    // A delta queued after an absolute jump applies relative to its target.
+    feathercast::motion::PendingNavigation pending;
+    pending.End();
+    pending.Move(-1);
+    assert(!pending.Empty());
+    assert(pending.Apply(3, 20) == 18);
+    pending.Clear();
+    pending.Home();
+    pending.Move(8);
+    assert(pending.Apply(15, 20) == 8);
+    pending.Move(100);
+    assert(pending.Apply(0, 20) == 19);
+    pending.Clear();
+    pending.End();
+    pending.Move(1);
+    assert(pending.Apply(0, 5) == 4);
+    // A later absolute jump discards earlier relative movement.
+    pending.Move(-3);
+    pending.Home();
+    assert(pending.Apply(10, 20) == 0);
+    pending.Move(-1);
+    assert(pending.Apply(10, 20) == 0);
+    assert(pending.Apply(10, 0) == 0);
+  }
+
   return 0;
 }

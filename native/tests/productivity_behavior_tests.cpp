@@ -1,3 +1,4 @@
+#include "dpapi_scope.hpp"
 #include "timers.hpp"
 #include "timer_service.hpp"
 #include "timer_items.hpp"
@@ -26,6 +27,8 @@ void Sql(const std::filesystem::path& path, const char* sql) {
 }
 
 int main() {
+  // This test account may have no user DPAPI master key.
+  feathercast::dpapi::AllowMachineScopeFallbackForTests();
   auto parsed = timers::Parse(L"timer 1h 30m 2s Tea");
   assert(parsed && parsed->action == timers::Action::Create && parsed->duration == 5402000 && parsed->name == L"Tea");
   assert(timers::Parse(L"timer 2m30s")->duration == 150000);
@@ -121,6 +124,49 @@ int main() {
   assert(std::any_of(timerSearch.flatItems.begin(), timerSearch.flatItems.end(), [](const auto& item) { return item.timerRequest && item.timerRequest->action == timers::Action::Create; }));
   assert(timers::Items(state, 10000, 10000).size() == state.timers.size() + 2);
   assert(timers::Actions(state, id).size() == 3);
+
+  // The Timers view filters on the label and state, never on the countdown.
+  {
+    auto timerState = state;
+    assert(timers::Apply(timerState, *timers::Parse(L"timer 15m Pasta"), 20000, 40));
+    app::QueryRequest view;
+    view.limit = 50;
+    view.browseView = app::BrowseView::Timers;
+    view.timerItems = timers::Items(timerState, 20000, 20000);
+    const auto hits = [&](const std::wstring& text) {
+      view.query = text;
+      return search_pipeline::ComputeResults(view).flatItems.size();
+    };
+    assert(hits(L"pasta") == 1);
+    assert(hits(L"PASTA") == 1);
+    // Count real timers only; fuzzy matching may also surface "New Timer".
+    const auto timerHits = [&](const std::wstring& text) {
+      view.query = text;
+      std::size_t count = 0;
+      for (const auto& item : search_pipeline::ComputeResults(view).flatItems) {
+        if (item.timerRequest && item.timerRequest->id > 0) ++count;
+      }
+      return count;
+    };
+    assert(timerHits(L"tea") == 2);
+    assert(timerHits(L"pasta") == 1);
+    assert(hits(L"finished") == 1);
+    assert(hits(L"stopwatch") == 1);
+    // "15" is only in the countdown of the Pasta timer.
+    assert(hits(L"15") == 0);
+    assert(hits(L"zzz") == 0);
+    view.empty = true;
+    assert(search_pipeline::ComputeResults(view).flatItems.size() == view.timerItems.size());
+  }
+
+  // Feature gates fold case and diacritics like the search core does.
+  assert(search_pipeline::MatchesFeatureQuery(L"ANIMATIONS", {L"Animation"}));
+  assert(search_pipeline::MatchesFeatureQuery(L"résumé", {L"Resume"}));
+  assert(search_pipeline::MatchesFeatureQuery(L"cafe", {L"Café"}));
+  assert(search_pipeline::MatchesFeatureQuery(L"ÄNDERN", {L"ändern"}));
+  assert(search_pipeline::MatchesFeatureQuery(L"increase volume", {L"Volume up", L"Increase"}));
+  assert(!search_pipeline::MatchesFeatureQuery(L"an", {L"Animation"}));
+  assert(search_pipeline::MatchesFeatureQuery(L"notif", {L"Notifications"}));
   app::DisplayItem clip;
   clip.isClipboard = true;
   clip.clipboard = {L"1", L"text", L"preview", 1, true};

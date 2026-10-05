@@ -5,10 +5,12 @@
 // from a worker thread, so the owner must marshal it to the UI thread.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -115,6 +117,7 @@ enum class EventKind {
   FileSaved,
   ClipboardHistoryRequested,
   FileDelivered,    // the phone saved a file sent from the PC (ok/text)
+  TransferProgress,
   RingState,        // ok = ringing
   MediaState,       // media.active == false when nothing plays
   SmsThreads,
@@ -141,6 +144,8 @@ struct Event {
   std::vector<std::string> features;  // Status: what the phone app supports
   std::string id;          // file transfer id, SMS ref, or thread id
   bool ok = false;
+  long long transferredBytes = 0;
+  long long totalBytes = 0;
   MediaInfo media;
   std::vector<SmsThread> smsThreads;  // SmsThreads, or one entry for SmsReceived
   std::vector<SmsMessage> smsMessages;
@@ -154,7 +159,7 @@ struct ServiceConfig {
   std::wstring stateFile;     // DPAPI-sealed identity and paired devices
   std::wstring downloadsDir;  // where received photos and files are saved
   std::wstring apkPath;       // served at http://<pc>:<port>/app.apk
-  std::uint16_t port = kDefaultPort;
+  std::uint16_t port = kDefaultPort;  // tries up to 10 ports from here; 0 = any free port
   std::function<void(Event)> onEvent;
   // Screen packets bypass the general UI event queue; the receiver must bound
   // media buffering and marshal its own window notifications.
@@ -166,6 +171,13 @@ struct ClipboardHistoryItem {
   long long time = 0;
 };
 
+// Marks a received file as downloaded from the internet (Zone.Identifier), so
+// Windows and Office apply their usual protections. False on volumes without streams.
+bool MarkFileFromInternet(const std::wstring& path);
+// IPv4 addresses a phone can reach this PC at, best candidates first. Empty
+// without a usable network.
+std::vector<std::string> LocalNetworkAddresses();
+
 class PhoneService {
  public:
   PhoneService();
@@ -174,16 +186,17 @@ class PhoneService {
   PhoneService& operator=(const PhoneService&) = delete;
 
   // Loads (or creates) the PC identity and starts listening. Returns false
-  // with a readable reason in *error when the port cannot be opened.
+  // with a readable reason in *error when the port cannot be opened or saved
+  // pairings exist but cannot be read (they are then left untouched).
   bool Start(ServiceConfig config, std::string* error = nullptr);
   void Stop();
   bool Running() const { return running_.load(); }
   std::uint16_t Port() const { return port_; }
 
-  // Creates a new single-use pairing invite, valid for five minutes.
+  // Creates a new single-use pairing invite, valid for five minutes. Empty
+  // when this PC has no network address a phone could reach.
   std::string CreatePairingUri();
-  std::string ApkUrl() const;
-  std::vector<std::string> LocalAddresses() const;
+  std::string ApkUrl() const;  // empty without a network address
 
   std::vector<PairedDevice> Devices() const;
   void Forget(const std::string& deviceId);
@@ -211,6 +224,7 @@ class PhoneService {
   bool CallSilence();
   bool ListFiles(const std::string& remotePath);
   bool RequestFile(const std::string& remotePath);
+  void CancelTransfers();
   std::string StartScreen(bool audio = true);
   void StopScreen(bool report = true);
   bool SendScreenInput(ScreenInput input);
@@ -223,23 +237,34 @@ class PhoneService {
   void ScreenSendLoop(std::stop_token stop);
   void EmitScreenState(std::string id, std::string state, std::string detail = {});
   void HandleConnection(std::uintptr_t socket);
-  void ServeHttp(std::uintptr_t socket, const Bytes& firstBytes);
+  void ServeHttp(std::uintptr_t socket, const Bytes& firstBytes,
+                 std::chrono::steady_clock::time_point deadline);
   bool HandlePlainFrame(const std::shared_ptr<Session>& session,
                         const Bytes& frame);
   void HandleSessionFrame(const std::shared_ptr<Session>& session,
                           const Bytes& frame);
-  bool Send(const std::string& json, const Bytes& binary = {});
-  bool SendToSession(const std::shared_ptr<Session>& session,
-                     const std::string& json, const Bytes& binary = {});
+  // Queue a message on the session's writer. True means queued; a failed write
+  // later closes the session. wait blocks while the queue is full.
+  bool Send(std::string json, Bytes binary = {});
+  bool SendToSession(const std::shared_ptr<Session>& session, std::string json,
+                     Bytes binary = {}, bool wait = false);
   bool SaveState();
-  bool LoadState();
+  enum class StateLoad { Loaded, Missing, Failed };
+  StateLoad LoadState();
   void Emit(Event event);
-  std::wstring UniqueDownloadPath(const std::string& name) const;
+  // Matches a received photo or storage file to its request.
+  void SettleRequest(Event& event);
+  // Reports photo and file requests the phone did not answer in time.
+  void ExpireRequests();
+  std::vector<Event> TakeExpiredLocked(bool all);  // mutex_ held
+  void EmitAll(std::vector<Event> events);
 
   ServiceConfig config_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> stateReady_{false};  // SaveState never overwrites unread pairings
   std::uint16_t port_ = 0;
   std::uintptr_t listenSocket_ = ~std::uintptr_t{0};
+  void* acceptEvent_ = nullptr;
   std::jthread acceptThread_;
   std::jthread beaconThread_;
   std::jthread screenSendThread_;
@@ -262,6 +287,14 @@ class PhoneService {
   std::deque<ScreenInput> screenInputs_;
   std::deque<std::pair<std::shared_ptr<Session>, std::string>> screenCommands_;
   std::vector<std::shared_ptr<Session>> sessions_;
+  std::size_t pendingHandshakes_ = 0;  // unauthenticated connections
+  // Outstanding photo.request ids and file.get paths with their deadlines.
+  std::map<std::string, long long> pendingPhotos_;
+  struct PendingFile {
+    std::string normalized;  // the path the phone answers with
+    long long deadline = 0;
+  };
+  std::map<std::string, PendingFile> pendingFiles_;
   struct Worker {
     std::jthread thread;
     std::shared_ptr<std::atomic<bool>> done;

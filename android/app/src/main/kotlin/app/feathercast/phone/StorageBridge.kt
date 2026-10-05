@@ -51,7 +51,12 @@ object StorageBridge {
         return PhoneMessages.filesList(normalized, entries)
     }
 
-    /** Returns the file.data message and its bytes (empty on error). */
+    fun streamFile(path: String): File? {
+        if (!active) return null
+        return resolve(path)?.second?.takeIf { it.isFile }
+    }
+
+    /** Returns the legacy file.data message and its bytes (empty on error). */
     fun read(path: String): Pair<String, ByteArray> {
         val fallbackName = path.substringAfterLast('/')
         if (!active) {
@@ -64,7 +69,7 @@ object StorageBridge {
             return PhoneMessages.fileData(normalized, file.name, "${file.name} is larger than 40 MB.") to ByteArray(0)
         }
         return try {
-            val bytes = file.inputStream().use { it.readAtMost(MAX_TRANSFER_BYTES.toInt()) }
+            val bytes = file.inputStream().use { it.readAtMost(MAX_TRANSFER_BYTES.toInt(), sizeHint = file.length()) }
                 ?: return PhoneMessages.fileData(normalized, file.name, "${file.name} is larger than 40 MB.") to ByteArray(0)
             PhoneMessages.fileData(normalized, file.name) to bytes
         } catch (_: IOException) {

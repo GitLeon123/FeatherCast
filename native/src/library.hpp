@@ -17,6 +17,9 @@ enum class ItemKind {
   AppAlias,
   CommandAlias,
   WebSearch,
+  Script,
+  Workspace,
+  CommandShortcut,
 };
 
 struct AppAlias {
@@ -52,6 +55,12 @@ struct OperationResult {
 };
 
 std::wstring NormalizeKeyword(std::wstring value);
+
+// Format rules shared by app and command aliases; they match what the search
+// index accepts (core::ValidateAlias): required, a single line, no reserved
+// @, > or : prefix, and at most 64 characters. Returns the user-facing error,
+// or nullopt when the alias is valid.
+std::optional<std::wstring> ValidateAliasText(const std::wstring& alias);
 
 std::optional<std::wstring> ValidateSnippet(
     const snippets::Snippet& candidate,

@@ -43,6 +43,7 @@ struct Callbacks {
   std::function<void()> findPhone;  // starts or stops ringing
   std::function<void(const std::string&)> mediaCommand;
   std::function<void()> pickFilesToSend;
+  std::function<void()> cancelTransfers;
   std::function<void(const std::vector<std::wstring>&)> sendFiles;
   std::function<void()> requestSmsThreads;
   std::function<void()> openScreen;
@@ -74,5 +75,10 @@ class PhoneWindow {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Opens a file received from the phone. Files are untrusted: types Windows
+// treats as dangerous (programs, scripts, shortcuts) and files without a type
+// are only shown selected in Explorer, never run.
+void OpenReceivedFileSafely(HWND owner, const std::wstring& path);
 
 }  // namespace feathercast::phone_ui

@@ -374,8 +374,9 @@ void VerifyAccessibleModelTransport() {
   VARIANT hit;
   assert(accessible->accHitTest(20, 90, &hit) == S_OK);
   assert(hit.vt == VT_I4 && hit.lVal == resultChild);
-  assert(accessible->accHitTest(500, 500, &hit) == S_OK);
-  assert(hit.vt == VT_I4 && hit.lVal == CHILDID_SELF);
+  // Without a window handle a point outside every child is not ours.
+  assert(accessible->accHitTest(500, 500, &hit) == S_FALSE);
+  assert(hit.vt == VT_EMPTY);
 
   assert(accessible->get_accName(Child(99), &text) == E_INVALIDARG);
   assert(accessible->accSelect(SELFLAG_TAKEFOCUS,
@@ -654,6 +655,208 @@ void VerifyUiaRangeValuePattern() {
   accessible->Release();
 }
 
+Item CheckBoxItem(bool checked) {
+  Item item;
+  item.name = L"Mute audio";
+  item.role = ROLE_SYSTEM_CHECKBUTTON;
+  item.state = STATE_SYSTEM_FOCUSABLE | (checked ? STATE_SYSTEM_CHECKED : 0);
+  item.screenRect = RECT{110, 110, 150, 140};
+  return item;
+}
+
+IRawElementProviderSimple* ChildElement(IAccessible* accessible, long child) {
+  IAccessibleEx* bridge = nullptr;
+  assert(accessible->QueryInterface(IID_IAccessibleEx,
+                                    reinterpret_cast<void**>(&bridge)) ==
+         S_OK);
+  IAccessibleEx* childObject = nullptr;
+  assert(bridge->GetObjectForChild(child, &childObject) == S_OK);
+  IRawElementProviderSimple* element = nullptr;
+  assert(childObject->QueryInterface(IID_IRawElementProviderSimple,
+                                     reinterpret_cast<void**>(&element)) ==
+         S_OK);
+  childObject->Release();
+  bridge->Release();
+  return element;
+}
+
+void VerifyUiaRuntimeIdLiveSettingAndCheckBox() {
+  Item status;
+  status.name = L"Status";
+  status.role = ROLE_SYSTEM_STATICTEXT;
+  status.state = STATE_SYSTEM_READONLY;
+  status.liveSetting = Polite;
+
+  // No MSAA default action: Toggle must still work.
+  TestModel model;
+  model.items = {std::move(status), CheckBoxItem(false)};
+  auto* accessible = new feathercast::accessibility::Window(&model, nullptr);
+
+  // A child's runtime id is relative to its host window.
+  IRawElementProviderSimple* checkBox = ChildElement(accessible, 2);
+  IAccessibleEx* checkBoxEx = nullptr;
+  assert(checkBox->QueryInterface(IID_IAccessibleEx,
+                                  reinterpret_cast<void**>(&checkBoxEx)) ==
+         S_OK);
+  SAFEARRAY* runtimeId = nullptr;
+  assert(checkBoxEx->GetRuntimeId(&runtimeId) == S_OK);
+  assert(runtimeId != nullptr);
+  LONG lower = -1;
+  LONG upper = -1;
+  assert(SafeArrayGetLBound(runtimeId, 1, &lower) == S_OK && lower == 0);
+  assert(SafeArrayGetUBound(runtimeId, 1, &upper) == S_OK && upper == 1);
+  int idPart = 0;
+  LONG index = 0;
+  assert(SafeArrayGetElement(runtimeId, &index, &idPart) == S_OK);
+  assert(idPart == UiaAppendRuntimeId);
+  index = 1;
+  assert(SafeArrayGetElement(runtimeId, &index, &idPart) == S_OK);
+  assert(idPart == 2);
+  SafeArrayDestroy(runtimeId);
+  checkBoxEx->Release();
+
+  // A check box offers Toggle, not Invoke.
+  IUnknown* pattern = nullptr;
+  assert(checkBox->GetPatternProvider(UIA_InvokePatternId, &pattern) == S_OK);
+  assert(pattern == nullptr);
+  assert(checkBox->GetPatternProvider(UIA_TogglePatternId, &pattern) == S_OK);
+  assert(pattern != nullptr);
+  IToggleProvider* toggle = nullptr;
+  assert(pattern->QueryInterface(IID_IToggleProvider,
+                                 reinterpret_cast<void**>(&toggle)) == S_OK);
+  pattern->Release();
+  ToggleState toggleState = ToggleState_On;
+  assert(toggle->get_ToggleState(&toggleState) == S_OK);
+  assert(toggleState == ToggleState_Off);
+  assert(toggle->Toggle() == S_OK);
+  assert(model.invokeRequests == std::vector<int>{2});
+
+  // The MSAA default action names what activating the box does now.
+  BSTR text = nullptr;
+  assert(accessible->get_accDefaultAction(Child(2), &text) == S_OK);
+  assert(TakeString(text) == L"Check");
+  model.items[1] = CheckBoxItem(true);
+  assert(accessible->get_accDefaultAction(Child(2), &text) == S_OK);
+  assert(TakeString(text) == L"Uncheck");
+  assert(toggle->get_ToggleState(&toggleState) == S_OK);
+  assert(toggleState == ToggleState_On);
+  assert(accessible->get_accDefaultAction(Child(1), &text) == S_FALSE);
+  assert(text == nullptr);
+
+  // A disabled check box cannot be toggled.
+  model.items[1].state |= STATE_SYSTEM_UNAVAILABLE;
+  assert(toggle->Toggle() == E_ACCESSDENIED);
+  assert(model.invokeRequests.size() == 1);
+  toggle->Release();
+  checkBox->Release();
+
+  // Live regions are exposed through the UIA LiveSetting property.
+  IRawElementProviderSimple* statusElement = ChildElement(accessible, 1);
+  VARIANT live;
+  assert(statusElement->GetPropertyValue(UIA_LiveSettingPropertyId, &live) ==
+         S_OK);
+  assert(live.vt == VT_I4 && live.lVal == Polite);
+  statusElement->Release();
+  IRawElementProviderSimple* checkElement = ChildElement(accessible, 2);
+  assert(checkElement->GetPropertyValue(UIA_LiveSettingPropertyId, &live) ==
+         S_OK);
+  assert(live.vt == VT_I4 && live.lVal == Off);
+  checkElement->Release();
+
+  // Without a window there is no parent object.
+  IDispatch* parent = static_cast<IDispatch*>(accessible);
+  assert(accessible->get_accParent(&parent) == S_FALSE);
+  assert(parent == nullptr);
+
+  accessible->Release();
+}
+
+void VerifyWindowHitTestParentAndDisconnect() {
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  assert(SUCCEEDED(com));
+  HWND hwnd = CreateWindowExW(0, L"STATIC", L"Accessibility test", WS_POPUP,
+                              100, 100, 200, 100, nullptr, nullptr,
+                              GetModuleHandleW(nullptr), nullptr);
+  assert(hwnd != nullptr);
+
+  TestModel model;
+  model.items = {CheckBoxItem(false)};
+  model.items[0].defaultAction = L"Toggle mute";
+  auto* accessible = new feathercast::accessibility::Window(&model, hwnd);
+
+  VARIANT hit;
+  assert(accessible->accHitTest(120, 120, &hit) == S_OK);
+  assert(hit.vt == VT_I4 && hit.lVal == 1);
+  assert(accessible->accHitTest(250, 180, &hit) == S_OK);
+  assert(hit.vt == VT_I4 && hit.lVal == CHILDID_SELF);
+  assert(accessible->accHitTest(500, 500, &hit) == S_FALSE);
+  assert(hit.vt == VT_EMPTY);
+  assert(accessible->accHitTest(99, 150, &hit) == S_FALSE);
+  assert(hit.vt == VT_EMPTY);
+
+  // The client object's parent is the window's own accessible object.
+  IDispatch* parent = nullptr;
+  assert(accessible->get_accParent(&parent) == S_OK);
+  assert(parent != nullptr);
+  IAccessible* parentAccessible = nullptr;
+  assert(parent->QueryInterface(IID_IAccessible,
+                                reinterpret_cast<void**>(&parentAccessible)) ==
+         S_OK);
+  VARIANT role;
+  assert(parentAccessible->get_accRole(Child(CHILDID_SELF), &role) == S_OK);
+  assert(role.vt == VT_I4 && role.lVal == ROLE_SYSTEM_WINDOW);
+  parentAccessible->Release();
+  parent->Release();
+
+  IRawElementProviderSimple* element = ChildElement(accessible, 1);
+  VARIANT name;
+  assert(element->GetPropertyValue(UIA_NamePropertyId, &name) == S_OK);
+  assert(name.vt == VT_BSTR);
+  VariantClear(&name);
+
+  // After Disconnect, objects that clients still hold fail instead of
+  // reaching the model.
+  feathercast::accessibility::Disconnect(hwnd);
+  LONG count = -1;
+  assert(accessible->get_accChildCount(&count) == RPC_E_DISCONNECTED);
+  assert(accessible->accDoDefaultAction(Child(1)) == RPC_E_DISCONNECTED);
+  assert(accessible->accHitTest(120, 120, &hit) == RPC_E_DISCONNECTED);
+  assert(element->GetPropertyValue(UIA_NamePropertyId, &name) ==
+         UIA_E_ELEMENTNOTAVAILABLE);
+  IUnknown* pattern = nullptr;
+  assert(element->GetPatternProvider(UIA_TogglePatternId, &pattern) ==
+         UIA_E_ELEMENTNOTAVAILABLE);
+  assert(pattern == nullptr);
+  IAccessibleEx* elementEx = nullptr;
+  assert(element->QueryInterface(IID_IAccessibleEx,
+                                 reinterpret_cast<void**>(&elementEx)) == S_OK);
+  SAFEARRAY* runtimeId = nullptr;
+  assert(elementEx->GetRuntimeId(&runtimeId) == UIA_E_ELEMENTNOTAVAILABLE);
+  assert(runtimeId == nullptr);
+  elementEx->Release();
+  assert(model.invokeRequests.empty());
+
+  // A window that answers again gets a fresh connection.
+  auto* fresh = new feathercast::accessibility::Window(&model, hwnd);
+  assert(fresh->get_accChildCount(&count) == S_OK && count == 1);
+
+  // A reused handle with a different model cuts off the previous owner.
+  TestModel other;
+  auto* reused = new feathercast::accessibility::Window(&other, hwnd);
+  assert(fresh->get_accChildCount(&count) == RPC_E_DISCONNECTED);
+  assert(reused->get_accChildCount(&count) == S_OK && count == 0);
+  feathercast::accessibility::Disconnect(hwnd);
+  assert(reused->get_accChildCount(&count) == RPC_E_DISCONNECTED);
+  feathercast::accessibility::Disconnect(hwnd);  // Repeated calls are harmless.
+
+  reused->Release();
+  fresh->Release();
+  element->Release();
+  accessible->Release();
+  DestroyWindow(hwnd);
+  CoUninitialize();
+}
+
 }  // namespace
 
 int main() {
@@ -662,5 +865,7 @@ int main() {
   VerifyScreenshotEditorAccessibility();
   VerifyUnavailableFocusIsNeverReported();
   VerifyUiaRangeValuePattern();
+  VerifyUiaRuntimeIdLiveSettingAndCheckBox();
+  VerifyWindowHitTestParentAndDisconnect();
   return 0;
 }

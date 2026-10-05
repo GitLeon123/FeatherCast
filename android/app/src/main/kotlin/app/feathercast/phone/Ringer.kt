@@ -31,10 +31,10 @@ object Ringer {
 
     private val main = Handler(Looper.getMainLooper())
     private var player: MediaPlayer? = null
+    // Ringing also covers vibration when the sound could not play, so it is tracked separately.
+    private var active = false
     private var savedVolume = -1
     private val timeout = Runnable { stop(PhoneApp.instance) }
-
-    val ringing: Boolean get() = player != null
 
     fun createChannel(context: Context) {
         val channel = NotificationChannel(CHANNEL_ID, "Find my phone", NotificationManager.IMPORTANCE_HIGH).apply {
@@ -46,7 +46,8 @@ object Ringer {
 
     fun start(context: Context) {
         main.post {
-            if (player != null) return@post
+            if (active) return@post
+            active = true
             val audio = context.getSystemService(AudioManager::class.java)
             try {
                 savedVolume = audio.getStreamVolume(AudioManager.STREAM_ALARM)
@@ -83,7 +84,8 @@ object Ringer {
     fun stop(context: Context) {
         main.post {
             main.removeCallbacks(timeout)
-            val wasRinging = player != null
+            val wasRinging = active
+            active = false
             player?.let {
                 try {
                     it.stop()

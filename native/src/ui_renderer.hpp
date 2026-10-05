@@ -6,8 +6,11 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <utility>
 #include <vector>
+
+struct IDWriteFactory;
 
 namespace feathercast::ui {
 
@@ -44,5 +47,12 @@ struct RenderFrameResult {
 // device-loss classification.
 RenderFrameResult RenderTransparentFrame(
     ID2D1DeviceContext* context, const std::function<void()>& draw);
+
+// First family of a comma-separated list that is installed on this system,
+// else "Segoe UI". DirectWrite's CreateTextFormat succeeds for unknown family
+// names, so callers must resolve the family through this before creating a
+// text format. Pass the app's factory, or null to use the shared one.
+std::wstring ResolveInstalledFontFamily(const std::wstring& familyList,
+                                        IDWriteFactory* factory = nullptr);
 
 }  // namespace feathercast::ui

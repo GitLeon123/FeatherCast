@@ -71,5 +71,53 @@ int main() {
   assert(!desktop.Policy().allowMaintenance);
   desktop.SetInteractive(false);
   assert(desktop.Policy().allowMaintenance);
+
+  // Moderate pressure must not lift Critical early: only the full recovery
+  // streak may step it up to Reduced.
+  PerformanceGovernor critical;
+  critical.Initialize({8, 16ULL * 1024ULL * 1024ULL * 1024ULL, false});
+  critical.ObserveUiTurn(40'000, 0, 0);
+  assert(critical.Tier() == QualityTier::Critical);
+  critical.ObserveUiTurn(22'000, 0, 0);
+  critical.ObserveUiTurn(22'000, 0, 0);
+  critical.ObserveUiTurn(1'000, 0, 0, true);
+  assert(critical.Tier() == QualityTier::Critical);
+  // Samples in the critical hysteresis band restart the recovery streak.
+  critical.ObserveUiTurn(28'000, 0, 0);
+  assert(critical.Tier() == QualityTier::Critical);
+  for (int sample = 0; sample < 29; ++sample) {
+    critical.ObserveUiTurn(22'000, 0, 0);
+    assert(critical.Tier() == QualityTier::Critical);
+  }
+  critical.ObserveUiTurn(22'000, 0, 0);
+  assert(critical.Tier() == QualityTier::Reduced);
+  // Moderate pressure keeps Reduced but never counts toward Full.
+  for (int sample = 0; sample < 120; ++sample) {
+    critical.ObserveUiTurn(22'000, 0, 0);
+  }
+  assert(critical.Tier() == QualityTier::Reduced);
+
+  // Samples just under the reduced limits sit in the band: they neither
+  // degrade nor recover, and they reset the Reduced -> Full streak.
+  PerformanceGovernor hovering;
+  hovering.Initialize({8, 16ULL * 1024ULL * 1024ULL * 1024ULL, false});
+  hovering.ObserveUiTurn(21'000, 0, 0);
+  assert(hovering.Tier() == QualityTier::Reduced);
+  for (int sample = 0; sample < 59; ++sample) {
+    hovering.ObserveUiTurn(1'000, 500, 0);
+  }
+  hovering.ObserveUiTurn(18'000, 0, 0);
+  assert(hovering.Tier() == QualityTier::Reduced);
+  for (int sample = 0; sample < 59; ++sample) {
+    hovering.ObserveUiTurn(1'000, 500, 0);
+    assert(hovering.Tier() == QualityTier::Reduced);
+  }
+  hovering.ObserveUiTurn(1'000, 500, 0);
+  assert(hovering.Tier() == QualityTier::Full);
+  // At Full, band samples do not degrade.
+  for (int sample = 0; sample < 10; ++sample) {
+    hovering.ObserveUiTurn(18'000, 1'800, 40);
+  }
+  assert(hovering.Tier() == QualityTier::Full);
   return 0;
 }

@@ -25,9 +25,23 @@ class UiEventQueue {
   UiEventQueue(const UiEventQueue&) = delete;
   UiEventQueue& operator=(const UiEventQueue&) = delete;
 
+  // Installing a notifier while events are already queued wakes the consumer
+  // once, so events pushed before the notifier existed are not stranded.
   void SetNotifier(Notifier notifier) {
-    std::lock_guard lock(mutex_);
-    notifier_ = std::move(notifier);
+    Notifier wake;
+    {
+      std::lock_guard lock(mutex_);
+      if (closed_) return;
+      notifier_ = std::move(notifier);
+      if (!notifier_) {
+        notificationPending_ = false;
+        return;
+      }
+      if (notificationPending_ || events_.empty()) return;
+      notificationPending_ = true;
+      wake = notifier_;
+    }
+    wake();
   }
 
   bool Push(Event event) {
@@ -36,11 +50,13 @@ class UiEventQueue {
       std::lock_guard lock(mutex_);
       if (closed_) return false;
       events_.push_back(std::move(event));
-      if (notificationPending_) return true;
+      // Only a notification that is actually delivered may suppress later
+      // ones; without a notifier the flag must stay clear.
+      if (notificationPending_ || !notifier_) return true;
       notificationPending_ = true;
       notifier = notifier_;
     }
-    if (notifier) notifier();
+    notifier();
     return true;
   }
 
@@ -56,8 +72,8 @@ class UiEventQueue {
         events_.pop_front();
       }
       result.more = !events_.empty();
-      notificationPending_ = result.more;
-      if (result.more) notifier = notifier_;
+      notificationPending_ = result.more && static_cast<bool>(notifier_);
+      if (notificationPending_) notifier = notifier_;
     }
     // The message that caused this drain has already been consumed. Re-arm a
     // single notification for the remainder without invoking user code while

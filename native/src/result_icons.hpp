@@ -45,7 +45,6 @@ enum class ResultIcon {
   Moon,
   Power,
   PowerRefresh,
-  Speaker,
   SpeakerOff,
   SpeakerPlus,
   SpeakerMinus,

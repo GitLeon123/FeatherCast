@@ -129,19 +129,14 @@ object SmsBridge {
             @Suppress("DEPRECATION")
             SmsManager.getDefault()
         }
-        val sent = PendingIntent.getBroadcast(
-            context, ref.hashCode(),
-            Intent(context, SmsSentReceiver::class.java).putExtra(SmsSentReceiver.EXTRA_REF, ref),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
         try {
             val parts = manager.divideMessage(body)
+            val count = parts.size.coerceAtLeast(1)
+            val sent = ArrayList(List(count) { part -> SmsSentReceiver.pendingIntent(context, ref, part, count) })
             if (parts.size <= 1) {
-                manager.sendTextMessage(address, null, body, sent, null)
+                manager.sendTextMessage(address, null, body, sent[0], null)
             } else {
-                val intents = ArrayList<PendingIntent?>(List(parts.size) { null })
-                intents[parts.size - 1] = sent
-                manager.sendMultipartTextMessage(address, null, parts, intents, null)
+                manager.sendMultipartTextMessage(address, null, parts, sent, null)
             }
         } catch (error: Exception) {
             link.sendAsync(PhoneMessages.smsSent(ref, false, error.message ?: "Could not send the message."))
@@ -149,16 +144,34 @@ object SmsBridge {
     }
 }
 
-/** Reports whether an SMS sent for the PC went out. */
+/** Reports whether an SMS sent for the PC went out, once every part has a result. */
 class SmsSentReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val ref = intent.getStringExtra(EXTRA_REF) ?: return
+        val parts = intent.getIntExtra(EXTRA_PARTS, 1).coerceAtLeast(1)
         val ok = resultCode == Activity.RESULT_OK
-        LinkManager.instance.sendAsync(PhoneMessages.smsSent(ref, ok, if (ok) "" else "The phone could not send the message."))
+        val progress = pending.merge(ref, Progress(1, ok)) { a, b -> Progress(a.done + b.done, a.ok && b.ok) } ?: return
+        if (progress.done < parts || !pending.remove(ref, progress)) return
+        LinkManager.instance.sendAsync(
+            PhoneMessages.smsSent(ref, progress.ok, if (progress.ok) "" else "The phone could not send the message."),
+        )
     }
 
+    private data class Progress(val done: Int, val ok: Boolean)
+
     companion object {
-        const val EXTRA_REF = "ref"
+        private const val EXTRA_REF = "ref"
+        private const val EXTRA_PARTS = "parts"
+        private val pending = ConcurrentHashMap<String, Progress>()
+
+        /** One distinct PendingIntent per part (the data Uri), so none replaces another. */
+        fun pendingIntent(context: Context, ref: String, part: Int, parts: Int): PendingIntent = PendingIntent.getBroadcast(
+            context, 0,
+            Intent(context, SmsSentReceiver::class.java)
+                .setData(Uri.Builder().scheme("feathercast-sms").authority("sent").appendPath(ref).appendPath(part.toString()).build())
+                .putExtra(EXTRA_REF, ref).putExtra(EXTRA_PARTS, parts),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
     }
 }
 

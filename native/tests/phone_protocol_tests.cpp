@@ -2,6 +2,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
+#include "dpapi_scope.hpp"
 #include "phone_crypto.hpp"
 #include "phone_messages.hpp"
 #include "phone_protocol.hpp"
@@ -417,7 +418,7 @@ void TestServiceEndToEnd() {
   config.stateFile = (dir / L"phone-link.dat").wstring();
   config.downloadsDir = (dir / L"downloads").wstring();
   config.apkPath = (dir / L"missing.apk").wstring();
-  config.port = 47890;
+  config.port = 0;  // a free port, so a running FeatherCast or another test never collides
   config.onEvent = [&](Event event) {
     std::lock_guard lock(mutex);
     events.push_back(std::move(event));
@@ -430,8 +431,18 @@ void TestServiceEndToEnd() {
   };
   std::string error;
   assert(service.Start(config, &error));
+  assert(service.Port() != 0);
 
   const std::string uri = service.CreatePairingUri();
+  if (uri.empty()) {
+    // An invite needs an address the phone can reach, which an offline PC lacks.
+    assert(LocalNetworkAddresses().empty() && service.ApkUrl().empty());
+    std::puts("phone service test skipped: no network address");
+    service.Stop();
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    return;
+  }
   assert(uri.starts_with("feathercast://pair?v=1&n=Test%20PC"));
   const Bytes pcPublic = *Base64UrlDecode(QueryParam(uri, "k"));
   const Bytes token = *Base64UrlDecode(QueryParam(uri, "t"));
@@ -542,6 +553,37 @@ void TestServiceEndToEnd() {
     assert(saved && std::filesystem::path(saved->path).parent_path() ==
                         std::filesystem::path(config.downloadsDir));
     assert(std::filesystem::file_size(saved->path) == 4);
+    assert(std::filesystem::path(saved->path).filename() == L"_evil.txt");
+    {
+      // Saved like a browser download, with the mark of the web.
+      std::ifstream zone(std::filesystem::path(saved->path + L":Zone.Identifier"), std::ios::binary);
+      std::string marker(64, '\0');
+      zone.read(marker.data(), static_cast<std::streamsize>(marker.size()));
+      marker.resize(static_cast<std::size_t>(zone.gcount()));
+      assert(marker.find("ZoneId=3") != std::string::npos);
+    }
+
+    // A requested photo is matched by id, and its extension follows its bytes.
+    assert(service.RequestPhoto("p9"));
+    const auto photoRequest = phone.ReadSealed();
+    assert(photoRequest && photoRequest->json.find("\"p9\"") != std::string::npos);
+    phone.SendSealed(Json("photo.full").Str("id", "p9").Str("name", "p.png").Build(),
+                     Bytes{0xFF, 0xD8, 0xFF, 0xE0});
+    const auto photo = waitFor(EventKind::PhotoSaved);
+    assert(photo && photo->photo.id == "p9" &&
+           std::filesystem::path(photo->path).filename() == L"p.jpg");
+
+    // A storage answer carries the path the phone resolved; the event reports the
+    // path that was requested and the file is named after it, not the phone's name.
+    assert(service.RequestFile("Download//./notes.txt"));
+    const auto fileRequest = phone.ReadSealed();
+    assert(fileRequest && fileRequest->json.find("file.request") != std::string::npos);
+    phone.SendSealed(
+        Json("file.data").Str("path", "/Download/notes.txt").Str("name", "notes.exe").Build(),
+        ToBytes("note"));
+    const auto requested = waitFor(EventKind::RemoteFileSaved);
+    assert(requested && requested->remotePath == "Download//./notes.txt" &&
+           std::filesystem::path(requested->path).filename() == L"notes.txt");
 
     assert(service.SendClipboard("from pc"));
     const auto received = phone.ReadSealed();
@@ -565,6 +607,78 @@ void TestServiceEndToEnd() {
     const auto delivered = waitFor(EventKind::FileDelivered);
     assert(delivered && delivered->ok && delivered->id == transferId);
 
+    // Header/body gather writes preserve consecutive empty and large legacy
+    // transfers, including binary NULs and multiple TCP receive fragments.
+    const auto emptyFile = dir / L"empty.txt";
+    std::ofstream(emptyFile, std::ios::binary).close();
+    const auto largeFile = dir / L"large.bin";
+    Bytes largeBytes(1024 * 1024);
+    for (std::size_t i = 0; i < largeBytes.size(); ++i) {
+      largeBytes[i] = static_cast<std::uint8_t>(i);
+    }
+    {
+      std::ofstream output(largeFile, std::ios::binary);
+      output.write(reinterpret_cast<const char*>(largeBytes.data()),
+                   static_cast<std::streamsize>(largeBytes.size()));
+      assert(output);
+    }
+    const auto emptyId = service.SendFile(emptyFile.wstring());
+    assert(!emptyId.empty());
+    const auto emptyMessage = phone.ReadSealed();
+    assert(emptyMessage && emptyMessage->binary.empty() &&
+           emptyMessage->json.find(emptyId) != std::string::npos);
+    const auto largeId = service.SendFile(largeFile.wstring());
+    assert(!largeId.empty());
+    const auto largeMessage = phone.ReadSealed();
+    assert(largeMessage && largeMessage->binary == largeBytes &&
+           largeMessage->json.find(largeId) != std::string::npos);
+    // Cancelling a pending screen request wakes the deadline wait and lets a
+    // new request through immediately, without an active screen connection.
+    const auto pendingId = service.StartScreen();
+    assert(!pendingId.empty());
+    assert(phone.ReadSealed());
+    service.StopScreen();
+    const auto pendingStop = phone.ReadSealed();
+    assert(pendingStop && pendingStop->json.find(pendingId) != std::string::npos);
+    const auto nextId = service.StartScreen();
+    assert(!nextId.empty() && nextId != pendingId);
+    const auto nextStart = phone.ReadSealed();
+    assert(nextStart && nextStart->json.find(nextId) != std::string::npos);
+    service.StopScreen();
+    assert(phone.ReadSealed());
+
+    // New peers negotiate streaming without changing the authenticated framing.
+    phone.SendSealed(Json("status").Raw("features", "[\"file.stream.v1\"]").Build());
+    assert(waitFor(EventKind::Status));
+    const auto streamedId = service.SendFile(outgoing.wstring());
+    assert(!streamedId.empty());
+    const auto beginStream = phone.ReadSealed();
+    assert(beginStream);
+    const auto beginRoot = feathercast::json::Parse(beginStream->json);
+    assert(beginRoot && JsonString(*beginRoot, "type") == "file.begin" && JsonInt(*beginRoot, "size") == 11);
+    const auto streamChunk = phone.ReadSealed();
+    assert(streamChunk && streamChunk->binary == ToBytes("hello phone"));
+    const auto chunkRoot = feathercast::json::Parse(streamChunk->json);
+    assert(chunkRoot && JsonString(*chunkRoot, "type") == "file.chunk" && JsonInt(*chunkRoot, "offset", -1) == 0);
+    const auto endStream = phone.ReadSealed();
+    assert(endStream);
+    const auto endRoot = feathercast::json::Parse(endStream->json);
+    assert(endRoot && JsonString(*endRoot, "type") == "file.end");
+    phone.SendSealed(Json("file.received").Str("id", streamedId).Bool("ok", true).Build());
+    const auto streamedReceipt = waitFor(EventKind::FileDelivered);
+    assert(streamedReceipt && streamedReceipt->ok && streamedReceipt->id == streamedId);
+
+    phone.SendSealed(Json("file.begin").Str("id", "incoming-stream").Str("name", "stream.txt")
+        .Str("purpose", "file").Int("size", 4).Build());
+    phone.SendSealed(Json("file.chunk").Str("id", "incoming-stream").Int("offset", 0).Build(), ToBytes("data"));
+    phone.SendSealed(Json("file.end").Str("id", "incoming-stream").Build());
+    const auto incomingStream = waitFor(EventKind::FileSaved);
+    assert(incomingStream && std::filesystem::file_size(incomingStream->path) == 4);
+    const auto incomingAck = phone.ReadSealed();
+    assert(incomingAck);
+    const auto ackRoot = feathercast::json::Parse(incomingAck->json);
+    assert(ackRoot && JsonString(*ackRoot, "type") == "file.received" && JsonBool(*ackRoot, "ok"));
+
     // Files requested from phone storage are saved to Downloads.
     phone.SendSealed(
         Json("file.data").Str("path", "/Download/report.pdf").Str("name", "report.pdf").Build(),
@@ -580,8 +694,13 @@ void TestServiceEndToEnd() {
     phone.SendSealed(Json("ping").Build());
     const auto pong = phone.ReadSealed();
     assert(pong && pong->json.find("pong") != std::string::npos);
+
+    // Never answered: ends with an error for that photo when the phone leaves.
+    assert(service.RequestPhoto("lost"));
   }
   assert(waitFor(EventKind::Disconnected));
+  const auto lost = waitFor(EventKind::Error);
+  assert(lost && lost->photo.id == "lost" && !lost->text.empty());
 
   // The pairing token is single use.
   {
@@ -713,12 +832,103 @@ void TestScreenPackets() {
   frame.keyframe = true; assert(buffer.Push(frame));
 }
 
+// Names chosen by the phone can never leave Downloads, hit a device name, hide
+// their extension, or give a photo an executable type.
+void TestSavedFileNames() {
+  assert(SanitizeFileName("../evil.txt") == "_evil.txt");
+  assert(SanitizeFileName("..\\evil.txt") == "_evil.txt");
+  assert(SanitizeFileName("a:b*c?.txt") == "a_b_c_.txt");
+  assert(SanitizeFileName("CON.txt") == "_CON.txt");
+  assert(SanitizeFileName("lpt1") == "_lpt1");
+  assert(SanitizeFileName("COM10.txt") == "COM10.txt");
+  assert(SanitizeFileName("report. . ") == "report");
+  assert(SanitizeFileName("photo\xE2\x80\xAEgpj.exe") == "photo_gpj.exe");  // U+202E
+  assert(SanitizeFileName("bad\xFF\xC0.txt") == "bad__.txt");
+  assert(SanitizeFileName("") == "phone-file");
+  assert(SanitizeFileName(" . ", "fallback") == "fallback");
+  const auto shortened = SanitizeFileName(std::string(200, 'a') + ".pdf");
+  assert(shortened.size() <= kMaxSavedNameBytes && shortened.ends_with(".pdf"));
+  std::string umlauts;
+  for (int i = 0; i < 100; ++i) umlauts += "\xC3\xBC";
+  const auto cut = SanitizeFileName(umlauts);
+  assert(cut.size() <= kMaxSavedNameBytes && cut.size() % 2 == 0);  // no split character
+
+  assert(RemoteFileName("/Download/a.pdf/") == "a.pdf");
+  assert(RemoteFileName("/Download/..") == "phone-file");
+  assert(RemoteFileName("/") == "phone-file");
+
+  const Bytes jpeg{0xFF, 0xD8, 0xFF, 0xE0};
+  const Bytes png{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+  const Bytes executable{'M', 'Z', 0x90, 0};
+  assert(DetectImageExtension(jpeg) == ".jpg" && DetectImageExtension(png) == ".png");
+  assert(DetectImageExtension(executable).empty());
+  assert(PhotoFileName("x.png", jpeg) == "x.jpg");
+  assert(PhotoFileName("IMG_1.JPEG", jpeg) == "IMG_1.JPEG");
+  assert(PhotoFileName("invoice.pdf.exe", png) == "invoice.pdf.png");
+  assert(PhotoFileName("run.exe", executable) == "run.bin");
+  assert(PhotoFileName("", jpeg) == "phone-photo.jpg");
+}
+
+void TestLimits() {
+  const auto root = feathercast::json::Parse(
+      R"({"half":1.5,"huge":1e30,"big":3000000000,"neg":-7,"text":"5"})");
+  assert(root);
+  assert(JsonInt(*root, "half", 9) == 9 && JsonInt(*root, "huge", 9) == 9);
+  assert(JsonInt(*root, "big") == 3000000000LL && JsonInt(*root, "neg") == -7);
+  assert(JsonInt(*root, "text", 4) == 4 && JsonInt(*root, "missing", 4) == 4);
+  assert(JsonInt32(*root, "big", -1) == -1 && JsonInt32(*root, "neg") == -7);
+
+  // Pasted text: 16 KB of UTF-8, and its escaped frame must fit the phone's 32 KB.
+  const std::string plain(kMaxScreenTextBytes, 'a');
+  assert(ValidScreenInput({"s1", 1, "text", 0, 0, 0, plain}));
+  assert(!ValidScreenInput({"s1", 1, "text", 0, 0, 0, plain + "a"}));
+  const std::string controls(kMaxScreenTextBytes, '\x01');  // each becomes \u0001
+  assert(!ValidScreenInput({"s1", 1, "text", 0, 0, 0, controls}));
+
+  KeyframeThrottle throttle;
+  assert(throttle.Allow(0) && !throttle.Allow(100) && !throttle.Allow(499));
+  assert(throttle.Allow(500) && !throttle.Allow(900));
+  throttle.Reset();
+  assert(throttle.Allow(901));
+}
+
+void TestIdleServiceShutdown() {
+  const auto dir = std::filesystem::temp_directory_path() /
+      ("feathercast-phone-idle-test-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(dir);
+  PhoneService service;
+  ServiceConfig config;
+  config.pcName = "Idle Test PC";
+  config.stateFile = (dir / L"state.dat").wstring();
+  config.downloadsDir = (dir / L"downloads").wstring();
+  config.port = 0;
+  for (int i = 0; i < 3; ++i) {
+    std::string error;
+    assert(service.Start(config, &error));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const auto begin = std::chrono::steady_clock::now();
+    service.Stop();
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    assert(!service.Running());
+    std::printf("Idle phone service stop: %.2f ms\n", elapsed);
+    assert(elapsed < 1000 * feathercast::test::TimingBudgetScale());
+  }
+  std::error_code ignored;
+  std::filesystem::remove_all(dir, ignored);
+}
+
 int main() {
+  // This test account may have no user DPAPI master key.
+  feathercast::dpapi::AllowMachineScopeFallbackForTests();
   TestEncodings();
   TestFraming();
   TestCrypto();
   TestMessageFixtures();
   TestScreenPackets();
+  TestSavedFileNames();
+  TestLimits();
+  TestIdleServiceShutdown();
   TestServiceEndToEnd();
   std::puts("phone protocol tests passed");
   return 0;

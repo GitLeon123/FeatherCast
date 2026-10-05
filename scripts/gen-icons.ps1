@@ -1,5 +1,8 @@
 ﻿# Generates the FeatherCast icon (build/icon.ico, build/icon.png)
 # from the checked-in source artwork.
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 3.0
+
 Add-Type -AssemblyName System.Drawing
 
 $buildDir = Join-Path $PSScriptRoot "..\build"

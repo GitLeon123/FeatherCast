@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,8 @@
 #endif
 
 namespace {
+
+uint32_t largeResponseCalls = 0;
 
 uint32_t WriteResponse(const std::string& response, char* buffer, uint32_t capacity) {
   const uint32_t required = static_cast<uint32_t>(response.size() + 1);
@@ -55,6 +58,42 @@ FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionHandleJson(const char*
   }
   if (Contains(requestUtf8, "\"query\":\"malformed\"")) {
     return WriteResponse("{\"items\":[", responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"isolated\"")) {
+    // Console I/O from a plugin must never reach the host protocol pipes.
+    std::printf("{\"items\":[{\"id\":\"stdout\",\"title\":\"Leaked printf\"}]}\n");
+    std::fflush(stdout);
+    const char leaked[] = "{\"items\":[{\"id\":\"stdout\",\"title\":\"Leaked WriteFile\"}]}\n";
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), leaked, static_cast<DWORD>(sizeof(leaked) - 1),
+              &written, nullptr);
+    char stolen[64];
+    DWORD read = 0;
+    const BOOL readInput = ReadFile(GetStdHandle(STD_INPUT_HANDLE), stolen,
+                                    static_cast<DWORD>(sizeof(stolen)), &read, nullptr);
+    return WriteResponse(readInput && read > 0
+                             ? "{\"items\":[{\"id\":\"stdin\",\"title\":\"Stole input\"}]}"
+                             : "{\"items\":[{\"id\":\"isolated\",\"title\":\"Isolated\"}]}",
+                         responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"large\"")) {
+    ++largeResponseCalls;
+    return WriteResponse("{\"items\":[{\"id\":\"large\",\"title\":\"Large\",\"subtitle\":\"" +
+                             std::string(64 * 1024, 'x') + "\"}]}",
+                         responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"large-calls\"")) {
+    return WriteResponse("{\"items\":[{\"id\":\"calls\",\"title\":\"calls=" +
+                             std::to_string(largeResponseCalls) + "\"}]}",
+                         responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"multiline\"")) {
+    return WriteResponse("{\n  \"items\": [\r\n    {\"id\": \"multi\", \"title\": \"Multiline\"}\n  ]\n}",
+                         responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"broken-line\"")) {
+    return WriteResponse("{\"items\":[{\"id\":\"broken\",\"title\":\"Broken\nLine\"}]}",
+                         responseUtf8, responseCapacity);
   }
   if (Contains(requestUtf8, "\"query\":\"version\"")) {
     if (Contains(requestUtf8, "\"apiVersion\":1")) {

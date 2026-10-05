@@ -25,3 +25,16 @@ screen_test.png
 build/Testing/
 Testing/
 
+.vs/
+CMakeUserPresets.json
+
+# Signing material and release staging
+*.pfx
+*.p12
+*.jks
+*.keystore
+/FeatherCast-Phone.apk
+release-assets/
+
+# Local design review captures
+.impeccable/review/

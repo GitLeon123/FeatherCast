@@ -34,26 +34,6 @@ bool HasDuplicateKeyword(const T& values, const std::wstring& keyword,
   return false;
 }
 
-std::optional<std::wstring> AliasFormatError(const std::wstring& value) {
-  const auto validation = core::ValidateAlias(value);
-  if (validation.valid) {
-    if (validation.value.size() > 64) {
-      return L"Alias must not exceed 64 characters.";
-    }
-    return std::nullopt;
-  }
-  switch (validation.error) {
-    case core::AliasValidationError::Multiline:
-      return L"Alias must be a single line.";
-    case core::AliasValidationError::ReservedPrefix:
-      return L"Alias must not begin with @, >, or :.";
-    case core::AliasValidationError::Empty:
-    case core::AliasValidationError::None:
-      return L"Alias is required.";
-  }
-  return L"Alias is invalid.";
-}
-
 bool CanonicalAliasCollision(
     const std::wstring& alias, const std::vector<AppAlias>& appAliases,
     const std::vector<snippets::Snippet>& snippets,
@@ -99,6 +79,26 @@ std::wstring NormalizeKeyword(std::wstring value) {
   return value;
 }
 
+std::optional<std::wstring> ValidateAliasText(const std::wstring& alias) {
+  const auto validation = core::ValidateAlias(alias);
+  if (validation.valid) {
+    if (validation.value.size() > 64) {
+      return L"Alias must not exceed 64 characters.";
+    }
+    return std::nullopt;
+  }
+  switch (validation.error) {
+    case core::AliasValidationError::Multiline:
+      return L"Alias must be a single line.";
+    case core::AliasValidationError::ReservedPrefix:
+      return L"Alias must not begin with @, >, or :.";
+    case core::AliasValidationError::Empty:
+    case core::AliasValidationError::None:
+      return L"Alias is required.";
+  }
+  return L"Alias is invalid.";
+}
+
 std::optional<std::wstring> ValidateSnippet(
     const snippets::Snippet& candidate,
     const std::vector<snippets::Snippet>& existing,
@@ -130,12 +130,13 @@ std::optional<std::wstring> ValidateAppAlias(
     const AppAlias& candidate, const std::vector<AppAlias>& existing,
     std::optional<std::size_t> editingIndex) {
   if (Trim(candidate.appId).empty()) return L"App is required.";
-  const std::wstring alias = Trim(candidate.alias);
-  if (alias.empty()) return L"Alias is required.";
-  if (alias.size() > 64) return L"Alias must not exceed 64 characters.";
-  if (HasDuplicateKeyword(existing, alias, editingIndex,
-                          [](const auto& item) { return item.alias; })) {
-    return L"Another app already uses this alias.";
+  if (const auto error = ValidateAliasText(candidate.alias)) return error;
+  const std::wstring normalized = core::NormalizeAlias(candidate.alias);
+  for (std::size_t index = 0; index < existing.size(); ++index) {
+    if (editingIndex && *editingIndex == index) continue;
+    if (core::NormalizeAlias(existing[index].alias) == normalized) {
+      return L"Another app already uses this alias.";
+    }
   }
   return std::nullopt;
 }
@@ -148,7 +149,7 @@ std::optional<std::wstring> ValidateCommandAlias(
     const std::vector<settings::Quicklink>& quicklinks,
     std::optional<std::size_t> editingIndex) {
   if (Trim(candidate.stableId).empty()) return L"Command is required.";
-  if (const auto error = AliasFormatError(candidate.alias)) return error;
+  if (const auto error = ValidateAliasText(candidate.alias)) return error;
   const std::wstring normalized = core::NormalizeAlias(candidate.alias);
   for (std::size_t index = 0; index < existing.size(); ++index) {
     if (editingIndex && *editingIndex == index) continue;

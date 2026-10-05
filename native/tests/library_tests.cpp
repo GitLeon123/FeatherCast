@@ -54,6 +54,21 @@ int main() {
   assert(ValidateAppAlias({L"", L"Missing", L"alias"}, aliases));
   assert(ValidateAppAlias({L"app:other", L"Other", std::wstring(65, L'x')},
                           aliases));
+  // App aliases follow the same format rules as command aliases and the
+  // search index, including accent-insensitive duplicates.
+  assert(ValidateAppAlias({L"app:other", L"Other", L"@other"}, aliases));
+  assert(ValidateAppAlias({L"app:other", L"Other", L">other"}, aliases));
+  assert(ValidateAppAlias({L"app:other", L"Other", L"two\nlines"}, aliases));
+  assert(ValidateAppAlias({L"app:other", L"Other", L"   "}, aliases));
+  assert(ValidateAppAlias({L"app:other", L"Other", L" T\u00c9RM "}, aliases) ==
+         std::optional<std::wstring>(L"Another app already uses this alias."));
+  assert(!ValidateAppAlias({L"app:other", L"Other", std::wstring(64, L'x')},
+                           aliases));
+  assert(feathercast::library::ValidateAliasText(L"two\nlines") ==
+         std::optional<std::wstring>(L"Alias must be a single line."));
+  assert(feathercast::library::ValidateAliasText(L":x") ==
+         std::optional<std::wstring>(L"Alias must not begin with @, >, or :."));
+  assert(!feathercast::library::ValidateAliasText(L" ok "));
   const auto aliasOrder = SortedAppAliasIndices(aliases);
   assert(aliasOrder.size() == 2 && aliasOrder[0] == 1 && aliasOrder[1] == 0);
 

@@ -26,6 +26,7 @@ class PhoneApp : Application() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         IncomingFiles.createChannel(this)
         Ringer.createChannel(this)
+        CallWatcher.restoreAfterRestart(this)
         if (store.load() != null) LinkService.start(this)
     }
 

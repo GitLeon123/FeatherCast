@@ -117,18 +117,6 @@ std::optional<DefaultOutputState> ReadDefaultOutputState() {
       muted != FALSE, DeviceFriendlyName(endpoint->device.Get())};
 }
 
-std::optional<int> ReadDefaultOutputVolumePercent() {
-  const auto endpoint = DefaultOutputEndpointInfo();
-  if (!endpoint) return std::nullopt;
-
-  float scalar = 0.0f;
-  if (FAILED(endpoint->volume->GetMasterVolumeLevelScalar(&scalar))) {
-    ResetCachedEndpoint();
-    return std::nullopt;
-  }
-  return ClampPercent(static_cast<int>(std::lround(scalar * 100.0f)));
-}
-
 bool SetDefaultOutputVolumePercent(int percent) {
   const auto endpoint = DefaultOutputEndpointInfo();
   if (!endpoint) return false;

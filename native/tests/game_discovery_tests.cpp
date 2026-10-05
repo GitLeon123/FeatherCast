@@ -1,14 +1,10 @@
-#ifdef NDEBUG
-#undef NDEBUG
-#endif
-
 #include "game_discovery.hpp"
 #include "search_pipeline.hpp"
+#include "test_framework.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
-#include <cassert>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -231,6 +227,18 @@ int main() {
   assert(feathercast::games::DiscoverFromSources(sources, {xboxShell},
                                                   stopped.get_token())
              .empty());
+
+  // An oversized product.db is skipped instead of being read into memory.
+  auto oversizedProducts = database;
+  oversizedProducts.resize(9 * 1024 * 1024, 0);
+  auto oversizedSources = sources;
+  oversizedSources.battleNetProductDb =
+      root / L"Battle.net" / L"Agent" / L"product-large.db";
+  WriteBytes(oversizedSources.battleNetProductDb, oversizedProducts);
+  const auto withoutOversized =
+      feathercast::games::DiscoverFromSources(oversizedSources, {xboxShell});
+  assert(!FindProvider(withoutOversized, L"Battle.net", L"Diablo III"));
+  assert(withoutOversized.size() == games.size() - 1);
 
   auto snapshot = std::make_shared<feathercast::app::SearchSnapshot>();
   feathercast::app::DisplayItem gameItem;

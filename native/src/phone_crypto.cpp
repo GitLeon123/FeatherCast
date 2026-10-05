@@ -1,5 +1,7 @@
 #include "phone_crypto.hpp"
 
+#include "dpapi_scope.hpp"
+
 #include <windows.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
@@ -160,7 +162,11 @@ std::optional<Bytes> AesGcm(bool encrypt, const Bytes& key, const Bytes& nonce,
   info.pbTag = tag.data();
   info.cbTag = static_cast<ULONG>(tag.size());
 
-  Bytes output(dataSize);
+  Bytes output;
+  // The tag is appended below; reserve it now instead of reallocating and
+  // copying the entire ciphertext for every encrypted transfer chunk.
+  output.reserve(dataSize + (encrypt ? kTagBytes : 0));
+  output.resize(dataSize);
   ULONG written = 0;
   // BCrypt rejects null buffers for empty payloads, so give it a dummy byte.
   std::uint8_t dummy = 0;
@@ -297,12 +303,8 @@ std::optional<Bytes> Protect(const Bytes& plaintext) {
   const DWORD flags = CRYPTPROTECT_UI_FORBIDDEN;
   if (!CryptProtectData(&input, L"FeatherCast phone link", nullptr, nullptr,
                         nullptr, flags, &output)) {
-    // Mirrors storage.hpp: isolated CTest accounts have no user master key.
-    wchar_t testFallback[2]{};
-    const bool testFallbackEnabled =
-        GetEnvironmentVariableW(L"FEATHERCAST_TEST_DPAPI_FALLBACK", testFallback,
-                                static_cast<DWORD>(std::size(testFallback))) > 0;
-    if (!testFallbackEnabled ||
+    // Mirrors storage.hpp: isolated test accounts have no user master key.
+    if (!feathercast::dpapi::MachineScopeFallbackAllowed() ||
         !CryptProtectData(&input, L"FeatherCast phone link", nullptr, nullptr,
                           nullptr, flags | CRYPTPROTECT_LOCAL_MACHINE,
                           &output)) {

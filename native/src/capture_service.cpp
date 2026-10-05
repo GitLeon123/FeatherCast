@@ -42,7 +42,6 @@ using winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
 
 constexpr std::uint32_t kFramesPerSecond = 30;
-constexpr std::uint64_t kHundredNanosecondsPerSecond = 10'000'000;
 
 struct ComApartment {
   ComApartment()
@@ -119,6 +118,61 @@ OutputPaths NextOutputPaths(CaptureOperation operation) {
   }
 }
 
+// Clipboard managers and remote-desktop clients routinely hold the clipboard
+// for a few milliseconds. Retry briefly instead of failing the copy outright.
+bool OpenClipboardWithRetry() {
+  constexpr int kAttempts = 8;
+  for (int attempt = 0;; ++attempt) {
+    if (OpenClipboard(nullptr)) return true;
+    if (attempt + 1 >= kAttempts) return false;
+    Sleep(attempt < 3 ? 5 : 25);
+  }
+}
+
+std::int64_t QpcNow() noexcept {
+  LARGE_INTEGER value{};
+  QueryPerformanceCounter(&value);
+  return value.QuadPart;
+}
+
+std::int64_t QpcFrequency() noexcept {
+  LARGE_INTEGER value{};
+  QueryPerformanceFrequency(&value);
+  return value.QuadPart;
+}
+
+// Physical pixels per DIP of the most scaled monitor under `bounds`, so
+// redaction effects keep their strength relative to on-screen text.
+float CapturePixelScale(PixelRect bounds) {
+  using GetDpiForMonitorProc = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+  HMODULE shcore = GetModuleHandleW(L"shcore.dll");
+  bool loaded = false;
+  if (!shcore) {
+    shcore = LoadLibraryExW(L"shcore.dll", nullptr,
+                            LOAD_LIBRARY_SEARCH_SYSTEM32);
+    loaded = shcore != nullptr;
+  }
+  const auto getDpiForMonitor =
+      shcore ? reinterpret_cast<GetDpiForMonitorProc>(
+                   GetProcAddress(shcore, "GetDpiForMonitor"))
+             : nullptr;
+  float scale = 1.0f;
+  if (getDpiForMonitor) {
+    for (const auto& slice : GetMonitorSlices(bounds)) {
+      UINT dpiX = 0;
+      UINT dpiY = 0;
+      constexpr int kEffectiveDpi = 0;  // MDT_EFFECTIVE_DPI
+      if (SUCCEEDED(getDpiForMonitor(slice.monitor, kEffectiveDpi, &dpiX,
+                                     &dpiY)) &&
+          dpiX > 0) {
+        scale = std::max(scale, static_cast<float>(dpiX) / 96.0f);
+      }
+    }
+  }
+  if (loaded) FreeLibrary(shcore);
+  return scale;
+}
+
 bool PublishClipboard(const std::vector<std::uint8_t>& pixels, int width,
                       int height) {
   const std::size_t pixelBytes =
@@ -149,7 +203,7 @@ bool PublishClipboard(const std::vector<std::uint8_t>& pixels, int width,
   std::memcpy(data + sizeof(header), pixels.data(), pixelBytes);
   GlobalUnlock(memory);
 
-  if (!OpenClipboard(nullptr)) {
+  if (!OpenClipboardWithRetry()) {
     GlobalFree(memory);
     return false;
   }
@@ -254,11 +308,13 @@ SinkWriter CreateSinkWriter(const std::filesystem::path& path,
                             std::uint32_t width, std::uint32_t height,
                             bool hardware) {
   ComPtr<IMFAttributes> attributes;
-  winrt::check_hresult(MFCreateAttributes(attributes.GetAddressOf(), 2));
+  winrt::check_hresult(MFCreateAttributes(attributes.GetAddressOf(), 1));
   winrt::check_hresult(attributes->SetUINT32(
       MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware));
-  winrt::check_hresult(
-      attributes->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE));
+  // Throttling stays enabled: WriteSample blocks while the encoder is behind,
+  // which bounds the sink writer's sample queue. The capture loop then skips
+  // the frame slots it missed, so a slow encoder drops frames instead of
+  // queueing uncompressed frames without limit.
 
   SinkWriter sink;
   winrt::check_hresult(MFCreateSinkWriterFromURL(
@@ -308,7 +364,7 @@ SinkWriter CreateSinkWriter(const std::filesystem::path& path,
 void WriteVideoFrame(SinkWriter& sink,
                      const std::vector<std::uint8_t>& topDownPixels,
                      std::uint32_t width, std::uint32_t height,
-                     std::uint64_t frameNumber) {
+                     LONGLONG sampleTime, LONGLONG sampleDuration) {
   const DWORD stride = width * 4;
   const DWORD byteCount = stride * height;
   ComPtr<IMFMediaBuffer> buffer;
@@ -323,12 +379,8 @@ void WriteVideoFrame(SinkWriter& sink,
   ComPtr<IMFSample> sample;
   winrt::check_hresult(MFCreateSample(sample.GetAddressOf()));
   winrt::check_hresult(sample->AddBuffer(buffer.Get()));
-  const LONGLONG start = static_cast<LONGLONG>(
-      frameNumber * kHundredNanosecondsPerSecond / kFramesPerSecond);
-  const LONGLONG end = static_cast<LONGLONG>(
-      (frameNumber + 1) * kHundredNanosecondsPerSecond / kFramesPerSecond);
-  winrt::check_hresult(sample->SetSampleTime(start));
-  winrt::check_hresult(sample->SetSampleDuration(end - start));
+  winrt::check_hresult(sample->SetSampleTime(sampleTime));
+  winrt::check_hresult(sample->SetSampleDuration(sampleDuration));
   winrt::check_hresult(sink.writer->WriteSample(sink.stream, sample.Get()));
 }
 
@@ -603,13 +655,23 @@ bool ExcludeWindowFromCapture(HWND window) noexcept {
          affinity == WDA_EXCLUDEFROMCAPTURE;
 }
 
+// Locking: every state change happens under stateMutex_ (so condition waits
+// can never miss one), and a transition plus the event that announces it are
+// published together under the recursive eventMutex_ (so observers see
+// Started/Paused/Resumed/Stopping/Completed in transition order). Lock order
+// is eventMutex_ -> stateMutex_, eventMutex_ -> callbackMutex_, and
+// mutex_ -> stateMutex_. Workers never take mutex_, so joining a finished
+// worker while holding mutex_ cannot deadlock.
 class CaptureService::Impl {
  public:
-  explicit Impl(Callback callback) : callback_(std::move(callback)) {}
+  explicit Impl(Callback callback)
+      : callback_(std::move(callback)),
+        qpcFrequency_(QpcFrequency()),
+        clock_(qpcFrequency_) {}
   ~Impl() { Shutdown(); }
 
   void SetCallback(Callback callback) {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(callbackMutex_);
     callback_ = std::move(callback);
   }
 
@@ -646,28 +708,34 @@ class CaptureService::Impl {
     if (bounds.Width() < 2 || bounds.Height() < 2) return false;
     {
       std::lock_guard lock(mutex_);
-      if (state_ != CaptureState::ScreenshotEditing) return false;
-      const CaptureScope scope = scope_;
-      state_ = CaptureState::StartingScreenshot;
-      stopRequested_ = false;
-      worker_ = std::jthread(
-          [this, draft = std::move(draft), crop,
-           annotations = std::move(annotations), destination,
-           scope](std::stop_token token) mutable {
-            ScreenshotOutputWorker(std::move(draft), crop,
-                                   std::move(annotations), destination, scope,
-                                   token);
-          });
+      const auto context =
+          BeginOperation(CaptureState::ScreenshotEditing,
+                         CaptureState::StartingScreenshot, std::nullopt);
+      if (!context) return false;
+      const CaptureScope scope = context->scope;
+      try {
+        worker_ = std::jthread(
+            [this, draft = std::move(draft), crop,
+             annotations = std::move(annotations), destination,
+             scope](std::stop_token token) mutable {
+              ScreenshotOutputWorker(std::move(draft), crop,
+                                     std::move(annotations), destination,
+                                     scope, token);
+            });
+      } catch (...) {
+        SetState(CaptureState::ScreenshotEditing);
+        throw;
+      }
     }
     return true;
   }
 
   bool CancelScreenshot() {
-    CaptureState current = state_.load();
-    if (current == CaptureState::ScreenshotEditing) {
-      state_ = CaptureState::Idle;
+    std::lock_guard events(eventMutex_);
+    if (TryTransition(CaptureState::ScreenshotEditing, CaptureState::Idle)) {
       return true;
     }
+    const CaptureState current = state_.load();
     if (current == CaptureState::PreparingScreenshot ||
         current == CaptureState::StartingScreenshot) {
       return Stop();
@@ -689,40 +757,68 @@ class CaptureService::Impl {
   }
 
   bool Pause() {
-    CaptureState expected = CaptureState::Recording;
-    if (!state_.compare_exchange_strong(expected, CaptureState::Paused)) {
-      return false;
+    std::lock_guard events(eventMutex_);
+    Context context;
+    {
+      std::lock_guard lock(stateMutex_);
+      if (state_.load() != CaptureState::Recording) return false;
+      clock_.Pause(QpcNow());
+      state_ = CaptureState::Paused;
+      context = context_;
     }
-    Emit({CaptureEventKind::Paused, CaptureOperation::Recording, scope_,
-          bounds_, {}, {}, Elapsed(), false});
     wake_.notify_all();
+    Emit({CaptureEventKind::Paused, CaptureOperation::Recording,
+          context.scope, context.bounds, {}, {}, Elapsed(), false});
     return true;
   }
 
   bool Resume() {
-    CaptureState expected = CaptureState::Paused;
-    if (!state_.compare_exchange_strong(expected, CaptureState::Recording)) {
-      return false;
+    std::lock_guard events(eventMutex_);
+    Context context;
+    {
+      std::lock_guard lock(stateMutex_);
+      if (state_.load() != CaptureState::Paused) return false;
+      clock_.Resume(QpcNow());
+      state_ = CaptureState::Recording;
+      context = context_;
     }
-    Emit({CaptureEventKind::Resumed, CaptureOperation::Recording, scope_,
-          bounds_, {}, {}, Elapsed(), false});
     wake_.notify_all();
+    Emit({CaptureEventKind::Resumed, CaptureOperation::Recording,
+          context.scope, context.bounds, {}, {}, Elapsed(), false});
     return true;
   }
 
   bool Stop() {
-    CaptureState current = state_.load();
-    while (current != CaptureState::Idle &&
-           current != CaptureState::Stopping) {
-      if (state_.compare_exchange_weak(current, CaptureState::Stopping)) {
+    std::lock_guard events(eventMutex_);
+    CaptureState previous = CaptureState::Idle;
+    Context context;
+    {
+      std::lock_guard lock(stateMutex_);
+      previous = state_.load();
+      if (previous == CaptureState::Idle ||
+          previous == CaptureState::Stopping) {
+        return false;
+      }
+      context = context_;
+      // Freeze the reported duration at the moment the stop was requested.
+      clock_.Pause(QpcNow());
+      if (previous == CaptureState::ScreenshotEditing) {
+        // No worker owns a screenshot that is waiting in the editor, so
+        // nothing would ever complete a Stopping state. Cancel it here.
+        state_ = CaptureState::Idle;
+      } else {
         stopRequested_ = true;
-        Emit({CaptureEventKind::Stopping, operation_, scope_, bounds_, {}, {},
-              Elapsed(), false});
-        wake_.notify_all();
-        return true;
+        state_ = CaptureState::Stopping;
       }
     }
-    return false;
+    wake_.notify_all();
+    Emit({CaptureEventKind::Stopping, context.operation, context.scope,
+          context.bounds, {}, {}, Elapsed(), false});
+    if (previous == CaptureState::ScreenshotEditing) {
+      Emit({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+            context.scope, context.bounds, {}, L"Screenshot canceled."});
+    }
+    return true;
   }
 
   void Shutdown() {
@@ -734,18 +830,64 @@ class CaptureService::Impl {
     }
     if (worker.joinable()) {
       worker.request_stop();
+      {
+        // Pair the stop request with the wait mutex so a waiter that just
+        // evaluated its predicate cannot miss the notification.
+        std::lock_guard lock(stateMutex_);
+      }
       wake_.notify_all();
       worker.join();
     }
-    state_ = CaptureState::Idle;
+    SetState(CaptureState::Idle);
   }
 
   CaptureState State() const noexcept { return state_.load(); }
 
  private:
-  std::chrono::milliseconds Elapsed() const noexcept {
+  struct Context {
+    CaptureOperation operation = CaptureOperation::Screenshot;
+    CaptureScope scope = CaptureScope::Region;
+    PixelRect bounds;
+  };
+
+  std::chrono::milliseconds Elapsed() {
+    std::lock_guard lock(stateMutex_);
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-        RecordingTimestamp(encodedFrames_));
+        clock_.Elapsed(QpcNow()));
+  }
+
+  void SetState(CaptureState next) {
+    {
+      std::lock_guard lock(stateMutex_);
+      state_ = next;
+    }
+    wake_.notify_all();
+  }
+
+  // Compare-and-set under the wait mutex, so waiters never miss the change.
+  bool TryTransition(CaptureState expected, CaptureState next) {
+    {
+      std::lock_guard lock(stateMutex_);
+      if (state_.load() != expected) return false;
+      state_ = next;
+    }
+    wake_.notify_all();
+    return true;
+  }
+
+  // Claims the service for a new operation in one atomic step. The stop flag
+  // and the operation context are reset before the new state is visible, so
+  // a Stop() that races with the start is never lost or overwritten.
+  std::optional<Context> BeginOperation(CaptureState expected,
+                                        CaptureState next,
+                                        std::optional<Context> context) {
+    std::lock_guard lock(stateMutex_);
+    if (state_.load() != expected) return std::nullopt;
+    if (context) context_ = *context;
+    if (expected == CaptureState::Idle) clock_ = RecordingClock(qpcFrequency_);
+    stopRequested_ = false;
+    state_ = next;
+    return context_;
   }
 
   template <typename Work>
@@ -764,23 +906,27 @@ class CaptureService::Impl {
     if (finished.joinable()) finished.join();
     {
       std::lock_guard lock(mutex_);
-      if (state_ != CaptureState::Idle) return false;
-      stopRequested_ = false;
-      encodedFrames_ = 0;
-      operation_ = operation;
-      scope_ = scope;
-      bounds_ = bounds;
-      state_ = startingState;
-      worker_ = std::jthread(std::move(work));
+      if (!BeginOperation(CaptureState::Idle, startingState,
+                          Context{operation, scope, bounds})) {
+        return false;
+      }
+      try {
+        worker_ = std::jthread(std::move(work));
+      } catch (...) {
+        SetState(CaptureState::Idle);
+        throw;
+      }
     }
     return true;
   }
 
   void Emit(CaptureEvent event) noexcept {
     Callback callback;
-    {
-      std::lock_guard lock(mutex_);
+    try {
+      std::lock_guard lock(callbackMutex_);
       callback = callback_;
+    } catch (...) {
+      return;
     }
     if (callback) {
       try {
@@ -791,24 +937,49 @@ class CaptureService::Impl {
   }
 
   void Complete(CaptureEvent event) {
-    state_ = CaptureState::Idle;
+    std::lock_guard events(eventMutex_);
+    SetState(CaptureState::Idle);
     Emit(std::move(event));
+  }
+
+  // Hands a failed screenshot output back to the editor, unless a stop was
+  // requested meanwhile; then the operation completes as canceled.
+  void ReturnToEditor(CaptureEvent event) {
+    {
+      std::lock_guard events(eventMutex_);
+      if (TryTransition(CaptureState::StartingScreenshot,
+                        CaptureState::ScreenshotEditing)) {
+        Emit(std::move(event));
+        return;
+      }
+    }
+    Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+              event.scope, event.bounds, {}, L"Screenshot canceled."});
   }
 
   void Fail(CaptureOperation operation, CaptureScope scope, PixelRect bounds,
             const std::filesystem::path& path = {}) {
     const std::wstring message = CurrentExceptionMessage();
-    state_ = CaptureState::Idle;
+    const auto elapsed = Elapsed();
+    std::lock_guard events(eventMutex_);
+    SetState(CaptureState::Idle);
     Emit({CaptureEventKind::Failed, operation, scope, bounds, path, message,
-          Elapsed(), false});
+          elapsed, false});
   }
 
   void PrepareScreenshotWorker(PixelRect sourceBounds, CaptureScope scope,
                                std::stop_token token) {
     try {
       ComApartment apartment;
-      Emit({CaptureEventKind::Started, CaptureOperation::Screenshot, scope,
-            sourceBounds});
+      {
+        // Never announce Started after a racing Stop() already announced
+        // Stopping.
+        std::lock_guard events(eventMutex_);
+        if (state_.load() == CaptureState::PreparingScreenshot) {
+          Emit({CaptureEventKind::Started, CaptureOperation::Screenshot,
+                scope, sourceBounds});
+        }
+      }
       if (token.stop_requested() || stopRequested_) {
         Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
                   scope, sourceBounds, {}, L"Screenshot canceled."});
@@ -836,11 +1007,22 @@ class CaptureService::Impl {
       draft->width = static_cast<std::uint32_t>(sourceBounds.Width());
       draft->height = static_cast<std::uint32_t>(sourceBounds.Height());
       draft->stride = draft->width * 4u;
+      draft->pixelScale = CapturePixelScale(sourceBounds);
       draft->pixels = std::make_shared<const std::vector<std::uint8_t>>(
           std::move(pixels));
-      state_ = CaptureState::ScreenshotEditing;
-      Emit({CaptureEventKind::ScreenshotReady, CaptureOperation::Screenshot,
-            scope, sourceBounds, {}, {}, {}, false, std::move(draft)});
+      {
+        std::lock_guard events(eventMutex_);
+        if (TryTransition(CaptureState::PreparingScreenshot,
+                          CaptureState::ScreenshotEditing)) {
+          Emit({CaptureEventKind::ScreenshotReady,
+                CaptureOperation::Screenshot, scope, sourceBounds, {}, {}, {},
+                false, std::move(draft)});
+          return;
+        }
+      }
+      // Stop() won the race while the desktop was being copied.
+      Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
+                scope, sourceBounds, {}, L"Screenshot canceled."});
     } catch (...) {
       Fail(CaptureOperation::Screenshot, scope, sourceBounds);
     }
@@ -864,11 +1046,10 @@ class CaptureService::Impl {
       const auto rendered = screenshot::Render(*draft, crop, annotations,
                                                &renderError);
       if (!rendered) {
-        state_ = CaptureState::ScreenshotEditing;
-        Emit({CaptureEventKind::ScreenshotOutputFailed,
-              CaptureOperation::Screenshot, scope,
-              {crop.left, crop.top, crop.right, crop.bottom}, {}, renderError,
-              {}, false, std::move(draft)});
+        ReturnToEditor({CaptureEventKind::ScreenshotOutputFailed,
+                        CaptureOperation::Screenshot, scope,
+                        {crop.left, crop.top, crop.right, crop.bottom}, {},
+                        renderError, {}, false, std::move(draft)});
         return;
       }
 
@@ -907,11 +1088,10 @@ class CaptureService::Impl {
                   L"Screenshot canceled."});
         return;
       }
-      state_ = CaptureState::ScreenshotEditing;
-      Emit({CaptureEventKind::ScreenshotOutputFailed,
-            CaptureOperation::Screenshot, scope,
-            {crop.left, crop.top, crop.right, crop.bottom}, temporary,
-            CurrentExceptionMessage(), {}, false, std::move(draft)});
+      ReturnToEditor({CaptureEventKind::ScreenshotOutputFailed,
+                      CaptureOperation::Screenshot, scope,
+                      {crop.left, crop.top, crop.right, crop.bottom}, temporary,
+                      CurrentExceptionMessage(), {}, false, std::move(draft)});
     }
   }
 
@@ -986,8 +1166,24 @@ class CaptureService::Impl {
         sink =
             CreateSinkWriter(partialPath, outputWidth, outputHeight, false);
       }
-      CaptureState expected = CaptureState::StartingRecording;
-      if (!state_.compare_exchange_strong(expected, CaptureState::Recording)) {
+      bool started = false;
+      {
+        std::lock_guard events(eventMutex_);
+        {
+          std::lock_guard lock(stateMutex_);
+          if (state_.load() == CaptureState::StartingRecording) {
+            clock_.Start(QpcNow());
+            state_ = CaptureState::Recording;
+            started = true;
+          }
+        }
+        if (started) {
+          keepPartial = true;
+          Emit({CaptureEventKind::Started, CaptureOperation::Recording, scope,
+                bounds, partialPath});
+        }
+      }
+      if (!started) {
         sink.writer->Finalize();
         sink.writer.Reset();
         std::error_code ignored;
@@ -997,17 +1193,17 @@ class CaptureService::Impl {
                   scope, bounds, {}, L"Recording canceled."});
         return;
       }
-      keepPartial = true;
-      Emit({CaptureEventKind::Started, CaptureOperation::Recording, scope,
-            bounds, partialPath});
 
       std::vector<std::uint8_t> composed;
+      const auto frameInterval = RecordingTimestamp(1);
+      const LONGLONG frameDuration =
+          static_cast<LONGLONG>(frameInterval.count() / 100);
       auto nextFrame = std::chrono::steady_clock::now();
       bool finalizeAttempted = false;
       try {
         while (!stopRequested_ && !token.stop_requested()) {
           if (state_ == CaptureState::Paused) {
-            std::unique_lock lock(waitMutex_);
+            std::unique_lock lock(stateMutex_);
             wake_.wait(lock, [&] {
               return stopRequested_.load() || token.stop_requested() ||
                      state_.load() != CaptureState::Paused;
@@ -1019,19 +1215,28 @@ class CaptureService::Impl {
             DrainLatestFrame(source, d3dDevice.Get(), d3dContext.Get());
           }
           ComposeFrame(sources, bounds, outputWidth, outputHeight, composed);
-          const std::uint64_t frameNumber = encodedFrames_.load();
+          LONGLONG sampleTime = 0;
+          {
+            std::lock_guard lock(stateMutex_);
+            sampleTime = clock_.SampleTime(QpcNow());
+          }
           WriteVideoFrame(sink, composed, outputWidth, outputHeight,
-                          frameNumber);
-          encodedFrames_ = frameNumber + 1;
-          nextFrame += std::chrono::nanoseconds(
-              1'000'000'000ll / kFramesPerSecond);
-          std::unique_lock lock(waitMutex_);
+                          sampleTime, frameDuration);
+          // Pace to the next frame slot. When encoding fell behind, skip the
+          // missed slots instead of bursting frames to catch up; sample times
+          // come from the capture clock, so playback speed stays correct.
+          nextFrame += frameInterval;
+          const auto now = std::chrono::steady_clock::now();
+          if (nextFrame <= now) {
+            nextFrame += ((now - nextFrame) / frameInterval + 1) * frameInterval;
+          }
+          std::unique_lock lock(stateMutex_);
           wake_.wait_until(lock, nextFrame, [&] {
             return stopRequested_.load() || token.stop_requested() ||
                    state_.load() == CaptureState::Paused;
           });
         }
-        state_ = CaptureState::Stopping;
+        SetState(CaptureState::Stopping);
         finalizeAttempted = true;
         winrt::check_hresult(sink.writer->Finalize());
       } catch (...) {
@@ -1062,17 +1267,18 @@ class CaptureService::Impl {
     }
   }
 
-  mutable std::mutex mutex_;
-  std::mutex waitMutex_;
+  std::mutex mutex_;  // guards worker_
+  std::mutex callbackMutex_;
+  std::recursive_mutex eventMutex_;
+  std::mutex stateMutex_;  // guards state_ writes, context_, and clock_
   std::condition_variable wake_;
   Callback callback_;
   std::jthread worker_;
   std::atomic<CaptureState> state_ = CaptureState::Idle;
   std::atomic<bool> stopRequested_ = false;
-  std::atomic<std::uint64_t> encodedFrames_ = 0;
-  CaptureOperation operation_ = CaptureOperation::Screenshot;
-  CaptureScope scope_ = CaptureScope::Region;
-  PixelRect bounds_;
+  std::int64_t qpcFrequency_ = 1;
+  RecordingClock clock_;
+  Context context_;
 };
 
 CaptureService::CaptureService(Callback callback)

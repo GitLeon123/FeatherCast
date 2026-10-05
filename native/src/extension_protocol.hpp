@@ -1,9 +1,12 @@
 ﻿#pragma once
 
+#include "json.hpp"
+
 #include <windows.h>
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cwctype>
 #include <cstdlib>
@@ -211,10 +214,6 @@ inline std::optional<std::string> JsonBalancedSlice(const std::string& json, con
   return std::nullopt;
 }
 
-inline std::optional<std::string> JsonObjectSlice(const std::string& json, const std::string& key) {
-  return JsonBalancedSlice(json, key, '{', '}');
-}
-
 inline std::optional<std::string> JsonArraySlice(const std::string& json, const std::string& key) {
   return JsonBalancedSlice(json, key, '[', ']');
 }
@@ -251,39 +250,6 @@ inline std::vector<std::string> JsonObjectArray(const std::string& json, const s
           ++i;
           break;
         }
-      }
-    }
-  }
-  return out;
-}
-
-inline std::vector<std::wstring> JsonStringArray(const std::string& json, const std::string& key) {
-  std::vector<std::wstring> out;
-  const auto array = JsonArraySlice(json, key);
-  if (!array) return out;
-
-  for (size_t i = 1; i + 1 < array->size();) {
-    if ((*array)[i] != '"') {
-      ++i;
-      continue;
-    }
-    ++i;
-    std::string raw;
-    bool escaped = false;
-    for (; i < array->size(); ++i) {
-      const char ch = (*array)[i];
-      if (escaped) {
-        raw.push_back('\\');
-        raw.push_back(ch);
-        escaped = false;
-      } else if (ch == '\\') {
-        escaped = true;
-      } else if (ch == '"') {
-        out.push_back(Utf8ToWide(UnescapeJsonString(raw)));
-        ++i;
-        break;
-      } else {
-        raw.push_back(ch);
       }
     }
   }
@@ -444,31 +410,113 @@ struct QueryResponse {
   std::vector<QueryResultItem> items;
 };
 
-inline std::optional<QueryResponse> ParseQueryResponse(const std::string& json, size_t maxItems = kDefaultQueryLimit) {
-  if (!JsonArraySlice(json, "items")) return std::nullopt;
+// Compact JSON serialization of a parsed value. The output never contains a
+// raw line break, so it is safe inside the line-framed host protocol.
+inline void AppendJson(std::string& out, const json::Value& value) {
+  switch (value.type) {
+    case json::Value::Type::Null:
+      out += "null";
+      break;
+    case json::Value::Type::Bool:
+      out += value.boolean ? "true" : "false";
+      break;
+    case json::Value::Type::Number: {
+      char buffer[32]{};
+      const auto [end, error] =
+          std::to_chars(buffer, buffer + sizeof(buffer), value.number);
+      if (error == std::errc{} && std::isfinite(value.number)) {
+        out.append(buffer, end);
+      } else {
+        out += "null";
+      }
+      break;
+    }
+    case json::Value::Type::String:
+      out += QuoteUtf8(value.str);
+      break;
+    case json::Value::Type::Array:
+      out.push_back('[');
+      for (size_t index = 0; index < value.array.size(); ++index) {
+        if (index > 0) out.push_back(',');
+        AppendJson(out, value.array[index]);
+      }
+      out.push_back(']');
+      break;
+    case json::Value::Type::Object:
+      out.push_back('{');
+      for (size_t index = 0; index < value.object.size(); ++index) {
+        if (index > 0) out.push_back(',');
+        out += QuoteUtf8(value.object[index].key);
+        out.push_back(':');
+        AppendJson(out, value.object[index].value);
+      }
+      out.push_back('}');
+      break;
+  }
+}
+
+inline std::string SerializeJson(const json::Value& value) {
+  std::string out;
+  AppendJson(out, value);
+  return out;
+}
+
+// Member of `object` when it exists and has the requested type.
+inline const json::Value* JsonMember(const json::Value& object, std::string_view key,
+                                     json::Value::Type type) {
+  const json::Value* member = object.Find(key);
+  return member && member->type == type ? member : nullptr;
+}
+
+inline std::optional<std::wstring> JsonMemberWide(const json::Value& object, std::string_view key) {
+  const auto* member = JsonMember(object, key, json::Value::Type::String);
+  if (!member) return std::nullopt;
+  return Utf8ToWide(member->str);
+}
+
+// Responses are parsed as complete JSON documents: keys are only matched on
+// the object they belong to, never inside nested values or string contents.
+inline std::optional<QueryResponse> ParseQueryResponse(const json::Value& root,
+                                                       size_t maxItems = kDefaultQueryLimit) {
+  const auto* items = JsonMember(root, "items", json::Value::Type::Array);
+  if (!items) return std::nullopt;
   QueryResponse response;
-  for (const auto& object : JsonObjectArray(json, "items")) {
+  for (const auto& object : items->array) {
     if (response.items.size() >= maxItems) break;
-    const auto id = JsonString(object, "id");
-    const auto title = JsonString(object, "title");
+    if (object.type != json::Value::Type::Object) continue;
+    auto id = JsonMemberWide(object, "id");
+    auto title = JsonMemberWide(object, "title");
     if (!id || !title || id->empty() || title->empty()) continue;
 
     QueryResultItem item;
-    item.id = Utf8ToWide(*id);
-    item.title = Utf8ToWide(*title);
-    if (auto subtitle = JsonString(object, "subtitle")) item.subtitle = Utf8ToWide(*subtitle);
-    item.keywords = JsonStringArray(object, "keywords");
-    if (auto score = JsonNumber(object, "score")) item.score = *score;
-    if (auto iconPath = JsonString(object, "iconPath")) item.iconPath = Utf8ToWide(*iconPath);
-    if (const auto detail = JsonObjectSlice(object, "detail")) {
-      if (auto type = JsonString(*detail, "type")) item.detailType = Utf8ToWide(*type);
-      if (auto detailTitle = JsonString(*detail, "title")) item.detailTitle = Utf8ToWide(*detailTitle);
-      if (auto body = JsonString(*detail, "body")) item.detailBody = Utf8ToWide(*body);
+    item.id = std::move(*id);
+    item.title = std::move(*title);
+    if (auto subtitle = JsonMemberWide(object, "subtitle")) item.subtitle = std::move(*subtitle);
+    if (const auto* keywords = JsonMember(object, "keywords", json::Value::Type::Array)) {
+      for (const auto& keyword : keywords->array) {
+        if (keyword.type == json::Value::Type::String) item.keywords.push_back(Utf8ToWide(keyword.str));
+      }
     }
-    item.payloadJson = JsonObjectSlice(object, "payload").value_or("{}");
+    if (const auto* score = JsonMember(object, "score", json::Value::Type::Number)) item.score = score->number;
+    if (auto iconPath = JsonMemberWide(object, "iconPath")) item.iconPath = std::move(*iconPath);
+    if (const auto* detail = JsonMember(object, "detail", json::Value::Type::Object)) {
+      if (auto type = JsonMemberWide(*detail, "type")) item.detailType = std::move(*type);
+      if (auto detailTitle = JsonMemberWide(*detail, "title")) item.detailTitle = std::move(*detailTitle);
+      if (auto body = JsonMemberWide(*detail, "body")) item.detailBody = std::move(*body);
+    }
+    if (const auto* payload = JsonMember(object, "payload", json::Value::Type::Object)) {
+      item.payloadJson = SerializeJson(*payload);
+    }
     response.items.push_back(std::move(item));
   }
   return response;
+}
+
+inline std::optional<QueryResponse> ParseQueryResponse(const std::string& text,
+                                                       size_t maxItems = kDefaultQueryLimit) {
+  const auto root = json::Parse(text);
+  if (!root) return std::nullopt;
+  return ParseQueryResponse(*root, maxItems);
 }
 
 enum class HostActionType {
@@ -494,16 +542,28 @@ inline HostActionType HostActionTypeFromString(const std::string& value) {
   return HostActionType::None;
 }
 
-inline std::optional<ActivationResponse> ParseActivationResponse(const std::string& json) {
+inline std::optional<ActivationResponse> ParseActivationResponse(const json::Value& root) {
+  if (root.type != json::Value::Type::Object) return std::nullopt;
   ActivationResponse response;
-  response.handled = JsonBool(json, "handled", false);
-  response.closeOverlay = JsonBool(json, "closeOverlay", true);
-  if (const auto action = JsonObjectSlice(json, "action")) {
-    const auto type = JsonString(*action, "type").value_or("none");
-    response.action = HostActionTypeFromString(type);
-    if (auto value = JsonString(*action, "value")) response.value = Utf8ToWide(*value);
+  if (const auto* handled = JsonMember(root, "handled", json::Value::Type::Bool)) {
+    response.handled = handled->boolean;
+  }
+  if (const auto* closeOverlay = JsonMember(root, "closeOverlay", json::Value::Type::Bool)) {
+    response.closeOverlay = closeOverlay->boolean;
+  }
+  if (const auto* action = JsonMember(root, "action", json::Value::Type::Object)) {
+    if (const auto* type = JsonMember(*action, "type", json::Value::Type::String)) {
+      response.action = HostActionTypeFromString(type->str);
+    }
+    if (auto value = JsonMemberWide(*action, "value")) response.value = std::move(*value);
   }
   return response;
+}
+
+inline std::optional<ActivationResponse> ParseActivationResponse(const std::string& text) {
+  const auto root = json::Parse(text);
+  if (!root) return std::nullopt;
+  return ParseActivationResponse(*root);
 }
 
 inline std::string BuildQueryRequestJson(const Manifest& manifest, const std::filesystem::path& dataDir,
@@ -538,6 +598,51 @@ inline std::string BuildActivateRequestJson(const Manifest& manifest, const std:
 
 inline bool ResponseSizeAllowed(size_t requiredBytes) {
   return requiredBytes > 0 && requiredBytes <= kMaxResponseBytes;
+}
+
+// FeatherCastPluginHost exit codes for failures before the ready line.
+inline constexpr unsigned long kHostExitMissingArgument = 2;
+inline constexpr unsigned long kHostExitLoadFailed = 3;
+inline constexpr unsigned long kHostExitMissingExports = 4;
+inline constexpr unsigned long kHostExitUnsupportedApi = 5;
+inline constexpr unsigned long kHostExitChannelFailed = 6;
+
+// First line the plugin host writes, once the plugin DLL is loaded and its API
+// version is supported. The manager sends requests only after it arrives, so
+// startup failures surface as exit codes instead of request timeouts.
+inline std::string BuildHostReadyJson(uint32_t pluginApiVersion) {
+  return "{\"ready\":true,\"apiVersion\":" + std::to_string(pluginApiVersion) + "}";
+}
+
+inline bool IsHostReadyJson(const std::string& line) {
+  const auto root = json::Parse(line);
+  if (!root) return false;
+  const auto* ready = JsonMember(*root, "ready", json::Value::Type::Bool);
+  return ready && ready->boolean;
+}
+
+// The host protocol frames every response as exactly one line. JSON allows
+// line breaks only as whitespace between tokens, so those become spaces. A raw
+// line break inside a string is invalid JSON; such a response is rejected
+// instead of being split into several protocol lines.
+inline std::optional<std::string> FrameResponseLine(std::string response) {
+  bool inString = false;
+  bool escaped = false;
+  for (char& ch : response) {
+    if (ch == '\n' || ch == '\r') {
+      if (inString) return std::nullopt;
+      ch = ' ';
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch == '\\') escaped = true;
+      else if (ch == '"') inString = false;
+    } else if (ch == '"') {
+      inString = true;
+    }
+  }
+  return response;
 }
 
 }  // namespace feathercast::extensions

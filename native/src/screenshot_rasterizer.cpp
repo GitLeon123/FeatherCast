@@ -244,18 +244,38 @@ void DrawText(RenderedImage& image, const Annotation& annotation, Rect crop) {
   DeleteDC(dc);
 }
 
-void ApplyPixelate(RenderedImage& image, LocalRect rect) {
+// Effect strengths are defined in DIPs and converted with the draft's pixel
+// scale, so a 200% display gets twice the physical block size and radius.
+constexpr float kPixelateBlockDips = 8.0f;
+constexpr float kBlurRadiusDips = 3.0f;
+
+int EffectPixels(float dips, float pixelScale) {
+  const float scale =
+      std::isfinite(pixelScale) ? std::clamp(pixelScale, 1.0f, 4.0f) : 1.0f;
+  return std::max(1, static_cast<int>(std::lround(dips * scale)));
+}
+
+// End of the pixelate block that starts at `start`. A trailing remainder
+// smaller than a full block is merged into the current block: a 1-2 px
+// sliver at the right or bottom edge would otherwise keep almost original
+// pixels and leak the redacted content.
+int PixelateBlockEnd(int start, int limit, int blockSize) {
+  const int end = start + blockSize;
+  return limit - end < blockSize ? limit : end;
+}
+
+void ApplyPixelate(RenderedImage& image, LocalRect rect, int blockSize) {
   rect = Clip(rect, static_cast<int>(image.width),
               static_cast<int>(image.height));
-  constexpr int blockSize = 8;
-  for (int top = rect.top; top < rect.bottom; top += blockSize) {
-    for (int left = rect.left; left < rect.right; left += blockSize) {
-      const int right = std::min(rect.right, left + blockSize);
-      const int bottom = std::min(rect.bottom, top + blockSize);
+  if (rect.Empty()) return;
+  blockSize = std::max(2, blockSize);
+  for (int top = rect.top; top < rect.bottom;) {
+    const int bottom = PixelateBlockEnd(top, rect.bottom, blockSize);
+    for (int left = rect.left; left < rect.right;) {
+      const int right = PixelateBlockEnd(left, rect.right, blockSize);
       std::uint64_t blue = 0;
       std::uint64_t green = 0;
       std::uint64_t red = 0;
-      std::uint64_t count = 0;
       for (int y = top; y < bottom; ++y) {
         for (int x = left; x < right; ++x) {
           const auto* pixel = image.pixels.data() +
@@ -264,25 +284,59 @@ void ApplyPixelate(RenderedImage& image, LocalRect rect) {
           blue += pixel[0];
           green += pixel[1];
           red += pixel[2];
-          ++count;
         }
       }
-      if (!count) continue;
-      const Color average{static_cast<std::uint8_t>(red / count),
-                          static_cast<std::uint8_t>(green / count),
-                          static_cast<std::uint8_t>(blue / count), 255};
+      const std::uint64_t count = static_cast<std::uint64_t>(right - left) *
+                                  static_cast<std::uint64_t>(bottom - top);
+      const Color average{
+          static_cast<std::uint8_t>((red + count / 2) / count),
+          static_cast<std::uint8_t>((green + count / 2) / count),
+          static_cast<std::uint8_t>((blue + count / 2) / count), 255};
       for (int y = top; y < bottom; ++y) {
         for (int x = left; x < right; ++x) BlendPixel(image, x, y, average);
       }
+      left = right;
     }
+    top = bottom;
   }
 }
 
-void ApplyBlur(RenderedImage& image, LocalRect rect) {
+// One box-filter pass over `length` pixels spaced `step` bytes apart, with a
+// running sum so the cost does not grow with the (DPI-scaled) radius. The
+// window is clipped to the line, matching the region-local sampling of the
+// editor preview.
+void BoxBlurLine(const std::uint8_t* source, std::uint8_t* destination,
+                 std::size_t step, int length, int radius) {
+  std::uint32_t sums[4]{};
+  const auto add = [&](int index, bool remove) {
+    const auto* pixel = source + static_cast<std::size_t>(index) * step;
+    for (int channel = 0; channel < 4; ++channel) {
+      if (remove) sums[channel] -= pixel[channel];
+      else sums[channel] += pixel[channel];
+    }
+  };
+  for (int index = 0; index <= std::min(length - 1, radius); ++index) {
+    add(index, false);
+  }
+  for (int index = 0; index < length; ++index) {
+    const int low = std::max(0, index - radius);
+    const int high = std::min(length - 1, index + radius);
+    const auto count = static_cast<std::uint32_t>(high - low + 1);
+    auto* pixel = destination + static_cast<std::size_t>(index) * step;
+    for (int channel = 0; channel < 4; ++channel) {
+      pixel[channel] =
+          static_cast<std::uint8_t>((sums[channel] + count / 2) / count);
+    }
+    if (index - radius >= 0) add(index - radius, true);
+    if (index + radius + 1 < length) add(index + radius + 1, false);
+  }
+}
+
+void ApplyBlur(RenderedImage& image, LocalRect rect, int radius) {
   rect = Clip(rect, static_cast<int>(image.width),
               static_cast<int>(image.height));
   if (rect.Empty()) return;
-  constexpr int radius = 3;
+  radius = std::max(1, radius);
   const int width = rect.right - rect.left;
   const int height = rect.bottom - rect.top;
   std::vector<std::uint8_t> source(static_cast<std::size_t>(width) * height * 4);
@@ -294,43 +348,26 @@ void ApplyBlur(RenderedImage& image, LocalRect rect) {
                     static_cast<std::size_t>(rect.left) * 4,
                 static_cast<std::size_t>(width) * 4);
   }
+  const std::size_t rowBytes = static_cast<std::size_t>(width) * 4;
   for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      std::uint32_t sums[4]{};
-      std::uint32_t count = 0;
-      for (int sample = std::max(0, x - radius);
-           sample <= std::min(width - 1, x + radius); ++sample) {
-        const auto* pixel = source.data() +
-                            (static_cast<std::size_t>(y) * width + sample) * 4;
-        for (int channel = 0; channel < 4; ++channel) sums[channel] += pixel[channel];
-        ++count;
-      }
-      auto* pixel = horizontal.data() +
-                    (static_cast<std::size_t>(y) * width + x) * 4;
-      for (int channel = 0; channel < 4; ++channel) {
-        pixel[channel] = static_cast<std::uint8_t>(sums[channel] / count);
-      }
-    }
+    BoxBlurLine(source.data() + static_cast<std::size_t>(y) * rowBytes,
+                horizontal.data() + static_cast<std::size_t>(y) * rowBytes, 4,
+                width, radius);
+  }
+  // The vertical pass writes back into `source`, which is no longer needed.
+  for (int x = 0; x < width; ++x) {
+    BoxBlurLine(horizontal.data() + static_cast<std::size_t>(x) * 4,
+                source.data() + static_cast<std::size_t>(x) * 4, rowBytes,
+                height, radius);
   }
   for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      std::uint32_t sums[4]{};
-      std::uint32_t count = 0;
-      for (int sample = std::max(0, y - radius);
-           sample <= std::min(height - 1, y + radius); ++sample) {
-        const auto* pixel = horizontal.data() +
-                            (static_cast<std::size_t>(sample) * width + x) * 4;
-        for (int channel = 0; channel < 4; ++channel) sums[channel] += pixel[channel];
-        ++count;
-      }
-      auto* destination = image.pixels.data() +
-                          static_cast<std::size_t>(rect.top + y) * image.stride +
-                          static_cast<std::size_t>(rect.left + x) * 4;
-      for (int channel = 0; channel < 4; ++channel) {
-        destination[channel] = static_cast<std::uint8_t>(sums[channel] / count);
-      }
-      destination[3] = 255;
-    }
+    auto* destination = image.pixels.data() +
+                        static_cast<std::size_t>(rect.top + y) * image.stride +
+                        static_cast<std::size_t>(rect.left) * 4;
+    std::memcpy(destination,
+                source.data() + static_cast<std::size_t>(y) * rowBytes,
+                rowBytes);
+    for (int x = 0; x < width; ++x) destination[x * 4 + 3] = 255;
   }
 }
 
@@ -415,10 +452,12 @@ std::optional<RenderedImage> Render(const Draft& draft, Rect crop,
     for (const auto& annotation : annotations) {
       switch (annotation.tool) {
         case Tool::Blur:
-          ApplyBlur(result, ToLocal(annotation.bounds, crop));
+          ApplyBlur(result, ToLocal(annotation.bounds, crop),
+                    EffectPixels(kBlurRadiusDips, draft.pixelScale));
           break;
         case Tool::Pixelate:
-          ApplyPixelate(result, ToLocal(annotation.bounds, crop));
+          ApplyPixelate(result, ToLocal(annotation.bounds, crop),
+                        EffectPixels(kPixelateBlockDips, draft.pixelScale));
           break;
         case Tool::Rectangle:
           DrawRectangle(result, ToLocal(annotation.bounds, crop),

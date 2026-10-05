@@ -5,6 +5,7 @@
 // the call sites in main.cpp next to the MIN/MAX constants.
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -145,6 +146,9 @@ struct Settings {
     long long lastUsed = 0;
   };
   std::map<std::wstring, UsageStat> usageStats;
+  bool searchLearningEnabled = false;
+  // Optional local preferences for app/command queries only, capped at 256.
+  std::map<std::wstring, std::wstring> learnedQueryActions;
   bool compactMode = false;
   bool autoFitResultHeight = true;
   AnimationLevel animationLevel = AnimationLevel::Full;
@@ -187,6 +191,9 @@ struct Settings {
   std::map<std::wstring, std::wstring> searchEngines =
       DefaultSearchEngines();
   std::vector<Quicklink> quicklinks;
+  std::vector<Quicklink> scripts;
+  std::vector<Quicklink> workspaces;
+  std::map<std::wstring, std::wstring> commandShortcuts;
 
   PrivacySettings Privacy() const {
     return {
@@ -311,20 +318,17 @@ inline void ReadBool(const Value& root, std::string_view key, bool& out) {
 
 inline void ReadInt(const Value& root, std::string_view key, int& out) {
   if (const Value* value = root.Find(key); value && value->type == Value::Type::Number) {
-    if (std::isfinite(value->number) &&
-        value->number >= static_cast<double>(std::numeric_limits<int>::min()) &&
-        value->number <= static_cast<double>(std::numeric_limits<int>::max())) {
-      out = static_cast<int>(value->number);
+    if (const auto parsed = feathercast::json::ToInteger<int>(value->number)) {
+      out = *parsed;
     }
   }
 }
 
+// Out-of-range values, including exactly 2^63, keep the default.
 inline void ReadLongLong(const Value& root, std::string_view key, long long& out) {
   if (const Value* value = root.Find(key); value && value->type == Value::Type::Number) {
-    if (std::isfinite(value->number) &&
-        value->number >= static_cast<double>(std::numeric_limits<long long>::min()) &&
-        value->number <= static_cast<double>(std::numeric_limits<long long>::max())) {
-      out = static_cast<long long>(value->number);
+    if (const auto parsed = feathercast::json::ToInteger<long long>(value->number)) {
+      out = *parsed;
     }
   }
 }
@@ -393,6 +397,16 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   settings.commandAliases = ReadCommandAliases(*root, "commandAliases");
   settings.pinnedItems = ReadStringArray(*root, "pinnedItems");
   settings.recentItems = ReadStringArray(*root, "recentItems");
+  ReadBool(*root, "searchLearningEnabled", settings.searchLearningEnabled);
+  settings.learnedQueryActions = ReadStringObject(*root, "learnedQueryActions");
+  std::erase_if(settings.learnedQueryActions, [](const auto& entry) {
+    return entry.first.empty() || entry.first.size() > 64 || entry.first.find_first_of(L"\r\n") != std::wstring::npos ||
+        entry.first.front() == L'@' || entry.first.front() == L'>' || entry.first.front() == L':' || entry.second.size() > 2048;
+  });
+  if (!settings.searchLearningEnabled) settings.learnedQueryActions.clear();
+  while (settings.learnedQueryActions.size() > 256) {
+    settings.learnedQueryActions.erase(settings.learnedQueryActions.begin());
+  }
   if (const Value* stats = root->Find("usageStats"); stats && stats->type == Value::Type::Object) {
     for (const auto& member : stats->object) {
       if (member.value.type != Value::Type::Object) continue;
@@ -459,6 +473,21 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
       if (!link.keyword.empty() && !link.target.empty()) settings.quicklinks.push_back(std::move(link));
     }
   }
+  for (const auto& [key, destination] :
+       std::array<std::pair<const char*, std::vector<Quicklink>*>, 2>{{
+           {"scripts", &settings.scripts}, {"workspaces", &settings.workspaces}}}) {
+    if (const Value* items = root->Find(key); items && items->type == Value::Type::Array) {
+      for (const auto& element : items->array) {
+        if (element.type != Value::Type::Object || destination->size() >= 256) continue;
+        Quicklink item;
+        ReadString(element, "keyword", item.keyword);
+        ReadString(element, "name", item.name);
+        ReadString(element, "target", item.target);
+        if (!item.keyword.empty() && !item.target.empty()) destination->push_back(std::move(item));
+      }
+    }
+  }
+  settings.commandShortcuts = ReadStringObject(*root, "commandShortcuts");
   return settings;
 }
 
@@ -559,6 +588,11 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"recentItems\": ";
   detail::WriteStringArray(out, settings.recentItems);
   out << ",\n";
+  out << "  \"searchLearningEnabled\": "
+      << (settings.searchLearningEnabled ? "true" : "false") << ",\n";
+  out << "  \"learnedQueryActions\": ";
+  detail::WriteStringObject(out, settings.learnedQueryActions);
+  out << ",\n";
   out << "  \"usageStats\": {";
   {
     bool first = true;
@@ -627,7 +661,23 @@ inline std::string SerializeSettings(const Settings& settings) {
           << JsonEscape(link.name) << "\", \"target\": \"" << JsonEscape(link.target) << "\"}";
     }
   }
-  out << "]\n";
+  out << "],\n";
+  for (const auto& [key, items] :
+       std::array<std::pair<const char*, const std::vector<Quicklink>*>, 2>{{
+           {"scripts", &settings.scripts}, {"workspaces", &settings.workspaces}}}) {
+    out << "  \"" << key << "\": [";
+    bool first = true;
+    for (const auto& item : *items) {
+      if (!first) out << ", ";
+      first = false;
+      out << "{\"keyword\": \"" << JsonEscape(item.keyword) << "\", \"name\": \""
+          << JsonEscape(item.name) << "\", \"target\": \"" << JsonEscape(item.target) << "\"}";
+    }
+    out << "],\n";
+  }
+  out << "  \"commandShortcuts\": ";
+  detail::WriteStringObject(out, settings.commandShortcuts);
+  out << "\n";
   out << "}\n";
   return out.str();
 }

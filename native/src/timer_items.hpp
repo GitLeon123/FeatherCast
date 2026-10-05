@@ -12,16 +12,23 @@ inline app::DisplayItem Item(Request request, std::wstring title, std::wstring d
   return item;
 }
 
+// The browse view filters on commandKeywords: the label first, then its state.
+// The ticking countdown in the title is left out, otherwise a digit such as
+// "1" would keep whichever timers happen to show it right now.
 inline std::vector<app::DisplayItem> Items(const State& state, long long now, unsigned long long ticks) {
   std::vector<app::DisplayItem> items;
   for (const auto& timer : state.timers) {
     const std::wstring status = timer.phase == Phase::Finished ? L"Finished" :
         timer.phase == Phase::Paused ? L"Paused" : L"Running";
     items.push_back(Item({Action::Open, timer.id}, timer.name + L"  " + Format(Remaining(timer, now)), status + L" - Enter for controls"));
+    items.back().commandKeywords = {timer.name, status, L"timer"};
   }
+  const std::wstring stopwatchStatus = state.stopwatch.running ? L"Running" : L"Paused";
   items.push_back(Item({Action::Open, 0}, L"Stopwatch  " + Format(state.stopwatch.Elapsed(ticks)),
-                       state.stopwatch.running ? L"Running - Enter for controls" : L"Paused - Enter for controls"));
+                       stopwatchStatus + L" - Enter for controls"));
+  items.back().commandKeywords = {L"Stopwatch", stopwatchStatus};
   items.push_back(Item({Action::Open, -1}, L"New Timer", L"Try: timer 10m Tea"));
+  items.back().commandKeywords = {L"New Timer", L"create", L"add"};
   return items;
 }
 

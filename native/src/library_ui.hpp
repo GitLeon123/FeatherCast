@@ -13,6 +13,9 @@ namespace feathercast::library_ui {
 struct ManagerData {
   std::vector<snippets::Snippet> snippets;
   std::vector<settings::Quicklink> quicklinks;
+  std::vector<settings::Quicklink> scripts;
+  std::vector<settings::Quicklink> workspaces;
+  std::vector<library::CommandAlias> commandShortcuts;
   std::vector<library::AppAlias> appAliases;
   std::vector<library::CommandAlias> commandAliases;
   std::vector<library::AppChoice> availableApps;
@@ -30,6 +33,9 @@ struct ManagerCallbacks {
       const std::vector<snippets::Snippet>&)> saveSnippets;
   std::function<library::OperationResult(
       const std::vector<settings::Quicklink>&)> saveQuicklinks;
+  std::function<library::OperationResult(const std::vector<settings::Quicklink>&)> saveScripts;
+  std::function<library::OperationResult(const std::vector<settings::Quicklink>&)> saveWorkspaces;
+  std::function<library::OperationResult(const std::vector<library::CommandAlias>&)> saveCommandShortcuts;
   std::function<library::OperationResult(
       const std::vector<library::AppAlias>&)> saveAppAliases;
   std::function<library::OperationResult(

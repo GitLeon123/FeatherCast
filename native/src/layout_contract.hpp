@@ -142,11 +142,6 @@ inline VolumeLayout VolumeControl(float width, int textSizePercent = 100) {
           footer};
 }
 
-inline feathercast::app::RectF LauncherSearch(float width) {
-  width = std::max(1.0f, width);
-  return {0.0f, 0.0f, std::max(1.0f, width - 60.0f), 60.0f};
-}
-
 struct LauncherLayout {
   feathercast::app::RectF searchHit;
   feathercast::app::RectF query;
@@ -244,10 +239,6 @@ inline float SettingsCategoryRowHeight(float availableHeight,
   if (categoryCount == 0) return 44.0f;
   return std::clamp(availableHeight / static_cast<float>(categoryCount),
                     24.0f, 44.0f);
-}
-
-inline float SettingsCategoryTargetHeight(float rowHeight) noexcept {
-  return std::max(24.0f, rowHeight - 6.0f);
 }
 
 inline LauncherLayout Launcher(float width, bool compactHintVisible,

@@ -4,31 +4,57 @@
 #include <windows.h>
 
 #include "phone_service.hpp"
+#include "file_transfer.hpp"
 
 #include "phone_crypto.hpp"
 #include "phone_messages.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
+#include <future>
 
 namespace feathercast::phone {
 namespace {
 
 constexpr long long kPairingLifetimeMs = 5 * 60 * 1000;
 constexpr DWORD kSessionIdleTimeoutMs = 75 * 1000;
-constexpr DWORD kHandshakeTimeoutMs = 20 * 1000;
+constexpr auto kHandshakeTimeout = std::chrono::seconds(20);
+constexpr auto kHttpTransferTimeout = std::chrono::minutes(5);
+constexpr DWORD kHttpSendTimeoutMs = 30 * 1000;
 constexpr std::size_t kMaxHandshakeBytes = 64 * 1024;
 constexpr std::size_t kMaxWorkers = 16;
+// Unauthenticated connections (handshakes and APK downloads) may hold only a
+// few of the workers, so a slow or hostile client cannot lock out the phone.
+constexpr std::size_t kMaxPendingHandshakes = 4;
+constexpr std::size_t kMaxQueuedMessages = 1024;
+constexpr std::size_t kMaxQueuedBytes = 64 * 1024 * 1024;
+// The phone sends nothing when it cannot deliver a photo or file, so requests
+// that get no answer end with an error instead of spinning forever.
+constexpr long long kRequestTimeoutMs = 2 * 60 * 1000;
 constexpr auto kBeaconInterval = std::chrono::seconds(3);
 
 long long NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+long long SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Remaining time until deadline as a socket timeout; 0 once it has passed.
+DWORD RemainingMs(std::chrono::steady_clock::time_point deadline) {
+  const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now())
+                        .count();
+  return left <= 0 ? 0 : static_cast<DWORD>(left);
 }
 
 std::wstring Widen(std::string_view text) {
@@ -66,16 +92,53 @@ bool SendAll(SOCKET socket, const Bytes& bytes) {
   return SendAll(socket, bytes.data(), bytes.size());
 }
 
+// Gather the four-byte header and body in one blocking send, without copying
+// a photo/file ciphertext into another frame-sized allocation.
+bool SendFrame(SOCKET socket, const Bytes& body) {
+  if (body.size() > kMaxFrameBytes) return false;
+  const auto size = static_cast<std::uint32_t>(body.size());
+  std::array<char, 4> header{
+      static_cast<char>(size >> 24), static_cast<char>(size >> 16),
+      static_cast<char>(size >> 8), static_cast<char>(size)};
+  WSABUF buffers[] = {
+      {4, header.data()},
+      {static_cast<ULONG>(body.size()),
+       reinterpret_cast<char*>(const_cast<std::uint8_t*>(body.data()))},
+  };
+  DWORD first = 0;
+  const DWORD count = body.empty() ? 1 : 2;
+  while (first < count) {
+    DWORD sent = 0;
+    if (WSASend(socket, buffers + first, count - first, &sent, 0,
+                nullptr, nullptr) == SOCKET_ERROR || sent == 0) {
+      return false;
+    }
+    while (first < count && sent >= buffers[first].len) {
+      sent -= buffers[first].len;
+      ++first;
+    }
+    if (first < count && sent != 0) {
+      buffers[first].buf += sent;
+      buffers[first].len -= sent;
+    }
+  }
+  return true;
+}
+
 bool SendAll(SOCKET socket, std::string_view text) {
   return SendAll(socket, reinterpret_cast<const std::uint8_t*>(text.data()),
                  text.size());
 }
 
+void SetSendTimeout(SOCKET socket, DWORD milliseconds) {
+  setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char*>(&milliseconds), sizeof(milliseconds));
+}
+
 void SetTimeout(SOCKET socket, DWORD milliseconds) {
   setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
              reinterpret_cast<const char*>(&milliseconds), sizeof(milliseconds));
-  setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
-             reinterpret_cast<const char*>(&milliseconds), sizeof(milliseconds));
+  SetSendTimeout(socket, milliseconds);
 }
 
 struct Ipv4Adapter {
@@ -129,19 +192,6 @@ std::vector<Ipv4Adapter> EnumerateAdapters() {
   return out;
 }
 
-std::string SanitizeFileName(std::string name) {
-  static constexpr std::string_view kInvalid = "<>:\"/\\|?*";
-  for (char& ch : name) {
-    if (static_cast<unsigned char>(ch) < 0x20 || kInvalid.find(ch) != std::string_view::npos) {
-      ch = '_';
-    }
-  }
-  while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
-  while (!name.empty() && name.front() == '.') name.erase(name.begin());
-  if (name.size() > 120) name = name.substr(name.size() - 120);
-  return name.empty() ? std::string("phone-file") : name;
-}
-
 std::optional<Bytes> ReadFileBytes(const std::wstring& path,
                                   std::size_t maxBytes = 1024 * 1024) {
   std::ifstream in(std::filesystem::path(path), std::ios::binary | std::ios::ate);
@@ -155,24 +205,113 @@ std::optional<Bytes> ReadFileBytes(const std::wstring& path,
   return bytes;
 }
 
-bool WriteFileBytes(const std::wstring& path, const Bytes& data) {
-  const std::filesystem::path target(path);
+// Temporary files get a random name of their own next to the target, so they
+// never truncate a user's file. A crash leaves only names the next start removes.
+constexpr std::wstring_view kTempPrefix = L".feathercast-phone-";
+constexpr std::wstring_view kTempSuffix = L".tmp";
+
+// Writes data to a new temporary file in dir. Returns its path, or empty.
+std::filesystem::path WriteTempFile(const std::filesystem::path& dir, const Bytes& data,
+                                    bool flush) {
   std::error_code ec;
-  std::filesystem::create_directories(target.parent_path(), ec);
-  const std::filesystem::path temp = target.wstring() + L".tmp";
-  {
-    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
-    out.write(reinterpret_cast<const char*>(data.data()),
-              static_cast<std::streamsize>(data.size()));
-    if (!out) return false;
+  std::filesystem::create_directories(dir, ec);
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const std::filesystem::path temp =
+        dir / (std::wstring(kTempPrefix) + Widen(HexEncode(crypto::RandomBytes(8))) +
+               std::wstring(kTempSuffix));
+    const HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+      if (GetLastError() == ERROR_FILE_EXISTS) continue;
+      return {};
+    }
+    bool ok = true;
+    for (std::size_t offset = 0; ok && offset < data.size();) {
+      const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(data.size() - offset, 1 << 20));
+      DWORD written = 0;
+      ok = WriteFile(file, data.data() + offset, chunk, &written, nullptr) && written == chunk;
+      offset += written;
+    }
+    if (ok && flush) ok = FlushFileBuffers(file) != FALSE;
+    CloseHandle(file);
+    if (!ok) {
+      DeleteFileW(temp.c_str());
+      return {};
+    }
+    return temp;
   }
-  std::filesystem::rename(temp, target, ec);
-  if (ec) {
-    std::filesystem::remove(temp, ec);
+  return {};
+}
+
+// Replaces path as a whole: readers see the old or the new content, never a part.
+bool ReplaceFileContents(const std::wstring& path, const Bytes& data) {
+  const std::filesystem::path target(path);
+  const auto temp = WriteTempFile(target.parent_path(), data, true);
+  if (temp.empty()) return false;
+  if (!MoveFileExW(temp.c_str(), target.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temp.c_str());
     return false;
   }
   return true;
+}
+
+// Saves data as a new file in dir and never replaces an existing one: "name.ext",
+// then "name (2).ext" and so on. The file carries the mark of the web, so Windows
+// and Office treat it like any other download. Returns the final path or empty.
+std::wstring SaveNewFile(const std::filesystem::path& dir, const std::string& name,
+                         const Bytes& data) {
+  const auto temp = WriteTempFile(dir, data, false);
+  if (temp.empty()) return {};
+  MarkFileFromInternet(temp.wstring());  // the stream moves with the file
+  const std::filesystem::path base(Widen(name));
+  const std::wstring stem = base.stem().wstring();
+  const std::wstring extension = base.extension().wstring();
+  for (int i = 1; i < 1000; ++i) {
+    const std::filesystem::path candidate =
+        dir / (i == 1 ? base.wstring() : stem + L" (" + std::to_wstring(i) + L")" + extension);
+    if (MoveFileExW(temp.c_str(), candidate.c_str(), 0)) return candidate.wstring();
+    const DWORD error = GetLastError();
+    if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+  }
+  DeleteFileW(temp.c_str());
+  return {};
+}
+
+void RemoveStaleTempFiles(const std::filesystem::path& dir) {
+  if (dir.empty()) return;
+  const std::wstring pattern =
+      (dir / (std::wstring(kTempPrefix) + L"*" + std::wstring(kTempSuffix))).wstring();
+  WIN32_FIND_DATAW data{};
+  const HANDLE find =
+      FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+  if (find == INVALID_HANDLE_VALUE) return;
+  do {
+    if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        std::wstring_view(data.cFileName).starts_with(kTempPrefix)) {
+      DeleteFileW((dir / data.cFileName).c_str());
+    }
+  } while (FindNextFileW(find, &data));
+  FindClose(find);
+}
+
+// The storage path the phone resolves a request to (normalizeStoragePath in
+// the Kotlin protocol), so its answer can be matched to the request.
+std::optional<std::string> NormalizeStoragePath(std::string_view path) {
+  std::string out;
+  std::size_t start = 0;
+  while (start <= path.size()) {
+    std::size_t end = path.find_first_of("/\\", start);
+    if (end == std::string_view::npos) end = path.size();
+    const std::string_view part = path.substr(start, end - start);
+    if (part == "..") return std::nullopt;
+    if (!part.empty() && part != ".") {
+      out += '/';
+      out += part;
+    }
+    start = end + 1;
+  }
+  return out.empty() ? std::string("/") : out;
 }
 
 class WinsockInit {
@@ -195,11 +334,22 @@ WinsockInit& Winsock() {
 
 }  // namespace
 
+bool MarkFileFromInternet(const std::wstring& path) {
+  static constexpr char kZone[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
+  constexpr DWORD kSize = sizeof(kZone) - 1;
+  const HANDLE file = CreateFileW((path + L":Zone.Identifier").c_str(), GENERIC_WRITE, 0,
+                                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const bool ok = WriteFile(file, kZone, kSize, &written, nullptr) && written == kSize;
+  CloseHandle(file);
+  return ok;
+}
+
 struct PhoneService::Session {
   enum class State { Hello, Auth, Open };
   SOCKET socket = INVALID_SOCKET;
-  State state = State::Hello;
-  std::mutex sendMutex;
+  std::atomic<State> state{State::Hello};
   std::string deviceId;
   std::string deviceName;
   Bytes linkKey;
@@ -207,17 +357,135 @@ struct PhoneService::Session {
   Bytes pcNonce;
   Bytes sendKey;
   Bytes recvKey;
-  std::uint64_t sendCounter = 0;
   std::uint64_t recvCounter = 0;
   std::string screenId;
+  std::atomic<bool> fileStreamSupported = false;
+  std::atomic<std::uint64_t> transferEpoch = 0;
+  std::atomic<std::size_t> outgoingTransfers = 0;
+  std::mutex cancellationMutex;
+  std::map<std::string, std::shared_ptr<std::atomic<bool>>> cancellations;
+  std::atomic<std::shared_ptr<transfer::Receiver>> incomingTransfers;
 
-  // Senders retain the session while using its socket. Close only after the
-  // receive worker and all senders release it, so a reused handle stays safe.
-  ~Session() {
+  // Everything sent after the handshake goes through one writer thread, in
+  // order, so callers never block on the network or on each other. A failed or
+  // partial write leaves the stream unusable: the session is closed and every
+  // queued message fails instead of following a gap.
+  struct Outgoing {
+    std::string json;
+    Bytes binary;
+    bool plain = false;  // the welcome, sent before any sealed frame
+    std::shared_ptr<std::promise<bool>> delivered;  // for callers that wait
+  };
+  std::mutex sendMutex;
+  std::condition_variable_any sendWake;
+  std::deque<Outgoing> outgoing;
+  std::size_t outgoingBytes = 0;
+  bool sendFailed = false;
+  std::uint64_t sendCounter = 0;  // writer thread only
+  std::jthread writer;
+
+  // Starts the writer with the welcome as its first frame. Called once, by the
+  // connection thread, before the session becomes visible to senders.
+  void Open(std::string welcome) {
+    {
+      std::lock_guard lock(sendMutex);  // Stop() may close the session meanwhile
+      Outgoing first;
+      first.json = std::move(welcome);
+      first.plain = true;
+      outgoingBytes += first.json.size();
+      outgoing.push_back(std::move(first));
+    }
+    writer = std::jthread([this](std::stop_token stop) { WriteLoop(stop); });
+    state = State::Open;
+  }
+
+  // Queues a sealed message. With wait, blocks until there is room and the
+  // message was written (true) or the session failed (false).
+  bool Enqueue(std::string json, Bytes binary, bool wait) {
+    std::shared_ptr<std::promise<bool>> delivered;
+    std::future<bool> result;
+    if (wait) {
+      delivered = std::make_shared<std::promise<bool>>();
+      result = delivered->get_future();
+    }
+    const std::size_t size = json.size() + binary.size();
+    {
+      std::unique_lock lock(sendMutex);
+      const auto fits = [&] {
+        return outgoing.empty() ||
+               (outgoing.size() < kMaxQueuedMessages && outgoingBytes + size <= kMaxQueuedBytes);
+      };
+      if (wait) sendWake.wait(lock, [&] { return sendFailed || fits(); });
+      if (sendFailed || !fits()) return false;
+      outgoing.push_back(Outgoing{std::move(json), std::move(binary), false, delivered});
+      outgoingBytes += size;
+    }
+    sendWake.notify_all();
+    return !wait || result.get();
+  }
+
+  // Ends the session: queued messages fail and blocked socket calls return.
+  void Close() {
+    std::deque<Outgoing> dropped;
+    {
+      std::lock_guard lock(sendMutex);
+      sendFailed = true;
+      dropped.swap(outgoing);
+      outgoingBytes = 0;
+    }
+    sendWake.notify_all();
     if (socket != INVALID_SOCKET) {
       shutdown(socket, SD_BOTH);
-      closesocket(socket);
+      CancelIoEx(reinterpret_cast<HANDLE>(socket), nullptr);
     }
+    for (auto& item : dropped) {
+      if (item.delivered) item.delivered->set_value(false);
+    }
+    if (auto incoming = incomingTransfers.load()) incoming->Cancel();
+  }
+
+  void WriteLoop(std::stop_token stop) {
+    for (;;) {
+      Outgoing item;
+      std::uint64_t counter = 0;
+      {
+        std::unique_lock lock(sendMutex);
+        sendWake.wait(lock, stop, [&] { return sendFailed || !outgoing.empty(); });
+        if (sendFailed || outgoing.empty()) return;
+        item = std::move(outgoing.front());
+        outgoing.pop_front();
+        outgoingBytes -= item.json.size() + item.binary.size();
+        if (!item.plain) counter = sendCounter++;
+      }
+      sendWake.notify_all();  // room for waiting senders
+      bool ok = false;
+      if (item.plain) {
+        ok = SendFrame(socket, ToBytes(item.json));
+      } else {
+        Bytes payload = PackPayload(item.json, item.binary);
+        item.binary = {};
+        const auto sealed = crypto::AesGcmEncrypt(sendKey, CounterNonce(counter), payload);
+        payload = {};
+        ok = sealed && SendFrame(socket, *sealed);
+      }
+      if (item.delivered) item.delivered->set_value(ok);
+      if (!ok) {
+        Close();
+        return;
+      }
+    }
+  }
+
+  // Senders and the connection thread retain the session while using its
+  // socket. Close only after all of them release it, so a reused handle stays
+  // safe. The writer never owns the session, so this never runs on it.
+  ~Session() {
+    Close();
+    if (writer.joinable()) {
+      writer.request_stop();
+      writer.join();
+    }
+    if (socket != INVALID_SOCKET) closesocket(socket);
   }
 };
 
@@ -233,15 +501,30 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
   };
   if (!Winsock().ok()) return fail("Windows networking is unavailable.");
   config_ = std::move(config);
-  if (!LoadState()) {
-    auto pair = crypto::EcdhKeyPair::Generate();
-    if (!pair) return fail("Could not create the phone link key.");
-    std::lock_guard lock(mutex_);
-    pcPrivateKey_ = pair->ExportPrivate();
-    pcPublicKey_ = pair->PublicKey();
-    pcId_ = HexEncode(crypto::RandomBytes(8));
-    devices_.clear();
+  stateReady_ = false;
+  RemoveStaleTempFiles(std::filesystem::path(config_.stateFile).parent_path());
+  if (!config_.downloadsDir.empty()) RemoveStaleTempFiles(config_.downloadsDir);
+  switch (LoadState()) {
+    case StateLoad::Loaded:
+      break;
+    case StateLoad::Missing: {
+      auto pair = crypto::EcdhKeyPair::Generate();
+      if (!pair) return fail("Could not create the phone link key.");
+      std::lock_guard lock(mutex_);
+      pcPrivateKey_ = pair->ExportPrivate();
+      pcPublicKey_ = pair->PublicKey();
+      pcId_ = HexEncode(crypto::RandomBytes(8));
+      devices_.clear();
+      break;
+    }
+    case StateLoad::Failed:
+      // Never replace pairings that could not be read: the cause (a locked file,
+      // an unavailable profile key) is often temporary.
+      return fail("Could not read the saved phone pairings (phone-link.dat). The file was left "
+                  "unchanged; turn Phone Connection off and on again to retry. If the file is "
+                  "damaged, delete it and pair your phones again.");
   }
+  stateReady_ = true;
   if (!SaveState()) return fail("Could not save the phone link identity.");
 
   const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -249,6 +532,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
   BOOL exclusive = TRUE;
   setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
              reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+  // Port 0 lets Windows pick a free port (used by the tests).
   bool bound = false;
   for (unsigned candidate = config_.port;
        candidate <= 65535 && candidate < static_cast<unsigned>(config_.port) + 10 && !bound;
@@ -257,15 +541,24 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(static_cast<std::uint16_t>(candidate));
-    if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
-      port_ = static_cast<std::uint16_t>(candidate);
-      bound = true;
-    }
+    bound = bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
   }
-  if (!bound || listen(listener, 8) != 0) {
+  sockaddr_in local{};
+  int localSize = sizeof(local);
+  if (!bound || listen(listener, 8) != 0 ||
+      getsockname(listener, reinterpret_cast<sockaddr*>(&local), &localSize) != 0) {
     closesocket(listener);
     return fail("The phone link port is already in use.");
   }
+  port_ = ntohs(local.sin_port);
+  const WSAEVENT acceptEvent = WSACreateEvent();
+  if (acceptEvent == WSA_INVALID_EVENT ||
+      WSAEventSelect(listener, acceptEvent, FD_ACCEPT | FD_CLOSE) == SOCKET_ERROR) {
+    if (acceptEvent != WSA_INVALID_EVENT) WSACloseEvent(acceptEvent);
+    closesocket(listener);
+    return fail("Could not monitor the phone link port.");
+  }
+  acceptEvent_ = acceptEvent;
   listenSocket_ = listener;
   running_ = true;
   acceptThread_ = std::jthread([this](std::stop_token stop) { AcceptLoop(stop); });
@@ -277,6 +570,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
 void PhoneService::Stop() {
   if (!running_.exchange(false)) return;
   acceptThread_.request_stop();
+  if (acceptEvent_) WSASetEvent(acceptEvent_);
   beaconThread_.request_stop();
   screenSendThread_.request_stop();
   screenWake_.notify_all();
@@ -285,29 +579,39 @@ void PhoneService::Stop() {
   if (acceptThread_.joinable()) acceptThread_.join();
   closesocket(static_cast<SOCKET>(listenSocket_));
   listenSocket_ = ~std::uintptr_t{0};
+  if (acceptEvent_) WSACloseEvent(acceptEvent_);
+  acceptEvent_ = nullptr;
   std::vector<Worker> workers;
   {
     std::lock_guard lock(mutex_);
-    for (const auto& session : sessions_) {
-      shutdown(session->socket, SD_BOTH);
-    }
+    for (const auto& session : sessions_) session->Close();
     workers = std::move(workers_);
     workers_.clear();
   }
   if (beaconThread_.joinable()) beaconThread_.join();
   if (screenSendThread_.joinable()) screenSendThread_.join();
   workers.clear();  // joins
-  std::lock_guard lock(mutex_);
-  sessions_.clear();
-  active_.reset();
-  screen_.reset();
-  screenOwner_.reset();
-  screenId_.clear();
-  screenKey_.clear();
-  screenInputs_.clear();
-  screenCommands_.clear();
-  pairingToken_.clear();
-  pairingExpiresAt_ = 0;
+  // Sessions are released outside the lock; their destructors join writers.
+  std::vector<std::shared_ptr<Session>> ended;
+  std::deque<std::pair<std::shared_ptr<Session>, std::string>> commands;
+  {
+    std::lock_guard lock(mutex_);
+    ended = std::move(sessions_);
+    sessions_.clear();
+    ended.push_back(std::move(active_));
+    ended.push_back(std::move(screen_));
+    active_.reset();
+    screen_.reset();
+    screenOwner_.reset();
+    screenId_.clear();
+    screenKey_.clear();
+    screenInputs_.clear();
+    commands.swap(screenCommands_);
+    pairingToken_.clear();
+    pairingExpiresAt_ = 0;
+    pendingPhotos_.clear();
+    pendingFiles_.clear();
+  }
 }
 
 void PhoneService::Emit(Event event) {
@@ -316,18 +620,21 @@ void PhoneService::Emit(Event event) {
 
 // ------------------------------------------------------------------- state
 
-bool PhoneService::LoadState() {
+PhoneService::StateLoad PhoneService::LoadState() {
+  std::error_code ec;
+  const auto status = std::filesystem::status(std::filesystem::path(config_.stateFile), ec);
+  if (status.type() == std::filesystem::file_type::not_found) return StateLoad::Missing;
   const auto sealed = ReadFileBytes(config_.stateFile);
-  if (!sealed) return false;
+  if (!sealed) return StateLoad::Failed;
   const auto plain = crypto::Unprotect(*sealed);
-  if (!plain) return false;
+  if (!plain) return StateLoad::Failed;
   const auto root = json::Parse(std::string_view(
       reinterpret_cast<const char*>(plain->data()), plain->size()));
-  if (!root || root->type != json::Value::Type::Object) return false;
+  if (!root || root->type != json::Value::Type::Object) return StateLoad::Failed;
   const auto privateKey = Base64UrlDecode(JsonString(*root, "key"));
-  if (!privateKey) return false;
+  if (!privateKey) return StateLoad::Failed;
   auto pair = crypto::EcdhKeyPair::Import(*privateKey);
-  if (!pair) return false;
+  if (!pair) return StateLoad::Failed;
   std::vector<PairedDevice> devices;
   if (const auto* list = root->Find("devices");
       list && list->type == json::Value::Type::Array) {
@@ -349,11 +656,14 @@ bool PhoneService::LoadState() {
   pcPrivateKey_ = *privateKey;
   pcPublicKey_ = pair->PublicKey();
   devices_ = std::move(devices);
-  return true;
+  return StateLoad::Loaded;
 }
 
 bool PhoneService::SaveState() {
   std::lock_guard saveLock(stateSaveMutex_);
+  // Until the saved state was read, writing would replace pairings this run
+  // never saw.
+  if (!stateReady_) return false;
   std::string devices = "[";
   std::string document;
   {
@@ -377,12 +687,12 @@ bool PhoneService::SaveState() {
   }
   const auto sealed = crypto::Protect(ToBytes(document));
   SecureZeroMemory(document.data(), document.size());
-  return sealed && WriteFileBytes(config_.stateFile, *sealed);
+  return sealed && ReplaceFileContents(config_.stateFile, *sealed);
 }
 
 // ----------------------------------------------------------------- queries
 
-std::vector<std::string> PhoneService::LocalAddresses() const {
+std::vector<std::string> LocalNetworkAddresses() {
   std::vector<std::string> out;
   for (const auto& adapter : EnumerateAdapters()) {
     if (std::find(out.begin(), out.end(), adapter.address) == out.end()) {
@@ -396,7 +706,9 @@ std::string PhoneService::CreatePairingUri() {
   PairingInvite invite;
   invite.pcName = config_.pcName;
   invite.port = port_;
-  invite.hosts = LocalAddresses();
+  invite.hosts = LocalNetworkAddresses();
+  // The phone cannot use an invite without an address; no token is issued.
+  if (invite.hosts.empty()) return {};
   if (invite.hosts.size() > 4) invite.hosts.resize(4);
   std::lock_guard lock(mutex_);
   pairingToken_ = crypto::RandomBytes(16);
@@ -408,9 +720,10 @@ std::string PhoneService::CreatePairingUri() {
 }
 
 std::string PhoneService::ApkUrl() const {
-  const auto hosts = LocalAddresses();
-  const std::string host = hosts.empty() ? std::string("localhost") : hosts.front();
-  return "http://" + host + ":" + std::to_string(port_) + "/app.apk";
+  // "localhost" would point the phone at itself; without a network there is no URL.
+  const auto hosts = LocalNetworkAddresses();
+  if (hosts.empty()) return {};
+  return "http://" + hosts.front() + ":" + std::to_string(port_) + "/app.apk";
 }
 
 std::vector<PairedDevice> PhoneService::Devices() const {
@@ -423,7 +736,7 @@ void PhoneService::Forget(const std::string& deviceId) {
     std::lock_guard lock(mutex_);
     std::erase_if(devices_, [&](const auto& device) { return device.id == deviceId; });
     for (const auto& session : sessions_) {
-      if (session->deviceId == deviceId) shutdown(session->socket, SD_BOTH);
+      if (session->deviceId == deviceId) session->Close();
     }
   }
   if (!SaveState()) {
@@ -445,28 +758,27 @@ std::string PhoneService::ConnectedDeviceName() const {
 
 // ------------------------------------------------------------------ sending
 
-bool PhoneService::Send(const std::string& json, const Bytes& binary) {
+bool PhoneService::Send(std::string json, Bytes binary) {
   std::shared_ptr<Session> session;
   {
     std::lock_guard lock(mutex_);
     session = active_;
   }
-  return SendToSession(session, json, binary);
+  return SendToSession(session, std::move(json), std::move(binary));
 }
 
-bool PhoneService::SendToSession(const std::shared_ptr<Session>& session,
-                                  const std::string& json, const Bytes& binary) {
+// Queues a sealed message for an authenticated session. Without wait, true
+// means queued; the writer closes the session if it cannot be delivered.
+bool PhoneService::SendToSession(const std::shared_ptr<Session>& session, std::string json,
+                                 Bytes binary, bool wait) {
   if (!session || binary.size() > kMaxTransferBytes ||
       json.size() > kMaxFrameBytes - 20 - binary.size()) return false;
   {
     std::lock_guard lock(mutex_);
-    if (!running_ || (active_ != session && screen_ != session)) return false;
+    if (!running_ || session->state != Session::State::Open ||
+        (active_ != session && screen_ != session)) return false;
   }
-  std::lock_guard lock(session->sendMutex);
-  const auto sealed = crypto::AesGcmEncrypt(
-      session->sendKey, CounterNonce(session->sendCounter++),
-      PackPayload(json, binary));
-  return sealed && SendAll(session->socket, EncodeFrame(*sealed));
+  return session->Enqueue(std::move(json), std::move(binary), wait);
 }
 
 bool PhoneService::SendClipboard(const std::string& text) {
@@ -480,8 +792,16 @@ bool PhoneService::SendClipboardHistory(
 
 bool PhoneService::RequestPhotos() { return Send(message::PhotosRequest(60)); }
 
+// Registered before sending, so even an immediate answer finds its request.
 bool PhoneService::RequestPhoto(const std::string& id) {
-  return Send(message::PhotoRequest(id));
+  {
+    std::lock_guard lock(mutex_);
+    pendingPhotos_[id] = SteadyMs() + kRequestTimeoutMs;
+  }
+  if (Send(message::PhotoRequest(id))) return true;
+  std::lock_guard lock(mutex_);
+  pendingPhotos_.erase(id);
+  return false;
 }
 
 bool PhoneService::DismissNotification(const std::string& key) {
@@ -505,7 +825,7 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
   if (ec || !std::filesystem::is_regular_file(file, ec)) {
     return fail("Only files can be sent to the phone.");
   }
-  if (size > kMaxTransferBytes) return fail("The file is larger than 40 MB.");
+  if (size > static_cast<std::uintmax_t>(transfer::kMaximumBytes)) return fail("The file is larger than 8 GB.");
   const std::string id = HexEncode(crypto::RandomBytes(6));
   const std::string name = Narrow(file.filename().wstring());
   auto done = std::make_shared<std::atomic<bool>>(false);
@@ -513,23 +833,126 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
   if (!running_) return fail("Phone Connection is off.");
   const auto session = active_;
   if (!session) return fail("Your phone is not connected.");
+  const bool stream = session->fileStreamSupported.load();
+  if (!stream && size > kMaxTransferBytes) return fail("Update the phone app to send files larger than 40 MB.");
+  const auto epoch = session->transferEpoch.load();
+  if (session->outgoingTransfers.fetch_add(1) >= transfer::kMaximumConcurrent) {
+    --session->outgoingTransfers;
+    return fail("Up to four files can be sent at once. Wait for a transfer to finish.");
+  }
+  const auto cancelled = std::make_shared<std::atomic<bool>>(false);
+  {
+    std::lock_guard cancellationLock(session->cancellationMutex);
+    session->cancellations[id] = cancelled;
+  }
   std::erase_if(workers_, [](const Worker& worker) { return worker.done->load(); });
-  if (workers_.size() >= kMaxWorkers) return fail("Too many phone transfers are in progress.");
+  if (workers_.size() >= kMaxWorkers) {
+    --session->outgoingTransfers;
+    std::lock_guard cancellationLock(session->cancellationMutex);
+    session->cancellations.erase(id);
+    return fail("Too many phone transfers are in progress.");
+  }
   workers_.push_back(Worker{
-      std::jthread([this, path, id, name, done, session] {
-        const auto bytes = ReadFileBytes(path, kMaxTransferBytes);
-        if (!bytes || !SendToSession(session, message::FileSend(id, name), *bytes)) {
+      std::jthread([this, path, id, name, done, session, stream, epoch, size, cancelled] {
+        struct Cleanup {
+          std::shared_ptr<Session> session;
+          std::string id;
+          ~Cleanup() {
+            --session->outgoingTransfers;
+            std::lock_guard lock(session->cancellationMutex);
+            session->cancellations.erase(id);
+          }
+        } cleanup{session, id};
+        if (stream) {
+          std::ifstream file(std::filesystem::path(path), std::ios::binary);
+          bool ok = static_cast<bool>(file) && SendToSession(session,
+              Json("file.begin").Str("id", id).Str("name", name)
+                  .Str("purpose", "file").Int("size", static_cast<long long>(size)).Build(), {}, true);
+          long long offset = 0;
+          int lastPercent = -1;
+          while (ok && offset < static_cast<long long>(size) && session->transferEpoch.load() == epoch && !cancelled->load()) {
+            Bytes bytes(static_cast<std::size_t>(std::min<long long>(
+                static_cast<long long>(transfer::kChunkBytes), static_cast<long long>(size) - offset)));
+            file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            ok = file.gcount() == static_cast<std::streamsize>(bytes.size());
+            if (ok) ok = SendToSession(session, Json("file.chunk").Str("id", id).Int("offset", offset).Build(), std::move(bytes), true);
+            if (!ok) break;
+            offset += file.gcount();
+            const int percent = size == 0 ? 100 : static_cast<int>(offset * 100 / static_cast<long long>(size));
+            if (percent != lastPercent) {
+              lastPercent = percent;
+              Event progress;
+              progress.kind = EventKind::TransferProgress;
+              progress.id = id;
+              progress.photo.name = name;
+              progress.transferredBytes = offset;
+              progress.totalBytes = static_cast<long long>(size);
+              Emit(std::move(progress));
+            }
+          }
+          ok = ok && session->transferEpoch.load() == epoch && !cancelled->load() && offset == static_cast<long long>(size);
+          if (ok) ok = SendToSession(session, Json("file.end").Str("id", id).Build(), {}, true);
+          if (!ok) {
+            SendToSession(session, Json("file.cancel").Str("id", id).Build());
+            Event error;
+            error.kind = EventKind::Error;
+            error.id = id;
+            error.text = session->transferEpoch.load() != epoch || cancelled->load() ? "File transfer cancelled." : "Could not send " + name + ".";
+            Emit(std::move(error));
+          }
+          done->store(true);
+          return;
+        }
+        auto bytes = ReadFileBytes(path, kMaxTransferBytes);
+        const bool read = bytes.has_value();
+        // Waits until the file was written to the connection or the link failed.
+        if (!read || !SendToSession(session, message::FileSend(id, name), std::move(*bytes), true)) {
           Event event;
           event.kind = EventKind::Error;
           event.id = id;
-          event.text = bytes ? "Could not send " + name + " to your phone."
-                             : "Could not read " + name + ".";
+          event.text = read ? "Could not send " + name + " to your phone."
+                            : "Could not read " + name + ".";
           Emit(std::move(event));
         }
         done->store(true);
       }),
       done});
   return id;
+}
+
+void PhoneService::CancelTransfers() {
+  std::shared_ptr<Session> session;
+  std::vector<Event> cancelled;
+  {
+    std::lock_guard lock(mutex_);
+    session = active_;
+    for (const auto& [id, unused] : pendingPhotos_) {
+      Event event;
+      event.kind = EventKind::Error;
+      event.photo.id = id;
+      event.text = "Photo transfer cancelled.";
+      cancelled.push_back(std::move(event));
+    }
+    for (const auto& [path, unused] : pendingFiles_) {
+      Event event;
+      event.kind = EventKind::Error;
+      event.remotePath = path;
+      event.text = "File transfer cancelled.";
+      cancelled.push_back(std::move(event));
+    }
+    pendingPhotos_.clear();
+    pendingFiles_.clear();
+  }
+  EmitAll(std::move(cancelled));
+  if (!session) return;
+  ++session->transferEpoch;
+  if (auto incoming = session->incomingTransfers.load()) incoming->RequestCancel();
+  SendToSession(session, Json("file.cancel").Str("id", "").Build());
+  Event event;
+  event.kind = EventKind::Error;
+  event.id = "*";
+  event.text = "File transfers cancelled.";
+  Emit(std::move(event));
 }
 
 bool PhoneService::Ring(bool start) { return Send(message::Ring(start)); }
@@ -561,7 +984,80 @@ bool PhoneService::ListFiles(const std::string& remotePath) {
 }
 
 bool PhoneService::RequestFile(const std::string& remotePath) {
-  return Send(message::FileRequest(remotePath));
+  {
+    std::lock_guard lock(mutex_);
+    pendingFiles_[remotePath] = PendingFile{
+        NormalizeStoragePath(remotePath).value_or(remotePath), SteadyMs() + kRequestTimeoutMs};
+  }
+  if (Send(message::FileRequest(remotePath))) return true;
+  std::lock_guard lock(mutex_);
+  pendingFiles_.erase(remotePath);
+  return false;
+}
+
+// Matches a photo or storage answer to its request and stops the request's
+// timeout. A storage answer carries the path the phone resolved; the event
+// gets the path the PC asked for, so the UI can match it exactly.
+void PhoneService::SettleRequest(Event& event) {
+  std::lock_guard lock(mutex_);
+  if (event.kind == EventKind::PhotoSaved) {
+    pendingPhotos_.erase(event.photo.id);
+    return;
+  }
+  if (event.kind != EventKind::RemoteFileSaved || event.remotePath.empty()) return;
+  if (pendingFiles_.erase(event.remotePath) > 0) return;
+  const auto normalized = NormalizeStoragePath(event.remotePath);
+  for (auto it = pendingFiles_.begin(); it != pendingFiles_.end(); ++it) {
+    if (normalized && it->second.normalized == *normalized) {
+      event.remotePath = it->first;
+      pendingFiles_.erase(it);
+      return;
+    }
+  }
+}
+
+// Takes the requests that ran out of time (all: every one, because the
+// connection that would answer them ended). Called with mutex_ held, in the
+// same section that ends a connection, so a request made for the next one stays.
+std::vector<Event> PhoneService::TakeExpiredLocked(bool all) {
+  std::vector<Event> expired;
+  const long long now = SteadyMs();
+  for (auto it = pendingPhotos_.begin(); it != pendingPhotos_.end();) {
+    if (!all && it->second > now) { ++it; continue; }
+    Event event;
+    event.kind = EventKind::Error;
+    event.photo.id = it->first;
+    event.text = all ? "Your phone disconnected before the photo arrived."
+                     : "Your phone did not send the photo in time.";
+    expired.push_back(std::move(event));
+    it = pendingPhotos_.erase(it);
+  }
+  for (auto it = pendingFiles_.begin(); it != pendingFiles_.end();) {
+    if (!all && it->second.deadline > now) { ++it; continue; }
+    Event event;
+    event.kind = EventKind::Error;
+    event.remotePath = it->first;
+    event.text = all ? "Your phone disconnected before the file arrived."
+                     : "Your phone did not send the file in time.";
+    expired.push_back(std::move(event));
+    it = pendingFiles_.erase(it);
+  }
+  return expired;
+}
+
+void PhoneService::EmitAll(std::vector<Event> events) {
+  for (auto& event : events) {
+    if (running_) Emit(std::move(event));
+  }
+}
+
+void PhoneService::ExpireRequests() {
+  std::vector<Event> expired;
+  {
+    std::lock_guard lock(mutex_);
+    expired = TakeExpiredLocked(false);
+  }
+  EmitAll(std::move(expired));
 }
 
 void PhoneService::EmitScreenState(std::string id, std::string state, std::string detail) {
@@ -582,7 +1078,7 @@ std::string PhoneService::StartScreen(bool audio) {
     screenKey_ = crypto::RandomBytes(32);
     if (screenKey_.size() != 32) { screenId_.clear(); return {}; }
     screenOwner_ = active_;
-    screenExpiresAt_ = NowMs() + kScreenRequestLifetimeMs;
+    screenExpiresAt_ = SteadyMs() + kScreenRequestLifetimeMs;
     screenCommands_.emplace_back(active_, Json("screen.start").Str("session", id)
         .Str("key", Base64UrlEncode(screenKey_)).Bool("audio", audio).Build());
   }
@@ -600,7 +1096,7 @@ void PhoneService::StopScreen(bool report) {
     screenInputs_.clear();
     screenOwner_.reset();
     screenExpiresAt_ = 0;
-    if (screen_) shutdown(screen_->socket, SD_BOTH);
+    if (screen_) screen_->Close();
     screen_.reset();
     if (!id.empty() && active_ && screenCommands_.size() < 8) {
       screenCommands_.emplace_back(active_, Json("screen.stop").Str("session", id).Build());
@@ -635,23 +1131,42 @@ void PhoneService::ScreenSendLoop(std::stop_token stop) {
   while (!stop.stop_requested()) {
     std::shared_ptr<Session> target;
     std::string json, expired;
+    bool input = false;
     {
       std::unique_lock lock(mutex_);
-      screenWake_.wait_for(lock, stop, std::chrono::milliseconds(100), [&] {
-        return !screenCommands_.empty() || !screenInputs_.empty();
-      });
+      while (!stop.stop_requested() && screenCommands_.empty() &&
+             screenInputs_.empty()) {
+        const auto id = screenId_;
+        const auto expiry = screenExpiresAt_;
+        const auto connection = screen_.get();
+        const auto changed = [&] {
+          return !screenCommands_.empty() || !screenInputs_.empty() ||
+                 screenId_ != id || screenExpiresAt_ != expiry ||
+                 screen_.get() != connection;
+        };
+        if (!id.empty() && !connection) {
+          const auto remaining = expiry - SteadyMs();
+          if (remaining <= 0) break;
+          screenWake_.wait_for(lock, stop, std::chrono::milliseconds(remaining),
+                                changed);
+        } else {
+          screenWake_.wait(lock, stop, changed);
+        }
+      }
       if (stop.stop_requested()) break;
-      if (!screenId_.empty() && !screen_ && NowMs() > screenExpiresAt_) {
+      if (!screenId_.empty() && !screen_ && SteadyMs() >= screenExpiresAt_) {
         expired = std::exchange(screenId_, {});
+        screenExpiresAt_ = 0;
         screenKey_.clear();
         screenOwner_.reset();
         if (active_) screenCommands_.emplace_back(active_, Json("screen.stop").Str("session", expired).Build());
       }
       if (!screenInputs_.empty()) {
-        auto input = std::move(screenInputs_.front());
+        auto next = std::move(screenInputs_.front());
         screenInputs_.pop_front();
         target = screen_;
-        json = ScreenInputJson(input);
+        json = ScreenInputJson(next);
+        input = true;
       } else if (!screenCommands_.empty()) {
         target = std::move(screenCommands_.front().first);
         json = std::move(screenCommands_.front().second);
@@ -659,7 +1174,15 @@ void PhoneService::ScreenSendLoop(std::stop_token stop) {
       }
     }
     if (!expired.empty()) EmitScreenState(expired, "stopped", "Screen sharing request expired. Start again and approve it on your phone.");
-    if (target && !SendToSession(target, json)) shutdown(target->socket, SD_BOTH);
+    if (!target) continue;
+    // Input waits for the screen connection, so moves keep coalescing while it
+    // is congested; a failed write already closed that connection. Commands to
+    // the phone connection are queued, and a full queue only drops the command.
+    if (input) {
+      SendToSession(target, std::move(json), {}, true);
+    } else {
+      SendToSession(target, std::move(json));
+    }
   }
 }
 
@@ -667,26 +1190,37 @@ void PhoneService::ScreenSendLoop(std::stop_token stop) {
 
 void PhoneService::AcceptLoop(std::stop_token stop) {
   const SOCKET listener = static_cast<SOCKET>(listenSocket_);
+  const WSAEVENT event = acceptEvent_;
   while (!stop.stop_requested()) {
-    fd_set readable;
-    FD_ZERO(&readable);
-    FD_SET(listener, &readable);
-    timeval timeout{0, 500 * 1000};
-    const int ready = select(0, &readable, nullptr, nullptr, &timeout);
-    if (ready == SOCKET_ERROR) break;
-    if (ready == 0) continue;
+    if (WSAWaitForMultipleEvents(1, &event, FALSE, WSA_INFINITE, FALSE) !=
+            WSA_WAIT_EVENT_0 || stop.stop_requested()) break;
+    WSANETWORKEVENTS events{};
+    if (WSAEnumNetworkEvents(listener, event, &events) == SOCKET_ERROR ||
+        (events.lNetworkEvents & FD_CLOSE)) break;
+    if (!(events.lNetworkEvents & FD_ACCEPT)) continue;
+    if (events.iErrorCode[FD_ACCEPT_BIT] != 0) break;
     const SOCKET client = accept(listener, nullptr, nullptr);
     if (client == INVALID_SOCKET) continue;
+    // Accepted sockets inherit the listener's event association and
+    // nonblocking mode. Session timeouts and I/O require a blocking socket.
+    u_long blocking = 0;
+    if (WSAEventSelect(client, nullptr, 0) == SOCKET_ERROR ||
+        ioctlsocket(client, FIONBIO, &blocking) == SOCKET_ERROR) {
+      closesocket(client);
+      continue;
+    }
     BOOL noDelay = TRUE;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
     auto done = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard lock(mutex_);
     std::erase_if(workers_, [](const Worker& worker) { return worker.done->load(); });
-    if (!running_ || workers_.size() >= kMaxWorkers) {
+    if (!running_ || workers_.size() >= kMaxWorkers ||
+        pendingHandshakes_ >= kMaxPendingHandshakes) {
       closesocket(client);
       continue;
     }
+    ++pendingHandshakes_;  // released by HandleConnection
     workers_.push_back(Worker{
         std::jthread([this, client, done] {
           HandleConnection(static_cast<std::uintptr_t>(client));
@@ -727,6 +1261,7 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
                reinterpret_cast<sockaddr*>(&address), sizeof(address));
       }
     }
+    ExpireRequests();
     std::unique_lock lock(waitMutex);
     wake.wait_for(lock, stop, kBeaconInterval, [] { return false; });
   }
@@ -735,6 +1270,19 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
 
 void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
   const SOCKET socket = static_cast<SOCKET>(rawSocket);
+  // The slot AcceptLoop reserved for an unauthenticated connection; returned
+  // once the session is authenticated or the connection ends.
+  struct PendingSlot {
+    PhoneService* service;
+    bool held = true;
+    void Release() {
+      if (!held) return;
+      held = false;
+      std::lock_guard lock(service->mutex_);
+      --service->pendingHandshakes_;
+    }
+    ~PendingSlot() { Release(); }
+  } pending{this};
   auto session = std::make_shared<Session>();
   session->socket = socket;
   {
@@ -744,7 +1292,9 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
     }
     sessions_.push_back(session);
   }
-  SetTimeout(socket, kHandshakeTimeoutMs);
+  // One deadline for the whole handshake, not per read, so a client that
+  // trickles bytes cannot hold the connection open.
+  const auto handshakeDeadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
 
   FrameDecoder decoder;
   std::uint8_t buffer[64 * 1024];
@@ -752,6 +1302,11 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
   Bytes firstBytes;
   bool open = true;
   while (open && running_) {
+    if (session->state != Session::State::Open) {
+      const DWORD left = RemainingMs(handshakeDeadline);
+      if (left == 0) break;
+      SetTimeout(socket, left);
+    }
     const int received = recv(socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
     if (received <= 0) break;
     if (first) {
@@ -759,7 +1314,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
       if (firstBytes.size() < 4) continue;
       first = false;
       if (LooksLikeHttp(firstBytes.data(), firstBytes.size())) {
-        ServeHttp(rawSocket, firstBytes);
+        ServeHttp(rawSocket, firstBytes, handshakeDeadline);
         open = false;
         break;
       }
@@ -782,6 +1337,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
         open = false;
       } else if (session->state == Session::State::Open) {
         SetTimeout(socket, session->screenId.empty() ? kSessionIdleTimeoutMs : 5000);
+        pending.Release();
       }
     }
   }
@@ -789,6 +1345,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
   bool wasActive = false;
   std::string deviceName;
   std::string endedScreen;
+  std::vector<Event> unanswered;
   {
     std::lock_guard lock(mutex_);
     std::erase(sessions_, session);
@@ -797,17 +1354,20 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
       screenKey_.clear();
       screenOwner_.reset();
       screenInputs_.clear();
-      if (screen_ && screen_ != session) shutdown(screen_->socket, SD_BOTH);
+      if (screen_ && screen_ != session) screen_->Close();
       screen_.reset();
     }
     if (active_ == session) {
       active_.reset();
       wasActive = true;
       deviceName = session->deviceName;
+      unanswered = TakeExpiredLocked(true);  // answers would have come over this connection
     }
   }
-  shutdown(socket, SD_BOTH);
+  session->Close();
+  if (!endedScreen.empty()) screenWake_.notify_all();
   if (!endedScreen.empty() && running_) EmitScreenState(endedScreen, "stopped", "The screen connection was lost. Start a new session to reconnect.");
+  EmitAll(std::move(unanswered));
   if (wasActive && running_) {
     Event event;
     event.kind = EventKind::Disconnected;
@@ -912,7 +1472,7 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
         std::lock_guard lock(mutex_);
         allowed = active_ && active_->deviceId == deviceId && screenOwner_.lock() == active_ &&
             screenId_ == session->screenId && screenKey_.size() == 32 && !screen_ &&
-            NowMs() <= screenExpiresAt_;
+            SteadyMs() < screenExpiresAt_;
         if (allowed) {
           session->deviceId = deviceId;
           session->deviceName = active_->deviceName;
@@ -964,43 +1524,43 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     session->sendKey = crypto::Hkdf(session->linkKey, salt, kPcToPhoneInfo, 32);
     const Bytes pcMac = crypto::HmacSha256(
         session->linkKey, Concat({&pcLabel, &session->phoneNonce, &session->pcNonce}));
-    if (!session->screenId.empty()) {
-      {
-        std::lock_guard lock(mutex_);
-        if (!running_ || !active_ || screenOwner_.lock() != active_ ||
-            active_->deviceId != session->deviceId || screenId_ != session->screenId ||
-            screenKey_ != session->linkKey || screen_ || NowMs() > screenExpiresAt_) return false;
-        screen_ = session;
-        screenKey_.clear();  // one authentication only, including concurrent challenges
-      }
-      std::lock_guard lock(session->sendMutex);
-      if (!sendPlain(Json("welcome").Str("mac", Base64UrlEncode(pcMac))
-          .Str("pcName", config_.pcName).Build())) return false;
-      session->state = Session::State::Open;
-      SetTimeout(session->socket, 5000);
-      return true;  // a media connection never replaces the normal phone connection
+    // Session::Open queues the welcome as the first frame and only then makes
+    // the session sendable, so no sealed frame can precede it. Senders find the
+    // session (active_ or screen_) only after that.
+    if (session->screenId.empty()) {
+      session->incomingTransfers.store(std::make_shared<transfer::Receiver>(config_.downloadsDir));
     }
-    {
-      std::lock_guard lock(session->sendMutex);
-      if (!sendPlain(Json("welcome")
-                         .Str("mac", Base64UrlEncode(pcMac))
-                         .Str("pcName", config_.pcName)
-                         .Build())) {
-        return false;
-      }
-      session->state = Session::State::Open;
+    std::string welcome = Json("welcome")
+                              .Str("mac", Base64UrlEncode(pcMac))
+                              .Str("pcName", config_.pcName)
+                              .Bool("fileStream", true)
+                              .Build();
+    if (!session->screenId.empty()) {
+      std::lock_guard lock(mutex_);
+      if (!running_ || !active_ || screenOwner_.lock() != active_ ||
+          active_->deviceId != session->deviceId || screenId_ != session->screenId ||
+          screenKey_ != session->linkKey || screen_ || SteadyMs() >= screenExpiresAt_) return false;
+      screenKey_.clear();  // one authentication only, including concurrent challenges
+      session->Open(std::move(welcome));
+      screen_ = session;
+      screenWake_.notify_all();
+      return true;  // a media connection never replaces the normal phone connection
     }
     std::shared_ptr<Session> previous;
     std::string endedScreen;
+    std::vector<Event> unanswered;
     {
       std::lock_guard lock(mutex_);
       const bool stillPaired = std::any_of(devices_.begin(), devices_.end(), [&](const auto& device) {
         return device.id == session->deviceId && device.linkKey == session->linkKey;
       });
       if (!running_ || !stillPaired) return false;
+      session->Open(std::move(welcome));
       previous = std::exchange(active_, session);
+      // Answers would have come over the replaced connection.
+      if (previous && previous != session) unanswered = TakeExpiredLocked(true);
       if (previous && !screenId_.empty()) {
-        if (screen_) shutdown(screen_->socket, SD_BOTH);
+        if (screen_) screen_->Close();
         screen_.reset();
         screenOwner_.reset();
         screenKey_.clear();
@@ -1008,7 +1568,9 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
         screenInputs_.clear();
       }
     }
-    if (previous && previous != session) shutdown(previous->socket, SD_BOTH);
+    if (previous && previous != session) previous->Close();
+    if (!endedScreen.empty()) screenWake_.notify_all();
+    EmitAll(std::move(unanswered));
     if (!endedScreen.empty()) EmitScreenState(endedScreen, "stopped", "The phone connection changed. Start a new screen sharing session.");
     Event event;
     event.kind = EventKind::Connected;
@@ -1036,7 +1598,7 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   const auto plain = crypto::AesGcmDecrypt(
       session->recvKey, CounterNonce(session->recvCounter++), frame);
   if (!plain) {
-    shutdown(session->socket, SD_BOTH);
+    session->Close();
     return;
   }
   const auto payload = UnpackPayload(*plain);
@@ -1044,7 +1606,7 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   if (!session->screenId.empty()) {
     auto packet = ParseScreenPacket(*payload);
     if (!packet || packet->sessionId != session->screenId) {
-      shutdown(session->socket, SD_BOTH);
+      session->Close();
       return;
     }
     if (config_.onScreenPacket) config_.onScreenPacket(std::move(*packet));
@@ -1052,6 +1614,7 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   }
   const auto root = json::Parse(payload->json);
   if (!root || root->type != json::Value::Type::Object) return;
+  if (const auto receiver = session->incomingTransfers.load()) receiver->Maintain();
   if (JsonString(*root, "type") == "ping") {
     SendToSession(session, Json("pong").Int("time", NowMs()).Build());
     return;
@@ -1067,6 +1630,91 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
     if (matches && config_.onScreenPacket) config_.onScreenPacket(*packet);
     return;
   }
+  const auto type = JsonString(*root, "type");
+  if (type == "file.cancel") {
+    const auto id = JsonString(*root, "id");
+    if (id.empty()) ++session->transferEpoch;
+    else {
+      std::lock_guard lock(session->cancellationMutex);
+      if (const auto found = session->cancellations.find(id); found != session->cancellations.end()) found->second->store(true);
+    }
+    if (auto incoming = session->incomingTransfers.load()) {
+      for (const auto& progress : incoming->Cancel(id)) {
+        Event event;
+        event.id = progress.id;
+        event.remotePath = progress.purpose == "storage" ? progress.reference : "";
+        event.photo.id = progress.purpose == "photo" ? progress.reference : "";
+        event.kind = progress.purpose == "storage" ? EventKind::RemoteFileSaved : EventKind::PhotoSaved;
+        SettleRequest(event);
+        event.kind = EventKind::Error;
+        event.text = "File transfer cancelled on your phone.";
+        Emit(std::move(event));
+      }
+    }
+    if (id.empty()) {
+      Event event;
+      event.kind = EventKind::Error;
+      event.id = "*";
+      event.text = "File transfers cancelled on your phone.";
+      Emit(std::move(event));
+    }
+    return;
+  }
+  if (type == "file.begin" || type == "file.chunk" || type == "file.end") {
+    auto incoming = session->incomingTransfers.load();
+    if (!incoming) return;
+    transfer::Result result;
+    if (type == "file.begin") {
+      result = incoming->Begin(*root, SanitizeFileName(JsonString(*root, "name")));
+    } else if (type == "file.chunk") {
+      result = incoming->Chunk(*root, payload->binary);
+    } else {
+      result = incoming->Finish(JsonString(*root, "id"));
+    }
+    if (!result.error.empty() || result.complete) {
+      Event event;
+      event.id = result.progress.id;
+      event.deviceId = session->deviceId;
+      event.deviceName = session->deviceName;
+      event.photo.name = result.progress.name;
+      event.path = result.path;
+      event.ok = result.complete;
+      event.text = result.error;
+      event.kind = result.complete ? EventKind::FileSaved : EventKind::Error;
+      if (result.progress.purpose == "storage") {
+        event.remotePath = result.progress.reference;
+        event.kind = EventKind::RemoteFileSaved;
+        SettleRequest(event);
+        if (!result.complete) event.kind = EventKind::Error;
+      } else if (result.progress.purpose == "photo") {
+        event.photo.id = result.progress.reference;
+        event.kind = EventKind::PhotoSaved;
+        SettleRequest(event);
+        if (!result.complete) event.kind = EventKind::Error;
+      }
+      if (result.complete) MarkFileFromInternet(result.path);
+      SendToSession(session, Json("file.received").Str("id", result.progress.id)
+          .Str("name", result.progress.name).Bool("ok", result.complete)
+          .Str("error", result.error).Build());
+      if (!result.complete) SendToSession(session, Json("file.cancel").Str("id", result.progress.id).Build());
+      Emit(std::move(event));
+    } else if (result.reportProgress) {
+      {
+        std::lock_guard lock(mutex_);
+        if (auto pending = pendingFiles_.find(result.progress.reference); pending != pendingFiles_.end()) {
+          pending->second.deadline = SteadyMs() + kRequestTimeoutMs;
+        }
+      }
+      Event progress;
+      progress.kind = EventKind::TransferProgress;
+      progress.id = result.progress.id;
+      progress.photo.name = result.progress.name;
+      progress.transferredBytes = result.progress.bytes;
+      progress.totalBytes = result.progress.total;
+      Emit(std::move(progress));
+    }
+    return;
+  }
   auto parsed = ParseSessionMessage(*root, payload->binary, NowMs());
   if (!parsed) return;  // unknown message types are ignored for forward compatibility
   Event event = std::move(*parsed);
@@ -1075,6 +1723,8 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   event.deviceName = session->deviceName;
 
   if (event.kind == EventKind::Status) {
+    session->fileStreamSupported.store(std::find(event.features.begin(), event.features.end(),
+        "file.stream.v1") != event.features.end());
     if (!reportedName.empty() && reportedName != session->deviceName &&
         reportedName.size() <= 80) {
       event.deviceName = reportedName;
@@ -1090,47 +1740,50 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   } else if (event.kind == EventKind::PhotoSaved ||
              event.kind == EventKind::FileSaved ||
              event.kind == EventKind::RemoteFileSaved) {
+    const bool incomingFile = event.kind == EventKind::FileSaved;
+    SettleRequest(event);
     if (event.kind == EventKind::RemoteFileSaved && !event.text.empty()) {
       event.kind = EventKind::Error;  // the phone could not read the file
     } else if (payload->binary.size() > kMaxTransferBytes) {
       event.kind = EventKind::Error;
       event.text = "The file from your phone is larger than 40 MB.";
     } else {
-      std::string name = event.photo.name;
-      if (name.empty()) {
-        name = event.kind == EventKind::PhotoSaved ? "phone-photo.jpg" : "phone-file";
-      }
-      event.path = UniqueDownloadPath(name);
-      if (!WriteFileBytes(event.path, payload->binary)) {
+      // Names come from the phone. They are made safe for Windows, a photo's
+      // extension follows its content, and a storage file is named after the
+      // requested path, as listed in the browser.
+      const std::string name =
+          event.kind == EventKind::PhotoSaved
+              ? PhotoFileName(event.photo.name, payload->binary)
+              : event.kind == EventKind::RemoteFileSaved ? RemoteFileName(event.remotePath)
+                                                         : SanitizeFileName(event.photo.name);
+      event.path = SaveNewFile(config_.downloadsDir, name, payload->binary);
+      if (event.path.empty()) {
         event.kind = EventKind::Error;
         event.text = "Could not save a file from your phone.";
       }
     }
+    // A failed incoming transfer has no photo; its id must not match one.
+    if (incomingFile && event.kind == EventKind::Error) event.photo.id.clear();
   }
   Emit(std::move(event));
 }
 
-std::wstring PhoneService::UniqueDownloadPath(const std::string& name) const {
-  const std::filesystem::path dir(config_.downloadsDir);
-  const std::filesystem::path base(Widen(SanitizeFileName(name)));
-  std::filesystem::path candidate = dir / base;
-  std::error_code ec;
-  for (int i = 2; std::filesystem::exists(candidate, ec) && i < 1000; ++i) {
-    candidate = dir / (base.stem().wstring() + L" (" + std::to_wstring(i) + L")" +
-                       base.extension().wstring());
-  }
-  return candidate.wstring();
-}
-
-void PhoneService::ServeHttp(std::uintptr_t rawSocket, const Bytes& firstBytes) {
+void PhoneService::ServeHttp(std::uintptr_t rawSocket, const Bytes& firstBytes,
+                             std::chrono::steady_clock::time_point deadline) {
   const SOCKET socket = static_cast<SOCKET>(rawSocket);
   std::string request(firstBytes.begin(), firstBytes.end());
   char buffer[2048];
   while (request.find("\r\n\r\n") == std::string::npos && request.size() < 8192) {
+    const DWORD left = RemainingMs(deadline);
+    if (left == 0) return;
+    SetTimeout(socket, left);
     const int received = recv(socket, buffer, sizeof(buffer), 0);
     if (received <= 0) return;
     request.append(buffer, static_cast<size_t>(received));
   }
+  // Each write may wait a while for a slow phone, the whole download not forever.
+  const auto transferDeadline = std::chrono::steady_clock::now() + kHttpTransferTimeout;
+  SetSendTimeout(socket, kHttpSendTimeoutMs);
   const size_t pathStart = 4;
   const size_t pathEnd = request.find(' ', pathStart);
   const std::string path =
@@ -1152,7 +1805,7 @@ void PhoneService::ServeHttp(std::uintptr_t rawSocket, const Bytes& firstBytes) 
         return;
       }
       std::vector<char> chunk(64 * 1024);
-      while (apk) {
+      while (apk && RemainingMs(transferDeadline) > 0) {
         apk.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
         const auto read = static_cast<size_t>(apk.gcount());
         if (read == 0 ||

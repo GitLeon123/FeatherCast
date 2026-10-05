@@ -5,10 +5,14 @@
 // key names inside string values can never be mistaken for keys.
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace feathercast::json {
@@ -153,7 +157,17 @@ struct Parser {
     }
     double parsed = 0;
     const auto result = std::from_chars(text.data() + pos, text.data() + end, parsed);
-    if (result.ec != std::errc{} || result.ptr == text.data() + pos) return false;
+    if (result.ptr == text.data() + pos) return false;
+    if (result.ec == std::errc::result_out_of_range) {
+      // Too small to represent ("1e-400") reads as zero. Too large ("1e400")
+      // has no finite value, so the document is rejected rather than handing
+      // infinity to callers that cast numbers to integers.
+      const std::string literal(text.data() + pos, result.ptr);
+      parsed = std::strtod(literal.c_str(), nullptr);
+      if (!std::isfinite(parsed)) return false;
+    } else if (result.ec != std::errc{}) {
+      return false;
+    }
     pos = static_cast<size_t>(result.ptr - text.data());
     out.type = Value::Type::Number;
     out.number = parsed;
@@ -253,7 +267,22 @@ struct Parser {
 
 }  // namespace detail
 
+// Converts a number to an integer type only when it fits. A plain range check
+// against static_cast<double>(max) is not enough: for 64-bit types that bound
+// rounds up to 2^63, and casting 2^63 back is undefined behavior.
+template <typename Integer>
+inline std::optional<Integer> ToInteger(double number) {
+  static_assert(std::is_integral_v<Integer> && std::is_signed_v<Integer>);
+  if (!std::isfinite(number)) return std::nullopt;
+  // -2^(N-1) and 2^(N-1) are exact powers of two for every signed type.
+  const double limit = -static_cast<double>(std::numeric_limits<Integer>::min());
+  if (number < -limit || number >= limit) return std::nullopt;
+  return static_cast<Integer>(number);
+}
+
 inline std::optional<Value> Parse(std::string_view text) {
+  // Editors on Windows like to save a UTF-8 byte order mark; it is not JSON.
+  if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
   detail::Parser parser{text};
   Value value;
   if (!parser.ParseValue(value)) return std::nullopt;

@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version 3.0
 
 $outPath = Join-Path $PSScriptRoot "..\native\src\emoji.hpp"
 Write-Host "Downloading $Source ..."

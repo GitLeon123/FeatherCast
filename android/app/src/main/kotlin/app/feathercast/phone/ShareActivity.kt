@@ -14,14 +14,14 @@ import kotlinx.coroutines.withContext
 class ShareActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        LinkService.start(this)
-        val link = LinkManager.instance
-        val pc = link.state.value.pcName.ifEmpty { "your PC" }
         if (PhoneApp.instance.store.load() == null) {
             SendClipboardActivity.toast(this, "Open FeatherCast and pair with your PC first.")
             finish()
             return
         }
+        LinkService.start(this)
+        val link = LinkManager.instance
+        val pc = link.state.value.pcName.ifEmpty { "your PC" }
         val uris = sharedUris(intent)
         val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
         lifecycleScope.launch {

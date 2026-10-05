@@ -1,10 +1,13 @@
-﻿#include "IExtension.h"
+#include "IExtension.h"
 #include "extension_protocol.hpp"
 
 #include <windows.h>
 
+#include <fcntl.h>
+#include <io.h>
+
+#include <algorithm>
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -50,62 +53,157 @@ std::string AdaptRequestForPluginApi(std::string request, uint32_t pluginApiVers
   return request;
 }
 
-std::string HandleRequest(HandleJsonFn fn, uint32_t pluginApiVersion, const std::string& request) {
+// The plugin is called exactly once per request. The buffer already has the
+// maximum allowed response size, so the plugin is never called a second time
+// with a larger buffer, which would run activations and other side effects
+// twice.
+std::string HandleRequest(HandleJsonFn fn, uint32_t pluginApiVersion, const std::string& request,
+                          std::vector<char>& buffer) {
   const std::string adaptedRequest = AdaptRequestForPluginApi(request, pluginApiVersion);
-  std::vector<char> buffer(4096, '\0');
-  uint32_t required = CallPlugin(fn, adaptedRequest.c_str(), buffer.data(), static_cast<uint32_t>(buffer.size()));
-  if (!feathercast::extensions::ResponseSizeAllowed(required)) return ErrorJson("plugin-call-failed");
+  buffer[0] = '\0';
+  const uint32_t required =
+      CallPlugin(fn, adaptedRequest.c_str(), buffer.data(), static_cast<uint32_t>(buffer.size()));
+  if (!feathercast::extensions::ResponseSizeAllowed(required) || required > buffer.size()) {
+    return ErrorJson("plugin-call-failed");
+  }
 
-  if (required > buffer.size()) {
-    buffer.assign(required, '\0');
-    required = CallPlugin(fn, adaptedRequest.c_str(), buffer.data(), static_cast<uint32_t>(buffer.size()));
-    if (!feathercast::extensions::ResponseSizeAllowed(required) || required > buffer.size()) {
-      return ErrorJson("plugin-call-failed");
+  // buffer[0] was cleared above, so a plugin that reports success without
+  // writing anything yields an empty string instead of a stale response.
+  const size_t length = strnlen_s(buffer.data(), buffer.size());
+  if (length == 0 || length >= buffer.size()) return ErrorJson("plugin-call-failed");
+  auto line = feathercast::extensions::FrameResponseLine(std::string(buffer.data(), length));
+  if (!line) return ErrorJson("invalid-response");
+  return std::move(*line);
+}
+
+// Points one standard stream (the Win32 handle and the CRT descriptor) at NUL.
+bool RedirectToNul(int descriptor, DWORD standardHandle, DWORD access, int flags) {
+  const HANDLE nul = CreateFileW(L"NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (nul == INVALID_HANDLE_VALUE) return false;
+  const int nulDescriptor = _open_osfhandle(reinterpret_cast<intptr_t>(nul), flags);
+  if (nulDescriptor < 0) {
+    CloseHandle(nul);
+    return false;
+  }
+  const bool redirected = _dup2(nulDescriptor, descriptor) == 0;
+  _close(nulDescriptor);
+  if (!redirected) return false;
+  const intptr_t redirectedHandle = _get_osfhandle(descriptor);
+  return redirectedHandle != -1 &&
+         SetStdHandle(standardHandle, reinterpret_cast<HANDLE>(redirectedHandle)) != FALSE;
+}
+
+// Moves the protocol pipes to private, non-inheritable handles and points the
+// process-wide stdin/stdout at NUL before the plugin DLL is loaded. A plugin
+// that prints (printf, std::cout, WriteFile on GetStdHandle) or reads stdin
+// can then neither corrupt nor consume protocol lines.
+bool IsolateProtocolChannel(HANDLE& input, HANDLE& output) {
+  const HANDLE self = GetCurrentProcess();
+  if (!DuplicateHandle(self, GetStdHandle(STD_INPUT_HANDLE), self, &input, 0, FALSE,
+                       DUPLICATE_SAME_ACCESS) ||
+      !DuplicateHandle(self, GetStdHandle(STD_OUTPUT_HANDLE), self, &output, 0, FALSE,
+                       DUPLICATE_SAME_ACCESS)) {
+    return false;
+  }
+  return RedirectToNul(0, STD_INPUT_HANDLE, GENERIC_READ, _O_RDONLY | _O_BINARY) &&
+         RedirectToNul(1, STD_OUTPUT_HANDLE, GENERIC_WRITE, _O_WRONLY | _O_BINARY);
+}
+
+bool WriteLine(HANDLE output, std::string line) {
+  line.push_back('\n');
+  size_t offset = 0;
+  while (offset < line.size()) {
+    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(line.size() - offset, 1u << 20));
+    DWORD written = 0;
+    if (!WriteFile(output, line.data() + offset, chunk, &written, nullptr) || written == 0) {
+      return false;
+    }
+    offset += written;
+  }
+  return true;
+}
+
+// Reads newline-terminated requests from the private protocol input. A final
+// line without a newline is still returned, like std::getline.
+class LineReader {
+ public:
+  explicit LineReader(HANDLE input) : input_(input) {}
+
+  bool Next(std::string& line) {
+    for (;;) {
+      if (const size_t newline = buffer_.find('\n', scanned_); newline != std::string::npos) {
+        line.assign(buffer_, 0, newline);
+        buffer_.erase(0, newline + 1);
+        scanned_ = 0;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return true;
+      }
+      scanned_ = buffer_.size();
+      char chunk[4096];
+      DWORD read = 0;
+      if (!ReadFile(input_, chunk, static_cast<DWORD>(sizeof(chunk)), &read, nullptr) || read == 0) {
+        if (buffer_.empty()) return false;
+        line.swap(buffer_);
+        buffer_.clear();
+        scanned_ = 0;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return true;
+      }
+      buffer_.append(chunk, read);
     }
   }
 
-  const size_t length = strnlen_s(buffer.data(), buffer.size());
-  if (length >= buffer.size()) return ErrorJson("plugin-call-failed");
-  return std::string(buffer.data(), length);
-}
+ private:
+  HANDLE input_;
+  std::string buffer_;
+  size_t scanned_ = 0;
+};
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  using namespace feathercast::extensions;
   if (argc == 2 && argv[1] && wcscmp(argv[1], L"--self-test") == 0) {
     return 0;
   }
-  if (argc < 2 || !argv[1] || !argv[1][0]) return 2;
+  if (argc < 2 || !argv[1] || !argv[1][0]) return static_cast<int>(kHostExitMissingArgument);
+
+  HANDLE protocolInput = nullptr;
+  HANDLE protocolOutput = nullptr;
+  if (!IsolateProtocolChannel(protocolInput, protocolOutput)) {
+    return static_cast<int>(kHostExitChannelFailed);
+  }
 
   HMODULE dll = LoadLibraryExW(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-  if (!dll) return 3;
+  if (!dll) return static_cast<int>(kHostExitLoadFailed);
 
   auto apiVersion = reinterpret_cast<ApiVersionFn>(GetProcAddress(dll, "FeatherCastExtensionApiVersion"));
   auto handleJson = reinterpret_cast<HandleJsonFn>(GetProcAddress(dll, "FeatherCastExtensionHandleJson"));
   if (!apiVersion || !handleJson) {
     FreeLibrary(dll);
-    return 4;
+    return static_cast<int>(kHostExitMissingExports);
   }
 
   const uint32_t pluginApiVersion = apiVersion();
-  if (pluginApiVersion < feathercast::extensions::kMinSupportedApiVersion ||
-      pluginApiVersion > feathercast::extensions::kApiVersion) {
+  if (pluginApiVersion < kMinSupportedApiVersion || pluginApiVersion > kApiVersion) {
     FreeLibrary(dll);
-    return 5;
+    return static_cast<int>(kHostExitUnsupportedApi);
   }
 
-  std::ios::sync_with_stdio(false);
+  std::vector<char> responseBuffer(kMaxResponseBytes, '\0');
+  LineReader requests(protocolInput);
   std::string request;
-  while (std::getline(std::cin, request)) {
-    if (!request.empty() && request.back() == '\r') request.pop_back();
-    if (request.empty()) {
-      std::cout << ErrorJson("empty-request") << '\n' << std::flush;
-      continue;
-    }
-    std::cout << HandleRequest(handleJson, pluginApiVersion, request) << '\n' << std::flush;
+  bool connected = WriteLine(protocolOutput, BuildHostReadyJson(pluginApiVersion));
+  while (connected && requests.Next(request)) {
+    connected = WriteLine(protocolOutput,
+                          request.empty() ? ErrorJson("empty-request")
+                                          : HandleRequest(handleJson, pluginApiVersion, request,
+                                                          responseBuffer));
   }
 
   FreeLibrary(dll);
+  CloseHandle(protocolInput);
+  CloseHandle(protocolOutput);
   return 0;
 }
-

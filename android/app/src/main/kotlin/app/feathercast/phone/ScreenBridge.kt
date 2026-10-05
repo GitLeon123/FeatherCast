@@ -47,7 +47,7 @@ object ScreenBridge {
         expiresAt = SystemClock.elapsedRealtime() + SCREEN_REQUEST_LIFETIME_MS
         mutableState.value = ScreenUiState(pending = true, detail = "Your PC requests screen sharing. Tap Share screen to approve it.")
         val notifications = context.getSystemService(NotificationManager::class.java)
-        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Screen sharing", NotificationManager.IMPORTANCE_DEFAULT))
+        createChannel(context)
         val open = PendingIntent.getActivity(context, 20,
             Intent(context, MainActivity::class.java).putExtra("screenRequest", next.sessionId),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -96,8 +96,10 @@ object ScreenBridge {
 
     @Synchronized
     fun stop(context: Context, detail: String = "Screen sharing stopped.", id: String? = null) {
-        if (id != null && id != request?.sessionId && id != activeId) return
+        // An empty id names no session, so it must not clear an unrelated request.
+        if (id != null && (id.isEmpty() || (id != request?.sessionId && id != activeId))) return
         val previous = request?.sessionId ?: activeId
+        val endsSession = activeId.isNotEmpty()
         request = null
         owner = null
         activeId = ""
@@ -106,7 +108,8 @@ object ScreenBridge {
         displayHeight = 0
         context.getSystemService(NotificationManager::class.java).cancel(REQUEST_NOTIFICATION)
         context.stopService(Intent(context, ScreenCaptureService::class.java))
-        main.post { RemoteControlService.instance?.cancelGesture(); PcKeyboardService.instance?.restoreKeyboard() }
+        // Only an ended session hands input back; a new or declined request must not switch keyboards.
+        if (endsSession) main.post { RemoteControlService.instance?.cancelGesture(); PcKeyboardService.instance?.restoreKeyboard() }
         mutableState.value = ScreenUiState(detail = detail)
         if (previous.isNotEmpty()) LinkManager.instance.sendAsync(ScreenMessages.state(previous, "stopped", detail = detail))
     }
@@ -114,6 +117,11 @@ object ScreenBridge {
     @Synchronized
     fun disconnected(context: Context, connection: LinkSession) {
         if (owner === connection) stop(context, "Connection lost. Start a new screen sharing session on your PC.")
+    }
+
+    fun createChannel(context: Context) {
+        context.getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(NotificationChannel(CHANNEL, "Screen sharing", NotificationManager.IMPORTANCE_DEFAULT))
     }
 
     const val CHANNEL = "screen-sharing"

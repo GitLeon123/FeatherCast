@@ -2,13 +2,14 @@
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 22,
+    "minor": 25,
     "patch": 0
   },
   "configurePresets": [
     {
       "name": "windows-x64",
       "displayName": "FeatherCast Windows x64",
+      "generator": "Visual Studio 18 2026",
       "binaryDir": "${sourceDir}/build-native",
       "architecture": "x64",
       "cacheVariables": {

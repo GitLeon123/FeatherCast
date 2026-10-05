@@ -3,7 +3,10 @@
 #include <windows.h>
 #include <winhttp.h>
 
-#include <fstream>
+#include <algorithm>
+#include <atomic>
+#include <limits>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,6 +68,40 @@ bool IsSuccessful(HINTERNET request) {
                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
                            WINHTTP_NO_HEADER_INDEX) != FALSE;
   return IsSuccessfulStatusQuery(queried, status);
+}
+
+// The Content-Length the server declared, if it sent a valid one.
+std::optional<unsigned long long> DeclaredContentLength(HINTERNET request) {
+  wchar_t text[32]{};
+  DWORD size = sizeof(text);
+  if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
+                           WINHTTP_HEADER_NAME_BY_INDEX, text, &size,
+                           WINHTTP_NO_HEADER_INDEX)) {
+    return std::nullopt;
+  }
+  const std::wstring_view digits(text, size / sizeof(wchar_t));
+  if (digits.empty()) return std::nullopt;
+  unsigned long long value = 0;
+  for (const wchar_t character : digits) {
+    if (character < L'0' || character > L'9') return std::nullopt;
+    const unsigned long long digit = static_cast<unsigned long long>(character - L'0');
+    if (value > (std::numeric_limits<unsigned long long>::max() - digit) / 10) {
+      return std::nullopt;
+    }
+    value = value * 10 + digit;
+  }
+  return value;
+}
+
+// A sibling of the destination that no other download (or process) shares, so
+// concurrent downloads cannot clobber each other's partial file.
+std::filesystem::path TemporaryDownloadPath(
+    const std::filesystem::path& destination) {
+  static std::atomic<unsigned> counter{0};
+  auto temp = destination;
+  temp += L"." + std::to_wstring(GetCurrentProcessId()) + L"-" +
+          std::to_wstring(counter.fetch_add(1)) + L".part";
+  return temp;
 }
 
 }  // namespace
@@ -136,18 +173,24 @@ std::optional<std::string> HttpsGetUrl(const std::wstring& url,
       !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
     return std::nullopt;
   }
+  const auto declaredLength = DeclaredContentLength(request);
   std::string body;
-  DWORD available = 0;
-  while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+  for (;;) {
+    DWORD available = 0;
+    // A failing query is a broken connection, not the end of the body.
+    if (!WinHttpQueryDataAvailable(request, &available)) return std::nullopt;
+    if (available == 0) break;
     if (body.size() + available > maxBytes) return std::nullopt;
     std::string chunk(available, '\0');
     DWORD read = 0;
     if (!WinHttpReadData(request, chunk.data(), available, &read)) {
       return std::nullopt;
     }
+    if (read == 0) break;
     chunk.resize(read);
     body += chunk;
   }
+  if (declaredLength && body.size() != *declaredLength) return std::nullopt;
   return body;
 }
 
@@ -158,9 +201,7 @@ bool HttpsDownloadToFile(const std::wstring& url,
   if (!parts) return false;
   std::error_code ec;
   std::filesystem::create_directories(destination.parent_path(), ec);
-  auto temp = destination;
-  temp += L".tmp";
-  std::filesystem::remove(temp, ec);
+  const auto temp = TemporaryDownloadPath(destination);
   HINTERNET session = WinHttpOpen(
       L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -181,34 +222,56 @@ bool HttpsDownloadToFile(const std::wstring& url,
       !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
     return false;
   }
-  std::ofstream file(temp, std::ios::binary | std::ios::trunc);
-  if (!file) return false;
-  std::size_t total = 0;
-  DWORD available = 0;
-  while (!stopToken.stop_requested() &&
-         WinHttpQueryDataAvailable(request, &available) && available > 0) {
-    if (total + available > maxBytes) return false;
-    std::string chunk(available, '\0');
-    DWORD read = 0;
-    if (!WinHttpReadData(request, chunk.data(), available, &read)) return false;
-    if (read == 0) continue;
-    file.write(chunk.data(), static_cast<std::streamsize>(read));
-    if (!file) return false;
-    total += read;
-  }
-  file.close();
-  if (stopToken.stop_requested() || total == 0) {
-    std::filesystem::remove(temp, ec);
+  // A declared size is checked up front and against what actually arrived.
+  const auto declaredLength = DeclaredContentLength(request);
+  if (declaredLength && (*declaredLength == 0 || *declaredLength > maxBytes)) {
     return false;
   }
+
+  HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  bool completed = false;
+  // Declared last so it runs first: a failed or canceled download never
+  // leaves its partial file behind.
+  ScopeExit removePartial([&] {
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (!completed) DeleteFileW(temp.c_str());
+  });
+
+  std::vector<char> buffer(64 * 1024);
+  unsigned long long total = 0;
+  for (;;) {
+    if (stopToken.stop_requested()) return false;
+    DWORD available = 0;
+    // A failing query is a broken connection, not the end of the body.
+    if (!WinHttpQueryDataAvailable(request, &available)) return false;
+    if (available == 0) break;
+    DWORD read = 0;
+    const DWORD wanted =
+        std::min(available, static_cast<DWORD>(buffer.size()));
+    if (!WinHttpReadData(request, buffer.data(), wanted, &read)) return false;
+    if (read == 0) break;
+    if (total + read > maxBytes) return false;
+    DWORD written = 0;
+    if (!WriteFile(file, buffer.data(), read, &written, nullptr) ||
+        written != read) {
+      return false;
+    }
+    total += read;
+  }
+  if (total == 0) return false;
+  if (declaredLength && total != *declaredLength) return false;
+  if (!FlushFileBuffers(file)) return false;
+  const bool closed = CloseHandle(file) != FALSE;
+  file = INVALID_HANDLE_VALUE;
+  if (!closed) return false;
   if (!MoveFileExW(temp.c_str(), destination.c_str(),
                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    std::filesystem::remove(destination, ec);
-    std::filesystem::rename(temp, destination, ec);
+    return false;
   }
-  const bool ok = std::filesystem::exists(destination, ec);
-  if (!ok) std::filesystem::remove(temp, ec);
-  return ok;
+  completed = true;
+  return true;
 }
 
 }  // namespace feathercast::network

@@ -109,6 +109,10 @@ const std::vector<SettingDescriptor>& Catalog() {
        L"Auto-fit Result Height",
        L"Resize the normal overlay to fit its results instead of keeping a fixed height.",
        L"Auto-fit result height"},
+      {L"results.learning", SettingsCategory::Results, HitType::SearchLearningToggle,
+       ControlKind::Toggle, L"Learn Search Choices",
+       L"Save up to 256 app and command queries locally. Clipboard, phone, and file searches are excluded.",
+       L"Learn search choices locally"},
       {L"results.width.down", SettingsCategory::Results, HitType::OverlayWidthDown,
        ControlKind::Decrement, L"Overlay Width", L"Width of the search overlay window.",
        L"Decrease overlay width"},
@@ -257,21 +261,26 @@ std::vector<const SettingDescriptor*> Search(const std::wstring& query) {
   const auto trimmed = core::Trim(query);
   if (trimmed.empty()) return {};
 
-  std::vector<core::SearchItem> items;
-  items.reserve(Catalog().size());
-  for (const auto& descriptor : Catalog()) {
-    core::SearchItem item;
-    item.id = std::wstring(descriptor.stableId);
-    item.name = std::wstring(descriptor.label);
-    item.keywords = {std::wstring(descriptor.description),
-                     std::wstring(descriptor.accessibleName),
-                     std::wstring(descriptor.stableId)};
-    if (const auto* category = FindCategory(descriptor.category)) {
-      item.keywords.push_back(std::wstring(category->label));
-      item.keywords.push_back(std::wstring(category->accessibleName));
+  // The catalog never changes, so the search items are built once. Both the
+  // Settings window and the launcher's global search use this function.
+  static const std::vector<core::SearchItem> items = [] {
+    std::vector<core::SearchItem> built;
+    built.reserve(Catalog().size());
+    for (const auto& descriptor : Catalog()) {
+      core::SearchItem item;
+      item.id = std::wstring(descriptor.stableId);
+      item.name = std::wstring(descriptor.label);
+      item.keywords = {std::wstring(descriptor.description),
+                       std::wstring(descriptor.accessibleName),
+                       std::wstring(descriptor.stableId)};
+      if (const auto* category = FindCategory(descriptor.category)) {
+        item.keywords.push_back(std::wstring(category->label));
+        item.keywords.push_back(std::wstring(category->accessibleName));
+      }
+      built.push_back(std::move(item));
     }
-    items.push_back(std::move(item));
-  }
+    return built;
+  }();
 
   const auto matches = core::Search(trimmed, items);
   std::vector<const SettingDescriptor*> results;
@@ -343,6 +352,7 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
       return settings.autoFitResultHeight;
     case HitType::ShowWindowsToggle: return settings.showOpenWindows;
     case HitType::ShowStoreAppsToggle: return settings.showStoreApps;
+    case HitType::SearchLearningToggle: return settings.searchLearningEnabled;
     case HitType::ClipboardHistoryToggle: return settings.clipboardHistoryEnabled;
     case HitType::FileIndexToggle: return settings.fileIndexEnabled;
     case HitType::FileContentIndexToggle:

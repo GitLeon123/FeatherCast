@@ -86,6 +86,7 @@ enum class HitType {
   UpdateChecksToggle,
   ShowWindowsToggle,
   ShowStoreAppsToggle,
+  SearchLearningToggle,
   ClipboardHistoryToggle,
   ClipboardLimitDown,
   ClipboardLimitUp,
@@ -171,6 +172,8 @@ enum class CommandKind {
   PhoneMessages,
   PhoneFiles,
   SendFileToPhone,
+  CancelPhoneTransfers,
+  ManageAutomation,
   PhoneScreen,
 };
 
@@ -294,6 +297,8 @@ enum class ActionKind {
   EditAlias,
   PinInvocation,
   UnpinInvocation,
+  ResetRanking,
+  ConfigureCommandShortcut,
   Preview,
   CopyText,
   PasteText,
@@ -509,11 +514,11 @@ struct DisplayItem {
     if (isSnippet) {
       return feathercast::core::StableInvocationKey(L"snippet", snippet.keyword);
     }
-    if (app.source == L"quicklink") {
-      constexpr std::wstring_view prefix = L"quicklink:";
+    if (app.source == L"quicklink" || app.source == L"script" || app.source == L"workspace") {
+      const auto prefix = app.source + L":";
       const std::wstring token =
           app.id.rfind(prefix, 0) == 0 ? app.id.substr(prefix.size()) : app.id;
-      return feathercast::core::StableInvocationKey(L"quicklink", token);
+      return feathercast::core::StableInvocationKey(app.source, token);
     }
     return Key();
   }
@@ -681,6 +686,10 @@ struct QueryRequest {
   feathercast::clock_utilities::ClockSnapshot clock;
   const std::atomic<unsigned long long>* latestGeneration = nullptr;
   std::set<std::wstring> recentIds;
+  std::wstring preferredInvocationKey;
+  bool offerFileRecovery = false;
+  bool fileIndexingEnabled = false;
+  bool fileIndexLimitReached = false;
   std::map<std::wstring, std::wstring> searchEngines;
   std::map<std::wstring, double> currencyRates;
   std::wstring defaultCurrency;

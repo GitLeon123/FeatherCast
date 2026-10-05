@@ -3,12 +3,22 @@ import argparse
 import ctypes as c
 from ctypes import wintypes as w
 import json
+import hashlib
+import os
+import platform
+from pathlib import Path
+from datetime import datetime, timezone
 import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("pid", type=int)
 parser.add_argument("--seconds", type=float, default=60)
+parser.add_argument("--label", default="hidden-idle", help="Operator-described scenario, e.g. phone-connected")
+parser.add_argument("--binary", type=Path, help="Built executable, recorded by SHA-256")
+parser.add_argument("--output", type=Path, help="Write the same JSON report to a file")
 args = parser.parse_args()
+if not 1 <= args.seconds <= 3600:
+    parser.error("--seconds must be between 1 and 3600")
 kernel = c.WinDLL("kernel32", use_last_error=True)
 psapi = c.WinDLL("psapi", use_last_error=True)
 kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
@@ -46,10 +56,32 @@ def sample():
 try:
     before = sample()
     started = time.monotonic()
-    time.sleep(args.seconds)
-    after = sample()
-    print(json.dumps(dict(pid=args.pid, seconds=time.monotonic() - started,
+    samples = [before]
+    while time.monotonic() - started < args.seconds:
+        time.sleep(min(1, max(0, args.seconds - (time.monotonic() - started))))
+        samples.append(sample())
+    after = samples[-1]
+    elapsed = time.monotonic() - started
+    cpu_ms = after["cpuMs"] - before["cpuMs"]
+    report = dict(schemaVersion=1, utc=datetime.now(timezone.utc).isoformat(),
+        scenario=args.label, pid=args.pid, seconds=elapsed, sampleCount=len(samples),
+        environment=dict(os=platform.platform(), architecture=platform.machine(),
+                         logicalProcessors=os.cpu_count(), cpu=os.environ.get("PROCESSOR_IDENTIFIER", "unknown")),
+        cpuMs=cpu_ms, cpuPercentOneCore=100 * cpu_ms / (elapsed * 1000),
         privateBytes=after["privateBytes"], workingBytes=after["workingBytes"],
-        delta={key: after[key] - before[key] for key in before}), indent=2))
+        peakSampledPrivateBytes=max(s["privateBytes"] for s in samples),
+        peakSampledWorkingBytes=max(s["workingBytes"] for s in samples),
+        delta={key: after[key] - before[key] for key in before})
+    if args.binary:
+        digest = hashlib.sha256()
+        with args.binary.open("rb") as binary:
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+        report["binary"] = dict(name=args.binary.name, sha256=digest.hexdigest())
+    encoded = json.dumps(report, indent=2)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
 finally:
     kernel.CloseHandle(handle)

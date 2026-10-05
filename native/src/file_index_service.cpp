@@ -1,5 +1,7 @@
 #include "file_index_service.hpp"
 
+#include "filesystem_semantics.hpp"
+
 #include <windows.h>
 
 #include <algorithm>
@@ -37,6 +39,32 @@ bool IsGeneratedDirectory(const std::filesystem::path& path) {
          name == L".cache";
 }
 
+// Full rescans while a configured root is unavailable. Later retries only
+// probe the missing roots and rescan once one of them is back.
+constexpr std::size_t kMaxRescanRetries = 4;
+constexpr DWORD kSkippedAttributes =
+    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT;
+
+// Key of %LOCALAPPDATA%\FeatherCast, or empty when it cannot be resolved.
+// FeatherCast writes its database, the file index itself and the icon cache
+// there, so a root containing it would rescan after every one of those writes.
+std::wstring OperationalDataKey() {
+  std::array<wchar_t, 32768> buffer{};
+  const DWORD length = GetEnvironmentVariableW(
+      L"LOCALAPPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) return {};
+  return filesystem_semantics::PathKey(
+      (std::filesystem::path(std::wstring(buffer.data(), length)) /
+       L"FeatherCast")
+          .wstring());
+}
+
+bool IsOperationalDataDirectory(const std::filesystem::path& path,
+                                const std::wstring& dataKey) {
+  return !dataKey.empty() &&
+         filesystem_semantics::PathKey(path.wstring()) == dataKey;
+}
+
 bool NewerEntry(const storage::FileIndexEntry& left,
                 const storage::FileIndexEntry& right) {
   if (left.lastWriteTime != right.lastWriteTime) {
@@ -55,6 +83,13 @@ struct OlderEntryFirst {
 bool FixedLocalRoot(const std::filesystem::path& path) {
   const auto root = RootOf(path);
   return !root.empty() && GetDriveTypeW(root.c_str()) == DRIVE_FIXED;
+}
+
+bool RootAvailable(const std::wstring& configured) {
+  const std::filesystem::path root(configured);
+  std::error_code ec;
+  return FixedLocalRoot(root) && std::filesystem::is_directory(root, ec) &&
+         !ec;
 }
 
 std::vector<std::wstring> NormalizedSegments(std::wstring_view value) {
@@ -175,6 +210,69 @@ bool EntryMatchesExclusion(
   return exclusionMatcher.Matches(relativeText);
 }
 
+// Whether a change reported below `root` can alter the index. It applies the
+// same rules as Scan: nothing below hidden, system, generated or excluded
+// folders, or below FeatherCast's own data folder, is ever indexed, so changes
+// there must not trigger a rescan. A path that no longer exists still counts,
+// because it may have been indexed.
+bool ChangeAffectsIndex(const std::filesystem::path& root,
+                        std::wstring_view relative,
+                        const RelativePathExclusionMatcher& exclusionMatcher,
+                        const std::wstring& dataKey) {
+  std::filesystem::path current = root;
+  std::wstring prefix;
+  std::size_t start = 0;
+  while (start < relative.size()) {
+    const auto end = std::min(relative.find(L'\\', start), relative.size());
+    const auto segment = relative.substr(start, end - start);
+    start = end + 1;
+    if (segment.empty()) continue;
+    const bool leaf = end >= relative.size();
+    current /= std::wstring(segment);
+    if (!prefix.empty()) prefix.push_back(L'/');
+    prefix.append(segment);
+    if (exclusionMatcher.Matches(prefix)) return false;
+    const DWORD attributes = GetFileAttributesW(current.c_str());
+    const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
+    if (exists && (attributes & kSkippedAttributes) != 0) return false;
+    // Every ancestor of a reported path is a directory, even after a delete.
+    const bool directory =
+        !leaf || (exists && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    if (directory && (IsGeneratedDirectory(current) ||
+                      IsOperationalDataDirectory(current, dataKey))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool NotificationsAffectIndex(const std::byte* buffer, DWORD length,
+                              const std::filesystem::path& root,
+                              const RelativePathExclusionMatcher& exclusionMatcher,
+                              const std::wstring& dataKey) {
+  DWORD offset = 0;
+  for (;;) {
+    if (offset > length ||
+        length - offset < offsetof(FILE_NOTIFY_INFORMATION, FileName)) {
+      return true;
+    }
+    const auto* record =
+        reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + offset);
+    const DWORD nameBytes = record->FileNameLength;
+    if (length - offset - offsetof(FILE_NOTIFY_INFORMATION, FileName) <
+        nameBytes) {
+      return true;
+    }
+    const std::wstring_view relative(record->FileName,
+                                     nameBytes / sizeof(wchar_t));
+    if (ChangeAffectsIndex(root, relative, exclusionMatcher, dataKey)) {
+      return true;
+    }
+    if (record->NextEntryOffset == 0) return false;
+    offset += record->NextEntryOffset;
+  }
+}
+
 }  // namespace
 
 bool IsFixedLocalIndexRoot(const std::filesystem::path& path) {
@@ -193,14 +291,10 @@ std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
     const std::vector<std::wstring>& configuredRoots,
     const std::vector<std::wstring>& availableRoots, std::size_t limit,
     const std::vector<std::wstring>& exclusionPatterns) {
-  auto normalized = [](const std::wstring& value) {
-    std::wstring result =
-        std::filesystem::path(value).lexically_normal().wstring();
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](wchar_t ch) {
-                     return static_cast<wchar_t>(std::towlower(ch));
-                   });
-    return result;
+  // Roots arrive in the user's spelling ("D:/Notes/", "d:\notes"), so
+  // compare path keys rather than the stored text.
+  const auto normalized = [](const std::wstring& value) {
+    return filesystem_semantics::PathKey(value);
   };
   std::set<std::wstring> configured;
   std::set<std::wstring> available;
@@ -276,7 +370,8 @@ void FileIndexService::Stop() {
   stopping_ = false;
   rebuildPending_ = false;
   restartWatchersPending_ = false;
-  retryDelay_ = std::chrono::seconds(2);
+  ResetRetries();
+  ForgetContentRecords();
 }
 
 void FileIndexService::Pause() {
@@ -286,8 +381,21 @@ void FileIndexService::Pause() {
     request_.reset();
     rebuildPending_ = false;
     restartWatchersPending_ = true;
+    ResetRetries();
+    ForgetContentRecords();
   }
   cv_.notify_all();
+}
+
+void FileIndexService::ForgetContentRecords() {
+  contentRecords_.clear();
+  ++contentEpoch_;
+}
+
+void FileIndexService::ResetRetries() {
+  retryDelay_ = std::chrono::seconds(2);
+  retryAttempts_ = 0;
+  probeOnly_ = false;
 }
 
 void FileIndexService::SetInteractive(bool interactive) {
@@ -311,6 +419,8 @@ bool FileIndexService::Reconfigure(IndexRequest request) {
     restartWatchersPending_ = true;
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
+    ResetRetries();
+    ForgetContentRecords();
   }
   cv_.notify_all();
   return true;
@@ -322,6 +432,9 @@ bool FileIndexService::Rebuild() {
     if (!request_ || stopping_ || !worker_.joinable()) return false;
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
+    // A rebuild is an explicit request to read every file again.
+    ResetRetries();
+    ForgetContentRecords();
   }
   cv_.notify_all();
   return true;
@@ -336,6 +449,7 @@ void FileIndexService::ScheduleWatchRefresh(bool restartWatchers) {
     std::lock_guard lock(mutex_);
     if (stopping_ || paused_ || !request_) return;
     rebuildPending_ = true;
+    probeOnly_ = false;
     restartWatchersPending_ = restartWatchersPending_ || restartWatchers;
     rebuildAfter_ = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(250);
@@ -343,11 +457,11 @@ void FileIndexService::ScheduleWatchRefresh(bool restartWatchers) {
   cv_.notify_all();
 }
 
-void FileIndexService::RestartWatchers(
-    const std::vector<std::wstring>& roots) {
+void FileIndexService::RestartWatchers(const IndexRequest& request) {
   std::lock_guard watchersLock(watchersMutex_);
   watchers_.clear();
-  for (const auto& root : roots) {
+  const auto dataKey = OperationalDataKey();
+  for (const auto& root : request.roots) {
     const std::filesystem::path path(root);
     if (!FixedLocalRoot(path)) continue;
     auto watcher = std::make_unique<Watcher>();
@@ -360,7 +474,10 @@ void FileIndexService::RestartWatchers(
         nullptr);
     if (watcher->directory == INVALID_HANDLE_VALUE) continue;
     Watcher* raw = watcher.get();
-    watcher->thread = std::jthread([this, raw](std::stop_token token) {
+    watcher->thread = std::jthread([this, raw, path, dataKey,
+                                    patterns = request.exclusionPatterns](
+                                       std::stop_token token) {
+      const RelativePathExclusionMatcher exclusionMatcher(patterns);
       alignas(DWORD) std::array<std::byte, 64 * 1024> buffer{};
       while (!token.stop_requested()) {
         OVERLAPPED overlapped{};
@@ -391,7 +508,10 @@ void FileIndexService::RestartWatchers(
           ScheduleWatchRefresh(true);
           continue;
         }
-        ScheduleWatchRefresh();
+        if (NotificationsAffectIndex(buffer.data(), transferred, path,
+                                     exclusionMatcher, dataKey)) {
+          ScheduleWatchRefresh();
+        }
       }
     });
     watchers_.push_back(std::move(watcher));
@@ -408,6 +528,8 @@ void FileIndexService::WorkerLoop(std::stop_token token) {
   for (;;) {
     IndexRequest request;
     bool restartWatchers = false;
+    bool probeOnly = false;
+    std::vector<std::wstring> missingRoots;
     {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] {
@@ -429,31 +551,83 @@ void FileIndexService::WorkerLoop(std::stop_token token) {
       rebuildPending_ = false;
       restartWatchers = restartWatchersPending_;
       restartWatchersPending_ = false;
+      probeOnly = probeOnly_;
+      probeOnly_ = false;
+      missingRoots = unavailableRoots_;
     }
 
     try {
-      if (restartWatchers && !token.stop_requested()) {
-        RestartWatchers(request.roots);
+      // A root that was missing during the previous scan has no watcher yet.
+      const bool rootReturned =
+          std::any_of(missingRoots.begin(), missingRoots.end(), RootAvailable);
+      if (probeOnly && !rootReturned) {
+        // Nothing came back: probe again later instead of rescanning.
+        std::lock_guard lock(mutex_);
+        if (!stopping_ && !rebuildPending_ && request_ &&
+            request_->generation == request.generation) {
+          rebuildPending_ = true;
+          probeOnly_ = true;
+          rebuildAfter_ = std::chrono::steady_clock::now() + retryDelay_;
+          retryDelay_ = std::min(retryDelay_ * 2, std::chrono::seconds(60));
+        }
+        continue;
       }
-      auto status = Scan(request, token);
+      if (rootReturned) restartWatchers = true;
+      ContentRecords previous;
+      std::uint64_t epoch = 0;
+      {
+        std::lock_guard lock(mutex_);
+        previous = std::move(contentRecords_);
+        contentRecords_.clear();
+        epoch = contentEpoch_;
+      }
+      if (restartWatchers && !token.stop_requested()) {
+        RestartWatchers(request);
+      }
+      ContentRecords current;
+      auto status = Scan(request, token, previous, current);
+      previous.clear();
       const bool needsRetry = status.unavailableRoots > 0;
+      missingRoots.clear();
+      for (const auto& root : status.configuredRoots) {
+        if (std::none_of(status.availableRoots.begin(),
+                         status.availableRoots.end(),
+                         [&](const std::wstring& available) {
+                           return filesystem_semantics::SamePath(available,
+                                                                 root);
+                         })) {
+          missingRoots.push_back(root);
+        }
+      }
+      bool delivered = false;
       if (!token.stop_requested() && IsCurrent(request.generation) && sink_) {
         sink_(std::move(status));
+        delivered = true;
       }
       std::lock_guard lock(mutex_);
       if (!stopping_ && request_ &&
           request_->generation == request.generation) {
+        // Records describe what the sink received. A scan that was not
+        // delivered leaves none, so the next scan reads every file again.
+        if (delivered && contentEpoch_ == epoch) {
+          contentRecords_ = std::move(current);
+        }
+        unavailableRoots_ = std::move(missingRoots);
         if (needsRetry) {
-          const auto retryAt = std::chrono::steady_clock::now() + retryDelay_;
-          if (!rebuildPending_ || retryAt < rebuildAfter_) {
-            rebuildAfter_ = retryAt;
+          // A rebuild that is already pending (a watcher refresh or an
+          // explicit request) rescans anyway and runs this check again.
+          if (!rebuildPending_) {
+            const bool probe = retryAttempts_ >= kMaxRescanRetries;
+            if (!probe) ++retryAttempts_;
+            rebuildPending_ = true;
+            probeOnly_ = probe;
+            if (!probe) restartWatchersPending_ = true;
+            rebuildAfter_ = std::chrono::steady_clock::now() + retryDelay_;
+            retryDelay_ = std::min(retryDelay_ * 2, std::chrono::seconds(60));
+            cv_.notify_all();
           }
-          rebuildPending_ = true;
-          restartWatchersPending_ = true;
-          retryDelay_ = std::min(retryDelay_ * 2, std::chrono::seconds(60));
-          cv_.notify_all();
         } else {
-          retryDelay_ = std::chrono::seconds(2);
+          ResetRetries();
         }
       }
     } catch (...) {
@@ -463,13 +637,17 @@ void FileIndexService::WorkerLoop(std::stop_token token) {
 }
 
 IndexStatus FileIndexService::Scan(const IndexRequest& request,
-                                   std::stop_token token) const {
+                                   std::stop_token token,
+                                   const ContentRecords& previous,
+                                   ContentRecords& current) const {
   IndexStatus status;
   status.generation = request.generation;
   status.configuredRoots = request.roots;
+  status.entryLimit = request.limit;
   const long long scan = NowMilliseconds();
   const RelativePathExclusionMatcher exclusionMatcher(
       request.exclusionPatterns);
+  const auto dataKey = OperationalDataKey();
   // Keep only the newest `limit` entries while traversing. The previous
   // implementation retained every path and trimmed only after the complete
   // recursive scan, which made a large Documents tree consume hundreds of MB.
@@ -519,7 +697,10 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
         const bool directoryEntry =
             (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if (directoryEntry) {
-          if (IsGeneratedDirectory(path)) continue;
+          if (IsGeneratedDirectory(path) ||
+              IsOperationalDataDirectory(path, dataKey)) {
+            continue;
+          }
           pending.push_back(path);
         }
         const auto normalizedPath = path.lexically_normal();
@@ -540,6 +721,7 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
           const auto bytes = std::filesystem::file_size(normalizedPath, ec);
           if (!ec) entry.size = static_cast<long long>(bytes);
         }
+        ++status.discoveredEntries;
         if (request.limit == 0) continue;
         if (newest.size() < request.limit) {
           newest.push(std::move(entry));
@@ -569,10 +751,41 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
       if (token.stop_requested() || !IsCurrent(request.generation)) return status;
       YieldDuringInteraction();
       if (entry.isDirectory) continue;
+      constexpr int kIndexed = static_cast<int>(file_content::State::Indexed);
+      constexpr int kBinary = static_cast<int>(file_content::State::Binary);
+      const auto known = previous.find(entry.path);
+      if (entry.lastWriteTime != 0 && known != previous.end() &&
+          known->second.lastWriteTime == entry.lastWriteTime &&
+          known->second.size == entry.size) {
+        // Unchanged since the last delivered scan: reuse the result instead
+        // of reading the file again. Storage keeps the indexed text.
+        entry.contentState = known->second.contentState;
+        if (entry.contentState == kIndexed) {
+          if (status.indexedContentBytes + known->second.contentBytes >
+              file_content::kTotalSourceQuotaBytes) {
+            entry.contentState =
+                static_cast<int>(file_content::State::TooLarge);
+            continue;
+          }
+          entry.contentBytes = known->second.contentBytes;
+          entry.contentUnchanged = true;
+          status.indexedContentBytes += entry.contentBytes;
+          ++status.indexedContentFiles;
+        }
+        current.insert_or_assign(entry.path, known->second);
+        continue;
+      }
       auto extraction = file_content::Extract(entry.path,
                                               file_content::kMaxIndexedBytes,
                                               token);
       entry.contentState = static_cast<int>(extraction.state);
+      // Only results that needed the whole file are worth remembering; the
+      // other states come from cheap checks that run again every scan.
+      if (entry.lastWriteTime != 0 && entry.contentState == kBinary) {
+        current.insert_or_assign(
+            entry.path,
+            ContentRecord{entry.lastWriteTime, entry.size, kBinary, 0});
+      }
       if (extraction.state != file_content::State::Indexed) continue;
       if (status.indexedContentBytes +
               static_cast<long long>(extraction.sourceBytes) >
@@ -584,13 +797,24 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
       entry.contentText = std::move(extraction.text);
       status.indexedContentBytes += entry.contentBytes;
       ++status.indexedContentFiles;
+      if (entry.lastWriteTime != 0) {
+        current.insert_or_assign(
+            entry.path, ContentRecord{entry.lastWriteTime, entry.size,
+                                      kIndexed, entry.contentBytes});
+      }
     }
   }
 
   status.entries = std::move(discovered);
+  status.limitReached = status.discoveredEntries > request.limit;
   status.live = status.unavailableRoots == 0;
   status.message = status.live ? L"File index is live."
                                : L"Some indexed folders are unavailable.";
+  if (status.limitReached) {
+    status.message += L" Limit reached: " + std::to_wstring(request.limit) +
+        L" of " + std::to_wstring(status.discoveredEntries) +
+        L" entries retained (newest first). Increase the limit or narrow folders in Privacy.";
+  }
   return status;
 }
 

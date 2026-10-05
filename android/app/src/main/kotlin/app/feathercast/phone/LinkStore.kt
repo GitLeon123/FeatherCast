@@ -32,38 +32,59 @@ class LinkStore(context: Context) {
             prefs.edit().putString("deviceId", it).apply()
         }
 
-    fun load(): PairedPc? {
-        val sealed = prefs.getString("linkKey", null) ?: return null
-        val linkKey = unwrap(sealed) ?: return null
-        return PairedPc(
-            prefs.getString("pcId", "") ?: "",
-            prefs.getString("pcName", "PC") ?: "PC",
-            prefs.getString("host", "") ?: "",
-            prefs.getInt("port", 0),
-            linkKey,
-        )
+    // The unwrapped pairing, so the Keystore decrypts it once instead of on every call.
+    private val lock = Any()
+    private var cached: PairedPc? = null
+    private var cacheValid = false
+
+    fun load(): PairedPc? = synchronized(lock) {
+        if (cacheValid) return@synchronized cached
+        val sealed = prefs.getString("linkKey", null)
+        val linkKey = sealed?.let { unwrap(it) ?: return@synchronized null }
+        cached = linkKey?.let {
+            PairedPc(
+                prefs.getString("pcId", "") ?: "",
+                prefs.getString("pcName", "PC") ?: "PC",
+                prefs.getString("host", "") ?: "",
+                prefs.getInt("port", 0),
+                it,
+            )
+        }
+        cacheValid = true
+        cached
     }
 
-    fun save(pc: PairedPc) {
-        prefs.edit()
-            .putString("pcId", pc.pcId)
+    fun save(pc: PairedPc): Unit = synchronized(lock) {
+        val edit = prefs.edit()
+        // A different PC must not inherit the extra access granted to the previous one.
+        if (prefs.getString("pcId", null) != pc.pcId) OPTIONAL_SWITCHES.forEach { edit.remove(it) }
+        edit.putString("pcId", pc.pcId)
             .putString("pcName", pc.pcName)
             .putString("host", pc.host)
             .putInt("port", pc.port)
             .putString("linkKey", wrap(pc.linkKey))
             .apply()
+        cached = pc
+        cacheValid = true
     }
 
-    fun updateAddress(host: String, port: Int) {
+    fun updateAddress(host: String, port: Int): Unit = synchronized(lock) {
         prefs.edit().putString("host", host).putInt("port", port).apply()
+        cached = cached?.copy(host = host, port = port)
     }
 
     fun updatePcName(name: String) {
-        if (name.isNotEmpty()) prefs.edit().putString("pcName", name).apply()
+        if (name.isEmpty()) return
+        synchronized(lock) {
+            prefs.edit().putString("pcName", name).apply()
+            cached = cached?.copy(pcName = name)
+        }
     }
 
-    fun clear() {
+    fun clear(): Unit = synchronized(lock) {
         prefs.edit().remove("pcId").remove("pcName").remove("host").remove("port").remove("linkKey").apply()
+        cached = null
+        cacheValid = true
     }
 
     var sendNotifications: Boolean
@@ -111,6 +132,11 @@ class LinkStore(context: Context) {
         get() = prefs.getBoolean("remoteControl", false)
         set(value) = prefs.edit().putBoolean("remoteControl", value).apply()
 
+    /** The ringer mode to restore after the PC silenced a call, or -1. Survives process death. */
+    var silencedRingerMode: Int
+        get() = prefs.getInt("silencedRingerMode", -1)
+        set(value) = prefs.edit().putInt("silencedRingerMode", value).apply()
+
     private fun keystoreKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
@@ -143,5 +169,6 @@ class LinkStore(context: Context) {
 
     private companion object {
         const val KEY_ALIAS = "feathercast-link-key"
+        val OPTIONAL_SWITCHES = listOf("smsAccess", "callAlerts", "storageAccess", "screenSharing", "remoteControl")
     }
 }

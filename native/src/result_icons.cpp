@@ -50,6 +50,8 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
     case CommandKind::PhoneMedia: return ResultIcon::PlayPause;
     case CommandKind::PhoneFiles: return ResultIcon::Folder;
     case CommandKind::SendFileToPhone: return ResultIcon::Download;
+    case CommandKind::CancelPhoneTransfers: return ResultIcon::Close;
+    case CommandKind::ManageAutomation: return ResultIcon::Terminal;
     case CommandKind::PhoneScreen: return ResultIcon::Phone;
     case CommandKind::Settings: return ResultIcon::Gear;
     case CommandKind::Quit: return ResultIcon::Exit;
@@ -140,6 +142,8 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::ReplyToPhoneNotification: return ResultIcon::Edit;
     case ActionKind::SendToPhone: return ResultIcon::Phone;
     case ActionKind::None: return ResultIcon::Actions;
+    case ActionKind::ResetRanking: return ResultIcon::HistoryOff;
+    case ActionKind::ConfigureCommandShortcut: return ResultIcon::Keyboard;
   }
   return ResultIcon::Actions;
 }
@@ -191,6 +195,8 @@ ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
   if (item.isWindow) return ResultIcon::Windows;
   if (item.app.isGame) return ResultIcon::Gamepad;
   if (item.app.source == L"quicklink") return ResultIcon::Link;
+  if (item.app.source == L"script") return ResultIcon::Terminal;
+  if (item.app.source == L"workspace") return ResultIcon::WindowLayout;
   if (item.app.source == L"file") {
     return item.app.fileIsDirectory ? ResultIcon::Folder : ResultIcon::File;
   }

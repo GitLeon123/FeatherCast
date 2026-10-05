@@ -1,3 +1,4 @@
+#include "dpapi_scope.hpp"
 #include "storage.hpp"
 #include "test_framework.hpp"
 
@@ -54,6 +55,8 @@ bool Contains(std::string_view value, std::string_view expected) {
 }  // namespace
 
 int main() {
+  // This test account may have no user DPAPI master key.
+  feathercast::dpapi::AllowMachineScopeFallbackForTests();
   const auto tempRoot = TestTempRoot();
   const auto databasePath = tempRoot / L"feathercast.db";
   std::error_code ec;

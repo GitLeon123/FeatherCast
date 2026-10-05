@@ -10,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 3.0
 $repo = Split-Path -Parent $PSScriptRoot
 
 if (-not $env:JAVA_HOME -or -not (Test-Path (Join-Path $env:JAVA_HOME 'bin\java.exe'))) {
@@ -41,7 +42,7 @@ if (-not (Test-Path $keystore)) {
 $password = (Get-Content -Path $secretFile -Raw).Trim()
 
 $tasks = @(':app:lintRelease', ':app:assembleRelease')
-if (-not $SkipTests) { $tasks = @(':protocol:test') + $tasks }
+if (-not $SkipTests) { $tasks = @(':protocol:test', ':app:testReleaseUnitTest') + $tasks }
 
 Push-Location (Join-Path $repo 'android')
 try {
@@ -70,8 +71,13 @@ if (-not (Test-Path $apk)) { throw "APK not found: $apk" }
 
 $buildTools = Get-ChildItem (Join-Path $env:ANDROID_HOME 'build-tools') -Directory |
   Sort-Object { [version]($_.Name -replace '[^0-9.]', '') } | Select-Object -Last 1
-& (Join-Path $buildTools.FullName 'apksigner.bat') verify $apk
-if ($LASTEXITCODE -ne 0) { throw 'apksigner verify failed.' }
+if (-not $buildTools) { throw 'Android build-tools missing. Run scripts\setup-android-sdk.ps1 first.' }
+$verification = & (Join-Path $buildTools.FullName 'apksigner.bat') verify --verbose --print-certs $apk |
+  Out-String
+if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed.`n$verification" }
+# Phones only accept updates signed with the same key; never ship the debug key.
+if ($verification -match 'CN=Android Debug') { throw 'The APK is signed with the Android debug key.' }
+Write-Host $verification.Trim()
 
 # FeatherCast serves the APK from next to its exe (http://<pc>:47800/app.apk).
 $native = Join-Path $repo $NativeBuildDir

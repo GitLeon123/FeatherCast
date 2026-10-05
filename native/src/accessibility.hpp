@@ -8,6 +8,9 @@
 #include <UIAutomationCoreApi.h>
 
 #include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,6 +32,9 @@ struct Item {
   LONG role = ROLE_SYSTEM_LISTITEM;
   LONG state = STATE_SYSTEM_FOCUSABLE;
   RECT screenRect{};
+  // UIA live region politeness. Status text that changes on its own should be
+  // Polite (or Assertive for errors) and announced with NotifyStatusChanged.
+  LiveSetting liveSetting = LiveSetting::Off;
 };
 
 class Model {
@@ -73,6 +79,76 @@ inline HRESULT SetVariantString(const std::wstring& value, VARIANT* result) {
   return result->bstrVal ? S_OK : E_OUTOFMEMORY;
 }
 
+// Increments a COM reference count unless it already reached zero, i.e. the
+// object is being destroyed and must not be revived.
+inline bool TryAddReference(std::atomic<ULONG>& references) noexcept {
+  ULONG current = references.load(std::memory_order_acquire);
+  while (current != 0) {
+    if (references.compare_exchange_weak(current, current + 1,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// An accessibility object that Disconnect can sever from its clients.
+class Tracked {
+ public:
+  virtual bool TryAddRefTracked() noexcept = 0;
+  virtual void DisconnectClients() noexcept = 0;
+  virtual void ReleaseTracked() noexcept = 0;
+
+ protected:
+  ~Tracked() = default;
+};
+
+// Shared by every object handed out for one window. Disconnect clears the
+// model, so objects that clients still hold fail instead of reaching a model
+// or window that no longer exists.
+struct Connection {
+  Connection(Model* connectedModel, HWND connectedHwnd)
+      : model(connectedModel), hwnd(connectedHwnd) {}
+
+  void Track(Tracked* object) {
+    std::lock_guard lock(mutex);
+    objects.push_back(object);
+  }
+
+  void Untrack(Tracked* object) noexcept {
+    std::lock_guard lock(mutex);
+    std::erase(objects, object);
+  }
+
+  std::atomic<Model*> model;
+  const HWND hwnd;
+  std::mutex mutex;
+  std::vector<Tracked*> objects;
+};
+
+inline std::mutex& ConnectionRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+inline std::map<HWND, std::shared_ptr<Connection>>& ConnectionRegistry() {
+  static std::map<HWND, std::shared_ptr<Connection>> registry;
+  return registry;
+}
+
+inline std::shared_ptr<Connection> ConnectionFor(Model* model, HWND hwnd) {
+  if (!hwnd) return std::make_shared<Connection>(model, hwnd);
+  std::lock_guard lock(ConnectionRegistryMutex());
+  auto& connection = ConnectionRegistry()[hwnd];
+  if (!connection || connection->model.load(std::memory_order_acquire) != model) {
+    // A reused window handle must not reach the previous owner's model.
+    if (connection) connection->model.store(nullptr, std::memory_order_release);
+    connection = std::make_shared<Connection>(model, hwnd);
+  }
+  return connection;
+}
+
 class ChildProvider final : public IServiceProvider,
                             public IAccessibleEx,
                             public IRawElementProviderSimple,
@@ -80,11 +156,14 @@ class ChildProvider final : public IServiceProvider,
                             public IValueProvider,
                             public IRangeValueProvider,
                             public IToggleProvider,
-                            public ISelectionItemProvider {
+                            public ISelectionItemProvider,
+                            private Tracked {
  public:
-  ChildProvider(Model* model, HWND hwnd, int child, IAccessible* parent)
-      : model_(model), hwnd_(hwnd), child_(child), parent_(parent) {
+  ChildProvider(std::shared_ptr<Connection> connection, int child,
+                IAccessible* parent)
+      : connection_(std::move(connection)), child_(child), parent_(parent) {
     if (parent_) parent_->AddRef();
+    connection_->Track(this);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
@@ -141,9 +220,24 @@ class ChildProvider final : public IServiceProvider,
     return parent_ ? S_OK : E_FAIL;
   }
 
+  // A fragment inside an MSAA-hosted window is identified relative to its
+  // host: UiaAppendRuntimeId followed by an id unique within that window.
   HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** runtimeId) override {
     if (!runtimeId) return E_POINTER;
     *runtimeId = nullptr;
+    if (!ConnectedModel()) return UIA_E_ELEMENTNOTAVAILABLE;
+    SAFEARRAY* ids = SafeArrayCreateVector(VT_I4, 0, 2);
+    if (!ids) return E_OUTOFMEMORY;
+    const int values[2] = {UiaAppendRuntimeId, child_};
+    for (LONG index = 0; index < 2; ++index) {
+      int value = values[index];
+      const HRESULT hr = SafeArrayPutElement(ids, &index, &value);
+      if (FAILED(hr)) {
+        SafeArrayDestroy(ids);
+        return hr;
+      }
+    }
+    *runtimeId = ids;
     return S_OK;
   }
 
@@ -165,7 +259,7 @@ class ChildProvider final : public IServiceProvider,
                                                 IUnknown** provider) override {
     if (!provider) return E_POINTER;
     *provider = nullptr;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if (pattern == UIA_ValuePatternId && item->role == ROLE_SYSTEM_TEXT) {
       return QueryInterface(IID_IValueProvider,
@@ -187,7 +281,10 @@ class ChildProvider final : public IServiceProvider,
       return QueryInterface(IID_ISelectionItemProvider,
                             reinterpret_cast<void**>(provider));
     }
-    if (pattern == UIA_InvokePatternId && !item->defaultAction.empty()) {
+    // A check box is operated through Toggle; also exposing Invoke would give
+    // clients two different actions for the same control.
+    if (pattern == UIA_InvokePatternId && !item->defaultAction.empty() &&
+        item->role != ROLE_SYSTEM_CHECKBUTTON) {
       return QueryInterface(IID_IInvokeProvider,
                             reinterpret_cast<void**>(provider));
     }
@@ -198,7 +295,7 @@ class ChildProvider final : public IServiceProvider,
                                               VARIANT* result) override {
     if (!result) return E_POINTER;
     VariantInit(result);
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     switch (property) {
       case UIA_NamePropertyId:
@@ -212,6 +309,10 @@ class ChildProvider final : public IServiceProvider,
       case UIA_ControlTypePropertyId:
         result->vt = VT_I4;
         result->lVal = UiaControlTypeForRole(item->role);
+        return S_OK;
+      case UIA_LiveSettingPropertyId:
+        result->vt = VT_I4;
+        result->lVal = static_cast<LONG>(item->liveSetting);
         return S_OK;
       case UIA_IsEnabledPropertyId:
         result->vt = VT_BOOL;
@@ -251,27 +352,30 @@ class ChildProvider final : public IServiceProvider,
   }
 
   HRESULT STDMETHODCALLTYPE Invoke() override {
-    const auto item = CurrentItem();
+    Model* const model = ConnectedModel();
+    const auto item = CurrentItem(model);
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0)
       return E_ACCESSDENIED;
     if (item->defaultAction.empty()) return UIA_E_NOTSUPPORTED;
-    model_->AccessibleInvokeChild(hwnd_, child_);
+    model->AccessibleInvokeChild(connection_->hwnd, child_);
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR value) override {
-    const auto item = CurrentItem();
+    Model* const model = ConnectedModel();
+    const auto item = CurrentItem(model);
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_READONLY)) != 0)
       return E_ACCESSDENIED;
-    return model_->AccessibleSetValue(hwnd_, child_, value ? value : L"");
+    return model->AccessibleSetValue(connection_->hwnd, child_,
+                                     value ? value : L"");
   }
 
   HRESULT STDMETHODCALLTYPE get_Value(BSTR* value) override {
     if (!value) return E_POINTER;
     *value = nullptr;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     *value = SysAllocString(item->value.c_str());
     return *value ? S_OK : E_OUTOFMEMORY;
@@ -279,14 +383,15 @@ class ChildProvider final : public IServiceProvider,
 
   HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* readOnly) override {
     if (!readOnly) return E_POINTER;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     *readOnly = (item->state & STATE_SYSTEM_READONLY) != 0;
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE SetValue(double value) override {
-    const auto item = CurrentItem();
+    Model* const model = ConnectedModel();
+    const auto item = CurrentItem(model);
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if (!item->rangeValue) return UIA_E_NOTSUPPORTED;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_READONLY)) != 0)
@@ -294,12 +399,12 @@ class ChildProvider final : public IServiceProvider,
     if (value < item->rangeMinimum || value > item->rangeMaximum) {
       return E_INVALIDARG;
     }
-    return model_->AccessibleSetRangeValue(hwnd_, child_, value);
+    return model->AccessibleSetRangeValue(connection_->hwnd, child_, value);
   }
 
   HRESULT STDMETHODCALLTYPE get_Value(double* value) override {
     if (!value) return E_POINTER;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if (!item->rangeValue) return UIA_E_NOTSUPPORTED;
     *value = *item->rangeValue;
@@ -322,11 +427,22 @@ class ChildProvider final : public IServiceProvider,
     return RangeProperty(value, &Item::rangeSmallChange);
   }
 
-  HRESULT STDMETHODCALLTYPE Toggle() override { return Invoke(); }
+  // Toggling a check box is its own action; it does not depend on the item
+  // also advertising an MSAA default action.
+  HRESULT STDMETHODCALLTYPE Toggle() override {
+    Model* const model = ConnectedModel();
+    const auto item = CurrentItem(model);
+    if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
+    if (item->role != ROLE_SYSTEM_CHECKBUTTON) return UIA_E_NOTSUPPORTED;
+    if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0)
+      return E_ACCESSDENIED;
+    model->AccessibleInvokeChild(connection_->hwnd, child_);
+    return S_OK;
+  }
 
   HRESULT STDMETHODCALLTYPE get_ToggleState(ToggleState* state) override {
     if (!state) return E_POINTER;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     *state = (item->state & STATE_SYSTEM_MIXED) != 0
                  ? ToggleState_Indeterminate
@@ -337,11 +453,12 @@ class ChildProvider final : public IServiceProvider,
   }
 
   HRESULT STDMETHODCALLTYPE Select() override {
-    const auto item = CurrentItem();
+    Model* const model = ConnectedModel();
+    const auto item = CurrentItem(model);
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0)
       return E_ACCESSDENIED;
-    model_->AccessibleFocusChild(hwnd_, child_);
+    model->AccessibleFocusChild(connection_->hwnd, child_);
     return S_OK;
   }
 
@@ -352,7 +469,7 @@ class ChildProvider final : public IServiceProvider,
 
   HRESULT STDMETHODCALLTYPE get_IsSelected(BOOL* selected) override {
     if (!selected) return E_POINTER;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     *selected = (item->state & (STATE_SYSTEM_SELECTED | STATE_SYSTEM_FOCUSED)) !=
                 0;
@@ -370,11 +487,28 @@ class ChildProvider final : public IServiceProvider,
 
  private:
   ~ChildProvider() {
+    connection_->Untrack(this);
     if (parent_) parent_->Release();
   }
 
-  std::optional<Item> CurrentItem() const {
-    const auto items = model_->AccessibleItems(hwnd_);
+  bool TryAddRefTracked() noexcept override {
+    return TryAddReference(references_);
+  }
+
+  void DisconnectClients() noexcept override {
+    UiaDisconnectProvider(static_cast<IRawElementProviderSimple*>(this));
+    CoDisconnectObject(static_cast<IAccessibleEx*>(this), 0);
+  }
+
+  void ReleaseTracked() noexcept override { Release(); }
+
+  Model* ConnectedModel() const noexcept {
+    return connection_->model.load(std::memory_order_acquire);
+  }
+
+  std::optional<Item> CurrentItem(Model* model) const {
+    if (!model) return std::nullopt;
+    const auto items = model->AccessibleItems(connection_->hwnd);
     if (child_ <= 0 || child_ > static_cast<int>(items.size())) {
       return std::nullopt;
     }
@@ -383,7 +517,7 @@ class ChildProvider final : public IServiceProvider,
 
   HRESULT RangeProperty(double* value, double Item::*member) const {
     if (!value) return E_POINTER;
-    const auto item = CurrentItem();
+    const auto item = CurrentItem(ConnectedModel());
     if (!item) return UIA_E_ELEMENTNOTAVAILABLE;
     if (!item->rangeValue) return UIA_E_NOTSUPPORTED;
     *value = (*item).*member;
@@ -391,8 +525,7 @@ class ChildProvider final : public IServiceProvider,
   }
 
   std::atomic<ULONG> references_ = 1;
-  Model* model_ = nullptr;
-  HWND hwnd_ = nullptr;
+  std::shared_ptr<Connection> connection_;
   int child_ = 0;
   IAccessible* parent_ = nullptr;
 };
@@ -402,9 +535,16 @@ class ChildProvider final : public IServiceProvider,
 class Window final : public IAccessible,
                      public IServiceProvider,
                      public IAccessibleEx,
-                     public IRawElementProviderSimple {
+                     public IRawElementProviderSimple,
+                     private detail::Tracked {
  public:
-  Window(Model* model, HWND hwnd) : model_(model), hwnd_(hwnd) {}
+  Window(Model* model, HWND hwnd)
+      : Window(detail::ConnectionFor(model, hwnd)) {}
+
+  explicit Window(std::shared_ptr<detail::Connection> connection)
+      : connection_(std::move(connection)), hwnd_(connection_->hwnd) {
+    connection_->Track(this);
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
     if (!object) return E_POINTER;
@@ -455,12 +595,14 @@ class Window final : public IAccessible,
                                                IAccessibleEx** result) override {
     if (!result) return E_POINTER;
     *result = nullptr;
-    const auto items = Items();
+    Model* const model = ConnectedModel();
+    if (!model) return UIA_E_ELEMENTNOTAVAILABLE;
+    const auto items = model->AccessibleItems(hwnd_);
     if (child <= 0 || child > static_cast<long>(items.size())) {
       return E_INVALIDARG;
     }
     auto* provider = new detail::ChildProvider(
-        model_, hwnd_, static_cast<int>(child), static_cast<IAccessible*>(this));
+        connection_, static_cast<int>(child), static_cast<IAccessible*>(this));
     *result = static_cast<IAccessibleEx*>(provider);
     return S_OK;
   }
@@ -474,6 +616,7 @@ class Window final : public IAccessible,
     return S_OK;
   }
 
+  // The window element itself is identified by its HWND host provider.
   HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** runtimeId) override {
     if (!runtimeId) return E_POINTER;
     *runtimeId = nullptr;
@@ -498,16 +641,18 @@ class Window final : public IAccessible,
                                                 IUnknown** provider) override {
     if (!provider) return E_POINTER;
     *provider = nullptr;
-    return S_OK;
+    return ConnectedModel() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
   }
 
   HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property,
                                               VARIANT* result) override {
     if (!result) return E_POINTER;
     VariantInit(result);
+    Model* const model = ConnectedModel();
+    if (!model) return UIA_E_ELEMENTNOTAVAILABLE;
     switch (property) {
       case UIA_NamePropertyId:
-        return detail::SetVariantString(model_->AccessibleWindowName(hwnd_),
+        return detail::SetVariantString(model->AccessibleWindowName(hwnd_),
                                         result);
       case UIA_AutomationIdPropertyId:
         return detail::SetVariantString(L"FeatherCastWindow", result);
@@ -547,33 +692,44 @@ class Window final : public IAccessible,
       IRawElementProviderSimple** provider) override {
     if (!provider) return E_POINTER;
     *provider = nullptr;
+    if (!ConnectedModel()) return UIA_E_ELEMENTNOTAVAILABLE;
     return hwnd_ ? UiaHostProviderFromHwnd(hwnd_, provider) : S_OK;
   }
 
+  // The client area's parent is the window's standard OBJID_WINDOW object.
   HRESULT STDMETHODCALLTYPE get_accParent(IDispatch** parent) override {
     if (!parent) return E_POINTER;
     *parent = nullptr;
-    return S_FALSE;
+    if (!ConnectedModel()) return RPC_E_DISCONNECTED;
+    if (!hwnd_) return S_FALSE;
+    return AccessibleObjectFromWindow(hwnd_, static_cast<DWORD>(OBJID_WINDOW),
+                                      IID_IDispatch,
+                                      reinterpret_cast<void**>(parent));
   }
   HRESULT STDMETHODCALLTYPE get_accChildCount(LONG* count) override {
     if (!count) return E_POINTER;
-    *count = static_cast<LONG>(Items().size());
+    *count = 0;
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    *count = static_cast<LONG>(model->AccessibleItems(hwnd_).size());
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch** child) override {
     if (!child) return E_POINTER;
     *child = nullptr;
-    return S_FALSE;
+    return ConnectedModel() ? S_FALSE : RPC_E_DISCONNECTED;
   }
   HRESULT STDMETHODCALLTYPE get_accName(VARIANT child, BSTR* name) override {
     if (!name) return E_POINTER;
     *name = nullptr;
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     if (IsSelf(child)) {
-      const std::wstring value = model_->AccessibleWindowName(hwnd_);
+      const std::wstring value = model->AccessibleWindowName(hwnd_);
       *name = SysAllocString(value.c_str());
       return *name ? S_OK : E_OUTOFMEMORY;
     }
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
     if (!item) return E_INVALIDARG;
     *name = SysAllocString(item->name.c_str());
     return *name ? S_OK : E_OUTOFMEMORY;
@@ -581,7 +737,9 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE get_accValue(VARIANT child, BSTR* value) override {
     if (!value) return E_POINTER;
     *value = nullptr;
-    const auto item = ItemFor(child);
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const auto item = ItemFor(model, child);
     if (!item || item->value.empty()) return S_FALSE;
     *value = SysAllocString(item->value.c_str());
     return *value ? S_OK : E_OUTOFMEMORY;
@@ -589,7 +747,9 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT child, BSTR* description) override {
     if (!description) return E_POINTER;
     *description = nullptr;
-    const auto item = ItemFor(child);
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const auto item = ItemFor(model, child);
     if (!item || item->description.empty()) return S_FALSE;
     *description = SysAllocString(item->description.c_str());
     return *description ? S_OK : E_OUTOFMEMORY;
@@ -597,36 +757,51 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE get_accRole(VARIANT child, VARIANT* role) override {
     if (!role) return E_POINTER;
     VariantInit(role);
-    role->vt = VT_I4;
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     if (IsSelf(child)) {
+      role->vt = VT_I4;
       role->lVal = ROLE_SYSTEM_WINDOW;
       return S_OK;
     }
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
     if (!item) return E_INVALIDARG;
+    role->vt = VT_I4;
     role->lVal = item->role;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accState(VARIANT child, VARIANT* state) override {
     if (!state) return E_POINTER;
     VariantInit(state);
-    state->vt = VT_I4;
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     if (IsSelf(child)) {
+      state->vt = VT_I4;
       state->lVal = IsWindowVisible(hwnd_) ? 0 : STATE_SYSTEM_INVISIBLE;
       return S_OK;
     }
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
     if (!item) return E_INVALIDARG;
+    state->vt = VT_I4;
     state->lVal = item->state;
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR*) override { return S_FALSE; }
-  HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR*, VARIANT, LONG*) override { return S_FALSE; }
+  HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR* help) override {
+    if (help) *help = nullptr;
+    return S_FALSE;
+  }
+  HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR* file, VARIANT, LONG* topic) override {
+    if (file) *file = nullptr;
+    if (topic) *topic = 0;
+    return S_FALSE;
+  }
   HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT child,
                                                       BSTR* shortcut) override {
     if (!shortcut) return E_POINTER;
     *shortcut = nullptr;
-    const auto item = ItemFor(child);
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const auto item = ItemFor(model, child);
     if (!item || item->keyboardShortcut.empty()) return S_FALSE;
     *shortcut = SysAllocString(item->keyboardShortcut.c_str());
     return *shortcut ? S_OK : E_OUTOFMEMORY;
@@ -634,9 +809,11 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT* focus) override {
     if (!focus) return E_POINTER;
     VariantInit(focus);
-    const LONG child = model_->AccessibleFocusedChild(hwnd_);
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const LONG child = model->AccessibleFocusedChild(hwnd_);
     focus->vt = VT_I4;
-    const auto items = Items();
+    const auto items = model->AccessibleItems(hwnd_);
     if (child > 0 && child <= static_cast<LONG>(items.size()) &&
         (items[static_cast<size_t>(child - 1)].state &
          (STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_UNAVAILABLE |
@@ -650,9 +827,11 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT* selection) override {
     if (!selection) return E_POINTER;
     VariantInit(selection);
-    const LONG child = model_->AccessibleSelectedChild(hwnd_);
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const LONG child = model->AccessibleSelectedChild(hwnd_);
     selection->vt = VT_I4;
-    const auto items = Items();
+    const auto items = model->AccessibleItems(hwnd_);
     if (child > 0 && child <= static_cast<LONG>(items.size()) &&
         (items[static_cast<size_t>(child - 1)].state &
          (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) == 0) {
@@ -662,24 +841,35 @@ class Window final : public IAccessible,
     }
     return S_OK;
   }
+  // A check box names the action it performs now ("Check" or "Uncheck"), so
+  // the MSAA default action stays in step with the toggle state.
   HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT child, BSTR* action) override {
     if (!action) return E_POINTER;
     *action = nullptr;
-    const auto item = ItemFor(child);
-    if (!item || item->defaultAction.empty()) return S_FALSE;
-    *action = SysAllocString(item->defaultAction.c_str());
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const auto item = ItemFor(model, child);
+    if (!item) return S_FALSE;
+    std::wstring text = item->defaultAction;
+    if (item->role == ROLE_SYSTEM_CHECKBUTTON) {
+      text = (item->state & STATE_SYSTEM_CHECKED) != 0 ? L"Uncheck" : L"Check";
+    }
+    if (text.empty()) return S_FALSE;
+    *action = SysAllocString(text.c_str());
     return *action ? S_OK : E_OUTOFMEMORY;
   }
   HRESULT STDMETHODCALLTYPE accSelect(LONG flags, VARIANT child) override {
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     const auto id = ChildId(child);
-    if (!id || !ItemFor(child)) return E_INVALIDARG;
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
+    if (!id || !item) return E_INVALIDARG;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0 ||
         (item->state & STATE_SYSTEM_FOCUSABLE) == 0) {
       return E_ACCESSDENIED;
     }
     if ((flags & (SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION)) != 0) {
-      model_->AccessibleFocusChild(hwnd_, *id);
+      model->AccessibleFocusChild(hwnd_, *id);
       return S_OK;
     }
     return S_FALSE;
@@ -687,11 +877,13 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE accLocation(LONG* left, LONG* top, LONG* width, LONG* height,
                                         VARIANT child) override {
     if (!left || !top || !width || !height) return E_POINTER;
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     RECT rect{};
     if (IsSelf(child)) {
       GetWindowRect(hwnd_, &rect);
     } else {
-      const auto item = ItemFor(child);
+      const auto item = ItemFor(model, child);
       if (!item) return E_INVALIDARG;
       rect = item->screenRect;
     }
@@ -704,7 +896,9 @@ class Window final : public IAccessible,
   HRESULT STDMETHODCALLTYPE accNavigate(LONG direction, VARIANT start, VARIANT* destination) override {
     if (!destination) return E_POINTER;
     VariantInit(destination);
-    const LONG count = static_cast<LONG>(Items().size());
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const LONG count = static_cast<LONG>(model->AccessibleItems(hwnd_).size());
     LONG id = IsSelf(start) ? 0 : start.lVal;
     if (!IsSelf(start) && (start.vt != VT_I4 || id <= 0 || id > count)) {
       return E_INVALIDARG;
@@ -721,12 +915,23 @@ class Window final : public IAccessible,
     destination->lVal = id;
     return S_OK;
   }
+  // Points outside the window report VT_EMPTY (S_FALSE); points inside it that
+  // miss every visible child report the window itself. Without a window
+  // handle only the children's own rectangles are known.
   HRESULT STDMETHODCALLTYPE accHitTest(LONG x, LONG y, VARIANT* child) override {
     if (!child) return E_POINTER;
     VariantInit(child);
-    const auto items = Items();
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
+    const POINT point{x, y};
+    if (hwnd_) {
+      RECT windowRect{};
+      if (!GetWindowRect(hwnd_, &windowRect) || !PtInRect(&windowRect, point)) {
+        return S_FALSE;
+      }
+    }
+    const auto items = model->AccessibleItems(hwnd_);
     for (size_t i = 0; i < items.size(); ++i) {
-      POINT point{x, y};
       if ((items[i].state & STATE_SYSTEM_INVISIBLE) != 0) continue;
       if (PtInRect(&items[i].screenRect, point)) {
         child->vt = VT_I4;
@@ -734,32 +939,54 @@ class Window final : public IAccessible,
         return S_OK;
       }
     }
+    if (!hwnd_) return S_FALSE;
     child->vt = VT_I4;
     child->lVal = CHILDID_SELF;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE accDoDefaultAction(VARIANT child) override {
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     const auto id = ChildId(child);
-    if (!id || !ItemFor(child)) return E_INVALIDARG;
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
+    if (!id || !item) return E_INVALIDARG;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0) {
       return E_ACCESSDENIED;
     }
-    model_->AccessibleInvokeChild(hwnd_, *id);
+    model->AccessibleInvokeChild(hwnd_, *id);
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE put_accValue(VARIANT child, BSTR value) override {
+    Model* const model = ConnectedModel();
+    if (!model) return RPC_E_DISCONNECTED;
     const auto id = ChildId(child);
-    if (!id || !ItemFor(child)) return E_INVALIDARG;
-    const auto item = ItemFor(child);
+    const auto item = ItemFor(model, child);
+    if (!id || !item) return E_INVALIDARG;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0) {
       return E_ACCESSDENIED;
     }
-    return model_->AccessibleSetValue(hwnd_, *id, value ? value : L"");
+    return model->AccessibleSetValue(hwnd_, *id, value ? value : L"");
   }
 
  private:
+  ~Window() { connection_->Untrack(this); }
+
+  bool TryAddRefTracked() noexcept override {
+    return detail::TryAddReference(references_);
+  }
+
+  void DisconnectClients() noexcept override {
+    UiaDisconnectProvider(static_cast<IRawElementProviderSimple*>(this));
+    CoDisconnectObject(static_cast<IAccessible*>(this), 0);
+  }
+
+  void ReleaseTracked() noexcept override { Release(); }
+
+  Model* ConnectedModel() const noexcept {
+    return connection_->model.load(std::memory_order_acquire);
+  }
+
   static bool IsSelf(const VARIANT& child) {
     return child.vt == VT_I4 && child.lVal == CHILDID_SELF;
   }
@@ -767,34 +994,68 @@ class Window final : public IAccessible,
     if (child.vt != VT_I4 || child.lVal <= 0) return std::nullopt;
     return static_cast<int>(child.lVal);
   }
-  std::vector<Item> Items() const { return model_->AccessibleItems(hwnd_); }
-  std::optional<Item> ItemFor(const VARIANT& child) const {
+  std::optional<Item> ItemFor(Model* model, const VARIANT& child) const {
     const auto id = ChildId(child);
     if (!id) return std::nullopt;
-    const auto items = Items();
+    const auto items = model->AccessibleItems(hwnd_);
     if (*id > static_cast<int>(items.size())) return std::nullopt;
     return items[static_cast<size_t>(*id - 1)];
   }
 
   std::atomic<ULONG> references_ = 1;
-  Model* model_ = nullptr;
+  std::shared_ptr<detail::Connection> connection_;
   HWND hwnd_ = nullptr;
 };
 
+// Answers WM_GETOBJECT for the client area. UIA reaches the items through the
+// MSAA-to-UIA bridge (IAccessibleEx), which supplies the fragment navigation
+// the simple providers here do not implement; returning a Window for
+// UiaRootObjectId would hand UIA a root without any children.
 inline LRESULT HandleGetObject(Model* model, HWND hwnd, WPARAM wParam, LPARAM lParam) {
-  if (static_cast<LONG>(lParam) == UiaRootObjectId) {
-    auto* provider = new Window(model, hwnd);
-    const LRESULT result = UiaReturnRawElementProvider(
-        hwnd, wParam, lParam, static_cast<IRawElementProviderSimple*>(provider));
-    provider->Release();
-    return result;
-  }
   if (static_cast<LONG>(lParam) != OBJID_CLIENT) return 0;
-  auto* accessible = new Window(model, hwnd);
+  auto* accessible = new Window(detail::ConnectionFor(model, hwnd));
   const LRESULT result = LresultFromObject(
       IID_IAccessible, wParam, static_cast<IAccessible*>(accessible));
   accessible->Release();
   return result;
+}
+
+// Call from WM_DESTROY (or WM_NCDESTROY) of every window that answers
+// WM_GETOBJECT with HandleGetObject. Objects that clients still hold stop
+// reaching the model, and their proxies are released.
+inline void Disconnect(HWND hwnd) {
+  if (!hwnd) return;
+  std::shared_ptr<detail::Connection> connection;
+  {
+    std::lock_guard lock(detail::ConnectionRegistryMutex());
+    auto& registry = detail::ConnectionRegistry();
+    const auto found = registry.find(hwnd);
+    if (found == registry.end()) return;
+    connection = std::move(found->second);
+    registry.erase(found);
+  }
+  connection->model.store(nullptr, std::memory_order_release);
+  UiaReturnRawElementProvider(hwnd, 0, 0, nullptr);
+
+  std::vector<detail::Tracked*> live;
+  {
+    std::lock_guard lock(connection->mutex);
+    for (auto* object : connection->objects) {
+      if (object->TryAddRefTracked()) live.push_back(object);
+    }
+  }
+  for (auto* object : live) {
+    object->DisconnectClients();
+    object->ReleaseTracked();
+  }
+}
+
+// Announces a status child whose text changed. Give the item a LiveSetting
+// other than Off so screen readers treat it as a live region.
+inline void NotifyStatusChanged(HWND hwnd, LONG child) {
+  if (!hwnd) return;
+  NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd, OBJID_CLIENT, child);
+  NotifyWinEvent(EVENT_OBJECT_LIVEREGIONCHANGED, hwnd, OBJID_CLIENT, child);
 }
 
 }  // namespace feathercast::accessibility

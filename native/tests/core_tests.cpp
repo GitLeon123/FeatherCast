@@ -4,6 +4,7 @@
 #include "background_executor.hpp"
 #include "core.hpp"
 #include "discovery.hpp"
+#include "dpapi_scope.hpp"
 #include "emoji.hpp"
 #include "extension_protocol.hpp"
 #include "json.hpp"
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <string_view>
@@ -46,7 +48,7 @@ using feathercast::extensions::ParseActivationResponse;
 using feathercast::extensions::ParseManifestJson;
 using feathercast::extensions::ParseQueryResponse;
 using feathercast::extensions::ResponseSizeAllowed;
-using feathercast::snippets::ParseSnippetsJson;
+using feathercast::snippets::ParseSnippetsDocument;
 using feathercast::shortcut::ParseShortcut;
 using feathercast::shortcut::PressedModifiers;
 using feathercast::shortcut::ShortcutRecorder;
@@ -110,6 +112,8 @@ void WriteUtf8(const std::filesystem::path& path, const std::string& text) {
 }  // namespace
 
 int main() {
+  // This test account may have no user DPAPI master key.
+  feathercast::dpapi::AllowMachineScopeFallbackForTests();
   {
     feathercast::background::Executor executor;
     executor.Start(1);
@@ -192,6 +196,44 @@ int main() {
 
     assert(!TryEvaluate(L"9+"));
     assert(!TryEvaluate(L"notepad"));
+
+    // A sign binds looser than a power but tighter than * and /.
+    const auto negatedPower = TryEvaluate(L"-2^2");
+    assert(negatedPower && negatedPower->display == L"-4");
+    const auto negativeExponent = TryEvaluate(L"2^-2");
+    assert(negativeExponent && negativeExponent->display == L"0.25");
+    const auto negativeFactor = TryEvaluate(L"2*-3");
+    assert(negativeFactor && negativeFactor->display == L"-6");
+    const auto minusMinus = TryEvaluate(L"1--3");
+    assert(minusMinus && minusMinus->display == L"4");
+    const auto signedGroup = TryEvaluate(L"-(2+3)*2");
+    assert(signedGroup && signedGroup->display == L"-10");
+    // A sign alone is a number, not a calculation.
+    assert(!TryEvaluate(L"-3"));
+    assert(!TryEvaluate(L"--3"));
+
+    // Functions need parentheses; a bare name or an unknown word is no math.
+    assert(!TryEvaluate(L"sin 30"));
+    assert(!TryEvaluate(L"sqrt"));
+    assert(!TryEvaluate(L"sqrt 16"));
+    assert(!TryEvaluate(L"2+sin"));
+    assert(!TryEvaluate(L"foo(2)"));
+    assert(!TryEvaluate(L"sqrt(-1)"));
+    const auto spacedCall = TryEvaluate(L"sqrt (16)");
+    assert(spacedCall && spacedCall->display == L"4");
+
+    // Hex needs digits after the prefix; a lone x is the multiplication sign
+    // only between operands.
+    assert(!TryEvaluate(L"x"));
+    assert(!TryEvaluate(L"0x"));
+    assert(!TryEvaluate(L"0x+1"));
+    assert(!TryEvaluate(L"0xg"));
+    const auto hex = TryEvaluate(L"0xff");
+    assert(hex && hex->display == L"255");
+    const auto hexSum = TryEvaluate(L"0x10 + 1");
+    assert(hexSum && hexSum->display == L"17");
+    const auto times = TryEvaluate(L"3x4");
+    assert(times && times->display == L"12");
   }
 
   {
@@ -267,6 +309,39 @@ int main() {
 
     const auto euroSymbol = TryConvert(L"\u20AC5 = $", rates);
     assert(euroSymbol && std::fabs(euroSymbol->value - 10.0) < 0.001);
+
+    // A decimal comma reads like the calculator's: one separator, either kind.
+    const auto decimalComma = TryConvert(L"1,5 km to m");
+    assert(decimalComma && std::fabs(decimalComma->value - 1500.0) < 0.001);
+    const auto attachedComma = TryConvert(L"2,5km to m");
+    assert(attachedComma && std::fabs(attachedComma->value - 2500.0) < 0.001);
+    const auto commaCurrency = TryConvert(L"1,5 usd to eur", rates);
+    assert(commaCurrency && std::fabs(commaCurrency->value - 0.75) < 0.001);
+    // Grouped digits are ambiguous, so they are not a conversion at all.
+    assert(!TryConvert(L"1.000,5 km to m"));
+    assert(!TryConvert(L"1,000.5 km to m"));
+    // Non-finite spellings that wcstod accepts are not amounts.
+    assert(!TryConvert(L"inf km to m"));
+    assert(!TryConvert(L"nan km to m"));
+    assert(!TryConvert(L"1e999 km to m"));
+    const auto scientific = TryConvert(L"1.5e3 m to km");
+    assert(scientific && std::fabs(scientific->value - 1.5) < 0.0001);
+
+    // "cup" is both a volume unit and the Cuban peso code. The unit wins
+    // unless the code is written in capitals.
+    const std::map<std::wstring, double> cupRates = {
+        {L"USD", 1.0}, {L"EUR", 0.5}, {L"CUP", 24.0}};
+    const auto cupVolume = TryConvert(L"1 cup to ml", cupRates);
+    assert(cupVolume && std::fabs(cupVolume->value - 236.588) < 0.001);
+    const auto cupsVolume = TryConvert(L"2 Cup to ml", cupRates);
+    assert(cupsVolume && std::fabs(cupsVolume->value - 473.177) < 0.001);
+    const auto cupPeso = TryConvert(L"24 CUP to USD", cupRates);
+    assert(cupPeso && std::fabs(cupPeso->value - 1.0) < 0.001);
+    assert(cupPeso->display == L"1 USD");
+    const auto pesoTarget = TryConvert(L"10 usd to CUP", cupRates);
+    assert(pesoTarget && std::fabs(pesoTarget->value - 240.0) < 0.001);
+    // A lowercase "cup" never turns into a currency query.
+    assert(!TryConvert(L"1 cup to eur", cupRates));
   }
 
   {
@@ -417,17 +492,38 @@ int main() {
   }
 
   {
-    const auto snippets = ParseSnippetsJson(
-        "{\"snippets\":["
-        "{\"keyword\":\"sig\",\"name\":\"Email Signature\",\"text\":\"Best,\\nLeon\"},"
-        "{\"keyword\":\"\",\"name\":\"Missing Keyword\",\"text\":\"ignored\"},"
-        "{\"keyword\":\"bad\",\"name\":\"Missing Text\"},"
-        "{\"keyword\":\"empty\",\"name\":\"Empty Text\",\"text\":\"   \"}"
+    using feathercast::snippets::ParseStatus;
+    // The same parser backs snippets_io::Load. A BOM is tolerated, keyword and
+    // name are trimmed, and the text is kept verbatim.
+    const auto parsed = ParseSnippetsDocument(
+        "\xEF\xBB\xBF{\"snippets\":["
+        "{\"keyword\":\" sig \",\"name\":\"Email Signature\",\"text\":\"Best,\\nLeon \"}"
         "]}");
-    assert(snippets.size() == 1);
-    assert(snippets.front().keyword == L"sig");
-    assert(snippets.front().name == L"Email Signature");
-    assert(snippets.front().text == L"Best,\nLeon");
+    assert(parsed.status == ParseStatus::Valid);
+    assert(parsed.snippets.size() == 1);
+    assert(parsed.snippets.front().keyword == L"sig");
+    assert(parsed.snippets.front().name == L"Email Signature");
+    assert(parsed.snippets.front().text == L"Best,\nLeon ");
+
+    // One bad entry rejects the file instead of being dropped on the next save.
+    for (const char* entry :
+         {"{\"keyword\":\"\",\"name\":\"Missing Keyword\",\"text\":\"x\"}",
+          "{\"keyword\":\"bad\",\"name\":\"Missing Text\"}",
+          "{\"keyword\":\"empty\",\"name\":\"Empty Text\",\"text\":\"   \"}",
+          "\"not an object\""}) {
+      const auto invalid = ParseSnippetsDocument(
+          std::string("{\"snippets\":[{\"keyword\":\"sig\",\"name\":\"Sig\","
+                      "\"text\":\"Best\"},") +
+          entry + "]}");
+      assert(invalid.status == ParseStatus::InvalidEntry);
+      assert(invalid.snippets.empty());
+    }
+    assert(ParseSnippetsDocument("{\"snippets\":[]}").status ==
+           ParseStatus::Valid);
+    assert(ParseSnippetsDocument("").status == ParseStatus::InvalidDocument);
+    assert(ParseSnippetsDocument("{\"snippets\":{}}").status ==
+           ParseStatus::InvalidDocument);
+    assert(ParseSnippetsDocument("[]").status == ParseStatus::InvalidDocument);
   }
 
   {
@@ -817,6 +913,76 @@ int main() {
     options.generation = 1;
     options.latestGeneration = &latestGeneration;
     assert(SearchPrepared(L"terminal", prepared, {}, options).empty());
+    assert(SearchPrepared(L"   ", prepared, {}, options).empty());
+  }
+
+  {
+    // ASCII preparation must agree with the Windows Unicode implementation,
+    // including control characters and embedded NULs, while mixed Unicode
+    // still keeps invariant casing and diacritic folding.
+    using namespace feathercast::core;
+    auto windowsNormalize = [](const std::wstring& value) {
+      return Trim(FoldDiacritics(LowerInvariant(value)));
+    };
+    for (wchar_t ch = 0; ch < 128; ++ch) {
+      for (const auto& value : {std::wstring(1, ch),
+                               L" \tA" + std::wstring(1, ch) + L"Z\r\n"}) {
+        assert(Normalize(value) == windowsNormalize(value));
+      }
+    }
+    for (const auto* value : {L"", L" \t\r\n", L"Visual Studio Code",
+                              L"C:\\Programs\\App.EXE", L" R\u00e9sum\u00e9 ",
+                              L"CAF\u00c9", L"\uD55C\uAE00 Notes"}) {
+      assert(Normalize(value) == windowsNormalize(value));
+    }
+
+    // Skipping weaker approximate fields must still consider stronger literal
+    // matches in an alias or keyword, even after the name already matched.
+    SearchItem aliased;
+    aliased.name = L"Terminal Preview";
+    aliased.aliases = {L"terminal"};
+    assert(ScoreItem(L"terminal", aliased, {}) == 608100.0);
+    SearchItem keyword;
+    keyword.name = L"Terminal";
+    keyword.keywords = {L"termainl"};
+    const auto normalized = Normalize(L"termainl");
+    const auto score = ScorePreparedItemDetailed(
+        normalized, TokensNormalized(normalized), PrepareSearchItem(keyword), {});
+    assert(score.matchClass == MatchClass::FieldPrefix);
+    assert(score.text == 4100.0);
+  }
+
+  {
+    // Equal names and scores have the same corpus order for full, capped and
+    // parallel searches. The corpus is large enough to enable worker splitting.
+    SearchItem repeated;
+    repeated.name = L"Application";
+    std::vector<feathercast::core::PreparedSearchItem> corpus(
+        20004, feathercast::core::PrepareSearchItem(repeated));
+    SearchOptions options;
+    options.maxWorkers = 1;
+    options.limit = corpus.size();
+    const auto all = SearchPrepared(L"application", corpus, {}, options);
+    assert(all.size() == corpus.size());
+    for (size_t i = 0; i < all.size(); ++i) assert(all[i] == i);
+    options.maxWorkers = 4;
+    const auto parallel = SearchPrepared(L"application", corpus, {}, options);
+    assert(parallel == all);
+    options.limit = 17;
+    const auto limited = SearchPrepared(L"application", corpus, {}, options);
+    assert(limited.size() == options.limit);
+    assert(std::equal(limited.begin(), limited.end(), all.begin()));
+    options.limit = 0;
+    assert(SearchPrepared(L"application", corpus, {}, options).empty());
+    std::vector<size_t> candidates{19000, 25, 7000, corpus.size()};
+    options.candidateIndices = &candidates;
+    options.limit = 2;
+    assert(SearchPrepared(L"application", corpus, {}, options) ==
+           std::vector<size_t>({25, 7000}));
+    assert(SearchPrepared(L"  ", corpus, {}, options) ==
+           std::vector<size_t>({19000, 25}));
+    candidates.clear();
+    assert(SearchPrepared(L"application", corpus, {}, options).empty());
   }
 
   {
@@ -927,6 +1093,19 @@ int main() {
         SearchPrepared(L"application", corpus, {}, limitedOptions);
     assert(limited.size() == 17);
     assert(std::equal(limited.begin(), limited.end(), all.begin()));
+
+    std::vector<size_t> candidates;
+    for (size_t index = 0; index < corpus.size(); index += 7) {
+      candidates.push_back(index);
+    }
+    std::vector<size_t> expected;
+    for (const auto index : all) {
+      if (index % 7 == 0 && expected.size() < limitedOptions.limit) {
+        expected.push_back(index);
+      }
+    }
+    limitedOptions.candidateIndices = &candidates;
+    assert(SearchPrepared(L"application", corpus, {}, limitedOptions) == expected);
   }
 
   const double base = ScoreItem(L"notepad", notepad, {});
@@ -1019,6 +1198,77 @@ int main() {
   }
 
   {
+    // Normalization changes the length of some text: a Hangul syllable
+    // decomposes into two or three jamo. Positions found in the normalized
+    // text must still line up with the case-preserved text that decides word
+    // boundaries.
+    using feathercast::core::MatchPreparedText;
+    using feathercast::core::Normalize;
+    using feathercast::core::PrepareField;
+    using feathercast::core::SearchFieldKind;
+    const std::wstring syllables = L"\uD55C\uAE00";
+    assert(Normalize(syllables).size() > syllables.size());
+
+    const auto spaced = PrepareField(syllables + L" Docs", 1.0, SearchFieldKind::Name);
+    assert(spaced.raw.size() == spaced.normalized.size());
+    assert(MatchPreparedText(L"docs", spaced).matchClass == MatchClass::NameBoundary);
+
+    const auto camel = PrepareField(syllables + L"FooBar", 1.0, SearchFieldKind::Name);
+    assert(camel.raw.size() == camel.normalized.size());
+    assert(MatchPreparedText(L"bar", camel).matchClass == MatchClass::NameBoundary);
+    // Inside a word there is no boundary, and the match ends at the text end.
+    assert(MatchPreparedText(L"oba", camel).matchClass == MatchClass::General);
+    assert(MatchPreparedText(L"r", camel).Matched());
+
+    // The same holds through the public scoring entry points.
+    assert(ScoreText(L"bar", syllables + L"FooBar") >
+           ScoreText(L"bar", syllables + L"xxxbar"));
+    SearchItem korean;
+    korean.id = L"korean";
+    korean.name = syllables + L" Notes";
+    assert(!Search(L"notes", {korean}).empty());
+    assert(!Search(L"\uD55C\uAE00", {korean}).empty());
+
+    // Accents that fold away keep the lengths equal.
+    const auto accented = PrepareField(L"Caf\u00E9Bar", 1.0, SearchFieldKind::Name);
+    assert(accented.raw.size() == accented.normalized.size());
+    assert(MatchPreparedText(L"bar", accented).matchClass == MatchClass::NameBoundary);
+  }
+
+  {
+    // A query made only of punctuation has no words. It matches nothing but
+    // literal occurrences in names, keywords and aliases, never every path.
+    SearchItem plusName;
+    plusName.id = L"plus";
+    plusName.kind = L"app";
+    plusName.name = L"Notepad++";
+    plusName.targetPath = L"C:\\Tools\\notepad.exe";
+    SearchItem plain;
+    plain.id = L"plain";
+    plain.kind = L"app";
+    plain.name = L"Terminal";
+    plain.targetPath = L"C:\\Windows\\System32\\terminal.exe";
+    plain.launchTarget = L"C:\\Windows\\System32\\terminal.exe";
+    SearchItem dotted;
+    dotted.id = L"dotted";
+    dotted.kind = L"window";
+    dotted.name = L"main.cpp - Visual Studio";
+    const std::vector<SearchItem> corpus = {plusName, plain, dotted};
+
+    // Every path has a dot or a backslash, but paths do not count.
+    assert(Search(L"\\", corpus).empty());
+    assert(Search(L"-", corpus) == std::vector<size_t>({2}));
+    assert(Search(L".", corpus) == std::vector<size_t>({2}));
+    assert(Search(L"+", corpus) == std::vector<size_t>({0}));
+    assert(Search(L"++", corpus) == std::vector<size_t>({0}));
+    assert(Search(L"?!", corpus).empty());
+    assert(Search(L"..", corpus).empty());
+    // Ordinary queries and the empty query keep their behavior.
+    assert(Search(L"   ", corpus).size() == corpus.size());
+    assert(!Search(L"notepad", corpus).empty());
+  }
+
+  {
     using feathercast::json::Parse;
     using feathercast::json::Value;
 
@@ -1045,6 +1295,44 @@ int main() {
     assert(!Parse(R"({"a": "unterminated)"));
     assert(!Parse("{} trailing"));
     assert(Parse("{}") && Parse("[]") && Parse("  42  "));
+
+    // Editors on Windows save a UTF-8 byte order mark; one is skipped, two are
+    // not JSON.
+    const auto bom = Parse("\xEF\xBB\xBF{\"a\": 1}");
+    assert(bom && bom->Find("a") && bom->Find("a")->number == 1);
+    assert(!Parse("\xEF\xBB\xBF\xEF\xBB\xBF{}"));
+    assert(!Parse("\xEF\xBB\xBF"));
+
+    // A number with no finite double value is rejected instead of becoming
+    // infinity; one below the smallest double reads as zero.
+    assert(!Parse("1e400"));
+    assert(!Parse("[-1e400]"));
+    assert(!Parse(R"({"a": 123456789e999})"));
+    const auto underflow = Parse("[1e-400]");
+    assert(underflow && underflow->array.size() == 1 &&
+           underflow->array[0].number == 0.0);
+    const auto large = Parse("1.7e308");
+    assert(large && std::isfinite(large->number));
+
+    // ToInteger accepts exactly the values the target type can hold. 2^63 and
+    // 2^31 are the first values past the signed maxima, but static_cast of
+    // them is undefined.
+    using feathercast::json::ToInteger;
+    assert(ToInteger<long long>(1234567890123.0) == 1234567890123LL);
+    assert(ToInteger<long long>(-2.9) == -2);
+    assert(ToInteger<long long>(-9223372036854775808.0) ==
+           std::numeric_limits<long long>::min());
+    assert(ToInteger<long long>(9223372036854774784.0) ==
+           9223372036854774784LL);
+    assert(!ToInteger<long long>(9223372036854775808.0));
+    assert(!ToInteger<long long>(1e30));
+    assert(!ToInteger<long long>(-1e30));
+    assert(!ToInteger<long long>(std::numeric_limits<double>::infinity()));
+    assert(!ToInteger<long long>(std::numeric_limits<double>::quiet_NaN()));
+    assert(ToInteger<int>(2147483647.0) == std::numeric_limits<int>::max());
+    assert(ToInteger<int>(-2147483648.0) == std::numeric_limits<int>::min());
+    assert(!ToInteger<int>(2147483648.0));
+    assert(!ToInteger<int>(-2147483649.0));
   }
 
   {
@@ -1222,6 +1510,19 @@ int main() {
     // (the old substring scanner got this wrong).
     const auto tricky = fs::ParseSettings(R"({"shortcut": "\"recentApps\": [\"fake\"]"})");
     assert(tricky.recentApps.empty());
+
+    // A byte order mark does not discard the whole file.
+    assert(fs::ParseSettings("\xEF\xBB\xBF{\"maxResults\": 120}").maxResults == 120);
+    // 64-bit values keep the default when they do not fit; exactly 2^63 is
+    // one past the maximum, INT64_MIN is the smallest valid value.
+    assert(fs::ParseSettings(R"({"lastUpdateCheck": 9223372036854775808})")
+               .lastUpdateCheck == 0);
+    assert(fs::ParseSettings(R"({"lastUpdateCheck": -9223372036854775808})")
+               .lastUpdateCheck == std::numeric_limits<long long>::min());
+    assert(fs::ParseSettings(R"({"lastUpdateCheck": 1e400})").lastUpdateCheck == 0);
+    assert(fs::ParseSettings(R"({"lastUpdateCheck": 1234567890123})")
+               .lastUpdateCheck == 1234567890123LL);
+    assert(fs::ParseSettings(R"({"maxResults": 2147483648})").maxResults == 200);
   }
 
   {
@@ -1428,6 +1729,54 @@ int main() {
     cmdAppCopy.targetPath = L"C:\\Windows\\System32\\cmd.exe";
 
     assert(fd::ShouldMergeApps(cmdApp1, cmdAppCopy));
+
+    // One launcher executable starts many games; only the same arguments
+    // describe the same game.
+    feathercast::app::AppEntry launcherGameA;
+    launcherGameA.id = L"C:\\Shortcuts\\Alpha.lnk";
+    launcherGameA.name = L"Alpha";
+    launcherGameA.launchTarget = L"C:\\Launcher\\launcher.exe";
+    launcherGameA.args = L"-applaunch 1";
+    feathercast::app::AppEntry launcherGameB = launcherGameA;
+    launcherGameB.id = L"C:\\Shortcuts\\Beta.lnk";
+    launcherGameB.name = L"Beta";
+    launcherGameB.args = L"-applaunch 2";
+    assert(!fd::ShouldMergeApps(launcherGameA, launcherGameB));
+    launcherGameB.args = launcherGameA.args;
+    assert(fd::ShouldMergeApps(launcherGameA, launcherGameB));
+
+    // Same name, different install folders: two separate copies of a game.
+    feathercast::app::AppEntry installA;
+    installA.id = L"game:steam:1";
+    installA.name = L"Frontier";
+    installA.isGame = true;
+    installA.path = L"C:\\Games\\Frontier";
+    feathercast::app::AppEntry installB = installA;
+    installB.id = L"game:epic:1";
+    installB.path = L"D:\\Games\\Frontier";
+    assert(!fd::ShouldMergeApps(installA, installB));
+    installB.path = L"c:/games/frontier/";
+    assert(fd::ShouldMergeApps(installA, installB));
+
+    // A shortcut that shares the name of a game merges only when it starts
+    // an executable inside the install folder or goes through a launcher.
+    feathercast::app::AppEntry gameShortcut;
+    gameShortcut.id = L"C:\\Shortcuts\\Frontier.lnk";
+    gameShortcut.name = L"Frontier";
+    gameShortcut.targetPath = L"C:\\Games\\Frontier\\Bin\\Frontier.exe";
+    assert(fd::ShouldMergeApps(installA, gameShortcut));
+    assert(fd::ShouldMergeApps(gameShortcut, installA));
+    // "Frontier Tools" is a sibling folder, not inside the install.
+    gameShortcut.targetPath = L"C:\\Games\\Frontier Tools\\Frontier.exe";
+    assert(!fd::ShouldMergeApps(installA, gameShortcut));
+    gameShortcut.targetPath = L"C:\\Elsewhere\\Frontier.exe";
+    assert(!fd::ShouldMergeApps(installA, gameShortcut));
+    gameShortcut.targetPath = L"C:\\Launcher\\launcher.exe";
+    gameShortcut.args = L"launch://frontier";
+    assert(fd::ShouldMergeApps(installA, gameShortcut));
+    gameShortcut.targetPath.clear();
+    gameShortcut.args.clear();
+    assert(fd::ShouldMergeApps(installA, gameShortcut));
   }
 
   {
@@ -1667,3 +2016,95 @@ int main() {
 
   return 0;
 }
+
+// --- UI review fixes: strict shortcut parsing and surrogate-safe editing ---
+// These run from a static initializer so they stay independent of main().
+
+namespace {
+
+void TestStrictShortcutParsing() {
+  using feathercast::shortcut::ShortcutSpec;
+
+  // Formats produced by the recorder and the settings defaults stay valid.
+  struct Valid {
+    const wchar_t* text;
+    const wchar_t* display;
+  };
+  for (const auto& sample : {
+           Valid{L"Alt+Space", L"Alt+Space"},
+           Valid{L"Control+Alt+K", L"Control+Alt+K"},
+           Valid{L"ctrl+shift+1", L"Control+Shift+1"},
+           Valid{L" Ctrl + Alt + Space ", L"Control+Alt+Space"},
+           Valid{L"Win+F12", L"Super+F12"},
+           Valid{L"Control+Print Screen", L"Control+Print Screen"},
+           Valid{L"Print Screen", L"Print Screen"},
+           Valid{L"Super", L"Super"},
+           Valid{L"Control+Plus", L"Control+Plus"},
+           Valid{L"Alt+F1", L"Alt+F1"},
+       }) {
+    const ShortcutSpec spec = ParseShortcut(sample.text);
+    assert(spec.valid);
+    assert(spec.display == sample.display);
+  }
+  const auto controlAltK = ParseShortcut(L"Control+Alt+K");
+  assert(controlAltK.ctrl && controlAltK.alt && !controlAltK.shift &&
+         !controlAltK.win && controlAltK.vk == L'K');
+  assert(!ParseShortcut(L"none").valid);
+  assert(ParseShortcut(L"").display == L"none");
+
+  // Unknown tokens, duplicate modifiers, empty segments, several keys,
+  // modifiers after the key and lax key names are rejected.
+  for (const auto* text : {
+           L"Ctrl+Foo+K", L"Ctrl+Ctrl+K", L"Control+Ctrl+K", L"Ctrl++",
+           L"Ctrl+", L"+K", L"Ctrl++K", L"Ctrl+K+J", L"Ctrl+K+Alt",
+           L"Ctrl+K extra", L"Ctrl+F1x", L"Ctrl+F01", L"Ctrl+F13",
+           L"Ctrl+F0", L"Ctrl+Alt", L"K", L"F5", L"Space", L"Hyper+K",
+       }) {
+    const ShortcutSpec spec = ParseShortcut(text);
+    assert(!spec.valid);
+    assert(spec.vk == 0 && !spec.singleModifier);
+    assert(!spec.ctrl && !spec.alt && !spec.shift && !spec.win);
+  }
+  assert(ParseShortcut(L" Ctrl+Foo+K ").display == L"Ctrl+Foo+K");
+}
+
+void TestSurrogateSafeEditing() {
+  namespace text_edit = feathercast::text_edit;
+  const std::wstring pair = L"a\U0001F600b";
+  assert(text_edit::SplitsSurrogatePair(pair, 2));
+  assert(!text_edit::SplitsSurrogatePair(pair, 1));
+  assert(!text_edit::SplitsSurrogatePair(pair, 3));
+  assert(text_edit::SnapToCodePoint(pair, 2) == 1);
+  assert(text_edit::SnapToCodePoint(pair, 3) == 3);
+  assert(text_edit::SnapToCodePoint(pair, 99) == pair.size());
+  assert(text_edit::ClipToCodePoints(pair, 2) == 1);
+  assert(text_edit::ClipToCodePoints(pair, 3) == 3);
+  assert(text_edit::ClipToCodePoints(pair, 99) == pair.size());
+
+  // Backspace and Delete from inside a pair remove the whole pair.
+  std::wstring text = pair;
+  size_t position = 2;
+  assert(text_edit::ErasePrevious(text, position));
+  assert(text == L"ab" && position == 1);
+  text = pair;
+  position = 2;
+  assert(text_edit::EraseNext(text, position));
+  assert(text == L"ab" && position == 1);
+
+  // Ordinary positions keep their behavior.
+  text = pair;
+  position = 1;
+  assert(text_edit::EraseNext(text, position));
+  assert(text == L"ab" && position == 1);
+  text = pair;
+  position = 0;
+  assert(!text_edit::ErasePrevious(text, position));
+  position = text.size();
+  assert(!text_edit::EraseNext(text, position));
+  assert(text == pair);
+}
+
+const bool kUiReviewTestsRan =
+    (TestStrictShortcutParsing(), TestSurrogateSafeEditing(), true);
+
+}  // namespace

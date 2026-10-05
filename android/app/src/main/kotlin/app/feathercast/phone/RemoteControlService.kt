@@ -94,12 +94,13 @@ class RemoteControlService : AccessibilityService() {
         revision++
         val previous = stroke
         stroke = null; latest = null; busy = false; held = false
-        if (previous != null) {
+        // A final stroke (the release) cannot be continued and leaves no pointer down.
+        if (previous != null && previous.willContinue()) {
             // End the continuation at its last position so no pointer remains down.
             val path = Path().apply { moveTo(x, y) }
             try {
                 dispatchGesture(GestureDescription.Builder().addStroke(previous.continueStroke(path, 0, 1, false)).build(), null, main)
-            } catch (_: IllegalArgumentException) { /* The system already cancelled the gesture. */ }
+            } catch (_: RuntimeException) { /* The system already cancelled the gesture. */ }
         }
     }
 

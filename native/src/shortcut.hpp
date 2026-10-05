@@ -20,6 +20,8 @@ struct ShortcutSpec {
   UINT singleModifierVk = 0;
   bool valid = false;
   std::wstring display;
+
+  bool operator==(const ShortcutSpec&) const = default;
 };
 
 struct PressedModifiers {
@@ -91,9 +93,15 @@ inline UINT VkFromName(std::wstring name) {
     if (ch >= L'a' && ch <= L'z') return static_cast<UINT>(L'A' + ch - L'a');
     if (ch >= L'0' && ch <= L'9') return static_cast<UINT>(ch);
   }
-  if (name.size() >= 2 && name[0] == L'f') {
-    const int n = _wtoi(name.c_str() + 1);
-    if (n >= 1 && n <= 12) return VK_F1 + n - 1;
+  // F1-F12 only, written exactly: "F1x", "F01" or "F13" are not keys.
+  if ((name.size() == 2 || name.size() == 3) && name[0] == L'f' &&
+      name[1] >= L'1' && name[1] <= L'9') {
+    int n = name[1] - L'0';
+    if (name.size() == 3) {
+      if (name[2] < L'0' || name[2] > L'9') return 0;
+      n = n * 10 + (name[2] - L'0');
+    }
+    if (n >= 1 && n <= 12) return VK_F1 + static_cast<UINT>(n) - 1;
   }
   return 0;
 }
@@ -157,15 +165,6 @@ inline bool ModifierPressed(UINT vk) {
   if (vk == VK_SHIFT) return (GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
   if (vk == VK_LWIN) return (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
   return false;
-}
-
-inline PressedModifiers CurrentPressedModifiers() {
-  return {
-    ModifierPressed(VK_CONTROL),
-    ModifierPressed(VK_MENU),
-    ModifierPressed(VK_SHIFT),
-    ModifierPressed(VK_LWIN),
-  };
 }
 
 inline std::wstring FormatShortcut(bool ctrl, bool alt, bool shift, bool win, UINT vk, bool singleModifier = false, UINT singleModifierVk = 0) {
@@ -293,6 +292,20 @@ class ShortcutRecorder {
   bool singleModifierChord_ = false;
 };
 
+inline UINT ModifierFromName(const std::wstring& name) {
+  const std::wstring lower = Lower(Trim(name));
+  if (lower == L"control" || lower == L"ctrl") return VK_CONTROL;
+  if (lower == L"alt") return VK_MENU;
+  if (lower == L"shift") return VK_SHIFT;
+  if (lower == L"super" || lower == L"win") return VK_LWIN;
+  return 0;
+}
+
+// Accepts "none", a single modifier ("Super"), bare "Print Screen", or
+// modifiers followed by exactly one key ("Control+Alt+K"). Each modifier may
+// appear once and must come before the key. Unknown tokens, empty segments
+// ("Ctrl+", "Ctrl++", "Ctrl++K") and anything after the key are rejected.
+// Invalid input keeps its trimmed text as the display string.
 inline ShortcutSpec ParseShortcut(const std::wstring& input) {
   ShortcutSpec spec;
   const std::wstring raw = Trim(input);
@@ -300,6 +313,7 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
     spec.display = L"none";
     return spec;
   }
+  spec.display = raw;
 
   std::vector<std::wstring> parts;
   std::wstring current;
@@ -311,16 +325,13 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
       current.push_back(ch);
     }
   }
-  if (!current.empty()) parts.push_back(Trim(current));
+  parts.push_back(Trim(current));
+  for (const auto& part : parts) {
+    if (part.empty()) return spec;
+  }
 
   if (parts.size() == 1) {
-    const std::wstring lower = Lower(parts[0]);
-    UINT mod = 0;
-    if (lower == L"control" || lower == L"ctrl") mod = VK_CONTROL;
-    else if (lower == L"alt") mod = VK_MENU;
-    else if (lower == L"shift") mod = VK_SHIFT;
-    else if (lower == L"super" || lower == L"win") mod = VK_LWIN;
-    if (mod) {
+    if (const UINT mod = ModifierFromName(parts[0])) {
       spec.singleModifier = true;
       spec.singleModifierVk = mod;
       spec.valid = true;
@@ -338,30 +349,35 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
       spec.display = KeyName(bareKey);
       return spec;
     }
+    return spec;
   }
 
-  bool hasModifier = false;
-  for (const auto& part : parts) {
-    const std::wstring lower = Lower(part);
-    if (lower == L"control" || lower == L"ctrl") {
-      spec.ctrl = true;
-      hasModifier = true;
-    } else if (lower == L"alt") {
-      spec.alt = true;
-      hasModifier = true;
-    } else if (lower == L"shift") {
-      spec.shift = true;
-      hasModifier = true;
-    } else if (lower == L"super" || lower == L"win") {
-      spec.win = true;
-      hasModifier = true;
-    } else {
-      spec.vk = VkFromName(part);
+  bool ctrl = false;
+  bool alt = false;
+  bool shift = false;
+  bool win = false;
+  for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
+    bool* flag = nullptr;
+    switch (ModifierFromName(parts[index])) {
+      case VK_CONTROL: flag = &ctrl; break;
+      case VK_MENU: flag = &alt; break;
+      case VK_SHIFT: flag = &shift; break;
+      case VK_LWIN: flag = &win; break;
+      default: return spec;
     }
+    if (*flag) return spec;
+    *flag = true;
   }
+  const UINT vk = VkFromName(parts.back());
+  if (vk == 0) return spec;
 
-  spec.valid = hasModifier && spec.vk != 0;
-  spec.display = spec.valid ? FormatShortcut(spec.ctrl, spec.alt, spec.shift, spec.win, spec.vk) : raw;
+  spec.ctrl = ctrl;
+  spec.alt = alt;
+  spec.shift = shift;
+  spec.win = win;
+  spec.vk = vk;
+  spec.valid = true;
+  spec.display = FormatShortcut(ctrl, alt, shift, win, vk);
   return spec;
 }
 

@@ -25,8 +25,10 @@ import app.feathercast.phone.ui.Feature
 import app.feathercast.phone.ui.FeatherTheme
 import app.feathercast.phone.ui.HomeActions
 import app.feathercast.phone.ui.HomeScreen
+import app.feathercast.phone.ui.PairConfirmDialog
 import app.feathercast.phone.ui.Permissions
 import app.feathercast.phone.ui.Switches
+import app.feathercast.protocol.PairingInvite
 import app.feathercast.protocol.PhoneMessages
 import com.google.zxing.client.android.Intents
 import com.journeyapps.barcodescanner.ScanContract
@@ -42,6 +44,8 @@ class MainActivity : ComponentActivity() {
     private var resumeTick by mutableIntStateOf(0)
     private var toggles by mutableIntStateOf(0)
     private var approvingScreenId = ""
+    // A pairing link opened from outside the app waits here until the user confirms it.
+    private var pendingPair by mutableStateOf<Pair<String, PairingInvite>?>(null)
 
     private val screenConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val id = approvingScreenId
@@ -68,9 +72,19 @@ class MainActivity : ComponentActivity() {
         resumeTick++
     }
 
-    private val photoPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    private var pairAfterNetworkPermission: String? = null
+    private val networkPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         resumeTick++
-        if (granted) link.sharePhotosNow()
+        val pending = pairAfterNetworkPermission
+        pairAfterNetworkPermission = null
+        if (granted) {
+            if (pending != null) pairWith(pending) else LinkService.start(this)
+        } else pairError = "Allow local network access in Android settings to connect to your PC."
+    }
+
+    private val photoPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        resumeTick++
+        link.sharePhotosNow()
     }
 
     private val featurePermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -86,6 +100,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         approvingScreenId = savedInstanceState?.getString("approvingScreenId").orEmpty()
+        savedInstanceState?.getString("pendingPair")?.let { confirmPairing(it) }
         WindowCompat.getInsetsController(window, window.decorView).apply {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
@@ -112,12 +127,25 @@ class MainActivity : ComponentActivity() {
                         screen = screenState,
                     )
                 }
+                pendingPair?.let { (uri, invite) ->
+                    PairConfirmDialog(
+                        pcName = invite.pcName,
+                        hosts = invite.hosts,
+                        replaces = state.pcName.ifEmpty { "your PC" }.takeIf { state.status != LinkStatus.Unpaired },
+                        onConfirm = {
+                            pendingPair = null
+                            pairWith(uri)
+                        },
+                        onDismiss = { pendingPair = null },
+                    )
+                }
             }
         }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("approvingScreenId", approvingScreenId)
+        outState.putString("pendingPair", pendingPair?.first)
         super.onSaveInstanceState(outState)
     }
 
@@ -135,6 +163,7 @@ class MainActivity : ComponentActivity() {
             link.requestPcClipboard()
             // Permissions may have changed in the system settings.
             link.refreshStatus()
+            link.sharePhotosNow()
         }
     }
 
@@ -142,8 +171,18 @@ class MainActivity : ComponentActivity() {
         val data = intent?.data ?: return
         if (data.scheme == "feathercast") {
             intent.data = null
-            pairWith(data.toString())
+            confirmPairing(data.toString())
         }
+    }
+
+    /** Links can come from any web page, so they never pair without the user's confirmation. */
+    private fun confirmPairing(uri: String) {
+        val invite = PairingInvite.parse(uri)
+        if (invite == null) {
+            pairError = "This is not a valid FeatherCast pairing code."
+            return
+        }
+        pendingPair = uri to invite
     }
 
     private fun startScan() {
@@ -160,6 +199,11 @@ class MainActivity : ComponentActivity() {
 
     private fun pairWith(uri: String) {
         if (pairing) return
+        if (!LocalNetworkAccess.allowed(this)) {
+            pairAfterNetworkPermission = uri
+            networkPermission.launch(LocalNetworkAccess.PERMISSION)
+            return
+        }
         if (!uri.startsWith("feathercast://pair")) {
             pairError = if (uri.contains("/app.apk") || uri.contains(".apk")) {
                 "That is the download code. Scan the pairing code shown next to it on your PC."
@@ -189,7 +233,7 @@ class MainActivity : ComponentActivity() {
 
     private fun currentPermissions(@Suppress("UNUSED_PARAMETER") tick: Int) = Permissions(
         notificationAccess = NotifyListener.hasAccess(this),
-        photos = PhotoSource.hasPermission(this),
+        photos = PhotoSource.access(this),
         postNotifications = Build.VERSION.SDK_INT < 33 ||
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED,
         saveFiles = !IncomingFiles.needsPermission(this),
@@ -199,6 +243,7 @@ class MainActivity : ComponentActivity() {
         remoteControl = RemoteControlService.instance != null,
         pcKeyboard = PcKeyboardService.selected(this),
         deviceAudio = Build.VERSION.SDK_INT >= 29,
+        localNetwork = LocalNetworkAccess.allowed(this),
     )
 
     private fun currentSwitches(@Suppress("UNUSED_PARAMETER") tick: Int) = Switches(
@@ -346,8 +391,10 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun requestPhotos() {
-            photoPermission.launch(PhotoSource.permission)
+            photoPermission.launch(PhotoSource.permissions())
         }
+        override fun cancelTransfers() { link.cancelTransfers() }
+        override fun requestLocalNetwork() { networkPermission.launch(LocalNetworkAccess.PERMISSION) }
 
         override fun requestPostNotifications() {
             if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)

@@ -1,5 +1,7 @@
 ﻿#pragma once
 
+#include "dpapi_scope.hpp"
+#include "filesystem_semantics.hpp"
 #include "sqlite3.h"
 #include "timers.hpp"
 
@@ -32,6 +34,11 @@ struct FileIndexEntry {
   long long contentBytes = 0;
   long long scanGeneration = 0;
   std::wstring contentText;
+  // Set by the file index scanner when the file kept its size and write time
+  // since the previous scan, so it reused contentState/contentBytes instead of
+  // reading the file again and left contentText empty. UpdateFileIndex then
+  // keeps the stored full-text row rather than rewriting it.
+  bool contentUnchanged = false;
 };
 
 struct ClipboardEntry {
@@ -224,6 +231,27 @@ class Storage {
     return out;
   }
 
+  // Positions of entries marked contentUnchanged whose stored row no longer
+  // holds the same file version and content state, for example after a failed
+  // write or when the row fell out of the index limit. UpdateFileIndex stores
+  // such entries without text, so callers read those files again first.
+  std::vector<std::size_t> EntriesWithoutStoredContent(
+      const std::vector<FileIndexEntry>& entries) {
+    std::vector<std::size_t> missing;
+    Statement stored;
+    const bool prepared =
+        db_ && stored.Prepare(db_,
+                              "SELECT last_write_time, size, content_state "
+                              "FROM file_index WHERE path=?;");
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+      if (!entries[index].contentUnchanged) continue;
+      if (!prepared || !StoredContentMatches(stored.get(), entries[index])) {
+        missing.push_back(index);
+      }
+    }
+    return missing;
+  }
+
   bool UpdateFileIndex(
       const std::vector<FileIndexEntry>& entries,
       const std::vector<std::wstring>& preserveContentRoots = {}) {
@@ -246,9 +274,13 @@ class Storage {
       return false;
     }
     Statement identity;
+    Statement stored;
     Statement removeContent;
     Statement insertContent;
     if (!identity.Prepare(db_, "SELECT id FROM file_index WHERE path=?;") ||
+        !stored.Prepare(db_,
+                        "SELECT last_write_time, size, content_state "
+                        "FROM file_index WHERE path=?;") ||
         !removeContent.Prepare(
             db_, "DELETE FROM file_content_fts WHERE rowid=?;") ||
         !insertContent.Prepare(
@@ -256,8 +288,18 @@ class Storage {
       Exec("ROLLBACK;");
       return false;
     }
+    std::vector<std::wstring> preserveKeys;
+    for (const auto& root : preserveContentRoots) {
+      preserveKeys.push_back(filesystem_semantics::PathKey(root));
+    }
 
     for (const auto& entry : entries) {
+      // Content the scanner did not re-read is kept only while the stored
+      // row still describes the same file version; anything else would pair
+      // the new metadata with missing or stale text.
+      const bool keepContent =
+          entry.contentUnchanged && StoredContentMatches(stored.get(), entry);
+      const bool contentKnown = !entry.contentUnchanged || keepContent;
       sqlite3_reset(stmt.get());
       sqlite3_clear_bindings(stmt.get());
       BindText(stmt.get(), 1, entry.path);
@@ -268,8 +310,8 @@ class Storage {
       sqlite3_bind_int64(stmt.get(), 6, entry.size);
       sqlite3_bind_int64(stmt.get(), 7, entry.indexedAt);
       BindText(stmt.get(), 8, entry.root);
-      sqlite3_bind_int(stmt.get(), 9, entry.contentState);
-      sqlite3_bind_int64(stmt.get(), 10, entry.contentBytes);
+      sqlite3_bind_int(stmt.get(), 9, contentKnown ? entry.contentState : 0);
+      sqlite3_bind_int64(stmt.get(), 10, contentKnown ? entry.contentBytes : 0);
       sqlite3_bind_int64(stmt.get(), 11, entry.scanGeneration);
       if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         Exec("ROLLBACK;");
@@ -283,12 +325,12 @@ class Storage {
         return false;
       }
       const auto rowId = sqlite3_column_int64(identity.get(), 0);
-      const bool preserveContent = std::any_of(
-          preserveContentRoots.begin(), preserveContentRoots.end(),
-          [&](const std::wstring& root) {
-            return _wcsicmp(root.c_str(), entry.root.c_str()) == 0;
-          });
-      if (preserveContent) continue;
+      const bool preserveContent =
+          !preserveKeys.empty() &&
+          std::find(preserveKeys.begin(), preserveKeys.end(),
+                    filesystem_semantics::PathKey(entry.root)) !=
+              preserveKeys.end();
+      if (preserveContent || keepContent) continue;
       sqlite3_reset(removeContent.get());
       sqlite3_clear_bindings(removeContent.get());
       sqlite3_bind_int64(removeContent.get(), 1, rowId);
@@ -747,15 +789,9 @@ class Storage {
     if (!CryptProtectData(&input, L"FeatherCast clipboard", nullptr, nullptr,
                           nullptr, protectionFlags, &output)) {
       // The offline Windows test account has no user DPAPI master key. Keep
-      // production strictly user-scoped, but let explicitly isolated CTest
-      // fixtures exercise persistence with a machine-scoped temporary key.
-      wchar_t testFallback[2]{};
-      const bool testFallbackEnabled =
-          GetEnvironmentVariableW(L"FEATHERCAST_TEST_DPAPI_FALLBACK",
-                                  testFallback,
-                                  static_cast<DWORD>(std::size(testFallback))) >
-          0;
-      if (!testFallbackEnabled ||
+      // production strictly user-scoped, but let test executables that opt
+      // in exercise persistence with a machine-scoped key.
+      if (!feathercast::dpapi::MachineScopeFallbackAllowed() ||
           !CryptProtectData(&input, L"FeatherCast clipboard", nullptr, nullptr,
                             nullptr,
                             protectionFlags | CRYPTPROTECT_LOCAL_MACHINE,
@@ -892,6 +928,21 @@ class Storage {
     const int bytes = sqlite3_column_bytes16(stmt, index);
     if (!raw || bytes <= 0) return L"";
     return std::wstring(raw, raw + bytes / static_cast<int>(sizeof(wchar_t)));
+  }
+
+  // `stored` selects last_write_time, size and content_state by path.
+  static bool StoredContentMatches(sqlite3_stmt* stored,
+                                   const FileIndexEntry& entry) {
+    sqlite3_reset(stored);
+    sqlite3_clear_bindings(stored);
+    BindText(stored, 1, entry.path);
+    const bool matches =
+        sqlite3_step(stored) == SQLITE_ROW &&
+        sqlite3_column_int64(stored, 0) == entry.lastWriteTime &&
+        sqlite3_column_int64(stored, 1) == entry.size &&
+        sqlite3_column_int(stored, 2) == entry.contentState;
+    sqlite3_reset(stored);
+    return matches;
   }
 
   sqlite3* db_ = nullptr;

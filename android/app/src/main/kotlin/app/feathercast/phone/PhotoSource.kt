@@ -29,8 +29,19 @@ object PhotoSource {
     val permission: String
         get() = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
 
-    fun hasPermission(context: Context): Boolean =
-        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    fun access(context: Context): PhotoAccess = resolvePhotoAccess(
+        Build.VERSION.SDK_INT,
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED,
+        Build.VERSION.SDK_INT >= 34 && ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+        ) == PackageManager.PERMISSION_GRANTED,
+    )
+
+    fun hasPermission(context: Context): Boolean = access(context) != PhotoAccess.Denied
+
+    fun permissions(): Array<String> = if (Build.VERSION.SDK_INT >= 34) {
+        arrayOf(permission, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+    } else arrayOf(permission)
 
     private val projection = arrayOf(
         MediaStore.Images.Media._ID,
@@ -80,14 +91,21 @@ object PhotoSource {
                 context.contentResolver, image.id, MediaStore.Images.Thumbnails.MINI_KIND, null,
             ) ?: return null
         }
-        ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray()
+        try {
+            val output = ByteArrayOutputStream()
+            if (bitmap.compress(Bitmap.CompressFormat.JPEG, 80, output)) output.toByteArray() else null
+        } finally {
+            // This thumbnail belongs to us. Release its native pixel buffer
+            // before loading the next photo instead of waiting for a GC pass.
+            bitmap.recycle()
+        }
     } catch (_: Exception) {
         null
     }
 
     fun fullBytes(context: Context, image: PhoneImage, maxBytes: Long): ByteArray? = try {
         if (image.size > maxBytes) null else context.contentResolver.openInputStream(image.uri)?.use {
-            it.readAtMost(maxBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+            it.readAtMost(maxBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), sizeHint = image.size)
         }
     } catch (_: Exception) {
         null
