@@ -573,11 +573,16 @@ set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS [=[
     Pop $0
 ]=])
 set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS [=[
-  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Install'
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Install'
   Pop $0
-  StrCmp $0 "0" +3
-    MessageBox MB_OK|MB_ICONEXCLAMATION "The elevated Windows-key broker could not be configured. Install FeatherCast in a protected Program Files folder to enable it." /SD IDOK
-    SetErrorLevel 1
+  Pop $1
+  StrCmp $0 "0" broker_setup_complete
+  FileOpen $2 "$INSTDIR\broker-setup.log" w
+  FileWrite $2 "$1"
+  FileClose $2
+  MessageBox MB_OK|MB_ICONEXCLAMATION "The elevated Windows-key broker could not be configured. See broker-setup.log in the installation folder for details." /SD IDOK
+  SetErrorLevel 1
+  broker_setup_complete:
 ]=])
 set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS [=[
   nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\bin\input-broker-task.ps1" -Mode Uninstall'
@@ -586,6 +591,7 @@ set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS [=[
     MessageBox MB_OK|MB_ICONSTOP "The elevated input broker could not be removed. Uninstall has been stopped so its executable stays protected." /SD IDOK
     Abort
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "FeatherCast"
+  Delete "$INSTDIR\broker-setup.log"
 ]=])
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_VERBATIM_VARIABLES TRUE)

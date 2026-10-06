@@ -122,6 +122,7 @@ jobs:
           $process = Start-Process $installer.FullName -ArgumentList $installArguments -WindowStyle Hidden -PassThru -Wait
           if ($process.ExitCode -ne 0) {
             Write-Host "Expected installation root: $installRoot"
+            Get-Content -LiteralPath (Join-Path $installRoot 'broker-setup.log') -ErrorAction Continue
             Get-ChildItem -LiteralPath $installRoot -Recurse -ErrorAction Continue | Select-Object FullName
             foreach ($registryRoot in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall')) {
               Get-ChildItem $registryRoot -ErrorAction SilentlyContinue | Where-Object PSChildName -eq 'FeatherCast' | Get-ItemProperty | Format-List
