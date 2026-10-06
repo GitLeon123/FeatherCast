@@ -129,6 +129,9 @@ jobs:
             $taskScript = Join-Path $installRoot 'bin\input-broker-task.ps1'
             if (Test-Path -LiteralPath $taskScript) {
               & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $taskScript -Mode Install
+              Write-Host "64-bit broker setup exit code: $LASTEXITCODE"
+              & "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $taskScript -Mode Install
+              Write-Host "32-bit broker setup exit code: $LASTEXITCODE"
             }
             throw "Installer failed with exit code $($process.ExitCode)."
           }
