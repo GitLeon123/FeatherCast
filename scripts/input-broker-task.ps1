@@ -56,6 +56,9 @@ function New-BrokerTaskXml([string]$Path, [string]$UserSid) {
 }
 
 function Assert-ProtectedBrokerPath([string]$Path) {
+  # Installers may inherit PSModulePath from PowerShell 7. Load this host's
+  # built-in security module rather than an incompatible module on that path.
+  Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
   $fullPath = [IO.Path]::GetFullPath($Path)
   $programRoots = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
   $protectedRoot = $programRoots | Where-Object {
