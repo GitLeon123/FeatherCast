@@ -7,7 +7,8 @@ on:
         required: true
         type: string
 permissions:
-  contents: read
+  # GitHub requires write permission to read unpublished draft assets.
+  contents: write
 jobs:
   packages:
     runs-on: windows-latest
