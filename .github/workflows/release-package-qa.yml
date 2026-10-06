@@ -1,0 +1,210 @@
+name: Release package QA
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag to verify
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  packages:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download draft packages and verify hashes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release download $env:RELEASE_TAG --dir .
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to download release packages.' }
+          foreach ($sidecar in Get-ChildItem FeatherCast-*.sha256) {
+            $parts = (Get-Content -LiteralPath $sidecar.FullName -Raw).Trim() -split '\s+', 2
+            if ((Get-FileHash -LiteralPath $parts[1] -Algorithm SHA256).Hash -ne $parts[0]) {
+              throw "Hash mismatch for $($parts[1])."
+            }
+          }
+      - name: Smoke-test installer
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ inputs.release_tag }}
+        run: |
+          function Invoke-SelfTest([string]$Path, [string]$Label) {
+            $selfTest = Start-Process $Path -ArgumentList '--self-test' -WindowStyle Hidden -PassThru -Wait
+            if ($selfTest.ExitCode -ne 0) {
+              throw "$Label self-test failed with exit code $($selfTest.ExitCode)."
+            }
+          }
+
+          $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer was not generated." }
+
+          # The installer only registers the elevated input broker inside a
+          # protected Program Files folder; anywhere else it fails on purpose.
+          $installRoot = Join-Path $env:ProgramFiles (
+            'feathercast-upgrade-smoke-' + [Guid]::NewGuid().ToString('N'))
+          $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $brokerTaskName = "FeatherCast Input Broker-$userSid"
+          # NSIS requires /D= to be the final argument and does not accept quotes.
+          $installArguments = @('/S', ('/D=' + $installRoot))
+
+          # Exercise a real in-place upgrade when a published predecessor exists.
+          $previousTag = $null
+          try {
+            $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
+              --limit 20 --json tagName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "gh release list exited with code $LASTEXITCODE. $releaseJson"
+            }
+            $releaseRecords = ConvertFrom-Json -InputObject (
+              $releaseJson -join [Environment]::NewLine)
+            $previousTag = $releaseRecords |
+              Where-Object { $_.tagName -and $_.tagName -ne $env:REF_NAME } |
+              Select-Object -ExpandProperty tagName -First 1
+          } catch {
+            Write-Warning "Unable to list previous releases; running a clean-install smoke test. $($_.Exception.Message)"
+          }
+          if ($previousTag) {
+            $previousDirectory = Join-Path $env:RUNNER_TEMP 'previous-release'
+            New-Item -ItemType Directory -Force $previousDirectory | Out-Null
+            $downloaded = $false
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Get-ChildItem $previousDirectory -File -ErrorAction SilentlyContinue |
+                Remove-Item -Force
+              $downloadOutput = gh release download $previousTag `
+                --pattern 'FeatherCast-*-win64.exe' --dir $previousDirectory 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Previous release download attempt $attempt failed. $downloadOutput"
+              if ($attempt -lt 3) { Start-Sleep -Seconds ([Math]::Pow(2, $attempt)) }
+            }
+            $previousInstaller = Get-ChildItem $previousDirectory -Filter 'FeatherCast-*-win64.exe' |
+              Select-Object -First 1
+            if ($downloaded -and $previousInstaller) {
+              $previousProcess = Start-Process $previousInstaller.FullName -ArgumentList $installArguments -WindowStyle Hidden -PassThru -Wait
+              if ($previousProcess.ExitCode -ne 0) {
+                throw "Previous installer failed with exit code $($previousProcess.ExitCode)."
+              }
+            } else {
+              Write-Warning "Previous release $previousTag is unavailable; running a clean-install smoke test."
+            }
+          }
+
+          $settingsRoot = Join-Path $env:APPDATA 'FeatherCast'
+          $pluginsRoot = Join-Path $settingsRoot 'plugins\upgrade-smoke-plugin'
+          $localRoot = Join-Path $env:LOCALAPPDATA 'FeatherCast'
+          New-Item -ItemType Directory -Force $pluginsRoot | Out-Null
+          New-Item -ItemType Directory -Force $localRoot | Out-Null
+          $preservedFiles = @(
+            (Join-Path $settingsRoot 'settings.json'),
+            (Join-Path $settingsRoot 'snippets.json'),
+            (Join-Path $pluginsRoot 'manifest.json'),
+            (Join-Path $localRoot 'installer-upgrade-marker.dat')
+          )
+          Set-Content -Encoding utf8 $preservedFiles[0] '{"schemaVersion":1}'
+          Set-Content -Encoding utf8 $preservedFiles[1] '{"snippets":[]}'
+          Set-Content -Encoding utf8 $preservedFiles[2] '{"name":"Upgrade Smoke Plugin"}'
+          Set-Content -Encoding ascii $preservedFiles[3] 'preserve-local-data'
+          $preservedHashes = @{}
+          foreach ($preservedFile in $preservedFiles) {
+            $preservedHashes[$preservedFile] = (Get-FileHash $preservedFile -Algorithm SHA256).Hash
+          }
+
+          $process = Start-Process $installer.FullName -ArgumentList $installArguments -WindowStyle Hidden -PassThru -Wait
+          if ($process.ExitCode -ne 0) {
+            $taskScript = Join-Path $installRoot 'bin\input-broker-task.ps1'
+            if (Test-Path -LiteralPath $taskScript) {
+              & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $taskScript -Mode Install
+            }
+            throw "Installer failed with exit code $($process.ExitCode)."
+          }
+          $app = Join-Path $installRoot 'bin\FeatherCast.exe'
+          $uninstaller = Join-Path $installRoot 'Uninstall.exe'
+          if (-not (Test-Path $app)) { throw "Installed FeatherCast.exe was not found." }
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found." }
+          if (-not (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue)) {
+            throw "The installer did not register the input broker task."
+          }
+          foreach ($preservedFile in $preservedFiles) {
+            if (-not (Test-Path $preservedFile)) {
+              throw "Upgrade removed user data: $preservedFile"
+            }
+            if ((Get-FileHash $preservedFile -Algorithm SHA256).Hash -ne $preservedHashes[$preservedFile]) {
+              throw "Upgrade changed user data: $preservedFile"
+            }
+          }
+          Invoke-SelfTest $app 'Installed FeatherCast'
+          $pluginHost = Join-Path $installRoot 'bin\FeatherCastPluginHost.exe'
+          if (-not (Test-Path $pluginHost)) { throw "Installed plugin host was not found." }
+          Invoke-SelfTest $pluginHost 'Installed plugin host'
+          $broker = Join-Path $installRoot 'bin\InputBroker.exe'
+          if (-not (Test-Path $broker)) { throw "Installed input broker was not found." }
+          Invoke-SelfTest $broker 'Installed input broker'
+
+          $zip = Get-ChildItem FeatherCast-*-win64.zip | Select-Object -First 1
+          $portableRoot = Join-Path $env:RUNNER_TEMP 'portable-release'
+          Expand-Archive $zip.FullName $portableRoot -Force
+          $portableApp = Get-ChildItem $portableRoot -Recurse -Filter FeatherCast.exe |
+            Select-Object -First 1
+          $portableHost = Get-ChildItem $portableRoot -Recurse -Filter FeatherCastPluginHost.exe |
+            Select-Object -First 1
+          $portableBroker = Get-ChildItem $portableRoot -Recurse -Filter InputBroker.exe |
+            Select-Object -First 1
+          if (-not $portableApp -or -not $portableHost -or -not $portableBroker) {
+            throw "Portable release binaries were not found."
+          }
+          Invoke-SelfTest $portableApp.FullName 'Portable FeatherCast'
+          Invoke-SelfTest $portableHost.FullName 'Portable plugin host'
+          Invoke-SelfTest $portableBroker.FullName 'Portable input broker'
+
+          $uninstallRoots = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $identities = @($uninstallRoots | ForEach-Object {
+            Get-ChildItem $_ -ErrorAction SilentlyContinue |
+              Where-Object PSChildName -eq 'FeatherCast'
+          })
+          if ($identities.Count -ne 1) {
+            throw "Expected one FeatherCast uninstall identity after upgrade; found $($identities.Count)."
+          }
+          $identity = Get-ItemProperty $identities[0].PSPath
+          $uninstallString = [string]$identity.UninstallString
+          if (-not $uninstallString -or
+              $uninstallString.IndexOf($installRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "The uninstall entry does not point at the custom install root."
+          }
+
+          # A plain NSIS uninstaller re-launches itself from %TEMP%, so its exit
+          # code says nothing. Run a copy with _?= (last, unquoted) in place.
+          $uninstallCopy = Join-Path $env:RUNNER_TEMP (
+            'feathercast-uninstall-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force $uninstallCopy | Out-Null
+          $uninstallerCopy = Join-Path $uninstallCopy 'Uninstall.exe'
+          Copy-Item -LiteralPath $uninstaller -Destination $uninstallerCopy
+          $uninstall = Start-Process $uninstallerCopy -ArgumentList @('/S', ('_?=' + $installRoot)) -WindowStyle Hidden -PassThru -Wait
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
+          Remove-Item -LiteralPath $uninstallCopy -Recurse -Force
+          if (Test-Path $installRoot) { throw "Installation directory remains after uninstall." }
+          if (Get-ScheduledTask -TaskName $brokerTaskName -ErrorAction SilentlyContinue) {
+            throw "Uninstall left the elevated input broker task behind."
+          }
+          foreach ($preservedFile in $preservedFiles) {
+            if (-not (Test-Path $preservedFile)) {
+              throw "Uninstall removed user data: $preservedFile"
+            }
+            if ((Get-FileHash $preservedFile -Algorithm SHA256).Hash -ne $preservedHashes[$preservedFile]) {
+              throw "Uninstall changed user data: $preservedFile"
+            }
+          }
+
+
