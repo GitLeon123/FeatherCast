@@ -531,6 +531,14 @@ int main() {
          settings.pendingShortcut == L"Ctrl+Space");
   feathercast::ui::SettingsController::CancelShortcutRecording(settings);
   assert(settings.pendingShortcut.empty());
+  assert(feathercast::ui::SettingsController::Deactivate(settings) == 0);
+  settings.recordingCaptureShortcut = 2;
+  feathercast::ui::SettingsController::BeginShortcutRecording(settings);
+  assert(feathercast::ui::HasEffect(
+      feathercast::ui::SettingsController::Deactivate(settings),
+      feathercast::ui::UiEffect::Invalidate));
+  assert(!settings.recordingShortcut &&
+         settings.recordingCaptureShortcut == -1);
 
   feathercast::ui::OverlayState history;
   for (int index = 0; index < 40; ++index) {

@@ -5,7 +5,8 @@
 
 namespace feathercast::commands {
 
-// Transactional registration keeps the previous assignments if a new chord is unavailable.
+// Assign is transactional: it keeps the previous assignments if a new chord is
+// unavailable. AssignAvailable registers what it can, for loading saved shortcuts.
 class HotKeys {
  public:
   HotKeys() = default;
@@ -26,25 +27,45 @@ class HotKeys {
     const auto previous = assignments_;
     Clear();
     window_ = window;
-    if (const auto error = Register(desired)) {
+    if (const auto error = Register(desired, true)) {
       Clear();
-      Register(previous);
+      // Best effort: another app may have taken one of the old chords meanwhile.
+      Register(previous, false);
       return error;
     }
     assignments_ = desired;
     return std::nullopt;
   }
+  // Registers every saved chord that is still available, so one chord taken by
+  // another app does not disable the rest. Returns the first failure.
+  std::optional<std::wstring> AssignAvailable(HWND window, const std::map<std::wstring, std::wstring>& desired) {
+    Clear();
+    window_ = window;
+    assignments_ = desired;
+    return Register(desired, false);
+  }
  private:
-  std::optional<std::wstring> Register(const std::map<std::wstring, std::wstring>& values) {
+  std::optional<std::wstring> Register(const std::map<std::wstring, std::wstring>& values, bool stopOnError) {
+    std::optional<std::wstring> firstError;
     int id = 0x3000;
     for (const auto& [stableId, text] : values) {
-      if (!commands::Find(stableId)) return L"That command is no longer available.";
-      if (const auto error = automation::ValidateShortcut(text)) return error;
-      const auto spec = shortcut::ToHotKeySpec(shortcut::ParseShortcut(text));
-      if (!RegisterHotKey(window_, id, spec.modifiers, spec.vk)) return L"The shortcut " + text + L" is already used by Windows, FeatherCast or another app.";
-      ids_[id++] = stableId;
+      std::optional<std::wstring> error;
+      if (!commands::Find(stableId)) {
+        error = L"That command is no longer available.";
+      } else if (auto invalid = automation::ValidateShortcut(text)) {
+        error = std::move(invalid);
+      } else {
+        const auto spec = shortcut::ToHotKeySpec(shortcut::ParseShortcut(text));
+        if (RegisterHotKey(window_, id, spec.modifiers, spec.vk)) {
+          ids_[id++] = stableId;
+          continue;
+        }
+        error = L"The shortcut " + text + L" is already used by Windows, FeatherCast or another app.";
+      }
+      if (stopOnError) return error;
+      if (!firstError) firstError = std::move(error);
     }
-    return std::nullopt;
+    return firstError;
   }
   HWND window_ = nullptr;
   std::map<int, std::wstring> ids_;

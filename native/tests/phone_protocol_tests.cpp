@@ -106,6 +106,11 @@ void TestFraming() {
 }
 
 void TestCrypto() {
+  // Failed HMACs are empty; an empty proof must never match one.
+  assert(!crypto::ConstantTimeEquals(Bytes{}, Bytes{}));
+  assert(crypto::ConstantTimeEquals(Bytes{1, 2, 3}, Bytes{1, 2, 3}));
+  assert(!crypto::ConstantTimeEquals(Bytes{1, 2, 3}, Bytes{1, 2, 4}));
+  assert(!crypto::ConstantTimeEquals(Bytes{1, 2}, Bytes{1, 2, 3}));
   // RFC 4231 test case 2.
   assert(HexEncode(crypto::HmacSha256(ToBytes("Jefe"),
                                       ToBytes("what do ya want for nothing?"))) ==
@@ -432,6 +437,7 @@ void TestServiceEndToEnd() {
   std::string error;
   assert(service.Start(config, &error));
   assert(service.Port() != 0);
+  assert(!service.CanSendFile());
 
   const std::string uri = service.CreatePairingUri();
   if (uri.empty()) {
@@ -595,10 +601,14 @@ void TestServiceEndToEnd() {
     // PC → phone file transfer and delivery receipt.
     const auto outgoing = dir / L"to-phone.txt";
     std::ofstream(outgoing, std::ios::binary) << "hello phone";
+    assert(service.CanSendFile());
     const std::string transferId = service.SendFile(outgoing.wstring());
     assert(!transferId.empty());
     const auto fileMessage = phone.ReadSealed();
     assert(fileMessage && fileMessage->binary == ToBytes("hello phone"));
+    // The finished worker hands its slot back before announcing it.
+    assert(waitFor(EventKind::SendSlotFree));
+    assert(service.CanSendFile());
     const auto fileRoot = feathercast::json::Parse(fileMessage->json);
     assert(fileRoot && JsonString(*fileRoot, "type") == "file.send" &&
            JsonString(*fileRoot, "id") == transferId &&

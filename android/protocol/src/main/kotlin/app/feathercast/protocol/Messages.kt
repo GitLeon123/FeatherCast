@@ -263,9 +263,11 @@ sealed class PcMessage {
 
 /**
  * Normalizes a PC-supplied storage path ("/" is the shared-storage root).
- * Returns null when it tries to leave the root.
+ * Returns null when it tries to leave the root or contains control characters
+ * (a NUL makes java.io.File canonicalization throw).
  */
 fun normalizeStoragePath(path: String): String? {
+    if (path.any { it.isISOControl() }) return null
     val parts = ArrayList<String>()
     for (part in path.replace('\\', '/').split('/')) {
         when (part) {

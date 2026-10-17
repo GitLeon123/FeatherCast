@@ -297,7 +297,7 @@
       const auto& entry = candidate[index];
       if (AutomationKeywordExists(entry.alias)) return {false, L"That alias is already used by a script or workspace."};
       if (const auto error = feathercast::library::ValidateAppAlias(
-              entry, candidate, index)) {
+              entry, candidate, index, settings_.commandAliases)) {
         return {false, *error};
       }
       next.appAliases[entry.appId] = entry.alias;

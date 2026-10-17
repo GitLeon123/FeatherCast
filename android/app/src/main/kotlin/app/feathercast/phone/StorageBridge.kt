@@ -32,8 +32,16 @@ object StorageBridge {
     /** Maps a PC path to a file under the storage root, or null when it escapes it. */
     private fun resolve(path: String): Pair<String, File>? {
         val normalized = normalizeStoragePath(path) ?: return null
-        val base = root.canonicalFile
-        val file = File(base, normalized.removePrefix("/")).canonicalFile
+        // Canonicalization hits the file system and can throw on odd names;
+        // treat that as "not available" instead of failing the link coroutine.
+        val (base, file) = try {
+            val base = root.canonicalFile
+            base to File(base, normalized.removePrefix("/")).canonicalFile
+        } catch (_: IOException) {
+            return null
+        } catch (_: SecurityException) {
+            return null
+        }
         if (file != base && !file.path.startsWith(base.path + File.separator)) return null
         return normalized to file
     }

@@ -64,6 +64,15 @@ int main() {
          std::optional<std::wstring>(L"Another app already uses this alias."));
   assert(!ValidateAppAlias({L"app:other", L"Other", std::wstring(64, L'x')},
                            aliases));
+  // App aliases must not shadow a command alias, mirroring the command-side
+  // check against app aliases.
+  const std::map<std::wstring, std::wstring> takenCommandAliases = {
+      {L"system.lock", L"lock"}};
+  assert(ValidateAppAlias({L"app:other", L"Other", L" LOCK "}, aliases,
+                          std::nullopt, takenCommandAliases) ==
+         std::optional<std::wstring>(L"A command already uses this alias."));
+  assert(!ValidateAppAlias({L"app:other", L"Other", L"locker"}, aliases,
+                           std::nullopt, takenCommandAliases));
   assert(feathercast::library::ValidateAliasText(L"two\nlines") ==
          std::optional<std::wstring>(L"Alias must be a single line."));
   assert(feathercast::library::ValidateAliasText(L":x") ==

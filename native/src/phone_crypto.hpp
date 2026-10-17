@@ -17,6 +17,7 @@ Bytes RandomBytes(std::size_t size);
 Bytes HmacSha256(const Bytes& key, const Bytes& data);
 Bytes Hkdf(const Bytes& ikm, const Bytes& salt, std::string_view info,
            std::size_t length);
+// False for empty input, so a failed HMAC never matches an empty proof.
 bool ConstantTimeEquals(const Bytes& a, const Bytes& b);
 
 // Returns ciphertext || 16-byte tag, or nullopt on failure.

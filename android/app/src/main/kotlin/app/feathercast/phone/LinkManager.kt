@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.util.Log
 import app.feathercast.protocol.BEACON_PORT
 import app.feathercast.protocol.Beacon
 import app.feathercast.protocol.Features
@@ -31,6 +32,7 @@ import app.feathercast.protocol.message
 import app.feathercast.protocol.readAtMost
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -78,7 +80,12 @@ data class LinkState(
  * messages in both directions.
  */
 class LinkManager(private val context: Context, private val store: LinkStore) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // A failing background handler must not take the whole app down: without a
+    // handler an uncaught exception in any child coroutine crashes the process.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO +
+            CoroutineExceptionHandler { _, error -> Log.w("FeatherCast", "Link task failed", error) },
+    )
     private val main = Handler(Looper.getMainLooper())
     private val wake = Channel<Unit>(Channel.CONFLATED)
     private val _state = MutableStateFlow(initialState())

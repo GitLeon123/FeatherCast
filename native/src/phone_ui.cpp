@@ -20,6 +20,7 @@
 #include <map>
 #include <set>
 
+#include "background_services.hpp"
 #include "motion.hpp"
 #include "text_layout_cache.hpp"
 #include "qrcodegen.hpp"
@@ -34,6 +35,11 @@ constexpr int kAppIconId = 101;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT_PTR kFrameTimer = 2;
 constexpr float kHeaderHeight = 84.0f;
+// Longest decoded edge, in pixels, for images from the phone: enough for the
+// drawn size at high DPI scales without keeping full-resolution bitmaps.
+constexpr std::uint32_t kIconDecodeEdge = 128;
+constexpr std::uint32_t kArtDecodeEdge = 256;
+constexpr std::uint32_t kPhotoDecodeEdge = 512;
 constexpr float kSidebarWidth = 212.0f;
 constexpr float kPad = 24.0f;
 constexpr size_t kMaxNotifications = 100;
@@ -394,26 +400,20 @@ struct PhoneWindow::Impl {
     return brush != nullptr;
   }
 
-  ComPtr<ID2D1Bitmap> DecodeImage(const phone::Bytes& data) {
+  // Phone images are untrusted: decode them through the size-capped WIC path
+  // and scale them down to what the window draws, so a huge or hostile image
+  // cannot exhaust memory or exceed the render target's bitmap limit.
+  ComPtr<ID2D1Bitmap> DecodeImage(const phone::Bytes& data, std::uint32_t maxEdge) {
     ComPtr<ID2D1Bitmap> bitmap;
     if (data.empty() || !wic || !target) return bitmap;
-    ComPtr<IStream> stream;
-    stream.Attach(SHCreateMemStream(data.data(), static_cast<UINT>(data.size())));
-    if (!stream) return bitmap;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr,
-                                            WICDecodeMetadataCacheOnDemand,
-                                            decoder.GetAddressOf())) ||
-        FAILED(decoder->GetFrame(0, frame.GetAddressOf())) ||
-        FAILED(wic->CreateFormatConverter(converter.GetAddressOf())) ||
-        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
-                                     WICBitmapDitherTypeNone, nullptr, 0.0,
-                                     WICBitmapPaletteTypeMedianCut))) {
-      return bitmap;
-    }
-    target->CreateBitmapFromWicBitmap(converter.Get(), nullptr, bitmap.GetAddressOf());
+    const auto decoded = runtime::DecodeImageBytes(wic.Get(), data, {}, maxEdge);
+    if (!decoded) return bitmap;
+    target->CreateBitmap(
+        D2D1::SizeU(decoded->width, decoded->height), decoded->pixels.data(),
+        decoded->stride,
+        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                 D2D1_ALPHA_MODE_PREMULTIPLIED)),
+        bitmap.GetAddressOf());
     return bitmap;
   }
 
@@ -774,7 +774,7 @@ struct PhoneWindow::Impl {
     const D2D1_RECT_F iconRect{row.left + 14.0f, row.top + 16.0f, row.left + 50.0f,
                                row.top + 52.0f};
     if (!item.icon && !item.iconFailed && !item.info.iconPng.empty()) {
-      item.icon = DecodeImage(item.info.iconPng);
+      item.icon = DecodeImage(item.info.iconPng, kIconDecodeEdge);
       item.iconFailed = !item.icon;
     }
     if (item.icon) {
@@ -910,7 +910,7 @@ struct PhoneWindow::Impl {
     Card(card);
     const D2D1_RECT_F art{left + 14.0f, y + 14.0f, left + 82.0f, y + 82.0f};
     if (!mediaArt && !mediaArtFailed && !media.artJpeg.empty()) {
-      mediaArt = DecodeImage(media.artJpeg);
+      mediaArt = DecodeImage(media.artJpeg, kArtDecodeEdge);
       mediaArtFailed = !mediaArt;
     }
     if (mediaArt) {
@@ -1047,8 +1047,11 @@ struct PhoneWindow::Impl {
       const float py = y + static_cast<float>(rowIndex) * (tileSize + gap);
       const D2D1_RECT_F rect{px, py, px + tileSize, py + tileSize};
       Fill(rect, ToD2D(theme.surfaceHover, 0.5f), 8.0f);
-      if (!photo.thumb && !photo.thumbFailed && !photo.info.thumbJpeg.empty()) {
-        photo.thumb = DecodeImage(photo.info.thumbJpeg);
+      // Decode lazily as tiles scroll into view instead of the whole grid at once.
+      const bool visible = rect.bottom > kHeaderHeight &&
+                           rect.top < kHeaderHeight + viewportHeight;
+      if (visible && !photo.thumb && !photo.thumbFailed && !photo.info.thumbJpeg.empty()) {
+        photo.thumb = DecodeImage(photo.info.thumbJpeg, kPhotoDecodeEdge);
         photo.thumbFailed = !photo.thumb;
       }
       if (photo.thumb) {

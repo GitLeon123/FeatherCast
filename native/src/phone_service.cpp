@@ -751,6 +751,17 @@ bool PhoneService::Connected() const {
   return active_ != nullptr;
 }
 
+bool PhoneService::CanSendFile() const {
+  std::lock_guard lock(mutex_);
+  if (!running_ || !active_ ||
+      active_->outgoingTransfers.load() >= transfer::kMaximumConcurrent) {
+    return false;
+  }
+  const auto busy = std::count_if(workers_.begin(), workers_.end(),
+                                  [](const Worker& worker) { return !worker.done->load(); });
+  return static_cast<std::size_t>(busy) < kMaxWorkers;
+}
+
 std::string PhoneService::ConnectedDeviceName() const {
   std::lock_guard lock(mutex_);
   return active_ ? active_->deviceName : std::string{};
@@ -855,14 +866,21 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
   workers_.push_back(Worker{
       std::jthread([this, path, id, name, done, session, stream, epoch, size, cancelled] {
         struct Cleanup {
+          PhoneService* service;
           std::shared_ptr<Session> session;
           std::string id;
           ~Cleanup() {
             --session->outgoingTransfers;
-            std::lock_guard lock(session->cancellationMutex);
-            session->cancellations.erase(id);
+            {
+              std::lock_guard lock(session->cancellationMutex);
+              session->cancellations.erase(id);
+            }
+            // Runs after done is set, so CanSendFile already sees the slot free.
+            Event freed;
+            freed.kind = EventKind::SendSlotFree;
+            service->Emit(std::move(freed));
           }
-        } cleanup{session, id};
+        } cleanup{this, session, id};
         if (stream) {
           std::ifstream file(std::filesystem::path(path), std::ios::binary);
           bool ok = static_cast<bool>(file) && SendToSession(session,
@@ -1430,6 +1448,10 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     const Bytes pairedLabel = ToBytes(kPairedProofLabel);
     const Bytes confirm = crypto::HmacSha256(
         device.linkKey, Concat({&pairedLabel, &*phonePublic}));
+    // A failed derivation must never be stored: an empty link key is public.
+    if (device.linkKey.size() != 32 || confirm.empty()) {
+      return reject("bad-key", "The phone key could not be used.");
+    }
     bool consumed = false;
     {
       std::lock_guard lock(mutex_);
@@ -1524,6 +1546,9 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     session->sendKey = crypto::Hkdf(session->linkKey, salt, kPcToPhoneInfo, 32);
     const Bytes pcMac = crypto::HmacSha256(
         session->linkKey, Concat({&pcLabel, &session->phoneNonce, &session->pcNonce}));
+    if (session->recvKey.size() != 32 || session->sendKey.size() != 32 || pcMac.empty()) {
+      return reject("bad-auth", "Authentication failed. Pair the phone again.");
+    }
     // Session::Open queues the welcome as the first frame and only then makes
     // the session sendable, so no sealed frame can precede it. Senders find the
     // session (active_ or screen_) only after that.

@@ -72,9 +72,12 @@ std::optional<std::wstring> ValidateQuicklink(
     const std::vector<settings::Quicklink>& existing,
     std::optional<std::size_t> editingIndex = std::nullopt);
 
+// commandAliases maps command stable ids to their aliases; an app alias must
+// not shadow one, mirroring the check ValidateCommandAlias does against apps.
 std::optional<std::wstring> ValidateAppAlias(
     const AppAlias& candidate, const std::vector<AppAlias>& existing,
-    std::optional<std::size_t> editingIndex = std::nullopt);
+    std::optional<std::size_t> editingIndex = std::nullopt,
+    const std::map<std::wstring, std::wstring>& commandAliases = {});
 
 std::optional<std::wstring> ValidateCommandAlias(
     const CommandAlias& candidate,

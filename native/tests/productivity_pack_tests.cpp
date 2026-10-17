@@ -3,6 +3,7 @@
 #include "capture_service.hpp"
 #include "screenshot_rasterizer.hpp"
 #include "command_catalog.hpp"
+#include "command_hotkeys.hpp"
 #include "core.hpp"
 #include "network_client.hpp"
 #include "search_pipeline.hpp"
@@ -63,6 +64,43 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
   }
 }
 
+// Loading saved command shortcuts keeps every chord that is still free when
+// another app holds one of them; editing stays all-or-nothing.
+void TestCommandHotKeysSkipTakenChords() {
+  const auto spec = [](const wchar_t* text) {
+    return feathercast::shortcut::ToHotKeySpec(
+        feathercast::shortcut::ParseShortcut(text));
+  };
+  const auto takenChord = spec(L"Ctrl+Alt+Shift+F11");
+  const auto freeChord = spec(L"Ctrl+Alt+Shift+F12");
+  // Another program may own the probe chord on this machine.
+  if (!RegisterHotKey(nullptr, 0x2F00, freeChord.modifiers, freeChord.vk)) return;
+  UnregisterHotKey(nullptr, 0x2F00);
+  if (!RegisterHotKey(nullptr, 0x2F01, takenChord.modifiers, takenChord.vk)) return;
+
+  const std::map<std::wstring, std::wstring> saved = {
+      {L"show-desktop", L"Ctrl+Alt+Shift+F12"},
+      {L"volume-up", L"Ctrl+Alt+Shift+F11"},
+  };
+  {
+    feathercast::commands::HotKeys hotKeys;
+    const auto error = hotKeys.AssignAvailable(nullptr, saved);
+    assert(error && error->find(L"F11") != std::wstring::npos);
+    bool showDesktop = false;
+    for (int id = 0x3000; id < 0x3002; ++id) {
+      if (hotKeys.Find(id) == feathercast::app::CommandKind::ShowDesktop) showDesktop = true;
+    }
+    assert(showDesktop);
+    // The free chord is now held by HotKeys.
+    assert(!RegisterHotKey(nullptr, 0x2F00, freeChord.modifiers, freeChord.vk));
+
+    // A transactional edit that hits the taken chord keeps what was active.
+    assert(hotKeys.Assign(nullptr, {{L"volume-up", L"Ctrl+Alt+Shift+F11"}}));
+    assert(hotKeys.Find(0x3000) == feathercast::app::CommandKind::ShowDesktop);
+  }
+  UnregisterHotKey(nullptr, 0x2F01);
+}
+
 }  // namespace
 
 int main() {
@@ -74,6 +112,8 @@ int main() {
   using feathercast::ui::CaptureUiState;
   using feathercast::ui::PixelPoint;
   using feathercast::ui::PixelRect;
+
+  TestCommandHotKeysSkipTakenChords();
 
   {
     const auto printScreen = feathercast::shortcut::ParseShortcut(L"Print Screen");

@@ -7578,6 +7578,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_CAPTURECHANGED:
         CancelPointerPress(hwnd);
         return 0;
+      case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE &&
+            feathercast::ui::HasEffect(
+                feathercast::ui::SettingsController::Deactivate(settingsState_),
+                feathercast::ui::UiEffect::Invalidate)) {
+          shortcutRecorder_.Reset();
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        break;
       case WM_CLOSE:
         HideSettings();
         return 0;
@@ -8732,7 +8741,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool RegisterAllHotKeys() {
     const bool launcherReady = RegisterShortcutHotKey();
     const bool captureReady = RegisterCaptureHotKeys();
-    if (const auto error = commandHotKeys_.Assign(hwnd_, settings_.commandShortcuts)) {
+    if (const auto error = commandHotKeys_.AssignAvailable(hwnd_, settings_.commandShortcuts)) {
       SetSettingsStatus(StatusSeverity::Error, *error);
     }
     return launcherReady && captureReady;
@@ -12323,14 +12332,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       OpenPhoneWindow();
       return;
     }
+    pendingPhoneSends_.insert(pendingPhoneSends_.end(), paths.begin(), paths.end());
     if (!phoneService_.Connected()) {
-      pendingPhoneSends_.insert(pendingPhoneSends_.end(), paths.begin(), paths.end());
       ShowTrayNotification(L"FeatherCast Phone",
                            L"The file will be sent when your phone connects.");
       return;
     }
-    if (!PhoneFeatureReady("files.receive", L"Files from the PC")) return;
-    for (const auto& path : paths) {
+    SendPendingPhoneFiles();
+  }
+
+  // The phone takes only a few transfers at a time; files beyond that stay
+  // queued until a transfer ends (SendSlotFree) or the phone reconnects.
+  void SendPendingPhoneFiles() {
+    if (pendingPhoneSends_.empty() || !phoneService_.Connected()) return;
+    if (!PhoneFeatureReady("files.receive", L"Files from the PC")) {
+      pendingPhoneSends_.clear();
+      return;
+    }
+    std::size_t started = 0;
+    while (started < pendingPhoneSends_.size() && phoneService_.CanSendFile()) {
+      const std::wstring path = pendingPhoneSends_[started++];
       std::string error;
       const std::string id = phoneService_.SendFile(path, &error);
       const std::wstring name = std::filesystem::path(path).filename().wstring();
@@ -12340,6 +12361,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         phoneSendNames_[id] = name;
       }
     }
+    pendingPhoneSends_.erase(pendingPhoneSends_.begin(),
+                             pendingPhoneSends_.begin() +
+                                 static_cast<std::ptrdiff_t>(started));
   }
 
   std::vector<std::wstring> PickFilesToSend() {
@@ -20138,9 +20162,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (pendingStorageOperation_) return;
     pendingStorageOperation_ = kind;
     if (kind == StorageOperationKind::ClearFileIndex) {
-      // Prevent a currently running index build from repopulating the database
-      // after the verified DELETE commits.
-      discoveryGeneration_ = discoveryService_.Cancel();
+      // Stop the live file index worker so a running crawl cannot repopulate
+      // the database after the verified DELETE commits. App discovery does not
+      // touch the file index, so it keeps running.
       StopFileIndexService();
     }
     SetSettingsStatus(
@@ -20168,9 +20192,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                ? L"Clipboard history was not deleted: "
                : L"File index was not deleted: ") +
               (result.error.empty() ? L"Unknown storage error." : result.error));
-      if (result.kind == StorageOperationKind::ClearFileIndex) {
-        StartAppDiscovery();
-      }
       return;
     }
 
@@ -20191,9 +20212,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         result.kind == StorageOperationKind::ClearClipboard
             ? L"Stored clipboard history was deleted. New entries may be collected while the feature remains enabled."
             : L"The stored file index was deleted. A future refresh may rebuild it while indexing remains enabled.");
-    if (result.kind == StorageOperationKind::ClearFileIndex) {
-      StartAppDiscovery(true);
-    }
   }
 
   void ClearClipboardHistoryData() {
@@ -21306,9 +21324,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                   std::to_wstring(phoneStore_.Battery()) + L"%.");
         }
         // Files queued while the phone was offline wait for its feature list.
-        if (!pendingPhoneSends_.empty()) {
-          SendFilesToPhone(std::exchange(pendingPhoneSends_, {}));
-        }
+        SendPendingPhoneFiles();
+        break;
+      case EventKind::SendSlotFree:
+        SendPendingPhoneFiles();
         break;
       case EventKind::TransferProgress: {
         if (visible_) {

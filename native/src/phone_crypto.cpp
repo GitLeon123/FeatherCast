@@ -122,7 +122,8 @@ Bytes Hkdf(const Bytes& ikm, const Bytes& salt, std::string_view info,
 }
 
 bool ConstantTimeEquals(const Bytes& a, const Bytes& b) {
-  if (a.size() != b.size()) return false;
+  // HmacSha256 and Hkdf return empty on failure; two failures must not match.
+  if (a.empty() || a.size() != b.size()) return false;
   std::uint8_t diff = 0;
   for (std::size_t i = 0; i < a.size(); ++i) diff |= a[i] ^ b[i];
   return diff == 0;

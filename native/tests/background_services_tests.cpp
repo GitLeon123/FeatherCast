@@ -64,6 +64,54 @@ int main() {
         factory.Get(), iconPath, L"corrupt-cache-entry"));
     std::filesystem::remove(iconPath, ec);
   }
+  {
+    // Images from the phone are decoded through DecodeImageBytes, which must
+    // scale large sources down to the requested edge and reject bad input.
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    assert(SUCCEEDED(CoCreateInstance(
+        CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory))));
+    Microsoft::WRL::ComPtr<IStream> memory;
+    assert(SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &memory)));
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    assert(SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr,
+                                            &encoder)));
+    assert(SUCCEEDED(encoder->Initialize(memory.Get(), WICBitmapEncoderNoCache)));
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+    Microsoft::WRL::ComPtr<IPropertyBag2> properties;
+    assert(SUCCEEDED(encoder->CreateNewFrame(&frame, &properties)));
+    assert(SUCCEEDED(frame->Initialize(properties.Get())));
+    constexpr UINT kWidth = 1024;
+    constexpr UINT kHeight = 512;
+    assert(SUCCEEDED(frame->SetSize(kWidth, kHeight)));
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppPBGRA;
+    assert(SUCCEEDED(frame->SetPixelFormat(&format)));
+    std::vector<BYTE> pixels(static_cast<std::size_t>(kWidth) * kHeight * 4, 0x80);
+    assert(SUCCEEDED(frame->WritePixels(kHeight, kWidth * 4,
+                                        static_cast<UINT>(pixels.size()),
+                                        pixels.data())));
+    assert(SUCCEEDED(frame->Commit()));
+    assert(SUCCEEDED(encoder->Commit()));
+    STATSTG stat{};
+    assert(SUCCEEDED(memory->Stat(&stat, STATFLAG_NONAME)));
+    std::vector<std::uint8_t> png(static_cast<std::size_t>(stat.cbSize.QuadPart));
+    assert(SUCCEEDED(memory->Seek({}, STREAM_SEEK_SET, nullptr)));
+    ULONG read = 0;
+    assert(SUCCEEDED(memory->Read(png.data(), static_cast<ULONG>(png.size()), &read)) &&
+           read == png.size());
+
+    const auto scaled =
+        feathercast::runtime::DecodeImageBytes(factory.Get(), png, L"", 128);
+    assert(scaled && scaled->width == 128 && scaled->height == 64 &&
+           scaled->stride == 128 * 4 &&
+           scaled->pixels.size() == static_cast<std::size_t>(128) * 64 * 4);
+    const auto unscaled =
+        feathercast::runtime::DecodeImageBytes(factory.Get(), png, L"", 4096);
+    assert(unscaled && unscaled->width == kWidth && unscaled->height == kHeight);
+    assert(!feathercast::runtime::DecodeImageBytes(factory.Get(), png, L"", 0));
+    std::vector<std::uint8_t> truncatedPng(png.begin(), png.begin() + 16);
+    assert(!feathercast::runtime::DecodeImageBytes(factory.Get(), truncatedPng, L"", 128));
+  }
 
   feathercast::runtime::LaunchService launch;
   launch.Start(1);

@@ -128,7 +128,8 @@ std::optional<std::wstring> ValidateQuicklink(
 
 std::optional<std::wstring> ValidateAppAlias(
     const AppAlias& candidate, const std::vector<AppAlias>& existing,
-    std::optional<std::size_t> editingIndex) {
+    std::optional<std::size_t> editingIndex,
+    const std::map<std::wstring, std::wstring>& commandAliases) {
   if (Trim(candidate.appId).empty()) return L"App is required.";
   if (const auto error = ValidateAliasText(candidate.alias)) return error;
   const std::wstring normalized = core::NormalizeAlias(candidate.alias);
@@ -136,6 +137,11 @@ std::optional<std::wstring> ValidateAppAlias(
     if (editingIndex && *editingIndex == index) continue;
     if (core::NormalizeAlias(existing[index].alias) == normalized) {
       return L"Another app already uses this alias.";
+    }
+  }
+  for (const auto& [stableId, alias] : commandAliases) {
+    if (core::NormalizeAlias(alias) == normalized) {
+      return L"A command already uses this alias.";
     }
   }
   return std::nullopt;

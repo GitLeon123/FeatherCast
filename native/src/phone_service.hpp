@@ -117,6 +117,7 @@ enum class EventKind {
   FileSaved,
   ClipboardHistoryRequested,
   FileDelivered,    // the phone saved a file sent from the PC (ok/text)
+  SendSlotFree,     // an outgoing file transfer ended; CanSendFile() may allow another
   TransferProgress,
   RingState,        // ok = ringing
   MediaState,       // media.active == false when nothing plays
@@ -213,6 +214,9 @@ class PhoneService {
   // Reads the file on a worker thread; the result arrives as FileDelivered or
   // Error. Returns the transfer id, or empty when not connected / too large.
   std::string SendFile(const std::wstring& path, std::string* error = nullptr);
+  // True while another SendFile would get a transfer slot. Slots are taken only
+  // by SendFile, so a caller on one thread can rely on the answer.
+  bool CanSendFile() const;
   bool Ring(bool start);
   bool MediaCommand(const std::string& command, long long position = -1);
   bool MediaVolume(int volume);

@@ -834,6 +834,14 @@ class SettingsController {
     state.pendingShortcut.clear();
     return Effect(UiEffect::Invalidate);
   }
+
+  // The keyboard hook swallows every key while a shortcut is recorded, so
+  // Settings losing activation must end the recording; otherwise the whole
+  // keyboard stays captured while the user works in another window.
+  static UiEffects Deactivate(SettingsState& state) {
+    if (!state.recordingShortcut) return Effect(UiEffect::None);
+    return CancelShortcutRecording(state);
+  }
 };
 
 }  // namespace feathercast::ui

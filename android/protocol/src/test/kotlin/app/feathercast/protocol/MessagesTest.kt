@@ -111,5 +111,7 @@ class MessagesTest {
         assertEquals("/Download/a.pdf", normalizeStoragePath("/Download//./a.pdf"))
         assertEquals("/DCIM/Camera", normalizeStoragePath("\\DCIM\\Camera\\"))
         assertNull(normalizeStoragePath("/Download/../../data"))
+        assertNull(normalizeStoragePath("/Download/a\u0000b.pdf"))
+        assertNull(normalizeStoragePath("/Download/a\nb"))
     }
 }
