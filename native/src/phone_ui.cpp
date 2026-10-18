@@ -397,6 +397,8 @@ struct PhoneWindow::Impl {
     }
     target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     target->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), brush.GetAddressOf());
+    // Without a brush the next call would accept the target and draw with null.
+    if (!brush) target.Reset();
     return brush != nullptr;
   }
 
