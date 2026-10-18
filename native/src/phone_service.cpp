@@ -1263,11 +1263,14 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
 }
 
 void PhoneService::BeaconLoop(std::stop_token stop) {
+  // Without a socket the loop keeps running: it also expires timed-out
+  // photo and file requests.
   const SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (udp == INVALID_SOCKET) return;
-  BOOL broadcast = TRUE;
-  setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
-             reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+  if (udp != INVALID_SOCKET) {
+    BOOL broadcast = TRUE;
+    setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
+               reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+  }
   std::mutex waitMutex;
   std::condition_variable_any wake;
   while (!stop.stop_requested()) {
@@ -1278,7 +1281,7 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
       anyDevice = !devices_.empty() || !pairingToken_.empty();
       pcId = pcId_;
     }
-    if (anyDevice) {
+    if (anyDevice && udp != INVALID_SOCKET) {
       const std::string beacon = BuildBeacon(pcId, port_);
       std::vector<ULONG> targets{htonl(INADDR_BROADCAST)};
       for (const auto& adapter : EnumerateAdapters()) {
@@ -1297,7 +1300,7 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
     std::unique_lock lock(waitMutex);
     wake.wait_for(lock, stop, kBeaconInterval, [] { return false; });
   }
-  closesocket(udp);
+  if (udp != INVALID_SOCKET) closesocket(udp);
 }
 
 // Returns the unauthenticated-connection slot AcceptLoop reserved for the
