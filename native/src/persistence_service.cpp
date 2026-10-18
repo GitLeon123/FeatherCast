@@ -244,9 +244,8 @@ bool PersistenceService::StoreClipboard(std::wstring text,
           entry = storage_.AddClipboardEntry(text, preview, capturedAt, limit,
                                              retentionDays);
         }
-        Emit(ClipboardStored{
-            std::move(entry),
-            entry ? storage::StorageError{} : storage_.LastError()});
+        auto error = entry ? storage::StorageError{} : storage_.LastError();
+        Emit(ClipboardStored{std::move(entry), std::move(error)});
       });
 }
 
