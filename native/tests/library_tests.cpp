@@ -166,14 +166,14 @@ int main() {
   assert(missing.status == feathercast::snippets_io::LoadStatus::Missing);
   assert(missing.fingerprint.inspected && !missing.fingerprint.exists);
   const auto saved = feathercast::snippets_io::Save(
-      path, {{L"unicode", L"Grüße", L"First line\nSecond U0001F680"}},
+      path, {{L"unicode", L"Grüße", L"First line\nSecond \U0001F680"}},
       missing.fingerprint);
   assert(saved.succeeded);
   const auto loaded = feathercast::snippets_io::Load(path);
   assert(loaded.status == feathercast::snippets_io::LoadStatus::Valid);
   assert(loaded.snippets.size() == 1);
   assert(loaded.snippets[0].name == L"Grüße");
-  assert(loaded.snippets[0].text == L"First line\nSecond U0001F680");
+  assert(loaded.snippets[0].text == L"First line\nSecond \U0001F680");
 
   const auto originalWriteTime = loaded.fingerprint.writeTime;
   const auto originalSize = loaded.fingerprint.size;
