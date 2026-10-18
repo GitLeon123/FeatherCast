@@ -7855,7 +7855,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // renders into a premultiplied-alpha swap chain for rounded edges, motion, and the
   // capture selector; ordinary panel backgrounds are opaque.
   HRESULT EnsureGlassDevice() {
-    if (d2dDevice_) return S_OK;
+    if (d2dDevice_ && dxgiFactory_ && dcompDevice_) return S_OK;
     // A previous partial initialization must never be reused or overwritten.
     dcompDevice_.Reset();
     dxgiFactory_.Reset();
