@@ -778,6 +778,11 @@ int main() {
     assert(shell);
     assert(shell->kind == feathercast::run_command::Kind::ShellCommand);
     assert(shell->input == L"echo hello");
+
+    const auto program = feathercast::run_command::Classify(L">notepad.exe");
+    assert(program);
+    assert(program->kind == feathercast::run_command::Kind::ShellCommand);
+    assert(program->input == L"notepad.exe");
   }
 
   {
