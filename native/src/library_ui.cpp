@@ -411,7 +411,8 @@ class EditorWindow {
         hwnd_,
         [this](const MSG& message) {
           if (message.message != WM_KEYDOWN) return false;
-          if (message.wParam == VK_ESCAPE) {
+          if (message.wParam == VK_ESCAPE ||
+              (message.wParam == VK_RETURN && GetFocus() == cancel_)) {
             SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
             return true;
           }
