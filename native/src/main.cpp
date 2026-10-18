@@ -12294,10 +12294,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     } else if (id == L"prev") {
       phoneService_.MediaCommand("prev");
     } else if (id == L"vol-up" || id == L"vol-down") {
-      if (media.volume < 0) return;
+      // Both values come from the phone; clamp needs a valid range.
+      if (media.volume < 0 || media.volumeMax <= 0) return;
       const int step = std::max(1, media.volumeMax / 15);
-      phoneService_.MediaVolume(std::clamp(media.volume + (id == L"vol-up" ? step : -step),
-                                           0, media.volumeMax));
+      const long long target = static_cast<long long>(media.volume) + (id == L"vol-up" ? step : -step);
+      phoneService_.MediaVolume(static_cast<int>(std::clamp(target, 0LL, static_cast<long long>(media.volumeMax))));
     }
   }
 
