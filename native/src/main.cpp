@@ -19841,6 +19841,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnImeComposition(LPARAM flags) {
+    // Same gate as OnChar, so IME text cannot edit the query behind a dialog.
+    if (confirmation_) return;
+    if (view_ != View::Search) return;
     SetLauncherAccessibilityFocus(
         feathercast::accessibility_projection::SearchFocus());
     HIMC context = ImmGetContext(hwnd_);
