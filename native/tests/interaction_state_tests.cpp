@@ -170,12 +170,9 @@ int main() {
         feathercast::motion::NormalizedProgress(0.105, duration);
     // Every visible row uses this one reveal clock. There is deliberately no
     // row-index delay, so rows become available in the same frame.
-    assert(std::abs(sharedProgress -
-                    feathercast::motion::NormalizedProgress(0.105, duration)) <
-           0.001);
+    assert(std::abs(sharedProgress - 0.5) < 0.001);
     assert(std::abs(feathercast::motion::NormalizedProgress(0.35, duration) -
                     1.0) < 0.001);
-    assert(std::abs(duration - 0.21) < 0.001);
   }
 
   {
