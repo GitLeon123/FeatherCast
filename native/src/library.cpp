@@ -135,6 +135,9 @@ std::optional<std::wstring> ValidateAppAlias(
   const std::wstring normalized = core::NormalizeAlias(candidate.alias);
   for (std::size_t index = 0; index < existing.size(); ++index) {
     if (editingIndex && *editingIndex == index) continue;
+    if (existing[index].appId == candidate.appId) {
+      return L"This app already has an alias.";
+    }
     if (core::NormalizeAlias(existing[index].alias) == normalized) {
       return L"Another app already uses this alias.";
     }

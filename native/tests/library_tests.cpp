@@ -64,6 +64,13 @@ int main() {
          std::optional<std::wstring>(L"Another app already uses this alias."));
   assert(!ValidateAppAlias({L"app:other", L"Other", std::wstring(64, L'x')},
                            aliases));
+  // Aliases are saved keyed by app id, so a second alias for the same app
+  // would silently replace the first.
+  assert(ValidateAppAlias({L"app:code", L"Visual Studio Code", L"vsc"},
+                          aliases) ==
+         std::optional<std::wstring>(L"This app already has an alias."));
+  assert(!ValidateAppAlias({L"app:code", L"Visual Studio Code", L"vsc"},
+                           aliases, 0));
   // App aliases must not shadow a command alias, mirroring the command-side
   // check against app aliases.
   const std::map<std::wstring, std::wstring> takenCommandAliases = {
