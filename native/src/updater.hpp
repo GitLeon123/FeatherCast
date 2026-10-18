@@ -13,6 +13,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -82,7 +83,10 @@ inline std::optional<Version> ParseVersion(std::wstring value) {
     int parsed = 0;
     for (size_t i = start; i < end; ++i) {
       if (!std::iswdigit(value[i])) return std::nullopt;
-      parsed = parsed * 10 + static_cast<int>(value[i] - L'0');
+      const int digit = static_cast<int>(value[i] - L'0');
+      // Tags come from the network; an oversized part must not overflow.
+      if (parsed > (std::numeric_limits<int>::max() - digit) / 10) return std::nullopt;
+      parsed = parsed * 10 + digit;
     }
     version.parts[part++] = parsed;
 

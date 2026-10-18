@@ -350,6 +350,8 @@ int main() {
     assert(CompareVersionStrings(L"1.0.0", L"1.0.0") == 0);
     assert(IsNewerVersion(L"0.2.0", L"v0.3.0"));
     assert(!IsNewerVersion(L"0.3.0", L"v0.2.9"));
+    assert(feathercast::updater::ParseVersion(L"2147483647.0"));
+    assert(!feathercast::updater::ParseVersion(L"2147483648.0"));
 
     const auto release = ParseGitHubReleaseJson(
         "{\"tag_name\":\"v0.3.0\",\"name\":\"FeatherCast 0.3.0\",\"html_url\":\"https://github.com/GenericLeon0/FeatherCast/releases/tag/v0.3.0\","
