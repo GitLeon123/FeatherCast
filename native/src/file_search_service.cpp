@@ -263,28 +263,35 @@ void FileSearchService::WorkerLoop(std::stop_token token) {
         pending_.reset();
       }
     }
-    if (projectStorageFiles) {
-      files.reserve(storageFiles.size());
-      for (const auto& entry : storageFiles) {
-        if (!entry.path.empty() && !entry.name.empty()) {
-          files.push_back(ProjectStorageEntry(entry));
+    // An exception escaping this thread would terminate the app, so corpus
+    // work is guarded like queries; the previous corpus stays in place.
+    try {
+      if (projectStorageFiles) {
+        files.reserve(storageFiles.size());
+        for (const auto& entry : storageFiles) {
+          if (!entry.path.empty() && !entry.name.empty()) {
+            files.push_back(ProjectStorageEntry(entry));
+          }
         }
+        filesGeneration = storageFilesGeneration;
+        updateCorpus = true;
       }
-      filesGeneration = storageFilesGeneration;
-      updateCorpus = true;
-    }
-    if (updateCorpus) {
-      auto corpus = BuildCorpus(std::move(files), filesGeneration);
-      auto projected = std::make_shared<const std::vector<app::AppEntry>>(
-          corpus->files);
-      {
-        std::lock_guard lock(mutex_);
-        corpus_ = std::move(corpus);
+      if (updateCorpus) {
+        auto corpus = BuildCorpus(std::move(files), filesGeneration);
+        auto projected = std::make_shared<const std::vector<app::AppEntry>>(
+            corpus->files);
+        {
+          std::lock_guard lock(mutex_);
+          corpus_ = std::move(corpus);
+        }
+        if (projectStorageFiles && projectionSink_) {
+          projectionSink_(PreparedFileIndex{filesGeneration,
+                                             std::move(projected)});
+        }
+        continue;
       }
-      if (projectStorageFiles && projectionSink_) {
-        projectionSink_(PreparedFileIndex{filesGeneration,
-                                           std::move(projected)});
-      }
+    } catch (...) {
+      if (errors_) errors_(std::current_exception());
       continue;
     }
     try {
