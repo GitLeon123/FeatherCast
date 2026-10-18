@@ -1445,7 +1445,12 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     const std::string deviceId = JsonString(*root, "deviceId");
     std::string name = JsonString(*root, "name");
     if (name.empty()) name = "Android phone";
-    if (name.size() > 80) name.resize(80);
+    if (name.size() > 80) {
+      // Cut before a whole UTF-8 sequence so the saved name stays valid.
+      std::size_t cut = 80;
+      while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0) == 0x80) --cut;
+      name.resize(cut);
+    }
     if (!phonePublic || !proof || deviceId.empty() || deviceId.size() > 64) {
       return reject("bad-request", "Malformed pairing request.");
     }
