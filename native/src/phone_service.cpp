@@ -29,7 +29,10 @@ constexpr std::size_t kMaxHandshakeBytes = 64 * 1024;
 constexpr std::size_t kMaxWorkers = 16;
 // Unauthenticated connections (handshakes and APK downloads) may hold only a
 // few of the workers, so a slow or hostile client cannot lock out the phone.
-constexpr std::size_t kMaxPendingHandshakes = 4;
+// One address gets only a share of them, so a single device on the network
+// cannot take them all.
+constexpr std::size_t kMaxPendingHandshakes = 8;
+constexpr std::size_t kMaxPendingPerAddress = 3;
 constexpr std::size_t kMaxQueuedMessages = 1024;
 constexpr std::size_t kMaxQueuedBytes = 64 * 1024 * 1024;
 // The phone sends nothing when it cannot deliver a photo or file, so requests
@@ -359,6 +362,8 @@ struct PhoneService::Session {
   Bytes recvKey;
   std::uint64_t recvCounter = 0;
   std::string screenId;
+  std::uint32_t address = 0;  // IPv4 peer, network byte order
+  bool pending = false;       // holds an unauthenticated slot; guarded by mutex_
   std::atomic<bool> fileStreamSupported = false;
   std::atomic<std::uint64_t> transferEpoch = 0;
   std::atomic<std::size_t> outgoingTransfers = 0;
@@ -503,7 +508,10 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
   config_ = std::move(config);
   stateReady_ = false;
   RemoveStaleTempFiles(std::filesystem::path(config_.stateFile).parent_path());
-  if (!config_.downloadsDir.empty()) RemoveStaleTempFiles(config_.downloadsDir);
+  if (!config_.downloadsDir.empty()) {
+    RemoveStaleTempFiles(config_.downloadsDir);
+    transfer::RemoveAbandonedPartials(config_.downloadsDir);
+  }
   switch (LoadState()) {
     case StateLoad::Loaded:
       break;
@@ -1217,8 +1225,11 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
         (events.lNetworkEvents & FD_CLOSE)) break;
     if (!(events.lNetworkEvents & FD_ACCEPT)) continue;
     if (events.iErrorCode[FD_ACCEPT_BIT] != 0) break;
-    const SOCKET client = accept(listener, nullptr, nullptr);
+    sockaddr_in peer{};
+    int peerSize = sizeof(peer);
+    const SOCKET client = accept(listener, reinterpret_cast<sockaddr*>(&peer), &peerSize);
     if (client == INVALID_SOCKET) continue;
+    const std::uint32_t address = peer.sin_addr.s_addr;
     // Accepted sockets inherit the listener's event association and
     // nonblocking mode. Session timeouts and I/O require a blocking socket.
     u_long blocking = 0;
@@ -1233,15 +1244,18 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
     auto done = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard lock(mutex_);
     std::erase_if(workers_, [](const Worker& worker) { return worker.done->load(); });
+    const auto fromAddress = pendingByAddress_.find(address);
     if (!running_ || workers_.size() >= kMaxWorkers ||
-        pendingHandshakes_ >= kMaxPendingHandshakes) {
+        pendingHandshakes_ >= kMaxPendingHandshakes ||
+        (fromAddress != pendingByAddress_.end() && fromAddress->second >= kMaxPendingPerAddress)) {
       closesocket(client);
       continue;
     }
-    ++pendingHandshakes_;  // released by HandleConnection
+    ++pendingHandshakes_;  // released by ReleasePendingLocked
+    ++pendingByAddress_[address];
     workers_.push_back(Worker{
-        std::jthread([this, client, done] {
-          HandleConnection(static_cast<std::uintptr_t>(client));
+        std::jthread([this, client, address, done] {
+          HandleConnection(static_cast<std::uintptr_t>(client), address);
           done->store(true);
         }),
         done});
@@ -1286,23 +1300,31 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
   closesocket(udp);
 }
 
-void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
+// Returns the unauthenticated-connection slot AcceptLoop reserved for the
+// session, once: on authentication, refusal, or the end of the connection.
+void PhoneService::ReleasePendingLocked(Session& session) {
+  if (!std::exchange(session.pending, false)) return;
+  --pendingHandshakes_;
+  if (const auto found = pendingByAddress_.find(session.address);
+      found != pendingByAddress_.end() && --found->second == 0) {
+    pendingByAddress_.erase(found);
+  }
+}
+
+void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t address) {
   const SOCKET socket = static_cast<SOCKET>(rawSocket);
-  // The slot AcceptLoop reserved for an unauthenticated connection; returned
-  // once the session is authenticated or the connection ends.
-  struct PendingSlot {
-    PhoneService* service;
-    bool held = true;
-    void Release() {
-      if (!held) return;
-      held = false;
-      std::lock_guard lock(service->mutex_);
-      --service->pendingHandshakes_;
-    }
-    ~PendingSlot() { Release(); }
-  } pending{this};
   auto session = std::make_shared<Session>();
   session->socket = socket;
+  session->address = address;
+  session->pending = true;
+  struct PendingSlot {
+    PhoneService* service;
+    Session* session;
+    ~PendingSlot() {
+      std::lock_guard lock(service->mutex_);
+      service->ReleasePendingLocked(*session);
+    }
+  } pending{this, session.get()};
   {
     std::lock_guard lock(mutex_);
     if (!running_) {
@@ -1355,7 +1377,6 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
         open = false;
       } else if (session->state == Session::State::Open) {
         SetTimeout(socket, session->screenId.empty() ? kSessionIdleTimeoutMs : 5000);
-        pending.Release();
       }
     }
   }
@@ -1366,6 +1387,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket) {
   std::vector<Event> unanswered;
   {
     std::lock_guard lock(mutex_);
+    ReleasePendingLocked(*session);  // before Close, so the peer can reconnect at once
     std::erase(sessions_, session);
     if (screen_ == session || (active_ == session && !screenId_.empty())) {
       endedScreen = std::exchange(screenId_, {});
@@ -1405,6 +1427,11 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     return SendAll(session->socket, EncodeFrame(ToBytes(json)));
   };
   const auto reject = [&](std::string_view code, std::string_view message) {
+    {
+      // The connection ends here, so a client that retries at once finds its slot free.
+      std::lock_guard lock(mutex_);
+      ReleasePendingLocked(*session);
+    }
     sendPlain(Json("error").Str("code", code).Str("message", message).Build());
     return false;
   };
@@ -1567,6 +1594,7 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
           screenKey_ != session->linkKey || screen_ || SteadyMs() >= screenExpiresAt_) return false;
       screenKey_.clear();  // one authentication only, including concurrent challenges
       session->Open(std::move(welcome));
+      ReleasePendingLocked(*session);
       screen_ = session;
       screenWake_.notify_all();
       return true;  // a media connection never replaces the normal phone connection
@@ -1581,6 +1609,7 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
       });
       if (!running_ || !stillPaired) return false;
       session->Open(std::move(welcome));
+      ReleasePendingLocked(*session);
       previous = std::exchange(active_, session);
       // Answers would have come over the replaced connection.
       if (previous && previous != session) unanswered = TakeExpiredLocked(true);
@@ -1690,7 +1719,13 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
     if (!incoming) return;
     transfer::Result result;
     if (type == "file.begin") {
-      result = incoming->Begin(*root, SanitizeFileName(JsonString(*root, "name")));
+      // Named like the single-frame answers: a storage file after the requested
+      // path, never a name the phone reports, and a photo with an extension that
+      // follows its bytes once they arrived (Receiver::Finish).
+      const auto purpose = JsonString(*root, "purpose");
+      result = incoming->Begin(*root, purpose == "storage"
+          ? RemoteFileName(JsonString(*root, "ref"))
+          : SanitizeFileName(JsonString(*root, "name"), purpose == "photo" ? "phone-photo" : "phone-file"));
     } else if (type == "file.chunk") {
       result = incoming->Chunk(*root, payload->binary);
     } else {

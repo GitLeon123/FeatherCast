@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -155,8 +156,15 @@ void TestCrypto() {
 // A minimal phone client used to exercise the real service over loopback.
 class FakePhone {
  public:
-  explicit FakePhone(std::uint16_t port) {
+  // source binds another loopback address, standing in for another device.
+  explicit FakePhone(std::uint16_t port, const char* source = nullptr) {
     socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (source) {
+      sockaddr_in local{};
+      local.sin_family = AF_INET;
+      inet_pton(AF_INET, source, &local.sin_addr);
+      if (bind(socket_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) return;
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -689,6 +697,26 @@ void TestServiceEndToEnd() {
     const auto ackRoot = feathercast::json::Parse(incomingAck->json);
     assert(ackRoot && JsonString(*ackRoot, "type") == "file.received" && JsonBool(*ackRoot, "ok"));
 
+    // Streamed answers are named like the single-frame ones: a storage file
+    // after the requested path, a photo with the extension its bytes call for.
+    const auto stream = [&](const std::string& id, const std::string& name, const std::string& purpose,
+                            const std::string& ref, const Bytes& bytes) {
+      phone.SendSealed(Json("file.begin").Str("id", id).Str("name", name).Str("purpose", purpose)
+          .Str("ref", ref).Int("size", static_cast<long long>(bytes.size())).Build());
+      phone.SendSealed(Json("file.chunk").Str("id", id).Int("offset", 0).Build(), bytes);
+      phone.SendSealed(Json("file.end").Str("id", id).Build());
+      const auto ack = phone.ReadSealed();
+      assert(ack && ack->json.find("file.received") != std::string::npos);
+    };
+    stream("stream-storage", "streamed.exe", "storage", "/Download/streamed.txt", ToBytes("note"));
+    const auto streamedStorage = waitFor(EventKind::RemoteFileSaved);
+    assert(streamedStorage && streamedStorage->remotePath == "/Download/streamed.txt" &&
+           std::filesystem::path(streamedStorage->path).filename() == L"streamed.txt");
+    stream("stream-photo", "x.exe", "photo", "p10", Bytes{0xFF, 0xD8, 0xFF, 0xE0});
+    const auto streamedPhoto = waitFor(EventKind::PhotoSaved);
+    assert(streamedPhoto && streamedPhoto->photo.id == "p10" &&
+           std::filesystem::path(streamedPhoto->path).filename() == L"x.jpg");
+
     // Files requested from phone storage are saved to Downloads.
     phone.SendSealed(
         Json("file.data").Str("path", "/Download/report.pdf").Str("name", "report.pdf").Build(),
@@ -731,7 +759,8 @@ void TestServiceEndToEnd() {
     assert(!phone.Authenticate("unknown-device", linkKey));
   }
 
-  // Racing valid requests must consume an invite exactly once.
+  // Racing valid requests must consume an invite exactly once. They come from
+  // different addresses, so the per-address handshake limit admits all of them.
   {
     const auto racingUri = service.CreatePairingUri();
     const auto racingToken = *Base64UrlDecode(QueryParam(racingUri, "t"));
@@ -742,7 +771,7 @@ void TestServiceEndToEnd() {
     std::vector<std::jthread> clients;
     for (int i = 0; i < 8; ++i) {
       clients.emplace_back([&, i] {
-        FakePhone phone(service.Port());
+        FakePhone phone(service.Port(), ("127.0.0." + std::to_string(i + 1)).c_str());
         ready.arrive_and_wait();
         phone.SendPlain(Json("pair")
                             .Str("deviceId", "racing-" + std::to_string(i))
@@ -928,6 +957,98 @@ void TestIdleServiceShutdown() {
   std::filesystem::remove_all(dir, ignored);
 }
 
+// A transfer cut short when FeatherCast ended leaves its hidden temporary file
+// in Downloads; the next start removes it, but never a file of the running
+// process or anything that is not such a temporary file.
+void TestAbandonedPartialFiles() {
+  const auto dir = std::filesystem::temp_directory_path() /
+      ("feathercast-phone-partials-test-" + std::to_string(GetCurrentProcessId()));
+  const auto downloads = dir / L"downloads";
+  std::filesystem::create_directories(downloads);
+  const auto create = [&](const std::wstring& name, bool hidden) {
+    const auto path = downloads / name;
+    std::ofstream(path, std::ios::binary) << "partial";
+    if (hidden) SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_HIDDEN);
+    return path;
+  };
+  const auto own = std::to_wstring(GetCurrentProcessId());
+  const auto abandoned = create(L".feathercast-abc-1.part", true);
+  const auto dashedId = create(L".feathercast-a-b-77.part", true);
+  const auto current = create(L".feathercast-abc-" + own + L".part", true);
+  const auto visible = create(L".feathercast-def-1.part", false);
+  const auto noId = create(L".feathercast--1.part", true);
+  const auto noPid = create(L".feathercast-abc-x1.part", true);
+  const auto userFile = create(L"keep.part", true);
+
+  PhoneService service;
+  ServiceConfig config;
+  config.pcName = "Partials Test PC";
+  config.stateFile = (dir / L"state.dat").wstring();
+  config.downloadsDir = downloads.wstring();
+  config.port = 0;
+  std::string error;
+  assert(service.Start(config, &error));
+  service.Stop();
+  assert(!std::filesystem::exists(abandoned) && !std::filesystem::exists(dashedId));
+  assert(std::filesystem::exists(current) && std::filesystem::exists(visible) &&
+         std::filesystem::exists(noId) && std::filesystem::exists(noPid) &&
+         std::filesystem::exists(userFile));
+  std::error_code ignored;
+  std::filesystem::remove_all(dir, ignored);
+}
+
+// One address may hold only a few unauthenticated connections, so a single
+// device on the network cannot lock the phone out; other addresses still get in.
+void TestPendingConnectionLimits() {
+  const auto dir = std::filesystem::temp_directory_path() /
+      ("feathercast-phone-limits-test-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(dir);
+  PhoneService service;
+  ServiceConfig config;
+  config.pcName = "Limits Test PC";
+  config.stateFile = (dir / L"state.dat").wstring();
+  config.downloadsDir = (dir / L"downloads").wstring();
+  config.port = 0;
+  std::string error;
+  assert(service.Start(config, &error));
+
+  // A served connection answers an unknown phone; a refused one just closes.
+  const auto served = [](FakePhone& phone) {
+    phone.SendPlain(Json("hello").Str("deviceId", "nobody")
+                        .Str("nonce", Base64UrlEncode(crypto::RandomBytes(16))).Build());
+    const auto reply = phone.ReadPlain();
+    return reply && JsonString(*reply, "code") == "unpaired";
+  };
+  std::vector<std::unique_ptr<FakePhone>> idle;
+  for (int i = 0; i < 3; ++i) {
+    idle.push_back(std::make_unique<FakePhone>(service.Port()));
+    assert(idle.back()->Connected());
+  }
+  {
+    FakePhone refused(service.Port());
+    const auto begin = std::chrono::steady_clock::now();
+    assert(!served(refused));
+    assert(std::chrono::steady_clock::now() - begin < std::chrono::seconds(3));
+  }
+  {
+    FakePhone other(service.Port(), "127.0.0.2");
+    assert(other.Connected() && served(other));
+  }
+  // The slot comes back when its connection ends.
+  idle.erase(idle.begin());
+  bool again = false;
+  for (int attempt = 0; attempt < 50 && !again; ++attempt) {
+    FakePhone retry(service.Port());
+    again = served(retry);
+    if (!again) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  assert(again);
+  idle.clear();
+  service.Stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(dir, ignored);
+}
+
 int main() {
   // This test account may have no user DPAPI master key.
   feathercast::dpapi::AllowMachineScopeFallbackForTests();
@@ -939,6 +1060,8 @@ int main() {
   TestSavedFileNames();
   TestLimits();
   TestIdleServiceShutdown();
+  TestAbandonedPartialFiles();
+  TestPendingConnectionLimits();
   TestServiceEndToEnd();
   std::puts("phone protocol tests passed");
   return 0;

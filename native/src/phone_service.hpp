@@ -240,7 +240,8 @@ class PhoneService {
   void BeaconLoop(std::stop_token stop);
   void ScreenSendLoop(std::stop_token stop);
   void EmitScreenState(std::string id, std::string state, std::string detail = {});
-  void HandleConnection(std::uintptr_t socket);
+  void HandleConnection(std::uintptr_t socket, std::uint32_t address);
+  void ReleasePendingLocked(Session& session);  // mutex_ held
   void ServeHttp(std::uintptr_t socket, const Bytes& firstBytes,
                  std::chrono::steady_clock::time_point deadline);
   bool HandlePlainFrame(const std::shared_ptr<Session>& session,
@@ -292,6 +293,7 @@ class PhoneService {
   std::deque<std::pair<std::shared_ptr<Session>, std::string>> screenCommands_;
   std::vector<std::shared_ptr<Session>> sessions_;
   std::size_t pendingHandshakes_ = 0;  // unauthenticated connections
+  std::map<std::uint32_t, std::size_t> pendingByAddress_;  // the same, per IPv4 address
   // Outstanding photo.request ids and file.get paths with their deadlines.
   std::map<std::string, long long> pendingPhotos_;
   struct PendingFile {

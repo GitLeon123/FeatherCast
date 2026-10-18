@@ -56,7 +56,13 @@ object CallWatcher {
         )
     }
 
+    /**
+     * Rejects the ringing call only. endCall() hangs up the call in progress when
+     * nothing rings, so a request that arrives after the call was answered must not reach it.
+     */
+    @Synchronized
     fun reject(context: Context) {
+        if (state != CallState.Ringing || ringingNow(context) == false) return
         if (Build.VERSION.SDK_INT < 28 ||
             context.checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -94,13 +100,15 @@ object CallWatcher {
     /** Restores a ringer that an earlier process silenced, unless a call is ringing right now. */
     @Synchronized
     fun restoreAfterRestart(context: Context) {
-        val ringing = try {
-            @Suppress("DEPRECATION")
-            context.getSystemService(TelephonyManager::class.java)?.callState == TelephonyManager.CALL_STATE_RINGING
-        } catch (_: SecurityException) {
-            false
-        }
-        if (!ringing) restoreRinger(context)
+        if (ringingNow(context) != true) restoreRinger(context)
+    }
+
+    /** Whether a call rings right now, or null when the phone state cannot be read. */
+    private fun ringingNow(context: Context): Boolean? = try {
+        @Suppress("DEPRECATION")
+        context.getSystemService(TelephonyManager::class.java)?.let { it.callState == TelephonyManager.CALL_STATE_RINGING }
+    } catch (_: SecurityException) {
+        null
     }
 
     private fun restoreRinger(context: Context) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "phone_protocol.hpp"
+#include "phone_messages.hpp"
 #include "extension_protocol.hpp"
 
 #include <windows.h>
@@ -107,6 +108,10 @@ class Receiver {
       files_.erase(found);
       return result;
     }
+    if (file.head.size() < kHeadBytes) {
+      const auto take = std::min(kHeadBytes - file.head.size(), bytes.size());
+      file.head.insert(file.head.end(), bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(take));
+    }
     file.progress.bytes += written;
     file.lastActivity = std::chrono::steady_clock::now();
     result.progress = file.progress;
@@ -128,6 +133,8 @@ class Receiver {
       return result;
     }
     auto& file = *found->second;
+    // Like a single-frame photo, a streamed one can only be saved as an image.
+    if (file.progress.purpose == "photo") file.progress.name = PhotoFileName(file.progress.name, file.head);
     result.progress = file.progress;
     if (file.progress.bytes != file.progress.total || !FlushFileBuffers(file.handle) || cancelRequested_.load()) {
       result.error = "The file transfer was incomplete or could not be saved.";
@@ -178,10 +185,12 @@ class Receiver {
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::minutes(5);
     std::erase_if(files_, [&](const auto& entry) { return entry.second->lastActivity < cutoff; });
   }
+  static constexpr std::size_t kHeadBytes = 32;  // enough to recognize an image format
   struct Incoming {
     Progress progress;
     std::filesystem::path temporary;
     HANDLE handle = INVALID_HANDLE_VALUE;
+    Bytes head;  // the first kHeadBytes received
     int lastPercent = -1;
     std::chrono::steady_clock::time_point lastActivity = std::chrono::steady_clock::now();
     ~Incoming() {
@@ -197,5 +206,38 @@ class Receiver {
   std::mutex mutex_;
   std::atomic<bool> cancelRequested_ = false;
 };
+
+// Deletes the hidden ".feathercast-<id>-<pid>.part" files that an earlier
+// process left in directory when it ended during a transfer. Files of this
+// process stay, and a live transfer's file is open without sharing anyway.
+inline void RemoveAbandonedPartials(const std::wstring& directory) {
+  constexpr std::wstring_view kPrefix = L".feathercast-";
+  constexpr std::wstring_view kSuffix = L".part";
+  const std::wstring own = std::to_wstring(GetCurrentProcessId());
+  const auto pattern = std::filesystem::path(directory) /
+      (std::wstring(kPrefix) + L"*" + std::wstring(kSuffix));
+  WIN32_FIND_DATAW data{};
+  const HANDLE find =
+      FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+  if (find == INVALID_HANDLE_VALUE) return;
+  do {
+    const std::wstring_view name(data.cFileName);
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        !(data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) ||
+        !name.starts_with(kPrefix) || !name.ends_with(kSuffix)) {
+      continue;
+    }
+    const auto stem = name.substr(0, name.size() - kSuffix.size());
+    const auto dash = stem.find_last_of(L'-');
+    if (dash == std::wstring_view::npos || dash <= kPrefix.size()) continue;  // no id
+    const auto pid = stem.substr(dash + 1);
+    if (pid.empty() || pid == own ||
+        !std::all_of(pid.begin(), pid.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; })) {
+      continue;
+    }
+    DeleteFileW((std::filesystem::path(directory) / data.cFileName).c_str());
+  } while (FindNextFileW(find, &data));
+  FindClose(find);
+}
 
 }  // namespace feathercast::phone::transfer

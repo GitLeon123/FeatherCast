@@ -14,6 +14,7 @@ import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
+import android.widget.Toast
 import app.feathercast.protocol.BEACON_PORT
 import app.feathercast.protocol.Beacon
 import app.feathercast.protocol.Features
@@ -98,9 +99,14 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     private val cancelledTransfers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var loop: Job? = null
 
-    // Bulk replies (photo lists, file reads and writes, SMS scans) run one at a time off
-    // the receive loop, so control messages such as ring, media and screen stay responsive.
+    // Bulk work runs off the receive loop, so control messages such as ring, media and
+    // screen stay responsive, and each kind has its own lane, so a long transfer never
+    // holds up the rest: replies (photo lists, SMS scans, folder listings) run one at a
+    // time, received chunks are written in order, and requested files stream side by side,
+    // two at a time, which leaves room for files the user shares within the PC's limit of four.
     private val bulk = Dispatchers.IO.limitedParallelism(1)
+    private val incomingWrites = Dispatchers.IO.limitedParallelism(1)
+    private val outgoingStreams = Dispatchers.IO.limitedParallelism(2)
 
     val deviceName: String
         get() = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
@@ -207,17 +213,68 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         return send(message("clipboard.set") { put("text", text) })
     }
 
+    /**
+     * Sends shared or picked files in the app's own scope, so leaving the screen that
+     * started the upload cancels nothing. A read grant that came with an activity's
+     * intent or result ends with that activity, so the app holds its own grant until
+     * the upload is done. [summary] words the outcome for a toast.
+     */
+    fun sendUrisInBackground(uris: List<Uri>, summary: (sent: Int, error: String?) -> String) {
+        val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        val granted = uris.filter { uri ->
+            try {
+                context.grantUriPermission(context.packageName, uri, read)
+                true
+            } catch (_: Exception) {
+                false  // the activity's own grant still covers the upload while it lasts
+            }
+        }
+        scope.launch {
+            var sent = 0
+            var error: String? = null
+            try {
+                awaitConnection()
+                for (uri in uris) sendUri(uri).onSuccess { sent++ }.onFailure { error = it.message }
+            } finally {
+                granted.forEach { uri -> runCatching { context.revokeUriPermission(context.packageName, uri, read) } }
+            }
+            toast(summary(sent, error))
+        }
+    }
+
+    /** Copies shared text to the PC clipboard; [summary] words the outcome for a toast. */
+    fun sendTextInBackground(text: String, summary: (sent: Boolean) -> String) {
+        scope.launch {
+            awaitConnection()
+            toast(summary(sendClipboardText(text)))
+        }
+    }
+
+    /** Gives a freshly started service a moment to connect. */
+    private suspend fun awaitConnection() {
+        withTimeoutOrNull(3_000) { while (!isConnected) delay(100) }
+    }
+
+    private fun toast(text: String) {
+        main.post { Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
+    }
+
     /** Sends a shared file or picture; the PC saves it to Downloads\FeatherCast. */
     suspend fun sendUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
         val active = session ?: return@withContext Result.failure(IOException("Not connected to your PC."))
         val resolver = context.contentResolver
         var name = "shared-file"
         var size = -1L
-        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use {
-            if (it.moveToFirst()) {
-                it.getString(0)?.let { value -> name = value }
-                if (!it.isNull(1)) size = it.getLong(1)
+        try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use {
+                if (it.moveToFirst()) {
+                    it.getString(0)?.let { value -> name = value }
+                    if (!it.isNull(1)) size = it.getLong(1)
+                }
             }
+        } catch (error: Exception) {
+            // The sharing app's provider may refuse or fail the lookup; name and size are optional.
+            Log.w("FeatherCast", "Could not look up the shared file", error)
         }
         if (active.fileStreamSupported) {
             val preparationEpoch = transferEpoch.get()
@@ -259,10 +316,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         }
         val bytes = try {
             resolver.openInputStream(uri)?.use { it.readAtMost(MAX_SEND_BYTES.toInt(), sizeHint = size) }
-        } catch (_: IOException) {
-            null
-        } catch (_: SecurityException) {
-            null
+        } catch (_: Exception) {
+            null  // providers also throw IllegalArgumentException, IllegalStateException, ...
         } ?: return@withContext Result.failure(IOException("Could not read $name."))
         if (bytes.size > MAX_SEND_BYTES) {
             return@withContext Result.failure(IOException("$name is too large (max 40 MB)."))
@@ -505,7 +560,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         if (type == "file.begin" || type == "file.chunk" || type == "file.end") {
             try {
                 // Backpressure: at most one received chunk is awaiting a disk write.
-                withContext(bulk + bulkJobs) {
+                withContext(incomingWrites + bulkJobs) {
                     when (type) {
                         "file.begin" -> {
                             val start = FileStart.parse(transferJson) ?: throw IOException("Invalid file transfer.")
@@ -559,19 +614,18 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             PcMessage.CallReject -> if (CallWatcher.active) CallWatcher.reject(context)
             PcMessage.CallSilence -> if (CallWatcher.active) CallWatcher.silence(context)
             is PcMessage.FilesListRequest -> inBackground { sendToSession(active, StorageBridge.list(msg.path)) }
-            is PcMessage.FileRequest -> inBackground {
-                if (active.fileStreamSupported) {
-                    scope.launch(bulk + bulkJobs) {
-                        try {
-                            val file = StorageBridge.streamFile(msg.path) ?: throw IOException("Allow phone storage access or choose an available file.")
-                            file.inputStream().use { sendStream(active, file.name, file.length(), "storage", msg.path, it) }
-                        } catch (error: Exception) {
-                            if (error is kotlinx.coroutines.CancellationException) throw error
-                            sendToSession(active, PhoneMessages.fileData(msg.path, "", error.message ?: "Could not read the file."))
-                        }
+            is PcMessage.FileRequest -> if (active.fileStreamSupported) {
+                scope.launch(outgoingStreams + bulkJobs) {
+                    if (session !== active) return@launch
+                    try {
+                        val file = StorageBridge.streamFile(msg.path) ?: throw IOException("Allow phone storage access or choose an available file.")
+                        file.inputStream().use { sendStream(active, file.name, file.length(), "storage", msg.path, it) }
+                    } catch (error: Exception) {
+                        if (error is kotlinx.coroutines.CancellationException) throw error
+                        sendToSession(active, PhoneMessages.fileData(msg.path, "", error.message ?: "Could not read the file."))
                     }
-                } else StorageBridge.read(msg.path).let { (json, bytes) -> sendToSession(active, json, bytes) }
-            }
+                }
+            } else inBackground { StorageBridge.read(msg.path).let { (json, bytes) -> sendToSession(active, json, bytes) } }
             PcMessage.Pong -> Unit
             is PcMessage.ScreenStart -> ScreenBridge.request(context, msg.request, active)
             is PcMessage.ScreenStop -> ScreenBridge.stop(context, id = msg.sessionId)

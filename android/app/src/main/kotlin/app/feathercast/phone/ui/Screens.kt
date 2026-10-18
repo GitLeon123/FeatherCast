@@ -91,8 +91,9 @@ private val Online = Color(0xFF4DC77A)
 private val Waiting = Color(0xFFF5B957)
 private val PanelShape = RoundedCornerShape(10.dp)
 
+/** [fillScreen] false leaves the window transparent, e.g. under a dialog. */
 @Composable
-fun FeatherTheme(content: @Composable () -> Unit) {
+fun FeatherTheme(fillScreen: Boolean = true, content: @Composable () -> Unit) {
     val colors = darkColorScheme(
         primary = Accent,
         onPrimary = Color.White,
@@ -117,7 +118,11 @@ fun FeatherTheme(content: @Composable () -> Unit) {
         labelLarge = androidx.compose.ui.text.TextStyle(fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold),
     )
     MaterialTheme(colorScheme = colors, typography = type) {
-        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, content = content)
+        if (fillScreen) {
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, content = content)
+        } else {
+            content()
+        }
     }
 }
 
@@ -201,6 +206,38 @@ fun PairConfirmDialog(pcName: String, hosts: List<String>, replaces: String?, on
             }
         },
         confirmButton = { TextButton(onClick = onConfirm) { Text("Pair") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Confirms what another app shared before it goes to the PC: any app can open the
+ * share target, so nothing is sent without the user's consent.
+ */
+@Composable
+fun ShareConfirmDialog(pcName: String, fileCount: Int, text: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Send to $pcName?", maxLines = 2, overflow = TextOverflow.Ellipsis) },
+        text = {
+            if (fileCount > 0) {
+                Text(
+                    (if (fileCount == 1) "1 file" else "$fileCount files") +
+                        " will be saved to Downloads\\FeatherCast on your PC.",
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("This text will be copied to the clipboard on your PC:")
+                    Text(
+                        text.take(500),
+                        maxLines = 6,
+                        overflow = TextOverflow.Ellipsis,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Send") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

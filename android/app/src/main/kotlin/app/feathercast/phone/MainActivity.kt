@@ -273,18 +273,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendFiles(uris: List<Uri>) {
-        lifecycleScope.launch {
-            var sent = 0
-            var error: String? = null
-            for (uri in uris) link.sendUri(uri).onSuccess { sent++ }.onFailure { error = it.message }
+        // Not tied to this activity, so leaving the app does not cancel the upload.
+        link.sendUrisInBackground(uris) { sent, error ->
             val pc = link.state.value.pcName.ifEmpty { "your PC" }
-            SendClipboardActivity.toast(
-                this@MainActivity,
-                when {
-                    sent == uris.size -> if (sent == 1) "Sent to $pc (Downloads\\FeatherCast)" else "$sent files sent to $pc"
-                    else -> error ?: "Could not send to $pc"
-                },
-            )
+            when {
+                sent == uris.size -> if (sent == 1) "Sent to $pc (Downloads\\FeatherCast)" else "$sent files sent to $pc"
+                else -> error ?: "Could not send to $pc"
+            }
         }
     }
 
