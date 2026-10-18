@@ -76,7 +76,8 @@ std::wstring HResultMessage(HRESULT result) {
       nullptr, static_cast<DWORD>(result), 0,
       reinterpret_cast<wchar_t*>(&text), 0, nullptr);
   std::wstring message =
-      length && text ? std::wstring(text, length) : std::format(L"0x{:08X}", result);
+      length && text ? std::wstring(text, length)
+                     : std::format(L"0x{:08X}", static_cast<DWORD>(result));
   if (text) LocalFree(text);
   while (!message.empty() &&
          (message.back() == L'\r' || message.back() == L'\n')) {
