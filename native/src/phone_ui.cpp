@@ -20,10 +20,12 @@
 #include <map>
 #include <set>
 
+#include "accessibility.hpp"
 #include "background_services.hpp"
 #include "motion.hpp"
 #include "text_layout_cache.hpp"
 #include "qrcodegen.hpp"
+#include "ui_renderer.hpp"
 
 namespace feathercast::phone_ui {
 namespace {
@@ -53,6 +55,16 @@ constexpr long long kNetworkRecheckMs = 3 * 1000;
 // The service reports an unanswered photo after two minutes; this only covers a
 // request that never reached it.
 constexpr long long kPhotoTimeoutMs = 150 * 1000;
+// A photo list request that is still unanswered after this long gets a hint.
+constexpr long long kPhotoListSlowMs = 15 * 1000;
+constexpr long long kToastMs = 2200;
+constexpr long long kToastActionMs = 8000;
+// The pairing screen scrolls independently of the dashboard tabs.
+constexpr int kPairingScrollKey = 100;
+// Accessible children before the actionable controls: header status, toast.
+constexpr int kFixedAccessibleChildren = 2;
+constexpr float kTransferRowHeight = 34.0f;
+constexpr size_t kMaxTransferRows = 3;
 
 // Segoe MDL2 Assets glyphs.
 constexpr wchar_t kGlyphPhone[] = L"";
@@ -101,13 +113,47 @@ enum class Action {
   OpenSmsThread,
   RefreshSms,
   OpenScreen,
+  RetryService,
+  CancelTransfers,
+  ToastAction,
 };
 
+// Where a control lives; focus keys include it because the sidebar tabs and the
+// overview cards trigger the same action.
+enum class Zone { Header, Sidebar, Content, Overlay };
+
+enum class Role { Button, Tab, Row, Toggle };
+
 struct Hit {
-  D2D1_RECT_F rect{};
+  D2D1_RECT_F rect{};  // clickable area, clipped to the visible content
+  D2D1_RECT_F full{};  // where the control is drawn, even when scrolled out of view
   Action action = Action::None;
   int index = 0;
   std::string id;
+  Zone zone = Zone::Content;
+  Role role = Role::Button;
+  std::wstring label;        // accessible name
+  std::wstring description;  // accessible description
+  std::wstring tip;          // hover/focus label for icon-only buttons
+  bool focusable = true;     // false: mouse-only duplicate of a nearby control
+  bool clickable = true;     // false while scrolled out of view
+  bool checked = false;
+  bool selected = false;
+};
+
+struct FocusKey {
+  Action action = Action::None;
+  int index = 0;
+  std::string id;
+  Zone zone = Zone::Content;
+  bool operator==(const FocusKey&) const = default;
+};
+
+struct Transfer {
+  std::string id;
+  std::wstring name;
+  long long done = 0;
+  long long total = 0;
 };
 
 struct NotificationItem {
@@ -143,6 +189,22 @@ std::wstring Widen(std::string_view text) {
   MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
                       out.data(), size);
   return out;
+}
+
+// Opens Explorer with the file selected (never runs it); falls back to its folder.
+bool RevealInFolder(HWND owner, const std::wstring& path) {
+  if (path.empty()) return false;
+  if (PIDLIST_ABSOLUTE item = ILCreateFromPathW(path.c_str())) {
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const HRESULT shown = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+    if (SUCCEEDED(initialized)) CoUninitialize();
+    ILFree(item);
+    if (SUCCEEDED(shown)) return true;
+  }
+  const std::wstring folder = std::filesystem::path(path).parent_path().wstring();
+  if (folder.empty()) return false;
+  return reinterpret_cast<INT_PTR>(
+             ShellExecuteW(owner, L"explore", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
 }
 
 std::wstring FormatTime(long long ms) {
@@ -196,11 +258,14 @@ UINT WindowDpi(HWND hwnd) {
 
 }  // namespace
 
-struct PhoneWindow::Impl {
+struct PhoneWindow::Impl : public accessibility::Model {
   HWND hwnd = nullptr;
   Callbacks callbacks;
-  theme::Theme theme;
+  theme::Theme baseTheme;
+  theme::Theme theme;  // baseTheme, or system colors in high contrast
+  theme::Color baseAccent{0.36f, 0.42f, 1.0f, 1.0f};
   theme::Color accent{0.36f, 0.42f, 1.0f, 1.0f};
+  bool highContrast = false;
   State state;
 
   // Model
@@ -209,10 +274,14 @@ struct PhoneWindow::Impl {
   int battery = -1;
   bool charging = false;
   std::deque<NotificationItem> notifications;
-  std::set<std::string> activeTransfers;
+  std::vector<Transfer> transfers;  // outgoing and incoming, in start order
   std::vector<PhotoItem> photos;
   std::deque<ClipItem> clips;
   bool photosRequested = false;
+  long long photosRequestedAt = 0;
+  bool photosLoaded = false;   // the phone answered the last photo list request
+  std::string photosAccess;    // "full", "selected" or "denied" from the phone
+  std::string photosError;
   std::string dataDeviceId;  // Phone the lists above came from
   std::vector<std::string> features;
   bool ringing = false;
@@ -221,6 +290,7 @@ struct PhoneWindow::Impl {
   bool mediaArtFailed = false;
   std::vector<phone::SmsThread> smsThreads;
   bool smsRequested = false;
+  bool smsLoaded = false;  // the phone answered the last conversation list request
 
   // View state
   Tab tab = Tab::Overview;
@@ -231,13 +301,28 @@ struct PhoneWindow::Impl {
   std::string apkUrl;               // install URL, rebuilt when the addresses change
   std::string networkKey;           // install URL and every local address
   long long networkCheckedAt = 0;
-  std::map<Tab, float> scroll;
+  std::map<int, float> scroll;  // keyed by ScrollKey()
   float contentHeight = 0.0f;
   float viewportHeight = 0.0f;
+  float transferStripHeight = 0.0f;
   std::vector<Hit> hits;
   D2D1_POINT_2F mouse{-1.0f, -1.0f};
   std::wstring toast;
   long long toastUntil = 0;
+  std::function<void()> toastRun;  // optional action shown inside the toast
+  std::wstring toastActionLabel;
+  std::string lastError;  // newest link error, shown on the pairing screen
+  long long lastErrorAt = 0;
+
+  // Keyboard focus lives over the hit list; the key survives repaints.
+  FocusKey focusKey;
+  int focusOrdinal = -1;
+  bool focusVisible = false;  // only after keyboard use
+  std::vector<size_t> focusOrder;
+  Zone currentZone = Zone::Header;
+  // Press feedback while the left button is held.
+  bool pressing = false;
+  D2D1_POINT_2F pressPoint{-1.0f, -1.0f};
 
   // Short-lived presentation state. The model and hit targets change immediately.
   bool fadeMotion = true;
@@ -255,7 +340,7 @@ struct PhoneWindow::Impl {
   motion::ScalarAnimation contentOffset;
   motion::ScalarAnimation toastOpacity;
   motion::ScalarAnimation toastOffset;
-  std::map<Tab, motion::Spring> visualScroll;
+  std::map<int, motion::Spring> visualScroll;
   std::map<Action, motion::Spring> toggleMotion;
 
   // Graphics
@@ -269,6 +354,7 @@ struct PhoneWindow::Impl {
   ComPtr<IDWriteTextFormat> bodyFormat;
   ComPtr<IDWriteTextFormat> bodyWrapFormat;
   ComPtr<IDWriteTextFormat> smallFormat;
+  ComPtr<IDWriteTextFormat> smallWrapFormat;
   ComPtr<IDWriteTextFormat> smallCenterFormat;
   ComPtr<IDWriteTextFormat> iconFormat;
   ComPtr<IDWriteTextFormat> iconLargeFormat;
@@ -301,6 +387,10 @@ struct PhoneWindow::Impl {
                        IID_PPV_ARGS(wic.GetAddressOf()));
     }
     if (!titleFormat) {
+      // The theme stores a fallback list; DirectWrite substitutes a default face
+      // for an unknown name, so resolve it to one installed family first.
+      const std::wstring family =
+          ui::ResolveInstalledFontFamily(theme.fontFamily, dwrite.Get());
       const auto make = [&](ComPtr<IDWriteTextFormat>& format, const wchar_t* family,
                             float size, DWRITE_FONT_WEIGHT weight, bool wrap,
                             DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
@@ -320,25 +410,77 @@ struct PhoneWindow::Impl {
           format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
       };
-      make(titleFormat, L"Segoe UI Variable Display", 22.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
-      make(headingFormat, L"Segoe UI Variable Text", 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
-      make(bodyFormat, L"Segoe UI Variable Text", 13.5f, DWRITE_FONT_WEIGHT_NORMAL, false);
-      make(bodyWrapFormat, L"Segoe UI Variable Text", 13.5f, DWRITE_FONT_WEIGHT_NORMAL, true);
-      make(smallFormat, L"Segoe UI Variable Text", 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false);
-      make(smallCenterFormat, L"Segoe UI Variable Text", 12.5f, DWRITE_FONT_WEIGHT_NORMAL,
+      make(titleFormat, family.c_str(), 22.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
+      make(headingFormat, family.c_str(), 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
+      make(bodyFormat, family.c_str(), 13.5f, DWRITE_FONT_WEIGHT_NORMAL, false);
+      make(bodyWrapFormat, family.c_str(), 13.5f, DWRITE_FONT_WEIGHT_NORMAL, true);
+      make(smallFormat, family.c_str(), 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false);
+      make(smallWrapFormat, family.c_str(), 12.0f, DWRITE_FONT_WEIGHT_NORMAL, true);
+      make(smallCenterFormat, family.c_str(), 12.5f, DWRITE_FONT_WEIGHT_NORMAL,
            true, DWRITE_TEXT_ALIGNMENT_CENTER);
       make(iconFormat, L"Segoe MDL2 Assets", 15.0f, DWRITE_FONT_WEIGHT_NORMAL, false,
            DWRITE_TEXT_ALIGNMENT_CENTER);
       make(iconLargeFormat, L"Segoe MDL2 Assets", 22.0f, DWRITE_FONT_WEIGHT_NORMAL, false,
            DWRITE_TEXT_ALIGNMENT_CENTER);
-      make(stepFormat, L"Segoe UI Variable Text", 14.0f, DWRITE_FONT_WEIGHT_BOLD, false,
+      make(stepFormat, family.c_str(), 14.0f, DWRITE_FONT_WEIGHT_BOLD, false,
            DWRITE_TEXT_ALIGNMENT_CENTER);
-      make(statFormat, L"Segoe UI Variable Display", 26.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
+      make(statFormat, family.c_str(), 26.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false);
       if (smallCenterFormat) {
         smallCenterFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
       }
     }
     return titleFormat != nullptr;
+  }
+
+  // Drops every text format (and the layouts built from them) so the next
+  // paint recreates them, e.g. after the theme font changed.
+  void ResetFormats() {
+    textLayouts.Clear();
+    ComPtr<IDWriteTextFormat>* formats[] = {
+        &titleFormat, &headingFormat, &bodyFormat, &bodyWrapFormat, &smallFormat,
+        &smallWrapFormat, &smallCenterFormat, &iconFormat, &iconLargeFormat,
+        &stepFormat, &statFormat};
+    for (auto* format : formats) format->Reset();
+  }
+
+  static theme::Color SystemColor(int index) {
+    const COLORREF value = GetSysColor(index);
+    return {static_cast<float>(GetRValue(value)) / 255.0f,
+            static_cast<float>(GetGValue(value)) / 255.0f,
+            static_cast<float>(GetBValue(value)) / 255.0f, 1.0f};
+  }
+
+  // Rebuilds the effective theme: the app theme normally, system colors when
+  // Windows high contrast is on.
+  void RefreshContrast() {
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
+    highContrast = (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    theme = baseTheme;
+    accent = baseAccent;
+    if (!highContrast) return;
+    const theme::Color window = SystemColor(COLOR_WINDOW);
+    const theme::Color text = SystemColor(COLOR_WINDOWTEXT);
+    theme.overlayBackground = window;
+    theme.settingsBackground = window;
+    theme.surface = window;
+    theme.selectedBase = window;
+    theme.surfaceHover = SystemColor(COLOR_BTNFACE);
+    theme.border = text;
+    theme.divider = text;
+    theme.textPrimary = text;
+    theme.textMuted = text;
+    theme.textDim = SystemColor(COLOR_GRAYTEXT);
+    theme.sectionText = text;
+    theme.danger = text;
+    theme.dangerText = text;
+    theme.success = SystemColor(COLOR_HOTLIGHT);
+    accent = SystemColor(COLOR_HIGHLIGHT);
+  }
+
+  // Text and glyphs drawn on an accent-filled control.
+  D2D1_COLOR_F OnAccent() const {
+    return highContrast ? ToD2D(SystemColor(COLOR_HIGHLIGHTTEXT)) : D2D1::ColorF(1, 1, 1);
   }
 
   void DiscardDeviceResources() {
@@ -359,20 +501,24 @@ struct PhoneWindow::Impl {
   void ReleaseWindowResources() {
     DiscardDeviceResources();
     textLayouts.Clear();
-    ComPtr<IDWriteTextFormat>* formats[] = {
-        &titleFormat, &headingFormat, &bodyFormat, &bodyWrapFormat, &smallFormat,
-        &smallCenterFormat, &iconFormat, &iconLargeFormat, &stepFormat, &statFormat};
-    for (auto* format : formats) format->Reset();
+    ResetFormats();
     wic.Reset();
     dwrite.Reset();
     d2d.Reset();
     photos.clear();
     photos.shrink_to_fit();
     photosRequested = false;
+    photosLoaded = false;
     hits.clear();
     hits.shrink_to_fit();
+    focusOrder.clear();
+    focusKey = {};
+    focusOrdinal = -1;
+    focusVisible = false;
+    pressing = false;
     ResetPairing();
     toast.clear();
+    toastRun = nullptr;
   }
 
   bool EnsureTarget() {
@@ -470,44 +616,95 @@ struct PhoneWindow::Impl {
   }
 
   bool Hovered(const D2D1_RECT_F& rect) const { return Contains(rect, mouse); }
+  bool Pressed(const D2D1_RECT_F& rect) const {
+    return pressing && Contains(rect, pressPoint) && Contains(rect, mouse);
+  }
 
-  void AddHit(const D2D1_RECT_F& rect, Action action, int index = 0, std::string id = {}) {
-    hits.push_back(Hit{rect, action, index, std::move(id)});
+  float MeasureHeight(const std::wstring& text, IDWriteTextFormat* format, float width) {
+    auto layout = textLayouts.Get(dwrite.Get(), text, format, std::max(width, 1.0f), 4000.0f);
+    if (!layout) return 20.0f;
+    DWRITE_TEXT_METRICS metrics{};
+    layout->GetMetrics(&metrics);
+    return std::ceil(metrics.height);
+  }
+
+  // Draws wrapped text and returns the height it needs.
+  float WrappedText(const std::wstring& text, float left, float y, float right,
+                    IDWriteTextFormat* format, D2D1_COLOR_F color) {
+    const float height = MeasureHeight(text, format, right - left);
+    Text(text, {left, y, right, y + height}, format, color);
+    return height;
+  }
+
+  Hit& AddHit(const D2D1_RECT_F& rect, Action action, int index = 0, std::string id = {},
+              std::wstring label = {}, Role role = Role::Button) {
+    Hit hit;
+    hit.rect = rect;
+    hit.full = rect;
+    hit.action = action;
+    hit.index = index;
+    hit.id = std::move(id);
+    hit.zone = currentZone;
+    hit.role = role;
+    hit.label = std::move(label);
+    hits.push_back(std::move(hit));
+    return hits.back();
+  }
+
+  static FocusKey KeyOf(const Hit& hit) {
+    return FocusKey{hit.action, hit.index, hit.id, hit.zone};
   }
 
   // Returns the button width so callers can lay out rows.
   float Button(float x, float y, const std::wstring& label, Action action, bool primary,
-               const wchar_t* glyph = nullptr, std::string id = {}, bool danger = false) {
+               const wchar_t* glyph = nullptr, std::string id = {}, bool danger = false,
+               std::wstring accessibleName = {}) {
     const float textWidth = MeasureWidth(label, bodyFormat.Get());
     const float width = textWidth + (glyph ? 52.0f : 32.0f);
     const D2D1_RECT_F rect{x, y, x + width, y + 36.0f};
     const bool hover = Hovered(rect);
     D2D1_COLOR_F fill = primary ? Accent() : ToD2D(theme.surfaceHover, hover ? 1.0f : 0.6f);
     if (primary && hover) fill = MixColor(fill, D2D1::ColorF(1, 1, 1), 0.12f);
+    if (Pressed(rect)) fill = MixColor(fill, D2D1::ColorF(0, 0, 0), 0.2f);
     Fill(rect, fill, theme.controlRadius);
+    if (highContrast) Stroke(rect, ToD2D(theme.border), theme.controlRadius);
     const D2D1_COLOR_F textColor =
-        primary ? D2D1::ColorF(1, 1, 1) : (danger ? ToD2D(theme.dangerText) : TextPrimary());
+        primary ? OnAccent() : (danger ? ToD2D(theme.dangerText) : TextPrimary());
     float textLeft = x + 16.0f;
     if (glyph) {
       Text(glyph, {x + 10.0f, y, x + 34.0f, y + 36.0f}, iconFormat.Get(), textColor);
       textLeft = x + 36.0f;
     }
     Text(label, {textLeft, y, x + width - 12.0f, y + 36.0f}, bodyFormat.Get(), textColor);
-    AddHit(rect, action, 0, std::move(id));
+    AddHit(rect, action, 0, std::move(id), accessibleName.empty() ? label : accessibleName);
     return width;
   }
 
+  // Icon-only buttons always carry a label: it is the accessible name and the
+  // hover/focus tooltip.
   void IconButton(const D2D1_RECT_F& rect, const wchar_t* glyph, Action action,
-                  std::string id, int index = 0) {
-    if (Hovered(rect)) Fill(rect, ToD2D(theme.surfaceHover), theme.controlRadius);
-    Text(glyph, rect, iconFormat.Get(), TextMuted());
-    AddHit(rect, action, index, std::move(id));
+                  std::string id, int index, const std::wstring& label,
+                  std::wstring description = {}) {
+    if (Pressed(rect)) {
+      Fill(rect, MixColor(ToD2D(theme.surfaceHover), D2D1::ColorF(0, 0, 0), 0.2f),
+           theme.controlRadius);
+    } else if (Hovered(rect)) {
+      Fill(rect, ToD2D(theme.surfaceHover), theme.controlRadius);
+    }
+    Text(glyph, rect, iconFormat.Get(), Hovered(rect) ? TextPrimary() : TextMuted());
+    Hit& hit = AddHit(rect, action, index, std::move(id), label);
+    hit.tip = label;
+    hit.description = std::move(description);
   }
 
   float Toggle(float left, float right, float y, const std::wstring& label,
                const std::wstring& description, bool on, Action action) {
     const D2D1_RECT_F row{left, y, right, y + 64.0f};
-    if (Hovered(row)) Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
+    if (Pressed(row)) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.85f), theme.rowRadius);
+    } else if (Hovered(row)) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
+    }
     Text(label, {left + 14.0f, y + 10.0f, right - 80.0f, y + 32.0f}, bodyFormat.Get(),
          TextPrimary());
     Text(description, {left + 14.0f, y + 32.0f, right - 80.0f, y + 54.0f},
@@ -521,12 +718,17 @@ struct PhoneWindow::Impl {
     it->second.Retarget(on ? 1.0 : 0.0, controlMotion);
     const float value = static_cast<float>(std::clamp(it->second.Value(), 0.0, 1.0));
     Fill(track, MixColor(ToD2D(theme.surfaceHover), Accent(), value), 11.0f);
-    if (value < 0.99f) Stroke(track, ToD2D(theme.textDim, 0.6f * (1.0f - value)), 11.0f);
+    if (value < 0.99f || highContrast) {
+      Stroke(track, ToD2D(highContrast ? theme.textPrimary : theme.textDim,
+                          highContrast ? 1.0f : 0.6f * (1.0f - value)), 11.0f);
+    }
     const float knobX = track.left + 11.0f + value * (track.right - track.left - 22.0f);
-    brush->SetColor(MixColor(TextMuted(), D2D1::ColorF(1, 1, 1), value));
+    brush->SetColor(MixColor(TextMuted(), OnAccent(), value));
     target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, track.top + 11.0f), 7.0f, 7.0f),
                         brush.Get());
-    AddHit(row, action);
+    Hit& hit = AddHit(row, action, 0, {}, label, Role::Toggle);
+    hit.checked = on;
+    hit.description = description;
     return 64.0f;
   }
 
@@ -570,10 +772,11 @@ struct PhoneWindow::Impl {
     target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 14.0f, y + 14.0f), 14.0f, 14.0f),
                         brush.Get());
     Text(std::to_wstring(number), {x, y, x + 28.0f, y + 28.0f}, stepFormat.Get(),
-         D2D1::ColorF(1, 1, 1));
+         OnAccent());
   }
 
   void DrawHeader(float width) {
+    currentZone = Zone::Header;
     Fill({0, 0, width, kHeaderHeight}, Surface());
     brush->SetColor(ToD2D(theme.divider));
     target->DrawLine({0, kHeaderHeight - 0.5f}, {width, kHeaderHeight - 0.5f}, brush.Get());
@@ -589,8 +792,11 @@ struct PhoneWindow::Impl {
     std::wstring title = L"FeatherCast Phone";
     if (connected && !deviceName.empty()) {
       title = Widen(deviceName);
-    } else if (paired) {
-      title = Widen(state.devices.back().name);
+    } else if (state.devices.size() == 1) {
+      title = Widen(state.devices.front().name);
+    } else if (state.devices.size() > 1) {
+      // Several phones are paired and none is connected: do not guess which one.
+      title = L"No phone connected";
     }
     const float textLeft = cx + 38.0f;
     Text(title, {textLeft, 16.0f, width - 260.0f, 46.0f}, titleFormat.Get(), TextPrimary());
@@ -600,7 +806,7 @@ struct PhoneWindow::Impl {
     if (!state.enabled) {
       status = L"Phone connection is off";
     } else if (!state.running) {
-      status = L"Not available";
+      status = L"Not available – phone connection could not start";
       dot = ToD2D(theme.danger);
     } else if (connected) {
       status = L"Connected";
@@ -609,11 +815,16 @@ struct PhoneWindow::Impl {
         if (charging) status += L" (charging)";
       }
       dot = ToD2D(theme.success);
-    } else if (paired) {
+    } else if (state.devices.size() == 1) {
       status = L"Waiting for your phone – open FeatherCast Phone on it";
+    } else if (paired) {
+      status = L"Waiting for one of your " + std::to_wstring(state.devices.size()) +
+               L" paired phones – open FeatherCast Phone on it";
     } else {
-      status = L"No phone connected yet";
+      status = L"No phone paired yet";
     }
+    headerTitle = title;
+    headerStatus = status;
     brush->SetColor(dot);
     target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(textLeft + 5.0f, 60.0f), 4.5f, 4.5f),
                         brush.Get());
@@ -627,40 +838,125 @@ struct PhoneWindow::Impl {
     }
   }
 
+  // The service is off (by the user) or could not start (port in use, ...).
   void DrawOff(float width, float height) {
+    currentZone = Zone::Content;
+    const bool failed = state.enabled && !state.running;
     const float cardWidth = std::min(520.0f, width - 2 * kPad);
     const float left = (width - cardWidth) / 2.0f;
-    const float top = kHeaderHeight + std::max(32.0f, (height - kHeaderHeight - 260.0f) / 2.0f);
+    const float inner = cardWidth - 56.0f;
+    const float top = kHeaderHeight + std::max(32.0f, (height - kHeaderHeight - 300.0f) / 2.0f);
+    float y = top + 24.0f;
+    if (failed) {
+      // Measure first so the card fits the error text and hint.
+      const std::wstring heading = L"Phone connection could not start";
+      const std::wstring error = Widen(state.error.empty()
+                                           ? std::string("The service did not start.")
+                                           : state.error);
+      const std::wstring hint =
+          L"Another program may be using FeatherCast's phone port (47800 and the next few), "
+          L"or Windows Firewall blocked FeatherCast. In Windows Security > Firewall & network "
+          L"protection > Allow an app through firewall, allow FeatherCast on private networks, "
+          L"then try again.";
+      const float errorHeight = MeasureHeight(error, bodyWrapFormat.Get(), inner);
+      const float hintHeight = MeasureHeight(hint, smallWrapFormat.Get(), inner);
+      const float cardHeight = 24.0f + 34.0f + errorHeight + 12.0f + hintHeight + 20.0f + 36.0f + 24.0f;
+      const D2D1_RECT_F card{left, top, left + cardWidth, top + cardHeight};
+      Card(card);
+      Text(heading, {left + 28, y, card.right - 28, y + 30}, titleFormat.Get(), TextPrimary());
+      y += 34.0f;
+      y += WrappedText(error, left + 28, y, card.right - 28, bodyWrapFormat.Get(),
+                       ToD2D(theme.dangerText));
+      y += 12.0f;
+      y += WrappedText(hint, left + 28, y, card.right - 28, smallWrapFormat.Get(), TextMuted());
+      y += 20.0f;
+      Button(left + 28, y, L"Try again", Action::RetryService, true, kGlyphRefresh);
+      return;
+    }
     const D2D1_RECT_F card{left, top, left + cardWidth, top + 240.0f};
     Card(card);
-    Text(L"Connect your Android phone", {left + 28, top + 24, card.right - 28, top + 54},
+    Text(L"Connect your Android phone", {left + 28, y, card.right - 28, y + 30},
          titleFormat.Get(), TextPrimary());
+    y += 40.0f;
     Text(L"See your phone's notifications, photos and clipboard on this PC, and send "
          L"your PC clipboard to the phone. Everything stays on your local network and "
          L"is end-to-end encrypted.",
-         {left + 28, top + 64, card.right - 28, top + 140}, bodyWrapFormat.Get(), TextMuted());
-    if (!state.error.empty()) {
-      Text(Widen(state.error), {left + 28, top + 140, card.right - 28, top + 164},
-           smallFormat.Get(), ToD2D(theme.dangerText));
-    }
+         {left + 28, y, card.right - 28, y + 76}, bodyWrapFormat.Get(), TextMuted());
     Button(left + 28, top + 176, L"Turn on phone connection", Action::TurnOn, true,
            kGlyphPhone);
   }
 
+  // Common scroll state for a scrolling view; returns the animated offset.
+  float BeginScrollView(int key) {
+    float& offset = scroll[key];
+    auto [visual, inserted] = visualScroll.try_emplace(key);
+    if (inserted) {
+      visual->second.Configure(0.30, 1.0);
+      visual->second.Snap(offset);
+    }
+    return static_cast<float>(visual->second.Value());
+  }
+
+  // Keeps hits that scroll under the header or the transfer strip from being
+  // clicked, but leaves them focusable so keyboard focus can scroll them back.
+  void FinishContentHits(size_t hitsBefore, float top, float bottom) {
+    for (size_t i = hitsBefore; i < hits.size(); ++i) {
+      Hit& hit = hits[i];
+      if (hit.rect.bottom <= top || hit.rect.top >= bottom) hit.clickable = false;
+      hit.rect.top = std::max(hit.rect.top, top);
+      hit.rect.bottom = std::min(hit.rect.bottom, bottom);
+    }
+  }
+
+  void FinishScrollView(int key, float used) {
+    contentHeight = used;
+    const float maxScroll = std::max(0.0f, contentHeight - viewportHeight);
+    float& offset = scroll[key];
+    if (offset > maxScroll) offset = maxScroll;
+    auto& visual = visualScroll[key];
+    if (visual.Target() > maxScroll) visual.Retarget(maxScroll, spatialMotion);
+  }
+
+  // Thin indicator at the right edge when the content overflows its viewport.
+  void DrawScrollbar(float width, float top, float viewport, float offsetValue) {
+    if (contentHeight <= viewport + 1.0f || viewport < 40.0f) return;
+    const float track = viewport - 8.0f;
+    const float thumb = std::clamp(track * viewport / contentHeight, 28.0f, track);
+    const float maxScroll = contentHeight - viewport;
+    const float t = std::clamp(offsetValue / maxScroll, 0.0f, 1.0f);
+    const float y = top + 4.0f + t * (track - thumb);
+    Fill({width - 8.0f, y, width - 4.0f, y + thumb},
+         ToD2D(highContrast ? theme.textPrimary : theme.textDim, 0.7f), 2.0f);
+  }
+
   void DrawPairing(float width, float height) {
-    const float top = kHeaderHeight + 28.0f;
+    currentZone = Zone::Content;
+    transferStripHeight = 0.0f;
+    viewportHeight = height - kHeaderHeight;
+    const float scrolled = BeginScrollView(kPairingScrollKey);
+    target->PushAxisAlignedClip({0, kHeaderHeight, width, height}, D2D1_ANTIALIAS_MODE_ALIASED);
+    const size_t hitsBefore = hits.size();
+    const float top = kHeaderHeight + 28.0f - scrolled;
     Text(L"Connect your phone in three steps", {kPad, top, width - kPad, top + 30},
          titleFormat.Get(), TextPrimary());
     Text(L"Your phone and this PC need to be on the same Wi-Fi network.",
          {kPad, top + 32, width - kPad, top + 54}, bodyFormat.Get(), TextMuted());
 
+    // The newest link error stays visible here, not only as a toast.
+    float errorHeight = 0.0f;
+    if (!lastError.empty()) {
+      const std::wstring error = L"Last problem: " + Widen(lastError);
+      errorHeight = WrappedText(error, kPad, top + 60, width - kPad, bodyWrapFormat.Get(),
+                                ToD2D(theme.dangerText)) + 8.0f;
+    }
+
     const bool stacked = width < 760.0f;
     const float gap = 20.0f;
-    const float cardTop = top + 72.0f;
-    const float available = height - cardTop - 110.0f;
+    const float cardTop = top + 72.0f + errorHeight;
+    const float available = height - (kHeaderHeight + 28.0f + 72.0f) - 110.0f;
     const float cardWidth = stacked ? width - 2 * kPad : (width - 2 * kPad - gap) / 2.0f;
     const float qrSide = std::clamp(std::min(cardWidth - 80.0f, available - 120.0f), 150.0f, 260.0f);
-    const float cardHeight = qrSide + 132.0f;
+    const float cardHeight = qrSide + 150.0f;
 
     const auto drawStep = [&](int number, float x, float y, const std::wstring& heading,
                               const std::wstring& caption, const std::string& qrPayload) {
@@ -691,31 +987,76 @@ struct PhoneWindow::Impl {
             ? noNetwork
             : L"The app file (FeatherCast-Phone.apk) was not found next to FeatherCast.exe. "
               L"Copy it to your phone and install it.";
+    std::wstring pairCaption;
+    if (pairingUri.empty() && pairingUnavailable) {
+      pairCaption = noNetwork;
+    } else {
+      const long long remaining =
+          std::max(0LL, kQrRefreshMs - (NowMs() - pairingCreatedAt)) / 1000;
+      wchar_t countdown[48]{};
+      swprintf_s(countdown, L"%lld:%02lld", remaining / 60, remaining % 60);
+      pairCaption = L"Open FeatherCast Phone and tap “Scan QR code”.\n"
+                    L"Code refreshes automatically in " + std::wstring(countdown) + L".";
+    }
     const float x1 = kPad;
     const float y1 = cardTop;
     const float x2 = stacked ? kPad : kPad + cardWidth + gap;
     const float y2 = stacked ? cardTop + cardHeight + gap : cardTop;
     drawStep(1, x1, y1, L"Install the app", installCaption,
              installReady ? apkUrl : std::string{});
-    drawStep(2, x2, y2, L"Scan this pairing code",
-             pairingUri.empty() && pairingUnavailable
-                 ? noNetwork
-                 : L"Open FeatherCast Phone and tap “Scan QR code”. "
-                   L"The code renews itself every few minutes.",
-             pairingUri);
+    drawStep(2, x2, y2, L"Scan this pairing code", pairCaption, pairingUri);
 
-    const float footer = (stacked ? y2 : y1) + cardHeight + 18.0f;
-    StepBadge(3, kPad, footer);
+    float y = (stacked ? y2 : y1) + cardHeight + 18.0f;
+    StepBadge(3, kPad, y);
     Text(L"Done – your phone shows up here automatically. If Windows asks, allow "
          L"FeatherCast on private networks.",
-         {kPad + 40.0f, footer, width - kPad, footer + 28.0f}, bodyFormat.Get(), TextMuted());
+         {kPad + 40.0f, y, width - kPad, y + 28.0f}, bodyFormat.Get(), TextMuted());
+    y += 42.0f;
     if (!state.devices.empty()) {
-      Button(kPad, footer + 42.0f, L"Back to my phone", Action::CancelPairing, false);
+      Button(kPad, y, L"Back to my phone", Action::CancelPairing, false);
+      y += 52.0f;
     }
-    contentHeight = footer + 90.0f - kHeaderHeight;
+
+    // Troubleshooting help, always visible so a failed pairing is easy to fix.
+    y += 8.0f;
+    const float helpInner = width - 2 * kPad - 40.0f;
+    std::vector<std::wstring> tips = {
+        L"Your phone and this PC must be on the same Wi-Fi network. Guest networks and "
+        L"routers with client isolation block the connection.",
+        L"Set this PC's network profile to Private: Settings > Network & internet > Wi-Fi > "
+        L"your network > Network profile type.",
+        L"Allow FeatherCast in Windows Firewall on private networks: Windows Security > "
+        L"Firewall & network protection > Allow an app through firewall.",
+    };
+    if (installReady) {
+      tips.push_back(L"Cannot scan the first code? Open " + Widen(apkUrl) +
+                     L" in the phone's browser to download the app.");
+    }
+    tips.push_back(L"Pairing codes work once. If a scan fails, wait for the new code or "
+                   L"choose Pair new phone again.");
+    float tipsHeight = 0.0f;
+    for (const auto& tip : tips) {
+      tipsHeight += MeasureHeight(L"•  " + tip, bodyWrapFormat.Get(), helpInner) + 6.0f;
+    }
+    const D2D1_RECT_F help{kPad, y, width - kPad, y + 48.0f + tipsHeight + 8.0f};
+    Card(help);
+    Text(L"Having trouble?", {kPad + 20.0f, y + 16.0f, width - kPad - 20.0f, y + 40.0f},
+         headingFormat.Get(), TextPrimary());
+    float ty = y + 48.0f;
+    for (const auto& tip : tips) {
+      ty += WrappedText(L"•  " + tip, kPad + 20.0f, ty, width - kPad - 20.0f,
+                        bodyWrapFormat.Get(), TextMuted()) + 6.0f;
+    }
+    y = help.bottom + 24.0f;
+
+    DrawScrollbar(width, kHeaderHeight, viewportHeight, scrolled);
+    target->PopAxisAlignedClip();
+    FinishContentHits(hitsBefore, kHeaderHeight, height);
+    FinishScrollView(kPairingScrollKey, y + scrolled - kHeaderHeight);
   }
 
   void DrawSidebar(float height) {
+    currentZone = Zone::Sidebar;
     Fill({0, kHeaderHeight, kSidebarWidth, height}, Opaque(theme.settingsBackground));
     brush->SetColor(ToD2D(theme.divider));
     target->DrawLine({kSidebarWidth - 0.5f, kHeaderHeight}, {kSidebarWidth - 0.5f, height},
@@ -741,7 +1082,7 @@ struct PhoneWindow::Impl {
     }
     const float pillY = static_cast<float>(sidebarY.Value());
     const D2D1_RECT_F pill{12.0f, pillY, kSidebarWidth - 12.0f, pillY + 42.0f};
-    Fill(pill, ToD2D(accent, 0.18f), theme.rowRadius);
+    Fill(pill, ToD2D(accent, highContrast ? 0.5f : 0.18f), theme.rowRadius);
     Fill({pill.left, pill.top + 11.0f, pill.left + 3.0f, pill.bottom - 11.0f},
          Accent(), 1.5f);
     float y = kHeaderHeight + 16.0f;
@@ -749,7 +1090,9 @@ struct PhoneWindow::Impl {
     for (const auto& entry : entries) {
       const D2D1_RECT_F row{12.0f, y, kSidebarWidth - 12.0f, y + 42.0f};
       const bool selected = tab == entry.tab;
-      if (!selected && Hovered(row)) {
+      if (Pressed(row)) {
+        Fill(row, ToD2D(theme.surfaceHover, 0.9f), theme.rowRadius);
+      } else if (!selected && Hovered(row)) {
         Fill(row, ToD2D(theme.surfaceHover, 0.6f), theme.rowRadius);
       }
       Text(entry.glyph, {row.left + 8.0f, row.top, row.left + 36.0f, row.bottom},
@@ -762,15 +1105,32 @@ struct PhoneWindow::Impl {
         Text(count, {row.right - 40.0f, row.top, row.right - 10.0f, row.bottom},
              smallFormat.Get(), TextMuted());
       }
-      AddHit(row, Action::SelectTab, index++);
+      Hit& hit = AddHit(row, Action::SelectTab, index++, {}, entry.label, Role::Tab);
+      hit.selected = selected;
+      if (entry.count > 0) hit.description = std::to_wstring(entry.count) + L" items";
       y += 46.0f;
     }
   }
 
+  static std::wstring NotificationSummary(const phone::NotificationInfo& info) {
+    std::wstring summary = Widen(info.appName);
+    const std::wstring title = SingleLine(Widen(info.title));
+    const std::wstring text = SingleLine(Widen(info.text));
+    if (!title.empty()) summary += (summary.empty() ? L"" : L": ") + title;
+    if (!text.empty()) summary += (summary.empty() ? L"" : L" – ") + text;
+    return summary;
+  }
+
   float DrawNotificationRow(const D2D1_RECT_F& row, NotificationItem& item, int index) {
     const bool hover = Hovered(row);
-    if (hover) Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
-    AddHit(row, Action::CopyNotification, index, item.info.key);
+    if (Pressed(row)) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.8f), theme.rowRadius);
+    } else if (hover) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
+    }
+    // The whole row copies on click; the keyboard reaches the same action through the
+    // Copy button, so the row itself is not a second tab stop.
+    AddHit(row, Action::CopyNotification, index, item.info.key, {}, Role::Row).focusable = false;
     const D2D1_RECT_F iconRect{row.left + 14.0f, row.top + 16.0f, row.left + 50.0f,
                                row.top + 52.0f};
     if (!item.icon && !item.iconFailed && !item.info.iconPng.empty()) {
@@ -797,10 +1157,13 @@ struct PhoneWindow::Impl {
     Text(SingleLine(Widen(item.info.text)), {textLeft, row.top + 46.0f, textRight, row.top + 66.0f},
          bodyFormat.Get(), TextMuted());
     const float by = row.top + 20.0f;
+    const std::wstring summary = NotificationSummary(item.info);
     IconButton({row.right - 82.0f, by, row.right - 50.0f, by + 32.0f}, kGlyphCopy,
-               Action::CopyNotification, item.info.key, index);
+               Action::CopyNotification, item.info.key, index, L"Copy notification text",
+               summary);
     IconButton({row.right - 44.0f, by, row.right - 12.0f, by + 32.0f}, kGlyphClose,
-               Action::DismissNotification, item.info.key, index);
+               Action::DismissNotification, item.info.key, index, L"Dismiss notification",
+               summary);
     return row.bottom - row.top;
   }
 
@@ -827,12 +1190,16 @@ struct PhoneWindow::Impl {
       const float x = left + static_cast<float>(i) * (cardWidth + gap);
       const D2D1_RECT_F card{x, y, x + cardWidth, y + 88.0f};
       Card(card);
+      if (Pressed(card)) {
+        Fill(card, ToD2D(theme.surfaceHover, 0.6f), theme.settingsRadius + 2.0f);
+      }
       if (Hovered(card)) Stroke(card, ToD2D(accent, 0.7f), theme.settingsRadius + 2.0f);
       Text(std::to_wstring(stats[i].value), {x + 18, y + 12, card.right - 12, y + 50},
            statFormat.Get(), TextPrimary());
       Text(stats[i].label, {x + 18, y + 52, card.right - 12, y + 74}, smallFormat.Get(),
            TextMuted());
-      AddHit(card, Action::SelectTab, static_cast<int>(stats[i].tab));
+      AddHit(card, Action::SelectTab, static_cast<int>(stats[i].tab), {},
+             std::wstring(stats[i].label) + L": " + std::to_wstring(stats[i].value));
     }
     y += 112.0f;
 
@@ -856,14 +1223,28 @@ struct PhoneWindow::Impl {
     SectionLabel(L"QUICK ACTIONS", left, right, y);
     y += 26.0f;
     float x = left;
+    // Buttons wrap onto a second row instead of disappearing at narrow widths.
+    const auto fits = [&](const std::wstring& label) {
+      return x + MeasureWidth(label, bodyFormat.Get()) + 52.0f <= right;
+    };
+    const auto wrapIfNeeded = [&](const std::wstring& label) {
+      if (x > left && !fits(label)) {
+        x = left;
+        y += 44.0f;
+      }
+    };
+    wrapIfNeeded(L"Send PC clipboard to phone");
     x += Button(x, y, L"Send PC clipboard to phone", Action::SendPcClipboard, true, kGlyphSend) + 10;
-    x += Button(x, y, activeTransfers.empty() ? L"Send files\u2026" : L"Cancel transfers",
-                Action::SendFiles, false, kGlyphUpload) + 10;
-    x += Button(x, y, ringing ? L"Stop ringing" : L"Find my phone", Action::FindPhone, false,
-                kGlyphRing) + 10;
-    if (x + 180.0f < right) {
-      Button(x, y, L"Load latest photos", Action::RefreshPhotos, false, kGlyphRefresh);
-    }
+    wrapIfNeeded(L"Send files…");
+    x += Button(x, y, L"Send files…", Action::SendFiles, false, kGlyphUpload) + 10;
+    const std::wstring ringLabel = ringing ? L"Stop ringing" : L"Find my phone";
+    wrapIfNeeded(ringLabel);
+    x += Button(x, y, ringLabel, Action::FindPhone, false, kGlyphRing) + 10;
+    const std::wstring photoLabel = fits(L"Load latest photos") ? L"Load latest photos"
+                                                                 : L"Load photos";
+    wrapIfNeeded(photoLabel);
+    Button(x, y, photoLabel, Action::RefreshPhotos, false, kGlyphRefresh, {}, false,
+           L"Load latest photos");
     y += 44.0f;
     Text(L"Tip: drop files on this window to send them to your phone.",
          {left, y, right, y + 20.0f}, smallFormat.Get(), TextMuted());
@@ -922,19 +1303,21 @@ struct PhoneWindow::Impl {
     const float textLeft = art.right + 16.0f;
     const float buttons = right - 150.0f;
     std::wstring meta = Widen(media.appName.empty() ? media.app : media.appName);
-    meta += (meta.empty() ? L"" : L"  \u00b7  ") + std::wstring(media.playing ? L"Playing" : L"Paused");
+    meta += (meta.empty() ? L"" : L"  ·  ") + std::wstring(media.playing ? L"Playing" : L"Paused");
     Text(meta, {textLeft, y + 16.0f, buttons, y + 34.0f}, smallFormat.Get(), TextMuted());
     Text(SingleLine(Widen(media.title)), {textLeft, y + 34.0f, buttons, y + 58.0f},
          headingFormat.Get(), TextPrimary());
     Text(SingleLine(Widen(media.artist)), {textLeft, y + 58.0f, buttons, y + 78.0f},
          bodyFormat.Get(), TextMuted());
     const float by = y + 30.0f;
+    const std::wstring track = SingleLine(Widen(media.title));
     IconButton({right - 144.0f, by, right - 104.0f, by + 36.0f}, kGlyphPrevious, Action::Media,
-               "prev");
+               "prev", 0, L"Previous track", track);
     IconButton({right - 100.0f, by, right - 60.0f, by + 36.0f},
-               media.playing ? kGlyphPause : kGlyphPlay, Action::Media, "toggle");
+               media.playing ? kGlyphPause : kGlyphPlay, Action::Media, "toggle", 0,
+               media.playing ? L"Pause" : L"Play", track);
     IconButton({right - 56.0f, by, right - 16.0f, by + 36.0f}, kGlyphNext, Action::Media,
-               "next");
+               "next", 0, L"Next track", track);
     return 116.0f;
   }
 
@@ -947,13 +1330,20 @@ struct PhoneWindow::Impl {
     y += 54.0f;
     if (smsThreads.empty()) {
       const bool allowed = HasFeature("sms");
+      const bool loading = connected && allowed && smsRequested && !smsLoaded;
       EmptyMessage(!connected ? L"Phone not connected"
-                   : allowed  ? L"No conversations loaded"
-                              : L"Text messages are off",
+                   : !allowed ? L"Text messages are off"
+                   : loading  ? L"Loading messages…"
+                   : smsLoaded ? L"No conversations found"
+                              : L"No conversations loaded",
                    !connected ? L"Open FeatherCast Phone on your phone to see your text messages."
-                   : allowed  ? L"Click Refresh to load your text messages."
-                              : L"On the phone, open FeatherCast Phone and turn on "
-                                L"\u201cText messages\u201d under Optional.",
+                   : !allowed ? L"On the phone, open FeatherCast Phone and turn on "
+                                L"“Text messages” under Optional. Android asks for "
+                                L"SMS and contacts permission."
+                   : loading  ? L"Asking your phone for its conversations."
+                   : smsLoaded ? L"Your phone returned no conversations. Click Refresh to check "
+                                 L"again."
+                              : L"Click Refresh to load your text messages.",
                    left, right, y);
       return y - start + 100.0f;
     }
@@ -961,7 +1351,11 @@ struct PhoneWindow::Impl {
       if (y - start > 20000.0f) break;
       const auto& thread = smsThreads[i];
       const D2D1_RECT_F row{left, y, right, y + 64.0f};
-      if (Hovered(row)) Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
+      if (Pressed(row)) {
+        Fill(row, ToD2D(theme.surfaceHover, 0.8f), theme.rowRadius);
+      } else if (Hovered(row)) {
+        Fill(row, ToD2D(theme.surfaceHover, 0.5f), theme.rowRadius);
+      }
       const std::wstring name = Widen(thread.name.empty() ? thread.address : thread.name);
       const D2D1_RECT_F badge{left + 14.0f, y + 14.0f, left + 50.0f, y + 50.0f};
       Fill(badge, ToD2D(accent, thread.unread ? 0.5f : 0.22f), 18.0f);
@@ -972,7 +1366,11 @@ struct PhoneWindow::Impl {
            smallFormat.Get(), thread.unread ? Accent() : TextMuted());
       Text(SingleLine(Widen(thread.snippet)), {left + 64.0f, y + 32.0f, right - 12.0f, y + 54.0f},
            bodyFormat.Get(), TextMuted());
-      AddHit(row, Action::OpenSmsThread, static_cast<int>(i), thread.thread);
+      Hit& hit = AddHit(row, Action::OpenSmsThread, static_cast<int>(i), thread.thread,
+                        (thread.unread ? L"Unread conversation with " : L"Conversation with ") +
+                            (name.empty() ? std::wstring(L"unknown") : name),
+                        Role::Row);
+      hit.description = SingleLine(Widen(thread.snippet));
       y += 68.0f;
     }
     return y - start;
@@ -981,7 +1379,11 @@ struct PhoneWindow::Impl {
   float DrawClipRow(float left, float right, float y, const ClipItem& clip, int index) {
     const D2D1_RECT_F row{left, y, right, y + 76.0f};
     Card(row);
-    if (Hovered(row)) Fill(row, ToD2D(theme.surfaceHover, 0.4f), theme.settingsRadius + 2.0f);
+    if (Pressed(row)) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.7f), theme.settingsRadius + 2.0f);
+    } else if (Hovered(row)) {
+      Fill(row, ToD2D(theme.surfaceHover, 0.4f), theme.settingsRadius + 2.0f);
+    }
     Text(FormatTime(clip.time), {left + 16, y + 8, right - 60, y + 26}, smallFormat.Get(),
          TextMuted());
     brush->SetColor(TextPrimary());
@@ -991,9 +1393,10 @@ struct PhoneWindow::Impl {
     Text(text.substr(0, 600), {left + 16, y + 28, right - 60, y + 120}, bodyWrapFormat.Get(),
          TextPrimary());
     target->PopAxisAlignedClip();
-    AddHit(row, Action::CopyClip, index);
+    AddHit(row, Action::CopyClip, index, {}, {}, Role::Row).focusable = false;
+    std::wstring preview = SingleLine(text.substr(0, 120));
     IconButton({right - 48, y + 22, right - 14, y + 54}, kGlyphCopy, Action::CopyClip, {},
-               index);
+               index, L"Copy clipboard item", preview);
     return 84.0f;
   }
 
@@ -1008,7 +1411,7 @@ struct PhoneWindow::Impl {
                    left, right, y);
       return 120.0f;
     }
-    Text(L"Click a notification to copy its text. ✕ dismisses it on the phone.",
+    Text(L"Click a notification to copy its text. The X button dismisses it on the phone.",
          {left, y, right, y + 20.0f}, smallFormat.Get(), TextMuted());
     y += 30.0f;
     for (size_t i = 0; i < notifications.size(); ++i) {
@@ -1023,15 +1426,42 @@ struct PhoneWindow::Impl {
     const float start = y;
     float x = left;
     x += Button(x, y, L"Refresh", Action::RefreshPhotos, false, kGlyphRefresh) + 14.0f;
-    Text(L"Click a photo to save it to Downloads\\FeatherCast and open it.",
+    Text(photosAccess == "selected" && !photos.empty()
+             ? L"Android shares only the photos you selected. Click a photo to save it and open it."
+             : L"Click a photo to save it to Downloads\\FeatherCast and open it.",
          {x, y, right, y + 36.0f}, smallFormat.Get(), TextMuted());
     y += 54.0f;
     if (photos.empty()) {
-      EmptyMessage(connected ? L"No photos loaded" : L"Phone not connected",
-                   connected ? L"Click Refresh. On the phone, allow “Photos to PC” "
-                               L"if Android asks for access to your photos."
-                             : L"Open FeatherCast Phone on your phone to see its latest photos.",
-                   left, right, y);
+      const bool slow = NowMs() - photosRequestedAt >= kPhotoListSlowMs;
+      std::wstring title;
+      std::wstring body;
+      if (!connected) {
+        title = L"Phone not connected";
+        body = L"Open FeatherCast Phone on your phone to see its latest photos.";
+      } else if (photosLoaded && photosAccess == "denied") {
+        title = L"Photo access is off on your phone";
+        body = (photosError.empty() ? std::wstring(L"Allow photo access in FeatherCast on your phone.")
+                                    : Widen(photosError)) +
+               L" Then click Refresh.";
+      } else if (photosLoaded) {
+        title = L"No photos found";
+        body = photosAccess == "selected"
+                   ? L"Android shares only the photos you selected for FeatherCast. Open the "
+                     L"app on the phone to choose more, then click Refresh."
+                   : L"Your phone returned no pictures. If you expected some, check that "
+                     L"“Photos to PC” is on in the phone app, then click Refresh.";
+      } else if (photosRequested && !slow) {
+        title = L"Loading photos…";
+        body = L"Asking your phone for its latest photos.";
+      } else if (photosRequested) {
+        title = L"Your phone has not answered yet";
+        body = L"Open FeatherCast Phone on the phone and allow photo access, then click "
+               L"Refresh to try again.";
+      } else {
+        title = L"No photos loaded";
+        body = L"Click Refresh to load the latest photos from your phone.";
+      }
+      EmptyMessage(title, body, left, right, y);
       return y - start + 100.0f;
     }
     const float tile = 150.0f;
@@ -1070,11 +1500,16 @@ struct PhoneWindow::Impl {
         Text(kGlyphPhoto, rect, iconLargeFormat.Get(), TextMuted());
       }
       if (Hovered(rect)) Stroke(rect, Accent(), 8.0f, 2.0f);
+      if (photo.downloading || Pressed(rect)) {
+        Fill(rect, D2D1::ColorF(0, 0, 0, photo.downloading ? 0.55f : 0.25f), 8.0f);
+      }
       if (photo.downloading) {
-        Fill(rect, D2D1::ColorF(0, 0, 0, 0.55f), 8.0f);
         Text(L"Downloading…", rect, smallCenterFormat.Get(), D2D1::ColorF(1, 1, 1));
       }
-      AddHit(rect, Action::OpenPhoto, static_cast<int>(i), photo.info.id);
+      std::wstring name = Widen(photo.info.name);
+      Hit& hit = AddHit(rect, Action::OpenPhoto, static_cast<int>(i), photo.info.id,
+                        name.empty() ? std::wstring(L"Photo") : L"Photo " + name, Role::Row);
+      hit.description = FormatTime(photo.info.time);
     }
     const int rows = (static_cast<int>(photos.size()) + columns - 1) / columns;
     y += static_cast<float>(rows) * (tileSize + gap);
@@ -1090,6 +1525,10 @@ struct PhoneWindow::Impl {
                 state.clipboardSync, Action::ToggleClipboardSync);
     y += 16.0f;
     SectionLabel(L"COPIED ON YOUR PHONE", left, right, y);
+    y += 24.0f;
+    Text(L"Keeps the last " + std::to_wstring(kMaxClips) +
+             L" items in memory only. They are gone when FeatherCast closes.",
+         {left, y, right, y + 20.0f}, smallFormat.Get(), TextMuted());
     y += 28.0f;
     if (clips.empty()) {
       EmptyMessage(L"Nothing here yet",
@@ -1102,6 +1541,13 @@ struct PhoneWindow::Impl {
       y += DrawClipRow(left, right, y, clips[i], static_cast<int>(i));
     }
     return y - start;
+  }
+
+  const phone::PairedDevice* FindDevice(const std::string& id) const {
+    for (const auto& device : state.devices) {
+      if (device.id == id) return &device;
+    }
+    return nullptr;
   }
 
   float DrawDevices(float left, float right, float y) {
@@ -1120,16 +1566,13 @@ struct PhoneWindow::Impl {
            online ? ToD2D(theme.success) : TextMuted());
       const float w = MeasureWidth(L"Forget", bodyFormat.Get()) + 32.0f;
       Button(right - 14 - w, y + 14, L"Forget", Action::ForgetDevice, false, nullptr,
-             device.id, true);
+             device.id, true, L"Forget " + Widen(device.name));
       y += 74.0f;
     }
     Button(left, y + 4, L"Pair new phone", Action::PairNew, false, kGlyphDevices);
     y += 60.0f;
     SectionLabel(L"SETTINGS", left, right, y);
     y += 26.0f;
-    y += Toggle(left, right, y, L"Sync clipboard automatically",
-                L"Send text copied on this PC to the phone.", state.clipboardSync,
-                Action::ToggleClipboardSync);
     y += Toggle(left, right, y, L"Show phone notifications on this PC",
                 L"Pop up a Windows alert when a new phone notification arrives.",
                 state.notificationToasts, Action::ToggleToasts);
@@ -1149,30 +1592,82 @@ struct PhoneWindow::Impl {
 
   std::string connectedId;
   const std::string& ConnectedId() const { return connectedId; }
+  std::wstring headerTitle;
+  std::wstring headerStatus;
+
+  float TransferStripHeight() const {
+    if (transfers.empty()) return 0.0f;
+    const size_t rows = std::min(transfers.size(), kMaxTransferRows);
+    return 52.0f + static_cast<float>(rows) * kTransferRowHeight +
+           (transfers.size() > rows ? 22.0f : 0.0f) + 10.0f;
+  }
+
+  // Persistent strip above the toast area: one row with progress per file and a
+  // Cancel button that stops them all.
+  void DrawTransferStrip(float width, float height) {
+    if (transfers.empty()) return;
+    currentZone = Zone::Overlay;
+    const float left = kSidebarWidth + kPad;
+    const float right = width - kPad;
+    const float strip = TransferStripHeight();
+    const D2D1_RECT_F card{left, height - 12.0f - strip, right, height - 12.0f};
+    Card(card);
+    const size_t n = transfers.size();
+    Text(n == 1 ? std::wstring(L"Transferring 1 file")
+                : L"Transferring " + std::to_wstring(n) + L" files",
+         {card.left + 16.0f, card.top + 8.0f, card.right - 120.0f, card.top + 44.0f},
+         headingFormat.Get(), TextPrimary());
+    const float cw = MeasureWidth(L"Cancel", bodyFormat.Get()) + 32.0f;
+    Button(card.right - 12.0f - cw, card.top + 8.0f, L"Cancel", Action::CancelTransfers, false,
+           nullptr, {}, false, L"Cancel file transfers");
+    float y = card.top + 52.0f;
+    const size_t rows = std::min(n, kMaxTransferRows);
+    for (size_t i = 0; i < rows; ++i) {
+      const Transfer& transfer = transfers[i];
+      const int percent = transfer.total <= 0
+                              ? 100
+                              : static_cast<int>(std::clamp<long long>(
+                                    transfer.done * 100 / transfer.total, 0, 100));
+      Text(transfer.name.empty() ? std::wstring(L"File") : transfer.name,
+           {card.left + 16.0f, y, card.right - 70.0f, y + 18.0f}, smallFormat.Get(),
+           TextPrimary());
+      Text(std::to_wstring(percent) + L"%", {card.right - 62.0f, y, card.right - 16.0f, y + 18.0f},
+           smallFormat.Get(), TextMuted());
+      const D2D1_RECT_F bar{card.left + 16.0f, y + 21.0f, card.right - 16.0f, y + 25.0f};
+      Fill(bar, ToD2D(theme.surfaceHover, 1.0f), 2.0f);
+      Fill({bar.left, bar.top,
+            bar.left + (bar.right - bar.left) * static_cast<float>(percent) / 100.0f, bar.bottom},
+           Accent(), 2.0f);
+      y += kTransferRowHeight;
+    }
+    if (n > rows) {
+      Text(L"+" + std::to_wstring(n - rows) + L" more",
+           {card.left + 16.0f, y, card.right - 16.0f, y + 18.0f}, smallFormat.Get(), TextMuted());
+    }
+  }
 
   void DrawDashboard(float width, float height) {
     DrawSidebar(height);
+    currentZone = Zone::Content;
     const float left = kSidebarWidth + kPad;
-    const float right = width - kPad;
+    const float right = width - kPad - 6.0f;
     const float top = kHeaderHeight;
-    viewportHeight = height - top;
-    float& offset = scroll[tab];
-    auto [visual, inserted] = visualScroll.try_emplace(tab);
-    if (inserted) {
-      visual->second.Configure(0.30, 1.0);
-      visual->second.Snap(offset);
-    }
-    target->PushAxisAlignedClip({kSidebarWidth, top, width, height},
+    const float strip = TransferStripHeight();
+    transferStripHeight = strip > 0.0f ? strip + 12.0f + 8.0f : 0.0f;
+    const float bottom = height - transferStripHeight;
+    viewportHeight = bottom - top;
+    const int key = ScrollKey();
+    const float scrolled = BeginScrollView(key);
+    target->PushAxisAlignedClip({kSidebarWidth, top, width, bottom},
                                 D2D1_ANTIALIAS_MODE_ALIASED);
     const bool fading = contentOpacity.Value() < 0.999;
     if (fading) {
       target->PushLayer(D2D1::LayerParameters(
-          D2D1::RectF(kSidebarWidth, top, width, height), nullptr,
+          D2D1::RectF(kSidebarWidth, top, width, bottom), nullptr,
           D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(),
           static_cast<float>(contentOpacity.Value())), nullptr);
     }
-    const float y = top + 22.0f - static_cast<float>(visual->second.Value()) +
-                    static_cast<float>(contentOffset.Value());
+    const float y = top + 22.0f - scrolled + static_cast<float>(contentOffset.Value());
     const size_t hitsBefore = hits.size();
     float used = 0.0f;
     switch (tab) {
@@ -1184,36 +1679,121 @@ struct PhoneWindow::Impl {
       case Tab::Devices: used = DrawDevices(left, right, y); break;
     }
     if (fading) target->PopLayer();
+    FinishScrollView(key, used + 44.0f);
+    DrawScrollbar(width, top, viewportHeight, scrolled);
     target->PopAxisAlignedClip();
-    // Content scrolled under the header must not stay clickable.
-    for (size_t i = hitsBefore; i < hits.size(); ++i) {
-      if (hits[i].rect.bottom <= top) hits[i].action = Action::None;
-      hits[i].rect.top = std::max(hits[i].rect.top, top);
-    }
-    contentHeight = used + 44.0f;
-    const float maxScroll = std::max(0.0f, contentHeight - viewportHeight);
-    if (offset > maxScroll) offset = maxScroll;
-    if (visual->second.Target() > maxScroll) {
-      visual->second.Retarget(maxScroll, spatialMotion);
-    }
+    FinishContentHits(hitsBefore, top, bottom);
+    DrawTransferStrip(width, height);
   }
 
   void DrawToast(float width, float height) {
     if (toast.empty() || toastOpacity.Value() <= 0.001) return;
-    const float w = MeasureWidth(toast, bodyFormat.Get()) + 40.0f;
+    currentZone = Zone::Overlay;
+    const float actionWidth =
+        toastRun ? MeasureWidth(toastActionLabel, bodyFormat.Get()) + 28.0f : 0.0f;
+    const float maxWidth = std::max(160.0f, width - 2 * kPad);
+    const float w = std::min(MeasureWidth(toast, bodyFormat.Get()) + 40.0f + actionWidth, maxWidth);
     const float lift = static_cast<float>(toastOffset.Value());
-    const D2D1_RECT_F rect{(width - w) / 2.0f, height - 64.0f + lift,
-                           (width + w) / 2.0f, height - 24.0f + lift};
+    const float bottomEdge = height - 24.0f - transferStripHeight;
+    const D2D1_RECT_F rect{(width - w) / 2.0f, bottomEdge - 40.0f + lift,
+                           (width + w) / 2.0f, bottomEdge + lift};
     if (toastOpacity.Value() < 0.999) {
       target->PushLayer(D2D1::LayerParameters(
           rect, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
           D2D1::IdentityMatrix(), static_cast<float>(toastOpacity.Value())), nullptr);
     }
-    Fill(rect, MixColor(Surface(), D2D1::ColorF(1, 1, 1), 0.08f), 20.0f);
+    Fill(rect, MixColor(Surface(), D2D1::ColorF(1, 1, 1), highContrast ? 0.0f : 0.08f), 20.0f);
     Stroke(rect, ToD2D(theme.border), 20.0f);
-    Text(toast, {rect.left + 20.0f, rect.top, rect.right - 12.0f, rect.bottom},
+    Text(toast, {rect.left + 20.0f, rect.top, rect.right - 12.0f - actionWidth, rect.bottom},
          bodyFormat.Get(), TextPrimary());
+    if (toastRun) {
+      const D2D1_RECT_F action{rect.right - actionWidth - 8.0f, rect.top + 6.0f, rect.right - 8.0f,
+                               rect.bottom - 6.0f};
+      Fill(action, ToD2D(accent, Pressed(action) ? 0.55f : (Hovered(action) ? 0.4f : 0.25f)), 14.0f);
+      Text(toastActionLabel, action, stepFormatBody(), Accent());
+      if (toastOpacity.Value() > 0.5) AddHit(action, Action::ToastAction, 0, {}, toastActionLabel);
+    }
     if (toastOpacity.Value() < 0.999) target->PopLayer();
+  }
+
+  // Centered body text for small pill buttons.
+  IDWriteTextFormat* stepFormatBody() { return smallCenterFormat.Get(); }
+
+  // Rebuilds the keyboard focus order from the hits of the last paint and
+  // re-finds the focused control, or its neighbor when it went away.
+  void RebuildFocusOrder() {
+    focusOrder.clear();
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (hits[i].action != Action::None && hits[i].focusable) focusOrder.push_back(i);
+    }
+    if (focusOrder.empty()) {
+      focusKey = {};
+      focusOrdinal = -1;
+      return;
+    }
+    if (focusKey.action == Action::None) {
+      focusOrdinal = -1;
+      return;
+    }
+    int found = -1;
+    for (size_t k = 0; k < focusOrder.size(); ++k) {
+      if (KeyOf(hits[focusOrder[k]]) == focusKey) found = static_cast<int>(k);
+    }
+    if (found < 0) {
+      found = std::clamp(focusOrdinal, 0, static_cast<int>(focusOrder.size()) - 1);
+      focusKey = KeyOf(hits[focusOrder[static_cast<size_t>(found)]]);
+    }
+    focusOrdinal = found;
+  }
+
+  const Hit* FocusedHit() const {
+    if (focusOrdinal < 0 || static_cast<size_t>(focusOrdinal) >= focusOrder.size()) return nullptr;
+    const size_t index = focusOrder[static_cast<size_t>(focusOrdinal)];
+    return index < hits.size() ? &hits[index] : nullptr;
+  }
+
+  void DrawFocusRing(float width, float height) {
+    if (!focusVisible) return;
+    const Hit* hit = FocusedHit();
+    if (!hit) return;
+    const bool content = hit->zone == Zone::Content;
+    if (content) {
+      target->PushAxisAlignedClip({hit->zone == Zone::Content && !ShowingPairing() ? kSidebarWidth : 0.0f,
+                                   kHeaderHeight, width, height - transferStripHeight},
+                                  D2D1_ANTIALIAS_MODE_ALIASED);
+    }
+    const D2D1_RECT_F ring{hit->full.left - 2.0f, hit->full.top - 2.0f, hit->full.right + 2.0f,
+                           hit->full.bottom + 2.0f};
+    const float radius = std::min(10.0f, (ring.bottom - ring.top) / 2.0f);
+    const D2D1_COLOR_F color = highContrast ? ToD2D(SystemColor(COLOR_HIGHLIGHT)) : Accent();
+    Stroke(ring, color, radius, 2.0f);
+    if (content) target->PopAxisAlignedClip();
+  }
+
+  // Name of icon-only buttons, shown under the pointer or the keyboard focus.
+  void DrawTooltip(float width, float height) {
+    const Hit* hit = nullptr;
+    if (mouse.x >= 0.0f) hit = HitAt(mouse);
+    if ((!hit || hit->tip.empty()) && focusVisible) hit = FocusedHit();
+    if (!hit || hit->tip.empty()) return;
+    const float w = MeasureWidth(hit->tip, smallFormat.Get()) + 20.0f;
+    float x = (hit->full.left + hit->full.right - w) / 2.0f;
+    x = std::clamp(x, 8.0f, std::max(8.0f, width - w - 8.0f));
+    float y = hit->full.bottom + 6.0f;
+    if (y + 26.0f > height - 4.0f) y = hit->full.top - 32.0f;
+    const D2D1_RECT_F rect{x, y, x + w, y + 26.0f};
+    Fill(rect, MixColor(Surface(), D2D1::ColorF(1, 1, 1), highContrast ? 0.0f : 0.12f), 6.0f);
+    Stroke(rect, ToD2D(theme.border), 6.0f);
+    Text(hit->tip, {rect.left + 10.0f, rect.top, rect.right - 6.0f, rect.bottom},
+         smallFormat.Get(), TextPrimary());
+  }
+
+  bool ShowingPairing() const {
+    return state.enabled && state.running && (pairing || state.devices.empty());
+  }
+
+  int ScrollKey() const {
+    return ShowingPairing() ? kPairingScrollKey : static_cast<int>(tab);
   }
 
   void Paint() {
@@ -1224,22 +1804,25 @@ struct PhoneWindow::Impl {
     target->SetTransform(D2D1::IdentityMatrix());
     target->Clear(Background());
     DrawHeader(size.width);
-    const bool showPairing = state.enabled && state.running &&
-                             (pairing || state.devices.empty());
+    transferStripHeight = 0.0f;
     if (!state.enabled || !state.running) {
+      contentHeight = 0.0f;
+      viewportHeight = size.height - kHeaderHeight;
       DrawOff(size.width, size.height);
-    } else if (showPairing) {
+    } else if (ShowingPairing()) {
       EnsurePairingUri();
       DrawPairing(size.width, size.height);
     } else {
       DrawDashboard(size.width, size.height);
     }
     DrawToast(size.width, size.height);
+    RebuildFocusOrder();
+    DrawFocusRing(size.width, size.height);
+    DrawTooltip(size.width, size.height);
     if (target->EndDraw() == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
     RequestFrame();
   }
 
-  // Forgets the cached install URL and pairing code; the next paint rebuilds them.
   void ResetPairing() {
     pairingUri.clear();
     pairingUnavailable = false;
@@ -1327,7 +1910,10 @@ struct PhoneWindow::Impl {
     for (auto& [_, value] : toggleMotion) value.Update(elapsed);
     ApplyWindowPresentation();
     if (!toast.empty() && NowMs() >= toastUntil && !toastOpacity.Active() &&
-        toastOpacity.Value() <= 0.001) toast.clear();
+        toastOpacity.Value() <= 0.001) {
+      toast.clear();
+      toastRun = nullptr;
+    }
     if (closing && !windowOpacity.Active() && !windowOffset.Active()) {
       KillTimer(hwnd, kFrameTimer);
       DestroyWindow(hwnd);
@@ -1406,10 +1992,16 @@ struct PhoneWindow::Impl {
     }
   }
 
-  void ShowToast(std::wstring text) {
+  // A toast with an action stays longer so there is time to use it.
+  void ShowToast(std::wstring text, std::wstring actionLabel = {},
+                 std::function<void()> run = {}) {
     const bool replacing = !toast.empty();
     toast = std::move(text);
-    toastUntil = NowMs() + 2200;
+    toastRun = std::move(run);
+    toastActionLabel = toastRun ? std::move(actionLabel) : std::wstring{};
+    toastUntil = NowMs() + (toastRun ? kToastActionMs : kToastMs);
+    // Screen readers announce the toast as a polite live region.
+    if (hwnd) accessibility::NotifyStatusChanged(hwnd, 2);
     if (!replacing) toastOpacity.Snap(fadeMotion ? 0.0 : 1.0);
     toastOpacity.Retarget(1.0, 0.17, fadeMotion);
     if (!replacing) toastOffset.Snap(spatialMotion ? 8.0 : 0.0);
@@ -1439,21 +2031,33 @@ struct PhoneWindow::Impl {
                             spatialMotion);
           AnimateContentChange();
         }
-        if (tab == Tab::Photos && photos.empty() && connected && !photosRequested &&
-            callbacks.requestPhotos) {
-          photosRequested = true;
-          callbacks.requestPhotos();
+        if (tab == Tab::Photos && photos.empty() && connected && !photosRequested) {
+          RequestPhotoList();
         }
         if (tab == Tab::Messages && connected && !smsRequested && callbacks.requestSmsThreads) {
           smsRequested = true;
+          smsLoaded = false;
           callbacks.requestSmsThreads();
         }
         break;
       case Action::TurnOn:
         if (callbacks.setEnabled) callbacks.setEnabled(true);
         break;
-      case Action::TurnOff:
-        if (callbacks.setEnabled) callbacks.setEnabled(!state.enabled);
+      case Action::TurnOff: {
+        const bool enable = !state.enabled;
+        if (callbacks.setEnabled) callbacks.setEnabled(enable);
+        if (!enable) ShowToast(L"Phone connection turned off");
+        break;
+      }
+      case Action::RetryService:
+        if (callbacks.setEnabled) {
+          // There is no restart callback: turning the service off and on again
+          // starts it afresh and picks up a changed port or firewall rule.
+          callbacks.setEnabled(false);
+          callbacks.setEnabled(true);
+          ShowToast(state.running ? L"Phone connection started"
+                                  : L"The phone connection still could not start");
+        }
         break;
       case Action::PairNew:
         pairing = true;
@@ -1479,13 +2083,10 @@ struct PhoneWindow::Impl {
         break;
       case Action::OpenPhoto:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < photos.size()) {
-          auto& photo = photos[static_cast<size_t>(hit.index)];
           if (!connected) {
             ShowToast(L"Connect your phone to download photos");
-          } else if (!photo.downloading && callbacks.requestPhoto) {
-            photo.downloading = true;
-            photo.downloadingSince = NowMs();
-            callbacks.requestPhoto(photo.info.id);
+          } else {
+            RequestPhoto(photos[static_cast<size_t>(hit.index)].info.id);
           }
         }
         break;
@@ -1493,8 +2094,7 @@ struct PhoneWindow::Impl {
         if (!connected) {
           ShowToast(L"Your phone is not connected");
         } else if (callbacks.requestPhotos) {
-          photosRequested = true;
-          callbacks.requestPhotos();
+          RequestPhotoList();
           ShowToast(L"Loading photos from your phone…");
         }
         break;
@@ -1520,11 +2120,21 @@ struct PhoneWindow::Impl {
           callbacks.setNotificationToasts(!state.notificationToasts);
         }
         break;
-      case Action::ForgetDevice:
+      case Action::ForgetDevice: {
+        const phone::PairedDevice* device = FindDevice(hit.id);
+        const std::wstring name = device ? Widen(device->name) : std::wstring(L"this phone");
+        const std::wstring question =
+            L"Forget " + name + L"?\n\nYou'll need to pair again to reconnect it.";
+        // No is the default so a stray Enter cannot unpair the phone.
+        if (MessageBoxW(hwnd, question.c_str(), L"Forget phone",
+                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) != IDYES) {
+          break;
+        }
         if (callbacks.forgetDevice) callbacks.forgetDevice(hit.id);
         if (hit.id == dataDeviceId) ClearPhoneData();
-        ShowToast(L"Phone removed");
+        ShowToast(name + L" removed");
         break;
+      }
       case Action::ToggleLowBattery:
         if (callbacks.setLowBatteryAlert) callbacks.setLowBatteryAlert(!state.lowBatteryAlert);
         break;
@@ -1539,12 +2149,21 @@ struct PhoneWindow::Impl {
         }
         break;
       case Action::SendFiles:
-        if (!activeTransfers.empty()) {
-          if (callbacks.cancelTransfers) callbacks.cancelTransfers();
-          activeTransfers.clear();
-          ShowToast(L"File transfers cancelled");
-        } else if (callbacks.pickFilesToSend) callbacks.pickFilesToSend();
+        if (callbacks.pickFilesToSend) callbacks.pickFilesToSend();
         break;
+      case Action::CancelTransfers:
+        // The service can only cancel every transfer at once.
+        if (callbacks.cancelTransfers) callbacks.cancelTransfers();
+        transfers.clear();
+        ShowToast(L"File transfers cancelled");
+        break;
+      case Action::ToastAction: {
+        const auto run = std::move(toastRun);
+        toastRun = nullptr;
+        toastUntil = 0;  // the toast fades out now
+        if (run) run();
+        break;
+      }
       case Action::Media:
         if (!connected) {
           ShowToast(L"Your phone is not connected");
@@ -1557,6 +2176,7 @@ struct PhoneWindow::Impl {
           ShowToast(L"Your phone is not connected");
         } else if (callbacks.requestSmsThreads) {
           smsRequested = true;
+          if (smsThreads.empty()) smsLoaded = false;
           callbacks.requestSmsThreads();
           ShowToast(L"Loading messages\u2026");
         }
@@ -1585,12 +2205,49 @@ struct PhoneWindow::Impl {
     deviceName.clear();
     dataDeviceId.clear();
     photosRequested = false;
+    photosRequestedAt = 0;
+    photosLoaded = false;
+    photosAccess.clear();
+    photosError.clear();
     features.clear();
     ringing = false;
     media = {};
     mediaArt.Reset();
     smsThreads.clear();
     smsRequested = false;
+    smsLoaded = false;
+    transfers.clear();
+  }
+
+  void EndTransfer(const std::string& id) {
+    std::erase_if(transfers, [&](const Transfer& t) { return t.id == id; });
+  }
+
+  void RequestPhotoList() {
+    if (!callbacks.requestPhotos) return;
+    photosRequested = true;
+    photosRequestedAt = NowMs();
+    if (photos.empty()) photosLoaded = false;
+    callbacks.requestPhotos();
+  }
+
+  // Asks the phone for the full photo; it is opened when it arrives.
+  void RequestPhoto(const std::string& id) {
+    if (!callbacks.requestPhoto) return;
+    for (auto& photo : photos) {
+      if (photo.info.id != id || photo.downloading) continue;
+      photo.downloading = true;
+      photo.downloadingSince = NowMs();
+      callbacks.requestPhoto(id);
+    }
+  }
+
+  void ShowPhotoFailure(const std::wstring& message, const std::string& id) {
+    if (id.empty() || !connected) {
+      ShowToast(message);
+      return;
+    }
+    ShowToast(message, L"Try again", [this, id] { RequestPhoto(id); });
   }
 
   void RemoveNotification(const std::string& key) {
@@ -1608,9 +2265,247 @@ struct PhoneWindow::Impl {
   const Hit* HitAt(D2D1_POINT_2F point) const {
     // Later hits are drawn on top (e.g. icon buttons inside rows).
     for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
-      if (it->action != Action::None && Contains(it->rect, point)) return &*it;
+      if (it->action != Action::None && it->clickable && Contains(it->rect, point)) {
+        return &*it;
+      }
     }
     return nullptr;
+  }
+
+  // ------------------------------------------------------------- keyboard
+
+  // Moves the scroll target of the visible view, clamped to its content.
+  void ScrollTo(float wanted) {
+    const int key = ScrollKey();
+    float& offset = scroll[key];
+    const float previous = offset;
+    const float maxScroll = std::max(0.0f, contentHeight - viewportHeight);
+    offset = std::clamp(wanted, 0.0f, maxScroll);
+    auto [it, inserted] = visualScroll.try_emplace(key);
+    if (inserted) {
+      it->second.Configure(0.30, 1.0);
+      it->second.Snap(previous);
+    }
+    it->second.Retarget(offset, spatialMotion);
+    RequestFrame();
+    Invalidate();
+  }
+
+  // Scrolls so the focused control is inside the visible content area.
+  void EnsureFocusVisible() {
+    const Hit* hit = FocusedHit();
+    if (!hit || hit->zone != Zone::Content) return;
+    const float top = kHeaderHeight + 8.0f;
+    const float bottom = kHeaderHeight + viewportHeight - 8.0f;
+    const auto it = visualScroll.find(ScrollKey());
+    const float current = it != visualScroll.end() ? static_cast<float>(it->second.Value())
+                                                   : scroll[ScrollKey()];
+    if (hit->full.top < top) {
+      ScrollTo(current - (top - hit->full.top));
+    } else if (hit->full.bottom > bottom) {
+      // Items taller than the view line up at the top instead.
+      ScrollTo(current + std::min(hit->full.bottom - bottom, hit->full.top - top));
+    }
+  }
+
+  void NotifyFocusChanged() {
+    if (hwnd) NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT, AccessibleFocusedChild(hwnd));
+  }
+
+  void SetFocusOrdinal(int ordinal) {
+    if (ordinal < 0 || static_cast<size_t>(ordinal) >= focusOrder.size()) return;
+    focusOrdinal = ordinal;
+    focusKey = KeyOf(hits[focusOrder[static_cast<size_t>(ordinal)]]);
+    focusVisible = true;
+    EnsureFocusVisible();
+    NotifyFocusChanged();
+    Invalidate();
+  }
+
+  void MoveFocus(int delta) {
+    if (focusOrder.empty()) return;
+    const int count = static_cast<int>(focusOrder.size());
+    const int next = focusOrdinal < 0 ? (delta > 0 ? 0 : count - 1)
+                                      : (focusOrdinal + delta + count) % count;
+    SetFocusOrdinal(next);
+  }
+
+  // Arrow keys jump to the nearest control in that direction; with nothing
+  // there, Up and Down scroll the view instead.
+  void MoveFocusDirection(WPARAM key) {
+    const Hit* current = FocusedHit();
+    if (!current) {
+      MoveFocus(key == VK_UP || key == VK_LEFT ? -1 : 1);
+      return;
+    }
+    const float cx = (current->full.left + current->full.right) / 2.0f;
+    const float cy = (current->full.top + current->full.bottom) / 2.0f;
+    int best = -1;
+    float bestScore = 0.0f;
+    for (size_t k = 0; k < focusOrder.size(); ++k) {
+      if (static_cast<int>(k) == focusOrdinal) continue;
+      const Hit& other = hits[focusOrder[k]];
+      const float dx = (other.full.left + other.full.right) / 2.0f - cx;
+      const float dy = (other.full.top + other.full.bottom) / 2.0f - cy;
+      float along = 0.0f;
+      float across = 0.0f;
+      switch (key) {
+        case VK_UP: along = -dy; across = std::abs(dx); break;
+        case VK_DOWN: along = dy; across = std::abs(dx); break;
+        case VK_LEFT: along = -dx; across = std::abs(dy); break;
+        default: along = dx; across = std::abs(dy); break;
+      }
+      if (along < 4.0f) continue;
+      const float score = along + 2.0f * across;
+      if (best < 0 || score < bestScore) {
+        best = static_cast<int>(k);
+        bestScore = score;
+      }
+    }
+    if (best >= 0) {
+      SetFocusOrdinal(best);
+    } else if (key == VK_UP || key == VK_DOWN) {
+      const auto it = visualScroll.find(ScrollKey());
+      const float now = it != visualScroll.end() ? static_cast<float>(it->second.Value()) : 0.0f;
+      ScrollTo(now + (key == VK_UP ? -80.0f : 80.0f));
+    }
+  }
+
+  void ActivateFocused() {
+    const Hit* hit = FocusedHit();
+    if (!hit) return;
+    const Hit copy = *hit;
+    focusVisible = true;
+    Activate(copy);
+  }
+
+  bool OnKeyDown(WPARAM key) {
+    if (GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MENU) < 0) return false;
+    const bool shift = GetKeyState(VK_SHIFT) < 0;
+    switch (key) {
+      case VK_ESCAPE:
+        BeginClose();
+        return true;
+      case VK_TAB:
+        MoveFocus(shift ? -1 : 1);
+        return true;
+      case VK_LEFT:
+      case VK_RIGHT:
+      case VK_UP:
+      case VK_DOWN:
+        MoveFocusDirection(key);
+        return true;
+      case VK_HOME:
+        SetFocusOrdinal(0);
+        return true;
+      case VK_END:
+        SetFocusOrdinal(static_cast<int>(focusOrder.size()) - 1);
+        return true;
+      case VK_PRIOR:
+      case VK_NEXT: {
+        const auto it = visualScroll.find(ScrollKey());
+        const float now = it != visualScroll.end() ? static_cast<float>(it->second.Value()) : 0.0f;
+        const float page = std::max(80.0f, viewportHeight * 0.9f);
+        ScrollTo(now + (key == VK_PRIOR ? -page : page));
+        return true;
+      }
+      case VK_RETURN:
+      case VK_SPACE:
+        ActivateFocused();
+        return true;
+    }
+    return false;
+  }
+
+  // -------------------------------------------------------- accessibility
+
+  std::wstring AccessibleWindowName(HWND) const override { return L"FeatherCast Phone"; }
+
+  std::vector<accessibility::Item> AccessibleItems(HWND window) const override {
+    using accessibility::Item;
+    std::vector<Item> items;
+    POINT origin{0, 0};
+    ClientToScreen(window, &origin);
+    RECT client{};
+    GetClientRect(window, &client);
+    const float scale = static_cast<float>(WindowDpi(window)) / 96.0f;
+    const auto screenRect = [&](const D2D1_RECT_F& rect) {
+      return RECT{origin.x + static_cast<LONG>(std::lround(rect.left * scale)),
+                  origin.y + static_cast<LONG>(std::lround(rect.top * scale)),
+                  origin.x + static_cast<LONG>(std::lround(rect.right * scale)),
+                  origin.y + static_cast<LONG>(std::lround(rect.bottom * scale))};
+    };
+    // Child 1: who is connected and how it is going.
+    Item status;
+    status.name = headerTitle.empty() ? std::wstring(L"FeatherCast Phone") : headerTitle;
+    status.value = headerStatus;
+    status.role = ROLE_SYSTEM_STATICTEXT;
+    status.state = STATE_SYSTEM_READONLY;
+    status.screenRect = screenRect({0.0f, 0.0f, static_cast<float>(client.right) / scale,
+                                    kHeaderHeight});
+    items.push_back(std::move(status));
+    // Child 2: the toast, announced politely when it changes.
+    Item message;
+    message.name = toast;
+    message.role = ROLE_SYSTEM_STATICTEXT;
+    message.state = STATE_SYSTEM_READONLY | (toast.empty() ? STATE_SYSTEM_INVISIBLE : 0);
+    message.liveSetting = LiveSetting::Polite;
+    message.screenRect = screenRect({0.0f, static_cast<float>(client.bottom) / scale - 80.0f,
+                                     static_cast<float>(client.right) / scale,
+                                     static_cast<float>(client.bottom) / scale});
+    items.push_back(std::move(message));
+    const bool windowFocused = GetFocus() == window;
+    for (size_t k = 0; k < focusOrder.size(); ++k) {
+      const Hit& hit = hits[focusOrder[k]];
+      Item item;
+      item.name = hit.label.empty() ? hit.tip : hit.label;
+      item.description = hit.description;
+      item.screenRect = screenRect(hit.full);
+      item.state = STATE_SYSTEM_FOCUSABLE;
+      switch (hit.role) {
+        case Role::Tab:
+          item.role = ROLE_SYSTEM_PAGETAB;
+          item.defaultAction = L"Switch";
+          if (hit.selected) item.state |= STATE_SYSTEM_SELECTED;
+          break;
+        case Role::Toggle:
+          item.role = ROLE_SYSTEM_CHECKBUTTON;
+          item.defaultAction = L"Toggle";
+          item.value = hit.checked ? L"On" : L"Off";
+          if (hit.checked) item.state |= STATE_SYSTEM_CHECKED;
+          break;
+        case Role::Row:
+          item.role = ROLE_SYSTEM_LISTITEM;
+          item.defaultAction = L"Open";
+          break;
+        default:
+          item.role = ROLE_SYSTEM_PUSHBUTTON;
+          item.defaultAction = L"Press";
+          break;
+      }
+      if (!hit.clickable) item.state |= STATE_SYSTEM_OFFSCREEN;
+      if (windowFocused && static_cast<int>(k) == focusOrdinal) item.state |= STATE_SYSTEM_FOCUSED;
+      items.push_back(std::move(item));
+    }
+    return items;
+  }
+
+  int AccessibleFocusedChild(HWND) const override {
+    if (focusOrdinal < 0 || static_cast<size_t>(focusOrdinal) >= focusOrder.size()) return 0;
+    return kFixedAccessibleChildren + 1 + focusOrdinal;
+  }
+
+  void AccessibleFocusChild(HWND, int child) override {
+    if (child <= kFixedAccessibleChildren) return;
+    SetFocusOrdinal(child - kFixedAccessibleChildren - 1);
+  }
+
+  void AccessibleInvokeChild(HWND, int child) override {
+    if (child <= kFixedAccessibleChildren) return;
+    const size_t ordinal = static_cast<size_t>(child - kFixedAccessibleChildren - 1);
+    if (ordinal >= focusOrder.size()) return;
+    const Hit copy = hits[focusOrder[ordinal]];
+    Activate(copy);
   }
 
   LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1681,13 +2576,61 @@ struct PhoneWindow::Impl {
         mouse = {-1.0f, -1.0f};
         Invalidate();
         return 0;
+      case WM_LBUTTONDOWN: {
+        const D2D1_POINT_2F point = ToDip(lParam);
+        mouse = point;
+        focusVisible = false;  // the ring is for keyboard use only
+        if (HitAt(point)) {
+          pressing = true;
+          pressPoint = point;
+          SetCapture(hwnd);
+        }
+        Invalidate();
+        return 0;
+      }
       case WM_LBUTTONUP: {
         const D2D1_POINT_2F point = ToDip(lParam);
-        if (const Hit* hit = HitAt(point)) {
-          const Hit copy = *hit;
+        const bool wasPressing = pressing;
+        const D2D1_POINT_2F start = pressPoint;
+        pressing = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        mouse = point;
+        // A click counts when the button goes down and up on the same control.
+        const Hit* down = wasPressing ? HitAt(start) : nullptr;
+        const Hit* up = HitAt(point);
+        if (down && up && KeyOf(*down) == KeyOf(*up)) {
+          const Hit copy = *up;
+          if (copy.focusable) focusKey = KeyOf(copy);
           Activate(copy);
         }
+        Invalidate();
         return 0;
+      }
+      case WM_CAPTURECHANGED:
+        if (pressing) {
+          pressing = false;
+          Invalidate();
+        }
+        return 0;
+      case WM_GETOBJECT:
+        if (static_cast<LONG>(lParam) == OBJID_CLIENT) {
+          return accessibility::HandleGetObject(this, hwnd, wParam, lParam);
+        }
+        break;
+      case WM_KILLFOCUS:
+        if (pressing) {
+          pressing = false;
+          Invalidate();
+        }
+        break;
+      case WM_SYSCOLORCHANGE:
+      case WM_THEMECHANGED:
+      case WM_SETTINGCHANGE: {
+        // High contrast switches the whole palette, so rebuild it and the chrome.
+        RefreshContrast();
+        ApplyChrome();
+        Invalidate();
+        break;
       }
       case WM_DROPFILES: {
         const auto drop = reinterpret_cast<HDROP>(wParam);
@@ -1706,51 +2649,37 @@ struct PhoneWindow::Impl {
           ShowToast(L"Only files can be sent, not folders");
         } else if (callbacks.sendFiles) {
           callbacks.sendFiles(paths);
-          ShowToast(paths.size() == 1 ? L"Sending 1 file\u2026"
-                                      : L"Sending " + std::to_wstring(paths.size()) + L" files\u2026");
+          const std::wstring noun =
+              paths.size() == 1 ? std::wstring(L"1 file") : std::to_wstring(paths.size()) + L" files";
+          // The launcher queues files while the phone is away and sends them on reconnect.
+          ShowToast(connected ? L"Sending " + noun + L"\u2026"
+                              : L"Phone is offline \u2013 " + noun +
+                                    L" will be sent when it connects");
         }
         return 0;
       }
       case WM_MOUSEWHEEL: {
         const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
-        float& offset = scroll[tab];
-        const float previous = offset;
-        const float maxScroll = std::max(0.0f, contentHeight - viewportHeight);
-        offset = std::clamp(offset - delta * 64.0f, 0.0f, maxScroll);
-        auto [it, inserted] = visualScroll.try_emplace(tab);
-        if (inserted) {
-          it->second.Configure(0.30, 1.0);
-          it->second.Snap(previous);
-        }
-        it->second.Retarget(offset, spatialMotion);
-        RequestFrame();
-        Invalidate();
+        ScrollTo(scroll[ScrollKey()] - delta * 64.0f);
         return 0;
       }
       case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-          BeginClose();
-          return 0;
-        }
+        if (OnKeyDown(wParam)) return 0;
         break;
       case WM_TIMER:
         if (wParam == kFrameTimer) {
           Frame();
         } else if (wParam == kTickTimer) {
-          const bool pairingVisible = state.enabled && state.running &&
-                                      (pairing || state.devices.empty());
-          if (pairingVisible && IsWindowVisible(hwnd)) {
+          if (ShowingPairing() && IsWindowVisible(hwnd)) {
             const long long now = NowMs();
-            if (now - networkCheckedAt >= kNetworkRecheckMs && RefreshNetwork()) Invalidate();
-            if (now - pairingCreatedAt >=
-                (pairingUri.empty() ? kNetworkRecheckMs : kQrRefreshMs)) {
-              Invalidate();
-            }
+            if (now - networkCheckedAt >= kNetworkRecheckMs) RefreshNetwork();
+            // The code's countdown changes every second.
+            Invalidate();
           }
           for (auto& photo : photos) {
             if (photo.downloading && NowMs() - photo.downloadingSince >= kPhotoTimeoutMs) {
               photo.downloading = false;
-              ShowToast(L"Your phone did not send the photo in time.");
+              ShowPhotoFailure(L"Your phone did not send the photo in time.", photo.info.id);
               Invalidate();
             }
           }
@@ -1762,6 +2691,7 @@ struct PhoneWindow::Impl {
               RequestFrame();
             } else {
               toast.clear();
+              toastRun = nullptr;
               toastOpacity.Snap(0.0);
               Invalidate();
             }
@@ -1772,6 +2702,7 @@ struct PhoneWindow::Impl {
         BeginClose();
         return 0;
       case WM_DESTROY:
+        accessibility::Disconnect(hwnd);
         KillTimer(hwnd, kTickTimer);
         KillTimer(hwnd, kFrameTimer);
         closing = false;
@@ -1799,7 +2730,7 @@ struct PhoneWindow::Impl {
 
   void ApplyChrome() {
     if (!hwnd) return;
-    const BOOL dark = TRUE;
+    const BOOL dark = highContrast ? FALSE : TRUE;
     DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
     const DWORD corners = 2;  // DWMWCP_ROUND
     DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corners,
@@ -1851,6 +2782,7 @@ struct PhoneWindow::Impl {
                     WS_OVERLAPPEDWINDOW, x, y, width, height, nullptr, nullptr, instance,
                     this);
     if (!hwnd) return false;
+    RefreshContrast();
     RECT bounds{};
     GetWindowRect(hwnd, &bounds);
     naturalWindowY = bounds.top;
@@ -1874,9 +2806,11 @@ struct PhoneWindow::Impl {
         dataDeviceId = event.deviceId;
         deviceName = event.deviceName;
         photosRequested = false;
+        photosLoaded = false;
+        lastError.clear();
         break;
       case EventKind::Disconnected:
-        activeTransfers.clear();
+        transfers.clear();
         connected = false;
         connectedId.clear();
         battery = -1;
@@ -1884,10 +2818,12 @@ struct PhoneWindow::Impl {
         media = {};
         mediaArt.Reset();
         smsRequested = false;
+        smsLoaded = false;
         for (auto& photo : photos) photo.downloading = false;
         break;
       case EventKind::Paired:
         pairing = false;
+        lastError.clear();
         ResetPairing();
         tab = Tab::Overview;
         sidebarY.Retarget(kHeaderHeight + 16.0f, spatialMotion);
@@ -1918,6 +2854,7 @@ struct PhoneWindow::Impl {
       }
       case EventKind::SmsThreads:
         smsThreads = event.smsThreads;
+        smsLoaded = true;
         break;
       case EventKind::SmsReceived:
         if (!event.smsThreads.empty()) {
@@ -1928,13 +2865,20 @@ struct PhoneWindow::Impl {
           smsThreads.insert(smsThreads.begin(), std::move(item));
         }
         break;
-      case EventKind::TransferProgress:
-        activeTransfers.insert(event.id);
-        ShowToast(L"Transferring " + Widen(event.photo.name) + L": " +
-            std::to_wstring(event.totalBytes == 0 ? 100 : event.transferredBytes * 100 / event.totalBytes) + L"%");
+      case EventKind::TransferProgress: {
+        // The persistent transfers strip shows progress; no toast per update.
+        auto found = std::find_if(transfers.begin(), transfers.end(),
+                                  [&](const Transfer& t) { return t.id == event.id; });
+        if (found == transfers.end()) {
+          transfers.push_back(Transfer{event.id, Widen(event.photo.name), 0, 0});
+          found = std::prev(transfers.end());
+        }
+        found->done = event.transferredBytes;
+        found->total = event.totalBytes;
         break;
+      }
       case EventKind::FileDelivered:
-        activeTransfers.erase(event.id);
+        EndTransfer(event.id);
         ShowToast(event.ok ? L"Sent " + Widen(event.photo.name) + L" to your phone"
                            : Widen(event.text.empty() ? "The phone could not save the file"
                                                       : event.text));
@@ -1969,6 +2913,9 @@ struct PhoneWindow::Impl {
         break;
       case EventKind::PhotoList: {
         if (!hwnd) break;  // Photos are only kept while the window is open.
+        photosLoaded = true;
+        photosAccess = event.id;  // "full", "selected" or "denied"
+        photosError = event.text;
         std::vector<PhotoItem> next;
         for (const auto& info : event.photos) {
           PhotoItem item;
@@ -1995,7 +2942,7 @@ struct PhoneWindow::Impl {
         }
         break;
       case EventKind::PhotoSaved: {
-        activeTransfers.erase(event.id);
+        EndTransfer(event.id);
         // Only open photos this window asked for; the launcher opens its own.
         bool requested = false;
         for (auto& photo : photos) {
@@ -2009,19 +2956,34 @@ struct PhoneWindow::Impl {
       }
       case EventKind::FileSaved:
       case EventKind::RemoteFileSaved:
-        activeTransfers.erase(event.id);
-        ShowToast(L"Saved to Downloads\\FeatherCast");
+        EndTransfer(event.id);
+        if (event.path.empty()) {
+          ShowToast(L"Saved to Downloads\\FeatherCast");
+        } else {
+          const std::wstring path = event.path;
+          const HWND owner = hwnd;
+          ShowToast(L"Saved " + std::filesystem::path(path).filename().wstring(),
+                    L"Show in folder", [owner, path] { RevealInFolder(owner, path); });
+        }
         break;
       case EventKind::Error:
-        if (event.id == "*") activeTransfers.clear();
-        else activeTransfers.erase(event.id);
+        if (event.id == "*") transfers.clear();
+        else EndTransfer(event.id);
         // Only the failed photo stops downloading; other requests are still pending.
         if (!event.photo.id.empty()) {
           for (auto& photo : photos) {
             if (photo.info.id == event.photo.id) photo.downloading = false;
           }
         }
-        if (!event.text.empty()) ShowToast(Widen(event.text));
+        if (!event.text.empty()) {
+          // Without a photo or transfer it is a link problem; the pairing screen shows it too.
+          if (event.photo.id.empty() && event.id.empty()) {
+            lastError = event.text;
+            lastErrorAt = NowMs();
+          }
+          if (event.photo.id.empty()) ShowToast(Widen(event.text));
+          else ShowPhotoFailure(Widen(event.text), event.photo.id);
+        }
         break;
       case EventKind::ClipboardHistoryRequested:
         break;
@@ -2039,8 +3001,10 @@ PhoneWindow::~PhoneWindow() {
 void PhoneWindow::SetCallbacks(Callbacks callbacks) { impl_->callbacks = std::move(callbacks); }
 
 void PhoneWindow::SetTheme(const theme::Theme& theme, theme::Color accent) {
-  impl_->theme = theme;
-  impl_->accent = accent;
+  impl_->baseTheme = theme;
+  impl_->baseAccent = accent;
+  impl_->RefreshContrast();
+  impl_->ResetFormats();  // the theme may name another font
   impl_->ApplyChrome();
   impl_->Invalidate();
 }
@@ -2070,10 +3034,8 @@ void PhoneWindow::Show(HWND owner, bool pairing) {
     impl_->ResetPairing();
   }
   impl_->networkCheckedAt = 0;  // look at the addresses again on the first paint
-  if (impl_->connected && impl_->photos.empty() && !impl_->photosRequested &&
-      impl_->callbacks.requestPhotos) {
-    impl_->photosRequested = true;
-    impl_->callbacks.requestPhotos();
+  if (impl_->connected && impl_->photos.empty() && !impl_->photosRequested) {
+    impl_->RequestPhotoList();
   }
   impl_->ShowAnimated();
 }
@@ -2097,17 +3059,7 @@ void OpenReceivedFileSafely(HWND owner, const std::wstring& path) {
           ShellExecuteW(owner, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32) {
     return;
   }
-  if (PIDLIST_ABSOLUTE item = ILCreateFromPathW(path.c_str())) {
-    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const HRESULT shown = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
-    if (SUCCEEDED(initialized)) CoUninitialize();
-    ILFree(item);
-    if (SUCCEEDED(shown)) return;
-  }
-  const std::wstring folder = file.parent_path().wstring();
-  if (!folder.empty()) {
-    ShellExecuteW(owner, L"explore", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-  }
+  RevealInFolder(owner, path);
 }
 
 }  // namespace feathercast::phone_ui
