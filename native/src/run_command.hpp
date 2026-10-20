@@ -59,7 +59,9 @@ inline bool LooksLikeHost(const std::wstring& host) {
   if (host.front() == L'.' || host.back() == L'.' || host.find(L'.') == std::wstring::npos) return false;
   // "notepad.exe" is a program to run, not a domain; none of these is a TLD.
   const std::wstring label = host.substr(host.rfind(L'.') + 1);
-  for (const wchar_t* extension : {L"exe", L"bat", L"cmd", L"msc", L"cpl", L"ps1", L"vbs"}) {
+  for (const wchar_t* extension :
+       {L"exe", L"bat", L"cmd", L"msc", L"cpl", L"ps1", L"vbs", L"vbe", L"js", L"jse",
+        L"wsf", L"wsh", L"hta", L"msi", L"msp", L"lnk", L"reg", L"scr", L"pif", L"jar"}) {
     if (label == extension) return false;
   }
   return std::all_of(host.begin(), host.end(), [](wchar_t ch) {

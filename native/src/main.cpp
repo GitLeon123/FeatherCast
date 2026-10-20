@@ -4445,8 +4445,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     auto projections = drain(fileProjectionEvents_, 2);
     for (auto& projection : projections.events) {
-      if (projection.generation != fileIndexProjectionGeneration_ ||
-          !projection.files) {
+      if (projection.generation != fileIndexProjectionGeneration_) continue;
+      if (!projection.files) {
+        // The projection failed; clear the flag so the next search retries.
+        fileIndexProjectionPending_ = false;
+        NotifyLauncherStatusChanged();
         continue;
       }
       {

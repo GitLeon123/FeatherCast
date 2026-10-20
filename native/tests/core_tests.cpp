@@ -783,6 +783,13 @@ int main() {
     assert(program);
     assert(program->kind == feathercast::run_command::Kind::ShellCommand);
     assert(program->input == L"notepad.exe");
+
+    // Launchable files that are not TLDs run as commands instead of becoming URLs.
+    for (const wchar_t* name : {L">setup.msi", L">regedit.lnk", L">script.js", L">tweak.reg"}) {
+      const auto launchable = feathercast::run_command::Classify(name);
+      assert(launchable);
+      assert(launchable->kind == feathercast::run_command::Kind::ShellCommand);
+    }
   }
 
   {

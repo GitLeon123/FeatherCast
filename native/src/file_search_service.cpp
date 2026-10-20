@@ -292,6 +292,13 @@ void FileSearchService::WorkerLoop(std::stop_token token) {
       }
     } catch (...) {
       if (errors_) errors_(std::current_exception());
+      if (projectStorageFiles && projectionSink_) {
+        // Tell the UI thread this projection failed so it can retry.
+        try {
+          projectionSink_(PreparedFileIndex{storageFilesGeneration, nullptr});
+        } catch (...) {
+        }
+      }
       continue;
     }
     try {
