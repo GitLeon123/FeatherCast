@@ -145,7 +145,7 @@ enum class Tool {
   Pixelate,
 };
 
-enum class Destination { File, Clipboard };
+enum class Destination { File, Clipboard, FileAndClipboard };
 
 // This is deliberately shared with the Win32 toolbar projection.  Keeping
 // the action order and bounds in a pure contract prevents paint, mouse hit
@@ -171,6 +171,7 @@ enum class ToolbarAction {
   StrokeUp,
   Save,
   Copy,
+  SaveCopy,
   Cancel,
 };
 
@@ -210,6 +211,7 @@ inline float ToolbarPreferredWidth(ToolbarAction action, bool compact) noexcept 
     case ToolbarAction::Save:
     case ToolbarAction::Copy:
     case ToolbarAction::Cancel: return compact ? 64.0f : 76.0f;
+    case ToolbarAction::SaveCopy: return compact ? 84.0f : 96.0f;
   }
   return 48.0f;
 }
@@ -236,9 +238,54 @@ inline const wchar_t* ToolbarActionLabel(ToolbarAction action) noexcept {
     case ToolbarAction::StrokeUp: return L"Stroke +";
     case ToolbarAction::Save: return L"Save";
     case ToolbarAction::Copy: return L"Copy";
+    case ToolbarAction::SaveCopy: return L"Save + Copy";
     case ToolbarAction::Cancel: return L"Cancel";
   }
   return L"";
+}
+
+// Accessible name for a toolbar button: the visible label can be terse or
+// symbolic, so this spells it out and includes the keyboard shortcut.
+inline const wchar_t* ToolbarActionAccessibleName(ToolbarAction action) noexcept {
+  switch (action) {
+    case ToolbarAction::Undo: return L"Undo (Ctrl+Z)";
+    case ToolbarAction::Redo: return L"Redo (Ctrl+Y)";
+    case ToolbarAction::ColorAccent: return L"Annotation color: Accent";
+    case ToolbarAction::ColorRed: return L"Annotation color: Red";
+    case ToolbarAction::ColorYellow: return L"Annotation color: Yellow";
+    case ToolbarAction::ColorWhite: return L"Annotation color: White";
+    case ToolbarAction::ColorBlack: return L"Annotation color: Black";
+    case ToolbarAction::StrokeDown: return L"Decrease stroke width";
+    case ToolbarAction::StrokeUp: return L"Increase stroke width";
+    case ToolbarAction::Save: return L"Save (Ctrl+S)";
+    case ToolbarAction::Copy: return L"Copy (Ctrl+C)";
+    case ToolbarAction::SaveCopy: return L"Save and copy (Ctrl+Shift+S)";
+    case ToolbarAction::Cancel: return L"Cancel (Esc)";
+    default: return ToolbarActionLabel(action);
+  }
+}
+
+// Footer hint shown while a toolbar button is hovered or focused (the editor
+// has no native tooltips). Returns an empty string for self-explanatory tools.
+inline const wchar_t* ToolbarActionHint(ToolbarAction action) noexcept {
+  switch (action) {
+    case ToolbarAction::Select:
+      return L"Select: drag the region or its handles to move or resize it";
+    case ToolbarAction::Undo: return L"Undo (Ctrl+Z)";
+    case ToolbarAction::Redo: return L"Redo (Ctrl+Y or Ctrl+Shift+Z)";
+    case ToolbarAction::ColorAccent: return L"Annotation color: Accent";
+    case ToolbarAction::ColorRed: return L"Annotation color: Red";
+    case ToolbarAction::ColorYellow: return L"Annotation color: Yellow";
+    case ToolbarAction::ColorWhite: return L"Annotation color: White";
+    case ToolbarAction::ColorBlack: return L"Annotation color: Black";
+    case ToolbarAction::Save:
+      return L"Save (Ctrl+S) to Pictures\\FeatherCast";
+    case ToolbarAction::Copy: return L"Copy (Ctrl+C) to the clipboard";
+    case ToolbarAction::SaveCopy:
+      return L"Save and copy (Ctrl+Shift+S): Pictures\\FeatherCast and clipboard";
+    case ToolbarAction::Cancel: return L"Cancel (Esc)";
+    default: return L"";
+  }
 }
 
 inline ToolbarLayout BuildToolbarLayout(float width, float height,
@@ -258,7 +305,7 @@ inline ToolbarLayout BuildToolbarLayout(float width, float height,
   const float rowHeight = std::max(32.0f, 18.0f * textScale + 12.0f);
   const float widthScale = 1.0f + 0.65f * std::max(0.0f, textScale - 1.0f);
 
-  constexpr std::array<ToolbarAction, 21> actions = {
+  constexpr std::array<ToolbarAction, 22> actions = {
       ToolbarAction::Select,       ToolbarAction::Rectangle,
       ToolbarAction::Ellipse,       ToolbarAction::Line,
       ToolbarAction::Arrow,         ToolbarAction::Freehand,
@@ -269,7 +316,7 @@ inline ToolbarLayout BuildToolbarLayout(float width, float height,
       ToolbarAction::ColorWhite,    ToolbarAction::ColorBlack,
       ToolbarAction::StrokeDown,    ToolbarAction::StrokeUp,
       ToolbarAction::Save,          ToolbarAction::Copy,
-      ToolbarAction::Cancel};
+      ToolbarAction::SaveCopy,      ToolbarAction::Cancel};
 
   ToolbarLayout result;
   result.buttons.reserve(actions.size());
@@ -833,8 +880,8 @@ class EditorController {
       return false;
     }
     CancelGesture(state);
-    state.phase = destination == Destination::File ? Phase::Saving
-                                                   : Phase::Copying;
+    state.phase = destination == Destination::Clipboard ? Phase::Copying
+                                                        : Phase::Saving;
     return true;
   }
 

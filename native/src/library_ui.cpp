@@ -39,6 +39,7 @@ enum ControlId : int {
   IdDelete,
   IdReload,
   IdOpenFile,
+  IdRestoreDefaults,
   IdStatus,
   IdName,
   IdKeyword,
@@ -48,6 +49,11 @@ enum ControlId : int {
 // Posted by the manager to itself so the initial editor opens after window
 // creation has finished instead of running a nested modal loop in WM_CREATE.
 constexpr UINT kMsgOpenInitialEditor = WM_APP + 1;
+
+// Polls for the result of an asynchronous snippet save.
+constexpr UINT_PTR kTimerSaveStatus = 1;
+constexpr UINT kSavePollMs = 150;
+constexpr int kSavePollMaxTicks = 100;
 
 constexpr UINT kBaseDpi = 96;
 constexpr int kWorkAreaInset = 24;
@@ -568,10 +574,10 @@ class EditorWindow {
         AddControl(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, IdKeyword);
     valueLabel_ = AddControl(
         WC_STATICW,
-        kind_ == library::ItemKind::Snippet ? L"Text" :
+        kind_ == library::ItemKind::Snippet ? L"Text (Ctrl+Enter to save)" :
         (webSearch ? L"URL template (use %s for the query)" :
          kind_ == library::ItemKind::Script ? L"PowerShell file (.ps1); runs under your Windows policy" :
-         kind_ == library::ItemKind::Workspace ? L"Apps, files, folders or URLs (one per line, up to 16)" : L"Target"),
+         kind_ == library::ItemKind::Workspace ? L"Apps, files, folders or URLs (one per line, up to 16; Ctrl+Enter to save)" : L"Target"),
         SS_LEFT, 0);
     DWORD valueStyle = WS_TABSTOP;
     if (kind_ == library::ItemKind::Snippet || kind_ == library::ItemKind::Workspace) {
@@ -674,6 +680,28 @@ class EditorWindow {
       SetWindowTextW(value_, webSearch_.urlTemplate.c_str());
     }
     SetFocus(webSearch ? keyword_ : name_);
+    initialState_ = CaptureState();
+  }
+
+  struct EditorState {
+    std::wstring name;
+    std::wstring keyword;
+    std::wstring value;
+    int selection = -1;
+    bool operator==(const EditorState&) const = default;
+  };
+
+  EditorState CaptureState() const {
+    return {ControlText(name_), ControlText(keyword_), ControlText(value_),
+            static_cast<int>(SendMessageW(name_, CB_GETCURSEL, 0, 0))};
+  }
+
+  // Cancelling with edited fields asks first; an untouched editor just closes.
+  bool ConfirmDiscard() const {
+    if (CaptureState() == initialState_) return true;
+    return MessageBoxW(hwnd_, L"Discard your unsaved changes?",
+                       L"FeatherCast Library",
+                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
   }
 
   void Layout(int width, int height) const {
@@ -858,12 +886,12 @@ class EditorWindow {
           return 0;
         }
         if (LOWORD(wParam) == IDCANCEL) {
-          Close();
+          if (ConfirmDiscard()) Close();
           return 0;
         }
         break;
       case WM_CLOSE:
-        Close();
+        if (ConfirmDiscard()) Close();
         return 0;
     }
     return DefWindowProcW(hwnd_, message, wParam, lParam);
@@ -872,6 +900,7 @@ class EditorWindow {
   HWND owner_ = nullptr;
   HWND hwnd_ = nullptr;
   HFONT font_ = nullptr;
+  EditorState initialState_;
   library::ItemKind kind_ = library::ItemKind::Snippet;
   std::vector<snippets::Snippet> snippets_;
   std::vector<settings::Quicklink> quicklinks_;
@@ -945,8 +974,18 @@ class ManagerWindow {
     RunDialogLoop(
         hwnd_,
         [this](const MSG& message) {
-          if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+          if (message.message != WM_KEYDOWN) return false;
+          if (message.wParam == VK_ESCAPE) {
             SendMessageW(hwnd_, WM_COMMAND, IDCANCEL, 0);
+            return true;
+          }
+          // Enter edits and Delete deletes the selected row.
+          if (message.hwnd == list_ && message.wParam == VK_RETURN) {
+            EditItem();
+            return true;
+          }
+          if (message.hwnd == list_ && message.wParam == VK_DELETE) {
+            DeleteItem();
             return true;
           }
           return false;
@@ -1002,7 +1041,7 @@ class ManagerWindow {
     const HFONT previous = font_;
     font_ = next;
     for (HWND control : {tabs_, list_, add_, edit_, remove_, reload_, openFile_,
-                         close_, status_}) {
+                         restore_, close_, status_, empty_}) {
       UseDefaultFont(control, font_);
     }
     if (previous) DeleteObject(previous);
@@ -1047,7 +1086,9 @@ class ManagerWindow {
   LRESULT ColorControl(UINT message, WPARAM wParam, LPARAM lParam) const {
     HDC dc = reinterpret_cast<HDC>(wParam);
     const HWND control = reinterpret_cast<HWND>(lParam);
-    const bool staticControl = message == WM_CTLCOLORSTATIC;
+    // The empty-state text sits on the list, so it uses the list's surface.
+    const bool staticControl =
+        message == WM_CTLCOLORSTATIC && control != empty_;
     const bool statusControl = control == status_;
     const COLORREF text = statusControl && operationStatusError_
                               ? (highContrast_ ? GetSysColor(COLOR_WINDOWTEXT)
@@ -1108,17 +1149,7 @@ class ManagerWindow {
     ListView_SetExtendedListViewStyle(
         list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     RefreshBrushes();
-    LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH};
-    column.pszText = const_cast<wchar_t*>(L"Name");
-    const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
-    column.cx = ScaleForDpi(190, dpi);
-    ListView_InsertColumn(list_, 0, &column);
-    column.pszText = const_cast<wchar_t*>(L"Keyword");
-    column.cx = ScaleForDpi(130, dpi);
-    ListView_InsertColumn(list_, 1, &column);
-    column.pszText = const_cast<wchar_t*>(L"Text / Target");
-    column.cx = ScaleForDpi(360, dpi);
-    ListView_InsertColumn(list_, 2, &column);
+    ConfigureColumns();
 
     add_ = AddControl(WC_BUTTONW, L"Add", WS_TABSTOP, IdAdd);
     edit_ = AddControl(WC_BUTTONW, L"Edit", WS_TABSTOP, IdEdit);
@@ -1126,10 +1157,13 @@ class ManagerWindow {
     reload_ = AddControl(WC_BUTTONW, L"Reload", WS_TABSTOP, IdReload);
     openFile_ =
         AddControl(WC_BUTTONW, L"Open File", WS_TABSTOP, IdOpenFile);
-    close_ = AddControl(WC_BUTTONW, L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        IDCANCEL);
+    restore_ = AddControl(WC_BUTTONW, L"Restore Defaults", WS_TABSTOP,
+                          IdRestoreDefaults);
+    // Not the default button: Enter in the list edits the selected row.
+    close_ = AddControl(WC_BUTTONW, L"Close", WS_TABSTOP, IDCANCEL);
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
     SetLiveSetting(status_, 1);
+    empty_ = AddControl(WC_STATICW, L"", SS_LEFT | SS_NOPREFIX, 0);
     RefreshFont();
     Refresh();
     // Opening the editor runs a nested modal loop, which does not belong in
@@ -1138,6 +1172,104 @@ class ManagerWindow {
          IsCommandItem(kind_) || IsLaunchItem(kind_)) &&
         !initialAppId_.empty()) {
       PostMessageW(hwnd_, kMsgOpenInitialEditor, 0, 0);
+    }
+  }
+
+  // Column headers differ per tab; web searches only have two columns.
+  void ConfigureColumns() {
+    const wchar_t* headers[3] = {L"Name", L"Keyword", L"Text"};
+    int count = 3;
+    switch (kind_) {
+      case library::ItemKind::Snippet:
+        headers[2] = L"Text";
+        break;
+      case library::ItemKind::Quicklink:
+        headers[2] = L"Target";
+        break;
+      case library::ItemKind::Script:
+        headers[2] = L"PowerShell file";
+        break;
+      case library::ItemKind::Workspace:
+        headers[2] = L"Items";
+        break;
+      case library::ItemKind::AppAlias:
+        headers[0] = L"App";
+        headers[1] = L"Alias";
+        headers[2] = L"Status";
+        break;
+      case library::ItemKind::CommandAlias:
+        headers[0] = L"Command";
+        headers[1] = L"Alias";
+        headers[2] = L"What it does";
+        break;
+      case library::ItemKind::CommandShortcut:
+        headers[0] = L"Command";
+        headers[1] = L"Shortcut";
+        headers[2] = L"What it does";
+        break;
+      case library::ItemKind::WebSearch:
+        headers[0] = L"Keyword";
+        headers[1] = L"URL template";
+        count = 2;
+        break;
+    }
+    while (Header_GetItemCount(ListView_GetHeader(list_)) > 0) {
+      ListView_DeleteColumn(list_, 0);
+    }
+    const UINT dpi = std::max(kBaseDpi, DpiForWindow(hwnd_));
+    const int widths[3] = {190, 130, 360};
+    for (int index = 0; index < count; ++index) {
+      LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH};
+      column.pszText = const_cast<wchar_t*>(headers[index]);
+      column.cx = ScaleForDpi(widths[index], dpi);
+      ListView_InsertColumn(list_, index, &column);
+    }
+    columnCount_ = count;
+  }
+
+  const wchar_t* EmptyText() const {
+    switch (kind_) {
+      case library::ItemKind::Snippet:
+        return L"No snippets yet. Add one, then type its keyword in FeatherCast to paste its text.";
+      case library::ItemKind::Quicklink:
+        return L"No quicklinks yet. Add one, then type its keyword in FeatherCast to open its URL or file.";
+      case library::ItemKind::AppAlias:
+        return L"No app aliases yet. Add one to launch an app by typing a short alias in FeatherCast.";
+      case library::ItemKind::CommandAlias:
+        return L"No command aliases yet. Add one to run a FeatherCast command by typing a short alias.";
+      case library::ItemKind::WebSearch:
+        return L"No web searches. Add one, then type its keyword and a query in FeatherCast, or choose Restore Defaults.";
+      case library::ItemKind::Script:
+        return L"No scripts yet. Add a PowerShell file (.ps1), then type its keyword in FeatherCast to run it.";
+      case library::ItemKind::Workspace:
+        return L"No workspaces yet. Add a set of apps, files or URLs, then type its keyword in FeatherCast to open them all.";
+      case library::ItemKind::CommandShortcut:
+        return L"No command shortcuts yet. Add one to run a FeatherCast command with a global keyboard shortcut.";
+    }
+    return L"";
+  }
+
+  // Name shown in the delete confirmation for the item at `index`.
+  std::wstring ItemDisplayName(std::size_t index) {
+    switch (kind_) {
+      case library::ItemKind::Snippet:
+        return data_.snippets[index].name.empty() ? data_.snippets[index].keyword
+                                                  : data_.snippets[index].name;
+      case library::ItemKind::AppAlias:
+        return data_.appAliases[index].appName.empty()
+                   ? data_.appAliases[index].alias
+                   : data_.appAliases[index].appName;
+      case library::ItemKind::CommandAlias:
+      case library::ItemKind::CommandShortcut: {
+        const auto& item = CommandItems()[index];
+        return item.commandName.empty() ? item.alias : item.commandName;
+      }
+      case library::ItemKind::WebSearch:
+        return data_.webSearches[index].keyword;
+      default: {
+        const auto& item = LaunchItems()[index];
+        return item.name.empty() ? item.keyword : item.name;
+      }
     }
   }
 
@@ -1202,16 +1334,26 @@ class ManagerWindow {
     const int listColumnWidth = std::max(1, contentWidth - px(4));
     const int nameColumn = listColumnWidth * 28 / 100;
     const int keywordColumn = listColumnWidth * 20 / 100;
-    ListView_SetColumnWidth(list_, 0, std::max(1, nameColumn));
-    ListView_SetColumnWidth(list_, 1, std::max(1, keywordColumn));
-    ListView_SetColumnWidth(
-        list_, 2, std::max(1, listColumnWidth - nameColumn - keywordColumn));
+    if (columnCount_ == 2) {
+      const int keyColumn = listColumnWidth * 25 / 100;
+      ListView_SetColumnWidth(list_, 0, std::max(1, keyColumn));
+      ListView_SetColumnWidth(list_, 1, std::max(1, listColumnWidth - keyColumn));
+    } else {
+      ListView_SetColumnWidth(list_, 0, std::max(1, nameColumn));
+      ListView_SetColumnWidth(list_, 1, std::max(1, keywordColumn));
+      ListView_SetColumnWidth(
+          list_, 2, std::max(1, listColumnWidth - nameColumn - keywordColumn));
+    }
+    MoveWindow(empty_, margin + px(12), listTop + px(40),
+               std::max(1, contentWidth - px(24)), px(48), TRUE);
     int x = margin;
     for (HWND button : {add_, edit_, remove_, reload_}) {
       MoveWindow(button, x, buttonsTop, actionWidth, buttonHeight, TRUE);
       x += actionWidth + gap;
     }
     MoveWindow(openFile_, specialX, buttonsTop, specialWidth, buttonHeight,
+               TRUE);
+    MoveWindow(restore_, specialX, buttonsTop, specialWidth, buttonHeight,
                TRUE);
     MoveWindow(close_, closeX, buttonsTop, closeWidth, buttonHeight, TRUE);
   }
@@ -1257,8 +1399,10 @@ class ManagerWindow {
     const int inserted = ListView_InsertItem(list_, &item);
     ListView_SetItemText(list_, inserted, 1,
                          const_cast<wchar_t*>(keyword.c_str()));
-    ListView_SetItemText(list_, inserted, 2,
-                         const_cast<wchar_t*>(detail.c_str()));
+    if (columnCount_ > 2) {
+      ListView_SetItemText(list_, inserted, 2,
+                           const_cast<wchar_t*>(detail.c_str()));
+    }
   }
 
   // Selects the row showing `sourceIndex` (an index into the underlying
@@ -1322,27 +1466,34 @@ class ManagerWindow {
       for (const auto index :
            library::SortedAppAliasIndices(data_.appAliases)) {
         const auto& alias = data_.appAliases[index];
+        // The app name is resolved from the discovered apps; the raw id is
+        // only shown when the app is no longer installed.
         InsertRow(row++, index,
                   alias.appName.empty() ? L"Missing app" : alias.appName,
-                  alias.alias, alias.appId);
+                  alias.alias,
+                  alias.appName.empty()
+                      ? L"Not installed (" + alias.appId + L")"
+                      : L"Available");
       }
     } else if (IsCommandItem(kind_)) {
       int row = 0;
       for (const auto index :
            library::SortedCommandAliasIndices(CommandItems())) {
         const auto& alias = CommandItems()[index];
+        const auto* descriptor = commands::Find(alias.stableId);
         InsertRow(row++, index,
                   alias.commandName.empty() ? L"Missing command"
                                             : alias.commandName,
-                  alias.alias, alias.stableId);
+                  alias.alias,
+                  descriptor ? descriptor->detail
+                             : L"Unknown command (" + alias.stableId + L")");
       }
     } else {
       int row = 0;
       for (const auto index :
            library::SortedWebSearchIndices(data_.webSearches)) {
         const auto& search = data_.webSearches[index];
-        InsertRow(row++, index, search.keyword, search.keyword,
-                  search.urlTemplate);
+        InsertRow(row++, index, search.keyword, search.urlTemplate, {});
       }
     }
     if (select) SelectSourceIndex(*select);
@@ -1353,11 +1504,18 @@ class ManagerWindow {
     EnableWindow(add_, canAdd);
     EnableWindow(edit_, Writable() && selected.has_value());
     EnableWindow(remove_, Writable() && selected.has_value());
-    EnableWindow(openFile_, kind_ == library::ItemKind::Snippet ||
-                                (kind_ == library::ItemKind::WebSearch &&
-                                 Writable()));
-    SetWindowTextW(openFile_, kind_ == library::ItemKind::WebSearch
-                                  ? L"Restore Defaults" : L"Open File");
+    // "Open File" only applies to snippets (snippets.json); web searches have
+    // their own "Restore Defaults" button. Other tabs show neither.
+    ShowWindow(openFile_,
+               kind_ == library::ItemKind::Snippet ? SW_SHOW : SW_HIDE);
+    ShowWindow(restore_,
+               kind_ == library::ItemKind::WebSearch ? SW_SHOW : SW_HIDE);
+    EnableWindow(openFile_, kind_ == library::ItemKind::Snippet);
+    EnableWindow(restore_, kind_ == library::ItemKind::WebSearch &&
+                               Writable() &&
+                               static_cast<bool>(callbacks_.restoreDefaultWebSearches));
+    SetWindowTextW(empty_, EmptyText());
+    ShowWindow(empty_, ListView_GetItemCount(list_) == 0 ? SW_SHOW : SW_HIDE);
     const std::wstring message = kind_ == library::ItemKind::Snippet
         ? data_.snippetsMessage
         : (IsLaunchItem(kind_) ? data_.quicklinksMessage
@@ -1380,11 +1538,46 @@ class ManagerWindow {
   }
 
   void ShowResult(const library::OperationResult& result) {
+    savePending_ = false;
+    KillTimer(hwnd_, kTimerSaveStatus);
+    if (result.succeeded && kind_ == library::ItemKind::Snippet &&
+        callbacks_.pollSnippetSave) {
+      // Snippet writes complete on a worker; report "saved" only once the
+      // file is actually written (see WM_TIMER).
+      savePending_ = true;
+      savePollTicks_ = 0;
+      SetTimer(hwnd_, kTimerSaveStatus, kSavePollMs, nullptr);
+      SetStatus(L"Saving...", false);
+      return;
+    }
+    // Settings-backed tabs apply immediately and persist in the background;
+    // their completion is reported in Settings, not here.
     SetStatus(result.succeeded
-                  ? L"Changes saved."
+                  ? L"Changes applied."
                   : (result.message.empty() ? L"Could not save changes."
                                              : result.message),
               !result.succeeded);
+  }
+
+  void PollSaveStatus() {
+    if (!savePending_) {
+      KillTimer(hwnd_, kTimerSaveStatus);
+      return;
+    }
+    const auto outcome = callbacks_.pollSnippetSave();
+    if (outcome) {
+      savePending_ = false;
+      KillTimer(hwnd_, kTimerSaveStatus);
+      SetStatus(outcome->succeeded
+                    ? L"Changes saved."
+                    : (outcome->message.empty() ? L"Could not save changes."
+                                                : outcome->message),
+                !outcome->succeeded);
+    } else if (++savePollTicks_ > kSavePollMaxTicks) {
+      savePending_ = false;
+      KillTimer(hwnd_, kTimerSaveStatus);
+      SetStatus(L"Saving is taking longer than expected.", true);
+    }
   }
 
   // Saves `candidate`. On success it becomes the stored list; on failure the
@@ -1487,8 +1680,9 @@ class ManagerWindow {
   void DeleteItem() {
     const auto selected = SelectedIndex();
     if (!selected || !Writable()) return;
-    if (MessageBoxW(hwnd_, L"Delete the selected library item?",
-                    L"FeatherCast Library",
+    const std::wstring prompt =
+        L"Delete \"" + ItemDisplayName(*selected) + L"\"?";
+    if (MessageBoxW(hwnd_, prompt.c_str(), L"FeatherCast Library",
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
       return;
     }
@@ -1530,6 +1724,12 @@ class ManagerWindow {
       case kMsgOpenInitialEditor:
         OpenInitialEditor();
         return 0;
+      case WM_TIMER:
+        if (wParam == kTimerSaveStatus) {
+          PollSaveStatus();
+          return 0;
+        }
+        break;
       case WM_ERASEBKGND:
         return 1;
       case WM_PAINT:
@@ -1597,6 +1797,10 @@ class ManagerWindow {
           initialAppId_.clear();
           operationStatus_.clear();
           operationStatusError_ = false;
+          savePending_ = false;
+          KillTimer(hwnd_, kTimerSaveStatus);
+          ConfigureColumns();
+          LayoutCurrentClient();
           Refresh();
           return 0;
         }
@@ -1621,8 +1825,11 @@ class ManagerWindow {
             operationStatus_.clear();
             operationStatusError_ = false;
             Refresh();
+            // Refresh leaves an unavailable/protected message in place; only
+            // confirm the reload when the library is usable.
+            if (Writable()) SetStatus(L"Library reloaded.", false);
             return 0;
-          case IdOpenFile:
+          case IdRestoreDefaults:
             if (kind_ == library::ItemKind::WebSearch &&
                 callbacks_.restoreDefaultWebSearches) {
               // Replaces every web search, including custom ones.
@@ -1638,9 +1845,10 @@ class ManagerWindow {
               ShowResult(result);
               if (callbacks_.reload) data_ = callbacks_.reload();
               Refresh();
-            } else if (callbacks_.openSnippetsFile) {
-              callbacks_.openSnippetsFile();
             }
+            return 0;
+          case IdOpenFile:
+            if (callbacks_.openSnippetsFile) callbacks_.openSnippetsFile();
             return 0;
           case IDCANCEL:
             Close();
@@ -1672,8 +1880,13 @@ class ManagerWindow {
   HWND remove_ = nullptr;
   HWND reload_ = nullptr;
   HWND openFile_ = nullptr;
+  HWND restore_ = nullptr;
   HWND close_ = nullptr;
   HWND status_ = nullptr;
+  HWND empty_ = nullptr;
+  int columnCount_ = 3;
+  bool savePending_ = false;
+  int savePollTicks_ = 0;
   HBRUSH backgroundBrush_ = nullptr;
   HBRUSH surfaceBrush_ = nullptr;
   HBRUSH selectedBrush_ = nullptr;

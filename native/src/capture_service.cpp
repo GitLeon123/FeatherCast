@@ -1054,7 +1054,7 @@ class CaptureService::Impl {
       }
 
       const PixelRect outputBounds{crop.left, crop.top, crop.right, crop.bottom};
-      if (destination == screenshot::Destination::File) {
+      if (destination != screenshot::Destination::Clipboard) {
         const auto output = NextOutputPaths(CaptureOperation::Screenshot);
         temporary = output.partialPath;
         EncodePng(temporary, rendered->pixels,
@@ -1065,8 +1065,14 @@ class CaptureService::Impl {
           winrt::check_hresult(HRESULT_FROM_WIN32(GetLastError()));
         }
         temporary.clear();
+        // The file is already on disk, so a clipboard failure here is
+        // reported through clipboardSucceeded instead of failing the save.
+        const bool alsoCopied =
+            destination == screenshot::Destination::FileAndClipboard &&
+            PublishClipboard(rendered->pixels, static_cast<int>(rendered->width),
+                             static_cast<int>(rendered->height));
         Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
-                  scope, outputBounds, output.finalPath, {}, {}, false});
+                  scope, outputBounds, output.finalPath, {}, {}, alsoCopied});
         return;
       }
 
