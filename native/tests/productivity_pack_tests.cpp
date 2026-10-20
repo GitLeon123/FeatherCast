@@ -1004,6 +1004,16 @@ int main() {
          aliasTarget->currentAlias == L"Louder Now");
   assert(feathercast::commands::IsPersonalizableInvocation(*aliasedVolume));
   assert(feathercast::commands::RecordsRecentActivation(*aliasedVolume));
+  for (const auto& command : feathercast::commands::BuildCommandItems()) {
+    const auto* descriptor = feathercast::commands::Find(command.commandStableId);
+    assert(descriptor);
+    // Commands that ask for confirmation never enter the Recent section.
+    assert(feathercast::commands::RequiresConfirmation(command) ==
+           descriptor->confirmation.has_value());
+    if (descriptor->confirmation) {
+      assert(!feathercast::commands::RecordsRecentActivation(command));
+    }
+  }
 
   const auto settingsTargets = feathercast::system_settings::Catalog();
   assert(settingsTargets.size() >= 100);

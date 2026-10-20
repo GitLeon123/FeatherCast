@@ -43,6 +43,7 @@ core::SearchItem BuildSearchItem(
 std::vector<app::DisplayItem> BuildActions(
     const app::DisplayItem& target, const app::Settings& settings);
 bool IsPersonalizableInvocation(const app::DisplayItem& item);
+bool RequiresConfirmation(const app::DisplayItem& item);
 bool RecordsRecentActivation(const app::DisplayItem& item);
 bool ValidateCatalog(std::wstring* error = nullptr);
 
