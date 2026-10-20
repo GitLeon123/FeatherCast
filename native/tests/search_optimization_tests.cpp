@@ -239,10 +239,12 @@ void CheckRoot(std::size_t count, bool aliases, bool exact, bool preferred,
     if (!explicitMatches.empty()) add(L"Best match", explicitMatches, SIZE_MAX);
   }
   if (noApps && explicitMatches.empty()) add(L"Best match", {order.front()}, 1);
+  // Every fixture window title starts with the query, so open windows are
+  // promoted directly behind Apps and Games.
   for (const auto& [title, limit] : std::vector<std::pair<std::wstring, std::size_t>>{
-           {L"Apps", 80}, {L"Games", 80}, {L"Windows Settings", 40},
-           {L"Snippets", 20}, {L"Files & Folders", 40},
-           {L"System Folders", 30}, {L"Open windows", 40}}) {
+           {L"Apps", 80}, {L"Games", 80}, {L"Open windows", 40},
+           {L"Windows Settings", 40}, {L"Snippets", 20},
+           {L"Files & Folders", 40}, {L"System Folders", 30}}) {
     std::vector<std::size_t> indices;
     for (const auto index : order) if (buckets[index] == title) indices.push_back(index);
     add(title, indices, limit);

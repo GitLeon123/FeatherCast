@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <string>
+#include <utility>
 
 namespace feathercast::text_edit {
 
@@ -65,6 +66,26 @@ inline size_t NextWord(const std::wstring& text, size_t position) {
   while (position < text.size() && std::iswspace(text[position])) position = NextCodePoint(text, position);
   while (position < text.size() && !std::iswspace(text[position])) position = NextCodePoint(text, position);
   return position;
+}
+
+// Bounds of the word (or whitespace run) around position, for double-click
+// selection. A position at the end of the text belongs to the last character.
+inline std::pair<size_t, size_t> WordBoundsAt(const std::wstring& text, size_t position) {
+  if (text.empty()) return {0, 0};
+  position = std::min(position, text.size());
+  const size_t probe = position < text.size() ? position : PreviousCodePoint(text, position);
+  const bool space = std::iswspace(text[probe]) != 0;
+  size_t start = probe;
+  size_t end = NextCodePoint(text, probe);
+  while (start > 0) {
+    const size_t previous = PreviousCodePoint(text, start);
+    if ((std::iswspace(text[previous]) != 0) != space) break;
+    start = previous;
+  }
+  while (end < text.size() && (std::iswspace(text[end]) != 0) == space) {
+    end = NextCodePoint(text, end);
+  }
+  return {start, end};
 }
 
 // Both erase helpers remove a whole surrogate pair when position is inside

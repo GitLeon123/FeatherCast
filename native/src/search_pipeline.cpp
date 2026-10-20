@@ -700,6 +700,20 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
           matchedPrepared(best(apps)).normalizedName.starts_with(
               queryWords.front());
 
+      // An open window whose title or process name starts with the whole
+      // query is promoted next to the apps instead of trailing Files,
+      // Commands and Settings.
+      bool strongWindowMatch = false;
+      if (!windows.empty() && featureQuery.joined.size() >= 2) {
+        strongWindowMatch = std::any_of(
+            windows.begin(), windows.end(), [&](const std::size_t position) {
+              const auto& prepared = matchedPrepared(position);
+              std::wstring process = core::Normalize(prepared.item.processName);
+              if (process.ends_with(L".exe")) process.resize(process.size() - 4);
+              return prepared.normalizedName.starts_with(featureQuery.joined) ||
+                     process.starts_with(featureQuery.joined);
+            });
+      }
       const bool hasLaunchableApps = !apps.empty() || !games.empty();
       std::vector<std::size_t> explicitMatches;
       const auto& normalizedQuery = explicitQuery;
@@ -738,11 +752,18 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       }
       addSection(L"Best match", takeRanked(explicitMatches));
       if (!strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
+      const bool windowsPromoted = strongWindowMatch;
+      if (strongWindowMatch && hasLaunchableApps && !strongAppMatch) {
+        addSection(L"Open windows", takeRanked(windows, 40));
+      }
       if (hasLaunchableApps) {
         addSection(L"Apps", takeRanked(apps, 80));
         addSection(L"Games", takeRanked(games, 80));
       } else if (!hits.empty() && explicitMatches.empty()) {
         addSection(L"Best match", takeMatches({matches[best(hits)].index}, 1));
+      }
+      if (strongWindowMatch && (strongAppMatch || !hasLaunchableApps)) {
+        addSection(L"Open windows", takeRanked(windows, 40));
       }
       if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
       addSection(L"Windows Settings", takeRanked(windowsSettings, 40));
@@ -752,7 +773,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       addSection(L"Snippets", takeRanked(snippets, 20));
       addSection(L"Files & Folders", takeRanked(files, 40));
       addSection(L"System Folders", takeRanked(systemFolders, 30));
-      addSection(L"Open windows", takeRanked(windows, 40));
+      if (!windowsPromoted) addSection(L"Open windows", takeRanked(windows, 40));
       addSection(L"System & Store apps", takeRanked(system, 80));
       addSection(L"Other matches", takeRanked(other, 40));
     }

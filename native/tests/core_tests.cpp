@@ -2103,6 +2103,15 @@ void TestSurrogateSafeEditing() {
   assert(text_edit::ClipToCodePoints(pair, 3) == 3);
   assert(text_edit::ClipToCodePoints(pair, 99) == pair.size());
 
+  // Double-click selects the word under the pointer, or a whitespace run.
+  const std::wstring words = L"open  chrome now";
+  assert((text_edit::WordBoundsAt(words, 1) == std::pair<size_t, size_t>{0, 4}));
+  assert((text_edit::WordBoundsAt(words, 4) == std::pair<size_t, size_t>{4, 6}));
+  assert((text_edit::WordBoundsAt(words, 8) == std::pair<size_t, size_t>{6, 12}));
+  assert((text_edit::WordBoundsAt(words, words.size()) == std::pair<size_t, size_t>{13, 16}));
+  assert((text_edit::WordBoundsAt(L"", 0) == std::pair<size_t, size_t>{0, 0}));
+  assert((text_edit::WordBoundsAt(pair, 1) == std::pair<size_t, size_t>{0, pair.size()}));
+
   // Backspace and Delete from inside a pair remove the whole pair.
   std::wstring text = pair;
   size_t position = 2;

@@ -545,8 +545,19 @@ bool IsPersonalizableInvocation(const app::DisplayItem& item) {
           item.app.source == L"quicklink" || item.app.source == L"script" || item.app.source == L"workspace");
 }
 
+bool RequiresConfirmation(const app::DisplayItem& item) {
+  if (!item.isCommand) return false;
+  const CommandDescriptor* descriptor = !item.commandStableId.empty()
+      ? Find(item.commandStableId)
+      : Find(item.command);
+  return descriptor && descriptor->confirmation.has_value();
+}
+
 bool RecordsRecentActivation(const app::DisplayItem& item) {
-  return IsPersonalizableInvocation(item) && !item.isAction;
+  // Power commands never enter Recent, so the launcher cannot open with
+  // "Restart PC" preselected.
+  return IsPersonalizableInvocation(item) && !item.isAction &&
+         !RequiresConfirmation(item);
 }
 
 bool ValidateCatalog(std::wstring* error) {
