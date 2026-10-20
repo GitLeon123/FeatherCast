@@ -16,7 +16,8 @@ import app.feathercast.protocol.SCREEN_REQUEST_LIFETIME_MS
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-data class ScreenUiState(val pending: Boolean = false, val active: Boolean = false, val detail: String = "")
+/** [expiresAt] is a SystemClock.elapsedRealtime() time, set while a request is pending. */
+data class ScreenUiState(val pending: Boolean = false, val active: Boolean = false, val detail: String = "", val expiresAt: Long = 0)
 
 /** In-memory consent tied to one authenticated connection. It never survives reconnect. */
 object ScreenBridge {
@@ -37,15 +38,15 @@ object ScreenBridge {
 
     @Synchronized
     fun request(context: Context, next: ScreenRequest, connection: LinkSession) {
-        stop(context, "The previous screen sharing request was replaced.")
+        stop(context, context.getString(R.string.screen_replaced))
         if (!PhoneApp.instance.store.screenSharing) {
-            LinkManager.instance.sendAsync(ScreenMessages.state(next.sessionId, "error", detail = "Enable Screen sharing in the FeatherCast app on your phone."))
+            LinkManager.instance.sendAsync(ScreenMessages.state(next.sessionId, "error", detail = context.getString(R.string.screen_enable_first)))
             return
         }
         request = next
         owner = connection
         expiresAt = SystemClock.elapsedRealtime() + SCREEN_REQUEST_LIFETIME_MS
-        mutableState.value = ScreenUiState(pending = true, detail = "Your PC requests screen sharing. Tap Share screen to approve it.")
+        mutableState.value = ScreenUiState(pending = true, detail = context.getString(R.string.screen_pending), expiresAt = expiresAt)
         val notifications = context.getSystemService(NotificationManager::class.java)
         createChannel(context)
         val open = PendingIntent.getActivity(context, 20,
@@ -53,14 +54,14 @@ object ScreenBridge {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         try {
             notifications.notify(REQUEST_NOTIFICATION, NotificationCompat.Builder(context, CHANNEL)
-                .setSmallIcon(R.drawable.ic_stat_feathercast).setContentTitle("Screen sharing request")
-                .setContentText("Open FeatherCast to share your screen with ${connection.pcName}.")
+                .setSmallIcon(R.drawable.ic_stat_feathercast).setContentTitle(context.getString(R.string.screen_request_title))
+                .setContentText(context.getString(R.string.screen_notification_text, connection.pcName))
                 .setContentIntent(open).setAutoCancel(true).build())
         } catch (_: SecurityException) { /* The in-app approval and PC hint remain available. */ }
         main.postDelayed({
             synchronized(this) {
                 if (request?.sessionId == next.sessionId && activeId.isEmpty() && SystemClock.elapsedRealtime() >= expiresAt) {
-                    stop(context, "The request expired. Start Phone Screen again on your PC.")
+                    stop(context, context.getString(R.string.screen_expired))
                 }
             }
         }, SCREEN_REQUEST_LIFETIME_MS)
@@ -77,7 +78,7 @@ object ScreenBridge {
         val pending = pendingRequest()?.takeIf { it.sessionId == id } ?: return null
         val connection = owner ?: return null
         activeId = id
-        mutableState.value = ScreenUiState(active = true, detail = "Connecting your screen to the PC…")
+        mutableState.value = ScreenUiState(active = true, detail = PhoneApp.instance.getString(R.string.screen_connecting))
         PhoneApp.instance.getSystemService(NotificationManager::class.java).cancel(REQUEST_NOTIFICATION)
         return pending to connection
     }
@@ -88,14 +89,15 @@ object ScreenBridge {
         generation = nextGeneration
         displayWidth = width
         displayHeight = height
-        mutableState.value = ScreenUiState(active = true, detail = "Your screen is shared with the PC. You can stop sharing at any time.")
+        mutableState.value = ScreenUiState(active = true, detail = PhoneApp.instance.getString(R.string.screen_shared))
     }
 
     fun accepts(id: String, version: Int): Boolean = activeId == id && id.isNotEmpty() && generation == version &&
         PhoneApp.instance.store.screenSharing && owner?.let { LinkManager.instance.ownsSession(it) } == true
 
     @Synchronized
-    fun stop(context: Context, detail: String = "Screen sharing stopped.", id: String? = null) {
+    fun stop(context: Context, detail: String? = null, id: String? = null) {
+        val message = detail ?: context.getString(R.string.screen_stopped)
         // An empty id names no session, so it must not clear an unrelated request.
         if (id != null && (id.isEmpty() || (id != request?.sessionId && id != activeId))) return
         val previous = request?.sessionId ?: activeId
@@ -110,18 +112,18 @@ object ScreenBridge {
         context.stopService(Intent(context, ScreenCaptureService::class.java))
         // Only an ended session hands input back; a new or declined request must not switch keyboards.
         if (endsSession) main.post { RemoteControlService.instance?.cancelGesture(); PcKeyboardService.instance?.restoreKeyboard() }
-        mutableState.value = ScreenUiState(detail = detail)
-        if (previous.isNotEmpty()) LinkManager.instance.sendAsync(ScreenMessages.state(previous, "stopped", detail = detail))
+        mutableState.value = ScreenUiState(detail = message)
+        if (previous.isNotEmpty()) LinkManager.instance.sendAsync(ScreenMessages.state(previous, "stopped", detail = message))
     }
 
     @Synchronized
     fun disconnected(context: Context, connection: LinkSession) {
-        if (owner === connection) stop(context, "Connection lost. Start a new screen sharing session on your PC.")
+        if (owner === connection) stop(context, context.getString(R.string.screen_connection_lost))
     }
 
     fun createChannel(context: Context) {
         context.getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(NotificationChannel(CHANNEL, "Screen sharing", NotificationManager.IMPORTANCE_DEFAULT))
+            .createNotificationChannel(NotificationChannel(CHANNEL, context.getString(R.string.channel_screen), NotificationManager.IMPORTANCE_DEFAULT))
     }
 
     const val CHANNEL = "screen-sharing"

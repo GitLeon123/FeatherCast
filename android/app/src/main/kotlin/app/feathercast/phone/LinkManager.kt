@@ -14,6 +14,7 @@ import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
+import androidx.annotation.StringRes
 import android.widget.Toast
 import app.feathercast.protocol.BEACON_PORT
 import app.feathercast.protocol.Beacon
@@ -70,6 +71,8 @@ data class LinkState(
     val pcName: String = "",
     val host: String = "",
     val detail: String = "",
+    /** True from a lost connection until the first failed retry or a new connection. */
+    val reconnecting: Boolean = false,
     val pcClipboard: List<PcClip> = emptyList(),
     val transferStatus: String = "",
     val transferActive: Boolean = false,
@@ -92,6 +95,11 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     private val _state = MutableStateFlow(initialState())
     val state: StateFlow<LinkState> = _state.asStateFlow()
 
+    // Changes whenever a sharing switch or permission may have changed, so the
+    // foreground notification can list what is shared.
+    private val _sharingRevision = MutableStateFlow(0)
+    val sharingRevision: StateFlow<Int> = _sharingRevision.asStateFlow()
+
     @Volatile private var session: LinkSession? = null
     @Volatile private var incomingTransfers: IncomingTransfers? = null
     private val transferEpoch = java.util.concurrent.atomic.AtomicLong()
@@ -107,6 +115,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     private val bulk = Dispatchers.IO.limitedParallelism(1)
     private val incomingWrites = Dispatchers.IO.limitedParallelism(1)
     private val outgoingStreams = Dispatchers.IO.limitedParallelism(2)
+
+    private fun s(@StringRes id: Int, vararg args: Any): String = context.getString(id, *args)
 
     val deviceName: String
         get() = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
@@ -124,7 +134,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     @Synchronized
     fun start() {
         if (!LocalNetworkAccess.allowed(context)) {
-            _state.update { it.copy(status = LinkStatus.Offline, detail = "Allow local network access to connect to your PC.") }
+            _state.update { it.copy(status = LinkStatus.Offline, detail = s(R.string.local_network_detail)) }
             return
         }
         if (loop?.isActive == true) {
@@ -145,7 +155,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         session?.close()
         val pc = store.load()
         // Keep the reason when the PC ended the pairing, so the connect screen can show it.
-        _state.update { if (pc == null) it.copy(status = LinkStatus.Unpaired) else it.copy(status = LinkStatus.Offline, detail = "") }
+        _state.update { if (pc == null) it.copy(status = LinkStatus.Unpaired) else it.copy(status = LinkStatus.Offline, detail = "", reconnecting = false) }
     }
 
     /** Wakes the loop immediately, for example after the network changed. */
@@ -154,9 +164,9 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     suspend fun pair(uri: String): Result<String> = withContext(Dispatchers.IO) {
-        if (!LocalNetworkAccess.allowed(context)) return@withContext Result.failure(IOException("Allow local network access to pair with your PC."))
+        if (!LocalNetworkAccess.allowed(context)) return@withContext Result.failure(IOException(s(R.string.pair_local_network)))
         val invite = PairingInvite.parse(uri.trim())
-            ?: return@withContext Result.failure(IOException("This is not a FeatherCast pairing code."))
+            ?: return@withContext Result.failure(IOException(s(R.string.pair_not_code)))
         try {
             val result = Pairing.pair(invite, store.deviceId, deviceName)
             stop()
@@ -167,14 +177,14 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         } catch (error: LinkException) {
             Result.failure(IOException(pairingMessage(error.code, error.message)))
         } catch (error: IOException) {
-            Result.failure(IOException("Could not reach ${invite.pcName}. Make sure the phone is on the same Wi-Fi and FeatherCast is allowed through the Windows firewall."))
+            Result.failure(IOException(s(R.string.pair_unreachable, invite.pcName)))
         }
     }
 
     private fun pairingMessage(code: String, fallback: String?): String = when (code) {
-        "expired" -> "This pairing code has expired. Show a new one on the PC and scan again."
-        "bad-proof" -> "The pairing code did not match. Scan the code again."
-        else -> fallback ?: "Pairing failed."
+        "expired" -> s(R.string.pair_expired)
+        "bad-proof" -> s(R.string.pair_bad_proof)
+        else -> fallback ?: s(R.string.pair_failed)
     }
 
     fun unpair() {
@@ -261,7 +271,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     /** Sends a shared file or picture; the PC saves it to Downloads\FeatherCast. */
     suspend fun sendUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
-        val active = session ?: return@withContext Result.failure(IOException("Not connected to your PC."))
+        val active = session ?: return@withContext Result.failure(IOException(s(R.string.not_connected_pc)))
         val resolver = context.contentResolver
         var name = "shared-file"
         var size = -1L
@@ -283,50 +293,50 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 if (size < 0) {
                     val preparation = java.io.File.createTempFile("fc-send-", ".part", context.cacheDir)
                     staged = preparation
-                    _state.update { it.copy(transferStatus = "Preparing $name…", transferActive = true) }
+                    _state.update { it.copy(transferStatus = s(R.string.transfer_preparing, name), transferActive = true) }
                     var count = 0L
                     resolver.openInputStream(uri)?.use { input ->
                         preparation.outputStream().use { output ->
                             val buffer = ByteArray(FILE_CHUNK_BYTES)
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException("File transfer cancelled.")
+                                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException(s(R.string.transfer_cancelled))
                                 val read = input.read(buffer)
                                 if (read < 0) break
                                 count += read
-                                if (count > MAX_STREAM_BYTES) throw IOException("Files must be 8 GB or smaller.")
+                                if (count > MAX_STREAM_BYTES) throw IOException(s(R.string.file_too_big_stream))
                                 output.write(buffer, 0, read)
                             }
                         }
-                    } ?: throw IOException("Could not read $name.")
+                    } ?: throw IOException(s(R.string.file_could_not_read, name))
                     size = count
                 }
-                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException("File transfer cancelled.")
-                val input = staged?.inputStream() ?: resolver.openInputStream(uri) ?: throw IOException("Could not read $name.")
+                if (transferEpoch.get() != preparationEpoch || session !== active) throw IOException(s(R.string.transfer_cancelled))
+                val input = staged?.inputStream() ?: resolver.openInputStream(uri) ?: throw IOException(s(R.string.file_could_not_read, name))
                 input.use { sendStream(active, name, size, "file", "", it) }
                 return@withContext Result.success(name)
             } catch (error: Exception) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
-                _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+                _state.update { it.copy(transferStatus = error.message ?: s(R.string.transfer_failed), transferActive = false) }
                 return@withContext Result.failure(error)
             } finally { staged?.delete() }
         }
         if (size > MAX_SEND_BYTES) {
-            return@withContext Result.failure(IOException("$name is too large (max 40 MB)."))
+            return@withContext Result.failure(IOException(s(R.string.file_too_large, name)))
         }
         val bytes = try {
             resolver.openInputStream(uri)?.use { it.readAtMost(MAX_SEND_BYTES.toInt(), sizeHint = size) }
         } catch (_: Exception) {
             null  // providers also throw IllegalArgumentException, IllegalStateException, ...
-        } ?: return@withContext Result.failure(IOException("Could not read $name."))
+        } ?: return@withContext Result.failure(IOException(s(R.string.file_could_not_read, name)))
         if (bytes.size > MAX_SEND_BYTES) {
-            return@withContext Result.failure(IOException("$name is too large (max 40 MB)."))
+            return@withContext Result.failure(IOException(s(R.string.file_too_large, name)))
         }
         currentCoroutineContext().ensureActive()
         if (sendToSession(active, message("file.send") { put("name", name) }, bytes)) {
             Result.success(name)
         } else {
-            Result.failure(IOException("Not connected to your PC."))
+            Result.failure(IOException(s(R.string.not_connected_pc)))
         }
     }
 
@@ -352,7 +362,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         var candidate: Pair<String, Int>? = null
         while (currentCoroutineContext().isActive) {
             if (!LocalNetworkAccess.allowed(context)) {
-                _state.update { it.copy(status = LinkStatus.Offline, detail = "Allow local network access to connect to your PC.") }
+                _state.update { it.copy(status = LinkStatus.Offline, detail = s(R.string.local_network_detail)) }
                 return
             }
             val pc = store.load() ?: run {
@@ -371,7 +381,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 // Only the last authenticated address may report it, and the user decides what to do.
                 if (error.code == "unpaired" && !fromBeacon && store.load()?.linkKey?.contentEquals(pc.linkKey) == true) {
                     _state.update {
-                        it.copy(status = LinkStatus.Offline, detail = "The PC no longer knows this phone. If you removed it on the PC, disconnect below and pair again.")
+                        it.copy(status = LinkStatus.Offline, detail = s(R.string.detail_unpaired), reconnecting = false)
                     }
                     // Retry when the app opens again or the network changes.
                     wake.receive()
@@ -396,11 +406,11 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                     if (session === connected) session = null
                 }
                 currentCoroutineContext().ensureActive()
-                _state.update { it.copy(status = LinkStatus.Offline, detail = "Connection lost. Reconnecting…") }
+                _state.update { it.copy(status = LinkStatus.Offline, detail = s(R.string.detail_connection_lost), reconnecting = true) }
                 delay(1_000)
                 continue
             }
-            _state.update { it.copy(status = LinkStatus.Offline, detail = "Looking for ${pc.pcName}…") }
+            _state.update { it.copy(status = LinkStatus.Offline, detail = s(R.string.detail_looking_for, pc.pcName), reconnecting = false) }
             // Wait for a beacon from the PC, a nudge, or the backoff to pass.
             val found = withTimeoutOrNull(backoff) { awaitBeaconOrWake(pc.pcId) }
             if (found != null && found.first.isNotEmpty()) {
@@ -482,7 +492,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         session = active
         store.updatePcName(active.pcName)
         _state.update {
-            it.copy(status = LinkStatus.Connected, pcName = active.pcName.ifEmpty { it.pcName }, host = active.host, detail = "")
+            it.copy(status = LinkStatus.Connected, pcName = active.pcName.ifEmpty { it.pcName }, host = active.host, detail = "", reconnecting = false)
         }
         sendStatus()
         NotifyListener.sendSnapshot()
@@ -516,7 +526,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             incoming.close()
             if (incomingTransfers === incoming) incomingTransfers = null
             transferEpoch.incrementAndGet()
-            transferAcks.values.forEach { it.complete("The phone connection was lost.") }
+            transferAcks.values.forEach { it.complete(s(R.string.transfer_lost)) }
             _state.update { it.copy(transferStatus = "", transferActive = false) }
             Ringer.stop(context)
             ScreenBridge.disconnected(context, active)
@@ -545,16 +555,16 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         val type = text("type")
         val transferId = text("id")
         if (type == "file.received") {
-            transferAcks[transferId]?.complete(if (text("ok") == "true") null else text("error").ifEmpty { "The PC could not save the file." })
+            transferAcks[transferId]?.complete(if (text("ok") == "true") null else text("error").ifEmpty { s(R.string.transfer_pc_could_not_save) })
             return
         }
         if (type == "file.cancel") {
             if (transferId.isEmpty()) transferEpoch.incrementAndGet()
             else if (transferAcks.containsKey(transferId)) cancelledTransfers.add(transferId)
             incoming.cancel(transferId)
-            if (transferId.isEmpty()) transferAcks.values.forEach { it.complete("File transfer cancelled.") }
-            else transferAcks[transferId]?.complete("File transfer cancelled.")
-            _state.update { it.copy(transferStatus = "File transfer cancelled.", transferActive = false) }
+            if (transferId.isEmpty()) transferAcks.values.forEach { it.complete(s(R.string.transfer_cancelled)) }
+            else transferAcks[transferId]?.complete(s(R.string.transfer_cancelled))
+            _state.update { it.copy(transferStatus = s(R.string.transfer_cancelled), transferActive = false) }
             return
         }
         if (type == "file.begin" || type == "file.chunk" || type == "file.end") {
@@ -563,21 +573,21 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 withContext(incomingWrites + bulkJobs) {
                     when (type) {
                         "file.begin" -> {
-                            val start = FileStart.parse(transferJson) ?: throw IOException("Invalid file transfer.")
+                            val start = FileStart.parse(transferJson) ?: throw IOException(s(R.string.transfer_invalid))
                             incoming.begin(start)
-                            _state.update { it.copy(transferStatus = "Receiving ${start.name}…", transferActive = true) }
+                            _state.update { it.copy(transferStatus = s(R.string.transfer_receiving, start.name), transferActive = true) }
                         }
                         "file.chunk" -> {
-                            if (!store.receiveFiles) throw IOException("Receiving files is turned off.")
+                            if (!store.receiveFiles) throw IOException(s(R.string.receive_off))
                             val offset = (transferJson["offset"] as? JsonPrimitive)?.longOrNull ?: -1
                             val (start, received) = incoming.chunk(transferId, offset, payload.binary)
                             val percent = if (start.size == 0L) 100 else received * 100 / start.size
-                            _state.update { it.copy(transferStatus = "Receiving ${start.name}: $percent%", transferActive = true) }
+                            _state.update { it.copy(transferStatus = s(R.string.transfer_receiving_percent, start.name, percent), transferActive = true) }
                         }
                         else -> {
                             val start = incoming.finish(transferId)
                             sendToSession(active, PhoneMessages.fileReceived(transferId, start.name, true, ""))
-                            _state.update { it.copy(transferStatus = "Saved ${start.name} to Downloads/FeatherCast.", transferActive = false) }
+                            _state.update { it.copy(transferStatus = s(R.string.transfer_saved_here, start.name), transferActive = false) }
                         }
                     }
                 }
@@ -586,7 +596,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
                 sendToSession(active, PhoneMessages.fileReceived(transferId, "", false, error.message.orEmpty()))
                 sendToSession(active, message("file.cancel") { put("id", transferId) })
-                _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+                _state.update { it.copy(transferStatus = error.message ?: s(R.string.transfer_failed), transferActive = false) }
             }
             return
         }
@@ -618,11 +628,11 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 scope.launch(outgoingStreams + bulkJobs) {
                     if (session !== active) return@launch
                     try {
-                        val file = StorageBridge.streamFile(msg.path) ?: throw IOException("Allow phone storage access or choose an available file.")
+                        val file = StorageBridge.streamFile(msg.path) ?: throw IOException(s(R.string.storage_unavailable))
                         file.inputStream().use { sendStream(active, file.name, file.length(), "storage", msg.path, it) }
                     } catch (error: Exception) {
                         if (error is kotlinx.coroutines.CancellationException) throw error
-                        sendToSession(active, PhoneMessages.fileData(msg.path, "", error.message ?: "Could not read the file."))
+                        sendToSession(active, PhoneMessages.fileData(msg.path, "", error.message ?: s(R.string.file_could_not_read_generic)))
                     }
                 }
             } else inBackground { StorageBridge.read(msg.path).let { (json, bytes) -> sendToSession(active, json, bytes) } }
@@ -634,17 +644,17 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     private suspend fun sendStream(active: LinkSession, name: String, size: Long,
                                    purpose: String, reference: String, input: java.io.InputStream) {
-        if (size !in 0..MAX_STREAM_BYTES) throw IOException("Files must be 8 GB or smaller.")
+        if (size !in 0..MAX_STREAM_BYTES) throw IOException(s(R.string.file_too_big_stream))
         val id = java.util.UUID.randomUUID().toString()
         val epoch = transferEpoch.get()
         val acknowledgment = CompletableDeferred<String?>()
         synchronized(transferAcks) {
-            if (transferAcks.size >= app.feathercast.protocol.MAX_STREAM_TRANSFERS) throw IOException("Up to four files can be sent at once.")
+            if (transferAcks.size >= app.feathercast.protocol.MAX_STREAM_TRANSFERS) throw IOException(s(R.string.transfer_max_four))
             transferAcks[id] = acknowledgment
         }
         fun sendChecked(json: String, bytes: ByteArray = ByteArray(0), binarySize: Int = bytes.size) {
             if (session !== active || transferEpoch.get() != epoch || id in cancelledTransfers || !sendToSession(active, json, bytes, binarySize)) {
-                throw IOException("File transfer cancelled or the connection was lost.")
+                throw IOException(s(R.string.transfer_cancelled_or_lost))
             }
         }
         try {
@@ -655,7 +665,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             while (offset < size) {
                 currentCoroutineContext().ensureActive()
                 val read = input.read(buffer, 0, minOf(buffer.size.toLong(), size - offset).toInt())
-                if (read < 0) throw IOException("The file changed or could not be read completely.")
+                if (read < 0) throw IOException(s(R.string.file_changed))
                 if (read == 0) continue
                 // Sending is synchronous and packPayload owns the used prefix
                 // before the next read reuses this buffer.
@@ -664,17 +674,17 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 val percent = if (size == 0L) 100 else offset * 100 / size
                 if (percent != lastPercent) {
                     lastPercent = percent
-                    _state.update { it.copy(transferStatus = "Sending $name: $percent%", transferActive = true) }
+                    _state.update { it.copy(transferStatus = s(R.string.transfer_sending_percent, name, percent), transferActive = true) }
                 }
             }
             sendChecked(message("file.end") { put("id", id) })
             val result = withTimeoutOrNull(30_000) { acknowledgment.await() to true }
-                ?: throw IOException("The PC did not confirm the saved file.")
+                ?: throw IOException(s(R.string.transfer_pc_not_confirmed))
             result.first?.let { throw IOException(it) }
-            _state.update { it.copy(transferStatus = "Saved $name on your PC.", transferActive = false) }
+            _state.update { it.copy(transferStatus = s(R.string.transfer_saved_on_pc, name), transferActive = false) }
         } catch (error: Exception) {
             sendToSession(active, message("file.cancel") { put("id", id) })
-            _state.update { it.copy(transferStatus = error.message ?: "File transfer failed.", transferActive = false) }
+            _state.update { it.copy(transferStatus = error.message ?: s(R.string.transfer_failed), transferActive = false) }
             throw error
         } finally { transferAcks.remove(id); cancelledTransfers.remove(id) }
     }
@@ -685,14 +695,14 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         val receiver = incomingTransfers
         scope.launch { receiver?.cancel() }
         sendAsync(message("file.cancel") { put("id", "") })
-        transferAcks.values.forEach { it.complete("File transfer cancelled.") }
-        _state.update { it.copy(transferStatus = "File transfers cancelled.", transferActive = false) }
+        transferAcks.values.forEach { it.complete(s(R.string.transfer_cancelled)) }
+        _state.update { it.copy(transferStatus = s(R.string.transfers_cancelled), transferActive = false) }
     }
 
     private fun onFileFromPc(active: LinkSession, id: String, name: String, bytes: ByteArray) {
         val error = when {
-            !store.receiveFiles -> "Receiving files is turned off on the phone."
-            IncomingFiles.needsPermission(context) -> "Allow FeatherCast to save files on the phone."
+            !store.receiveFiles -> s(R.string.receive_off_phone)
+            IncomingFiles.needsPermission(context) -> s(R.string.receive_needs_permission)
             else -> IncomingFiles.save(context, name, bytes)
         }
         sendToSession(active, PhoneMessages.fileReceived(id, name, error == null, error.orEmpty()))
@@ -716,6 +726,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
 
     /** Resends status (e.g. after a switch changed) so the PC updates its actions. */
     fun refreshStatus() {
+        _sharingRevision.update { it + 1 }
         scope.launch { if (session != null) sendStatus() }
         MediaWatcher.start(context)
     }
@@ -746,7 +757,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
         val photos = if (access != PhotoAccess.Denied) PhotoSource.latest(context, limit.coerceIn(1, 120)) else emptyList()
         sendToSession(active, message("photos.list") {
             put("access", access.name.lowercase())
-            if (access == PhotoAccess.Denied) put("error", "Allow photo access in FeatherCast on your phone.")
+            if (access == PhotoAccess.Denied) put("error", s(R.string.photos_allow_in_app))
             putJsonArray("items") {
                 for (photo in photos) {
                     addJsonObject {

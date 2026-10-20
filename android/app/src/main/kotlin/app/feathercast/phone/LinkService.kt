@@ -18,8 +18,8 @@ import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /** Keeps the PC connection alive in the background with a quiet notification. */
@@ -47,7 +47,8 @@ class LinkService : Service() {
         }
         if (watcher == null) {
             watcher = scope.launch {
-                link.state.map { Triple(it.status, it.pcName, it.detail) }.distinctUntilChanged().collect {
+                // Also refreshes when a sharing switch changes, so the text lists what is shared.
+                combine(link.state, link.sharingRevision) { state, _ -> notificationContent(state) }.distinctUntilChanged().collect {
                     if (NotificationManagerCompat.from(this@LinkService).areNotificationsEnabled()) {
                         try {
                             NotificationManagerCompat.from(this@LinkService)
@@ -99,28 +100,54 @@ class LinkService : Service() {
             Intent(this, SendClipboardActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val name = state.pcName.ifEmpty { "your PC" }
-        val title = when (state.status) {
-            LinkStatus.Connected -> "Connected to $name"
-            LinkStatus.Connecting -> "Connecting to $name…"
-            else -> "Waiting for $name"
-        }
-        val text = if (state.status == LinkStatus.Connected) {
-            "Notifications, photos and clipboard are shared."
-        } else {
-            state.detail.ifEmpty { "Reconnects automatically when the PC is on the same Wi-Fi." }
-        }
+        val (title, text) = notificationContent(state)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_feathercast)
             .setContentTitle(title)
             .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(0, "Send clipboard", sendClip)
+            .addAction(0, getString(R.string.send_clipboard), sendClip)
             .build()
+    }
+
+    /** The title and text for [state]; the text lists what is actually switched on. */
+    private fun notificationContent(state: LinkState): Pair<String, String> {
+        val name = state.pcName.ifEmpty { getString(R.string.your_pc) }
+        val title = when {
+            state.status == LinkStatus.Connected -> getString(R.string.notification_connected, name)
+            state.status == LinkStatus.Connecting -> getString(R.string.notification_connecting, name)
+            state.reconnecting -> getString(R.string.notification_reconnecting, name)
+            else -> getString(R.string.notification_waiting, name)
+        }
+        val text = if (state.status == LinkStatus.Connected) {
+            val shared = sharedFeatures()
+            if (shared.isEmpty()) getString(R.string.notification_connected_text)
+            else getString(R.string.notification_sharing, shared.joinToString(", "))
+        } else {
+            state.detail.ifEmpty { getString(R.string.notification_waiting_text) }
+        }
+        return title to text
+    }
+
+    private fun sharedFeatures(): List<String> {
+        val store = PhoneApp.instance.store
+        return buildList {
+            if (store.sendNotifications) add(getString(R.string.share_name_notifications))
+            if (store.sendPhotos) add(getString(R.string.share_name_photos))
+            if (store.clipboardSync) add(getString(R.string.share_name_clipboard))
+            if (store.receiveFiles) add(getString(R.string.share_name_files))
+            if (store.allowRing) add(getString(R.string.share_name_ring))
+            if (store.mediaControl) add(getString(R.string.share_name_media))
+            if (store.smsAccess) add(getString(R.string.share_name_sms))
+            if (store.callAlerts) add(getString(R.string.share_name_calls))
+            if (store.storageAccess) add(getString(R.string.share_name_storage))
+            if (store.screenSharing) add(getString(R.string.share_name_screen))
+        }
     }
 
     companion object {

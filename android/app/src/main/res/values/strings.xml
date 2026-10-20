@@ -4,4 +4,265 @@
     <string name="share_label">Send to PC</string>
     <string name="tile_label">Clipboard to PC</string>
     <string name="notification_listener_label">FeatherCast: notifications to PC</string>
+
+    <!-- Common -->
+    <string name="cancel">Cancel</string>
+    <string name="send">Send</string>
+    <string name="pair">Pair</string>
+    <string name="allow">Allow</string>
+    <string name="continue_label">Continue</string>
+    <string name="not_now">Not now</string>
+    <string name="retry">Retry</string>
+    <string name="your_pc">your PC</string>
+    <string name="your_pc_title">Your PC</string>
+    <string name="open_app_settings">Open app settings</string>
+    <string name="turn_on_in_permissions">Turn on %1$s in Permissions</string>
+
+    <!-- Notification channels -->
+    <string name="channel_link">Connection to PC</string>
+    <string name="channel_link_description">Shows while FeatherCast is linked with your PC.</string>
+    <string name="channel_files">Files from PC</string>
+    <string name="channel_files_description">Shows files that your PC sent to this phone.</string>
+    <string name="channel_ring">Find my phone</string>
+    <string name="channel_ring_description">Shows while the PC makes this phone ring.</string>
+    <string name="channel_screen">Screen sharing</string>
+
+    <!-- Connect screen -->
+    <string name="connect_title">Connect to your PC</string>
+    <string name="connect_intro">See your phone\'s notifications, photos and clipboard in FeatherCast on your PC.</string>
+    <string name="step_open_title">Open FeatherCast on your PC</string>
+    <string name="step_open_text">Tray icon → Phone, or search for “Phone”.</string>
+    <string name="step_scan_title">Scan the pairing code</string>
+    <string name="step_scan_text">Tap the button below and point the camera at the code. Your phone\'s camera app can scan it too.</string>
+    <string name="step_done_title">Done</string>
+    <string name="step_done_text">The phone reconnects by itself whenever both are on the same Wi-Fi.</string>
+    <string name="scan_qr">Scan QR code</string>
+    <string name="connecting">Connecting…</string>
+    <string name="paste_link">Paste pairing link</string>
+    <string name="pairing_link_label">Pairing link</string>
+    <string name="pairing_link_hint">Starts with feathercast://pair</string>
+    <string name="use_link">Use this link</string>
+    <string name="scan_prompt">Point the camera at the pairing code on your PC</string>
+    <string name="camera_blocked">Camera access is off. Turn on Camera in Permissions, scan the code with your phone\'s camera app, or paste the pairing link.</string>
+    <string name="camera_denied">Camera access is needed to scan the code. Allow it, scan with your phone\'s camera app, or paste the pairing link.</string>
+    <string name="pair_invalid">This is not a valid FeatherCast pairing code.</string>
+    <string name="pair_not_code">This is not a FeatherCast pairing code.</string>
+    <string name="pair_download_code">That is the download code. Scan the pairing code shown next to it on your PC.</string>
+    <string name="network_denied">Allow local network access in Android settings to connect to your PC.</string>
+    <string name="toast_connected">Connected to %1$s</string>
+
+    <!-- Pairing and share dialogs -->
+    <string name="pair_title">Pair with %1$s?</string>
+    <string name="pair_connect_to">This phone will connect to “%1$s” at:</string>
+    <string name="pair_replaces">This replaces the pairing with %1$s.</string>
+    <string name="pair_warning">Only continue if you opened the pairing code that FeatherCast shows on your own PC.</string>
+    <string name="share_title">Send to %1$s?</string>
+    <plurals name="share_files_saved">
+        <item quantity="one">%d file will be saved to Downloads\\FeatherCast on your PC.</item>
+        <item quantity="other">%d files will be saved to Downloads\\FeatherCast on your PC.</item>
+    </plurals>
+    <string name="share_text_copied">This text will be copied to the clipboard on your PC:</string>
+    <string name="share_pair_first">Open FeatherCast and pair with your PC first.</string>
+    <string name="share_nothing">Nothing to send.</string>
+    <plurals name="share_sent">
+        <item quantity="one">Sent to %2$s</item>
+        <item quantity="other">%1$d files sent to %2$s</item>
+    </plurals>
+    <string name="share_partial">Files sent: %1$d of %2$d. %3$s</string>
+    <string name="share_text_done">Copied to the clipboard on %1$s</string>
+    <string name="not_connected_to">Not connected to %1$s</string>
+    <string name="send_failed">Could not send to %1$s</string>
+    <plurals name="picked_sent">
+        <item quantity="one">Sent to %2$s (Downloads\\FeatherCast)</item>
+        <item quantity="other">%1$d files sent to %2$s</item>
+    </plurals>
+    <string name="copied">Copied</string>
+    <string name="clipboard_empty">The clipboard is empty.</string>
+    <string name="clipboard_sent">Clipboard sent to %1$s</string>
+
+    <!-- Home screen -->
+    <string name="home_title">FeatherCast Phone</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_offline">Not connected</string>
+    <string name="status_hint_default">Make sure FeatherCast runs and both are on the same Wi-Fi.</string>
+    <string name="battery_title">Android may be putting FeatherCast to sleep</string>
+    <string name="battery_text">The connection to your PC keeps dropping. Allow FeatherCast to run in the background so it can reconnect.</string>
+    <string name="battery_button">Open battery settings</string>
+    <string name="local_network_needed">Local network access is needed to connect to your PC.</string>
+    <string name="allow_local_network">Allow local network access</string>
+    <string name="send_clipboard">Send clipboard</string>
+    <string name="send_file">Send photo or file</string>
+    <string name="section_shared">Shared with your PC</string>
+    <string name="section_optional">Optional</string>
+    <string name="section_phone_screen">Phone screen</string>
+    <string name="section_pc_clipboard">PC clipboard</string>
+
+    <string name="feature_notifications">Notifications</string>
+    <string name="feature_notifications_text">Messages and alerts appear on the PC, and you can reply from there.</string>
+    <string name="feature_photos">Photos</string>
+    <string name="feature_photos_text">Your newest photos can be opened on the PC.</string>
+    <string name="feature_photos_selected">Only your selected photos are shared. You can change the selection.</string>
+    <string name="feature_clipboard">Clipboard sync</string>
+    <string name="feature_clipboard_text">Text copied on the PC is copied on the phone. Use “Send clipboard” for the other way.</string>
+    <string name="feature_files">Files from the PC</string>
+    <string name="feature_files_text">Files sent from the PC are saved to Download/FeatherCast.</string>
+    <string name="feature_ring">Find my phone</string>
+    <string name="feature_ring_text">The PC can make this phone ring loudly, even when it is on silent.</string>
+    <string name="feature_media">Media controls</string>
+    <string name="feature_media_text">See what is playing and control it from the PC.</string>
+    <string name="feature_sms">Text messages</string>
+    <string name="feature_sms_text">Read and send SMS from the PC. Contacts are used to show names instead of numbers.</string>
+    <string name="feature_calls">Calls</string>
+    <string name="feature_calls_text">Incoming calls show on the PC with the contact\'s name, where you can reject or silence them.</string>
+    <string name="feature_storage">Phone storage</string>
+    <string name="feature_storage_text">Browse the phone\'s files from the PC and download them.</string>
+    <string name="feature_screen">Screen sharing</string>
+    <string name="feature_screen_text">Open Phone Screen on your PC. You approve each session here before your screen is shared.</string>
+    <string name="feature_remote">Remote control</string>
+    <string name="feature_remote_text">Allow your paired PC to tap, swipe and navigate during an approved screen sharing session.</string>
+
+    <string name="allow_notification_access">Allow notification access</string>
+    <string name="choose_photos">Choose photos</string>
+    <string name="allow_photo_access">Allow photo access</string>
+    <string name="allow_saving_files">Allow saving files</string>
+    <string name="allow_sms_access">Allow SMS access</string>
+    <string name="allow_phone_access">Allow phone access</string>
+    <string name="allow_all_files">Allow all files access</string>
+    <string name="enable_remote_control">Enable FeatherCast Remote Control</string>
+
+    <string name="pc_keyboard">PC keyboard</string>
+    <string name="pc_keyboard_selected">FeatherCast PC Keyboard is selected. Type directly in phone apps from your PC.</string>
+    <string name="pc_keyboard_enable">Enable FeatherCast PC Keyboard in Android settings, then select it for direct PC typing.</string>
+    <string name="enable_keyboard">Enable keyboard</string>
+    <string name="select_keyboard">Select keyboard</string>
+    <string name="device_audio_requested">Device audio is requested when you share. Some apps do not allow audio capture.</string>
+    <string name="device_audio_unsupported">This Android version supports screen sharing without device audio.</string>
+    <string name="restricted_settings_hint">If Android blocks the accessibility setting after installing the APK, open FeatherCast\'s App info and allow restricted settings first.</string>
+    <string name="stop_sharing">Stop sharing</string>
+    <string name="post_notifications_text">Allow notifications to see connection status in the notification drawer. Connecting does not require this permission.</string>
+    <string name="pc_clipboard_empty">Nothing yet. Text you copy on the PC shows up here.</string>
+    <string name="pc_clipboard_offline">Shows the PC clipboard once connected.</string>
+    <string name="copy_to_clipboard">Copy to clipboard</string>
+
+    <!-- Unpair -->
+    <string name="unpair_button">Unpair this phone</string>
+    <string name="unpair_title">Unpair this phone?</string>
+    <string name="unpair_text">This removes the pairing with %1$s and stops everything this phone shares with it: notifications, photos, clipboard, files and the rest. You can pair again at any time by scanning the code on your PC.</string>
+    <string name="unpair_confirm">Unpair</string>
+
+    <!-- Screen sharing request -->
+    <string name="screen_request_title">Screen sharing request</string>
+    <string name="screen_request_text">%1$s wants to show this phone\'s screen on the PC. Only share it if you just started Phone Screen on your PC.</string>
+    <plurals name="screen_request_expires">
+        <item quantity="one">Expires in %d second</item>
+        <item quantity="other">Expires in %d seconds</item>
+    </plurals>
+    <string name="share_screen">Share screen</string>
+    <string name="decline">Decline</string>
+
+    <!-- Permission names, as Android lists them in the app\'s Permissions -->
+    <string name="permission_notification_access">Notification access</string>
+    <string name="permission_photos">Photos and videos</string>
+    <string name="permission_storage">Files and media</string>
+    <string name="permission_sms">SMS and Contacts</string>
+    <string name="permission_phone">Phone and Contacts</string>
+    <string name="permission_files">All files access</string>
+    <string name="permission_notifications">Notifications</string>
+    <string name="permission_local_network">Local network</string>
+
+    <!-- Consent before permissions -->
+    <string name="consent_pc_only">This is only sent to your paired PC over your local network. It is never sent anywhere else.</string>
+    <string name="consent_permissions_label">Android will ask for</string>
+    <string name="consent_notifications_title">Share notifications?</string>
+    <string name="consent_notifications_reads">FeatherCast reads the notifications on this phone, including their text and which media is playing, so your PC can show them, let you reply, and control playback.</string>
+    <string name="consent_notifications_permissions">Notification access (opens Android settings)</string>
+    <string name="consent_photos_title">Share photos?</string>
+    <string name="consent_photos_reads">FeatherCast reads your newest photos. Small previews go to the PC, and a full photo is sent only when you open it there.</string>
+    <string name="consent_photos_permissions">Photos and videos (or only the photos you select)</string>
+    <string name="consent_sms_title">Share text messages?</string>
+    <string name="consent_sms_reads">FeatherCast reads your text messages and can send SMS when you ask from the PC. Your contacts are used only to show names instead of numbers.</string>
+    <string name="consent_sms_permissions">SMS (read, send and receive) and Contacts</string>
+    <string name="consent_calls_title">Share calls?</string>
+    <string name="consent_calls_reads">FeatherCast sees incoming calls, who is calling (with the contact\'s name) and the call log, and lets the PC reject or silence a ringing call.</string>
+    <string name="consent_calls_permissions">Phone state, Call log, Contacts and Answer phone calls</string>
+    <string name="consent_storage_title">Share phone storage?</string>
+    <string name="consent_storage_reads">This is the broadest access in FeatherCast. The PC can browse every folder in the phone\'s storage and download any file in it, except other apps\' private data. Turn it off whenever you like.</string>
+    <string name="consent_storage_permissions">All files access (opens Android settings; on Android 10 and older, Files and media)</string>
+
+    <!-- Choose what to share -->
+    <string name="choose_title">Choose what to share</string>
+    <string name="choose_text">Nothing is shared with your PC until you decide. Android asks for permissions only for the things you turn on.</string>
+    <string name="choose_later">You can change this any time on the main screen.</string>
+    <string name="choose_save">Save</string>
+
+    <!-- Foreground service notification -->
+    <string name="notification_connected">Connected to %1$s</string>
+    <string name="notification_connecting">Connecting to %1$s…</string>
+    <string name="notification_reconnecting">Reconnecting to %1$s…</string>
+    <string name="notification_waiting">Waiting for %1$s</string>
+    <string name="notification_sharing">Sharing: %1$s</string>
+    <string name="notification_connected_text">Connected</string>
+    <string name="notification_waiting_text">Reconnects automatically when the PC is on the same Wi-Fi.</string>
+    <string name="share_name_notifications">notifications</string>
+    <string name="share_name_photos">photos</string>
+    <string name="share_name_clipboard">clipboard</string>
+    <string name="share_name_files">files</string>
+    <string name="share_name_ring">find my phone</string>
+    <string name="share_name_media">media</string>
+    <string name="share_name_sms">text messages</string>
+    <string name="share_name_calls">calls</string>
+    <string name="share_name_storage">storage</string>
+    <string name="share_name_screen">screen</string>
+
+    <!-- Link status and transfers -->
+    <string name="local_network_detail">Allow local network access to connect to your PC.</string>
+    <string name="pair_local_network">Allow local network access to pair with your PC.</string>
+    <string name="pair_unreachable">Could not reach %1$s. Make sure the phone is on the same Wi-Fi and FeatherCast is allowed through the Windows firewall.</string>
+    <string name="pair_expired">This pairing code has expired. Show a new one on the PC and scan again.</string>
+    <string name="pair_bad_proof">The pairing code did not match. Scan the code again.</string>
+    <string name="pair_failed">Pairing failed.</string>
+    <string name="detail_unpaired">The PC no longer knows this phone. If you removed it on the PC, choose “Unpair this phone” below and pair again.</string>
+    <string name="detail_connection_lost">Connection lost. Reconnecting…</string>
+    <string name="detail_looking_for">Looking for %1$s…</string>
+    <string name="not_connected_pc">Not connected to your PC.</string>
+    <string name="file_too_large">%1$s is too large (max 40 MB).</string>
+    <string name="file_too_big_stream">Files must be 8 GB or smaller.</string>
+    <string name="file_could_not_read">Could not read %1$s.</string>
+    <string name="file_could_not_read_generic">Could not read the file.</string>
+    <string name="file_changed">The file changed or could not be read completely.</string>
+    <string name="transfer_preparing">Preparing %1$s…</string>
+    <string name="transfer_cancelled">File transfer cancelled.</string>
+    <string name="transfers_cancelled">File transfers cancelled.</string>
+    <string name="transfer_cancelled_or_lost">File transfer cancelled or the connection was lost.</string>
+    <string name="transfer_failed">File transfer failed.</string>
+    <string name="transfer_invalid">Invalid file transfer.</string>
+    <string name="transfer_lost">The phone connection was lost.</string>
+    <string name="transfer_max_four">Up to four files can be sent at once.</string>
+    <string name="transfer_receiving">Receiving %1$s…</string>
+    <string name="transfer_receiving_percent">Receiving %1$s: %2$d%%</string>
+    <string name="transfer_sending_percent">Sending %1$s: %2$d%%</string>
+    <string name="transfer_saved_here">Saved %1$s to Downloads/FeatherCast.</string>
+    <string name="transfer_saved_on_pc">Saved %1$s on your PC.</string>
+    <string name="transfer_pc_not_confirmed">The PC did not confirm the saved file.</string>
+    <string name="transfer_pc_could_not_save">The PC could not save the file.</string>
+    <string name="receive_off">Receiving files is turned off.</string>
+    <string name="receive_off_phone">Receiving files is turned off on the phone.</string>
+    <string name="receive_needs_permission">Allow FeatherCast to save files on the phone.</string>
+    <string name="storage_unavailable">Allow phone storage access or choose an available file.</string>
+    <string name="photos_allow_in_app">Allow photo access in FeatherCast on your phone.</string>
+
+    <!-- Screen sharing -->
+    <string name="screen_replaced">The previous screen sharing request was replaced.</string>
+    <string name="screen_enable_first">Enable Screen sharing in the FeatherCast app on your phone.</string>
+    <string name="screen_pending">Your PC requests screen sharing. Tap Share screen to approve it.</string>
+    <string name="screen_notification_text">Open FeatherCast to share your screen with %1$s.</string>
+    <string name="screen_expired">The request expired. Start Phone Screen again on your PC.</string>
+    <string name="screen_connecting">Connecting your screen to the PC…</string>
+    <string name="screen_shared">Your screen is shared with the PC. You can stop sharing at any time.</string>
+    <string name="screen_stopped">Screen sharing stopped.</string>
+    <string name="screen_connection_lost">Connection lost. Start a new screen sharing session on your PC.</string>
+    <string name="screen_start_failed">Android could not start screen sharing. Start a new request on your PC.</string>
+    <string name="screen_declined">Screen sharing was declined or the request expired.</string>
 </resources>
