@@ -50,7 +50,32 @@ asks for the Android permissions they need. Screen sharing and Remote control
 are under **Phone screen**; the other optional features are under **Optional**. Every feature can be
 switched off in the phone app. On the PC, **Settings → Privacy →
 Phone Connection** turns the whole feature off. The **Devices** tab in the Phone
-window unpairs a phone.
+window unpairs a phone, after a confirmation that defaults to **No**.
+
+## Using the Phone window
+
+- **Keyboard.** Tab and Shift+Tab move between controls, the arrow keys jump to
+  the nearest control (Up and Down scroll when nothing is there), Home and End
+  go to the first and last control, Page Up and Page Down scroll, and Enter or
+  Space activates. The focus ring appears only after you use the keyboard. Esc
+  closes the window.
+- **Screen readers.** The window exposes its status line, the toast messages, and
+  every control with a name (for example *Copy notification text*, *Dismiss
+  notification*, *Previous track*). Icon-only buttons show their name as a
+  tooltip on hover and keyboard focus. Windows high contrast themes are
+  followed, and the font comes from the FeatherCast theme.
+- **File transfers.** Files you send show in a strip at the bottom with one
+  progress row per file and a **Cancel** button (which cancels all running
+  transfers). Dropping files while the phone is offline queues them; they are
+  sent when it connects. A received file's toast offers **Show in folder**.
+- **If the phone connection cannot start**, the window says why and offers
+  **Try again**; the usual causes are another program using port 47800 or
+  Windows Firewall blocking FeatherCast.
+- **Pairing.** The pairing screen scrolls, shows when the code refreshes, lists
+  the last link problem, and has a *Having trouble?* checklist (same Wi-Fi,
+  Private network profile, firewall, install URL).
+- **Clipboard.** The **Clipboard** tab keeps the last 50 items copied on the
+  phone, in memory only.
 
 ## Phone Screen
 
@@ -73,11 +98,11 @@ scroll. **Back**, **Home**, and **Recent apps** provide Android navigation.
 Type while the screen area is focused; **Ctrl+V** pastes up to 16 KB of text,
 **Ctrl+A** selects all, and Enter, Delete, Backspace, Tab, and arrow keys go to
 the phone. **Ctrl+Tab** focuses the PC toolbar. **F11** switches full screen;
-Escape leaves full screen, otherwise it sends Back.
+Escape leaves full screen, otherwise it sends Back, as does a right-click.
 
 **Mute**, the volume slider, and **Stop** affect this session. Closing the
-window, turning off screen sharing, locking or turning off the phone screen,
-losing the connection, or Android revoking projection stops the session.
+window ends sharing (the hint line at the bottom of the window says so). So does turning off screen sharing, locking or turning off the phone
+screen, losing the connection, or Android revoking projection.
 Reconnecting never resumes sharing: start again and approve a new prompt.
 FeatherCast returns to the previous Android keyboard when sharing ends; if
 Android cannot switch back, use the keyboard picker.

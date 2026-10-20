@@ -47,6 +47,28 @@ struct ScreenMailbox {
     if (!notified && notifyWindow) { notified = true; PostMessageW(notifyWindow, kUpdated, 0, 0); }
   }
 };
+// Tracks which owner-drawn button the pointer is over so it can draw a hover state.
+LRESULT CALLBACK HoverProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+  auto* hover = reinterpret_cast<HWND*>(ref);
+  switch (msg) {
+    case WM_MOUSEMOVE:
+      if (*hover != window) {
+        *hover = window;
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+        TrackMouseEvent(&track);
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_MOUSELEAVE:
+      if (*hover == window) { *hover = nullptr; InvalidateRect(window, nullptr, FALSE); }
+      break;
+    case WM_NCDESTROY:
+      if (*hover == window) *hover = nullptr;
+      RemoveWindowSubclass(window, HoverProc, 1);
+      break;
+  }
+  return DefSubclassProc(window, msg, wp, lp);
+}
 bool Caption(HWND window, const std::wstring& text) {
   const int length = GetWindowTextLengthW(window);
   std::wstring old(static_cast<std::size_t>(length) + 1, 0);
@@ -61,7 +83,10 @@ struct PhoneScreenWindow::Impl {
   std::array<HWND, 14> controls{};
   HFONT font = nullptr, titleFont = nullptr;
   HBRUSH background = nullptr, canvasBackground = nullptr;
-  theme::Theme theme;
+  HWND hoverButton = nullptr;
+  bool highContrast = false;
+  theme::Theme baseTheme;
+  theme::Theme theme;  // baseTheme, or system colors in Windows high contrast
   ScreenCallbacks callbacks;
   bool connected = false, available = false, sound = true, fullscreen = false;
   bool controlReady = false, keyboardReady = false, audioReady = false, mouseHeld = false;
@@ -174,7 +199,7 @@ struct PhoneScreenWindow::Impl {
     if (!audioDetail.empty()) status += L" " + audioDetail;
     else if (audioReady) status += sound ? L" Device audio on; some apps cannot share sound." : L" Device audio muted.";
     accessibleText(Status, status); accessibleText(EmptyTitle, phase);
-    const std::wstring help = !connected ? L"Connect your Android phone in Phone Connect to share its screen."
+    const std::wstring help = !connected ? L"Connect your Android phone in Phone Connection to share its screen."
         : !available ? L"Enable Screen sharing in the updated FeatherCast app on your phone, then choose Start."
         : sessionId.empty() ? L"Choose Start, then approve screen sharing on your phone. Every session stays on your local network."
         : L"Waiting for your phone to approve the Android screen sharing prompt.";
@@ -231,8 +256,22 @@ struct PhoneScreenWindow::Impl {
     if (target) { target->SetDpi(96 * scale, 96 * scale); target->Resize(D2D1::SizeU(rc.right, rc.bottom)); }
     InvalidateRect(hwnd, nullptr, FALSE);
   }
+  static theme::Color SystemColor(int index) {
+    const COLORREF value = GetSysColor(index);
+    return {GetRValue(value) / 255.0f, GetGValue(value) / 255.0f, GetBValue(value) / 255.0f, 1.0f};
+  }
   void Style() {
     if (!hwnd) return;
+    HIGHCONTRASTW contrast{sizeof(HIGHCONTRASTW)}; SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
+    highContrast = (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    theme = baseTheme;
+    if (highContrast) {
+      const auto window = SystemColor(COLOR_WINDOW), text = SystemColor(COLOR_WINDOWTEXT);
+      theme.surface = theme.overlayBackground = theme.selectedBase = window;
+      theme.surfaceHover = SystemColor(COLOR_BTNFACE);
+      theme.border = theme.textPrimary = theme.textMuted = text;
+      theme.textDim = SystemColor(COLOR_GRAYTEXT);
+    }
     if (font) DeleteObject(font);
     if (titleFont) DeleteObject(titleFont);
     // The theme stores a comma-separated fallback list; GDI and DirectWrite
@@ -246,8 +285,6 @@ struct PhoneScreenWindow::Impl {
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, family.c_str());
     if (canvasBackground) DeleteObject(canvasBackground);
     canvasBackground = CreateSolidBrush(GdiColor(theme::CompositeOver(theme.overlayBackground, theme.surface)));
-    HIGHCONTRASTW contrast{sizeof(HIGHCONTRASTW)}; SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
-    const bool highContrast = (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
     for (auto control : controls) if (control) { SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE); SetWindowTheme(control, highContrast ? L"" : L"DarkMode_Explorer", nullptr); }
     SendMessageW(controls[EmptyTitle], WM_SETFONT, reinterpret_cast<WPARAM>(titleFont), TRUE);
     if (dwrite) {
@@ -346,17 +383,30 @@ struct PhoneScreenWindow::Impl {
         const auto* r = reinterpret_cast<RECT*>(lp); SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         Style(); Layout(); return 0;
       }
+      case WM_SYSCOLORCHANGE: case WM_SETTINGCHANGE: case WM_THEMECHANGED: Style(); InvalidateRect(hwnd, nullptr, TRUE); break;
       case WM_GETMINMAXINFO: reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {static_cast<LONG>(624 * scale), static_cast<LONG>(520 * scale)}; return 0;
       case WM_DRAWITEM: {
         const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
         if (item->CtlType != ODT_BUTTON) break;
         const bool disabled = (item->itemState & ODS_DISABLED) != 0;
         const bool pressed = (item->itemState & ODS_SELECTED) != 0;
-        const auto fill = theme::CompositeOver(pressed ? theme.surfaceHover : theme.selectedBase, theme.surface);
-        HBRUSH bg = CreateSolidBrush(GdiColor(fill)); FillRect(item->hDC, &item->rcItem, bg); DeleteObject(bg);
-        HBRUSH edge = CreateSolidBrush(GdiColor(theme::CompositeOver(theme.surfaceHover, theme.surface)));
+        const bool hover = !disabled && !pressed && item->hwndItem == hoverButton;
+        COLORREF fillColor, edgeColor, textColor;
+        if (highContrast) {
+          // Windows high contrast: system colors only, inverted while hot.
+          fillColor = GetSysColor(pressed || hover ? COLOR_HIGHLIGHT : COLOR_BTNFACE);
+          edgeColor = GetSysColor(COLOR_WINDOWTEXT);
+          textColor = GetSysColor(disabled ? COLOR_GRAYTEXT : (pressed || hover ? COLOR_HIGHLIGHTTEXT : COLOR_BTNTEXT));
+        } else {
+          const auto base = pressed ? theme.surfaceHover : (hover ? theme::CompositeOver(theme.surfaceHover, theme.selectedBase) : theme.selectedBase);
+          fillColor = GdiColor(theme::CompositeOver(base, theme.surface));
+          edgeColor = GdiColor(theme::CompositeOver(hover ? theme.border : theme.surfaceHover, theme.surface));
+          textColor = GdiColor(disabled ? theme.textDim : theme.textPrimary);
+        }
+        HBRUSH bg = CreateSolidBrush(fillColor); FillRect(item->hDC, &item->rcItem, bg); DeleteObject(bg);
+        HBRUSH edge = CreateSolidBrush(edgeColor);
         FrameRect(item->hDC, &item->rcItem, edge); DeleteObject(edge);
-        SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, GdiColor(disabled ? theme.textDim : theme.textPrimary));
+        SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, textColor);
         const auto oldFont = SelectObject(item->hDC, font); wchar_t label[64]{}; GetWindowTextW(item->hwndItem, label, 64);
         RECT textRect = item->rcItem; DrawTextW(item->hDC, label, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(item->hDC, oldFont);
@@ -441,6 +491,7 @@ struct PhoneScreenWindow::Impl {
         controls[id] = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             0, 0, 1, 1, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), cls.hInstance, nullptr);
         SetWindowLongPtrW(controls[id], GWL_STYLE, (GetWindowLongPtrW(controls[id], GWL_STYLE) & ~BS_TYPEMASK) | BS_OWNERDRAW);
+        SetWindowSubclass(controls[id], HoverProc, 1, reinterpret_cast<DWORD_PTR>(&hoverButton));
       };
       button(Start, L"Start"); button(Stop, L"Stop"); button(Back, L"Back"); button(Home, L"Home");
       button(Apps, L"Recent apps"); button(Sound, L"Mute"); button(Fullscreen, L"Full screen");
@@ -450,8 +501,8 @@ struct PhoneScreenWindow::Impl {
       controls[Title] = CreateWindowExW(0, L"STATIC", L"Phone Screen", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
           0, 0, 1, 1, hwnd, reinterpret_cast<HMENU>(Title), cls.hInstance, nullptr);
       for (int id : {Status, Hint, EmptyTitle, EmptyHelp}) {
-        controls[id] = CreateWindowExW(0, L"STATIC", id == Hint ? L"F11 full screen · Ctrl+Tab toolbar · Stop ends sharing" : L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 1, 1, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), cls.hInstance, nullptr);
+        controls[id] = CreateWindowExW(0, L"STATIC", id == Hint ? L"F11 full screen · Esc or right-click = Back · Ctrl+Tab toolbar · Closing ends sharing" : L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | (id == Hint ? SS_ENDELLIPSIS : 0), 0, 0, 1, 1, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), cls.hInstance, nullptr);
       }
       Style(); Layout();
       MONITORINFO monitor{sizeof(MONITORINFO)};
@@ -475,7 +526,7 @@ void PhoneScreenWindow::SetCallbacks(ScreenCallbacks cb) {
   std::lock_guard lock(impl_->mailbox->mutex);
   impl_->mailbox->input = impl_->callbacks.input;
 }
-void PhoneScreenWindow::SetTheme(const theme::Theme& theme, theme::Color) { impl_->theme = theme; impl_->Style(); }
+void PhoneScreenWindow::SetTheme(const theme::Theme& theme, theme::Color) { impl_->baseTheme = theme; impl_->theme = theme; impl_->Style(); }
 void PhoneScreenWindow::SetTextScale(float scale) {
   impl_->textScale = std::clamp(scale, 0.9f, 2.0f); impl_->Style(); impl_->Layout();
   if (impl_->hwnd && !impl_->fullscreen) {
