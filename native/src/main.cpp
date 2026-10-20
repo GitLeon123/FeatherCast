@@ -2907,9 +2907,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const bool parentFocused = GetFocus() == hwnd;
       for (std::size_t index = 0; index < layout.buttons.size(); ++index) {
         Item button;
-        button.name = layout.buttons[index].label;
-        button.defaultAction = button.name;
         const auto action = layout.buttons[index].action;
+        button.name = feathercast::screenshot::ToolbarActionAccessibleName(action);
+        button.defaultAction = button.name;
         const bool selectable = IsScreenshotToolAction(action) ||
                                 IsScreenshotColorAction(action);
         button.role = selectable ? ROLE_SYSTEM_RADIOBUTTON
@@ -2930,12 +2930,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             action == ScreenshotToolbarAction::ColorYellow ||
             action == ScreenshotToolbarAction::ColorWhite ||
             action == ScreenshotToolbarAction::ColorBlack) {
-          button.name = ScreenshotToolbarColorName(action);
           button.description = L"Set annotation color";
         }
         if (action == ScreenshotToolbarAction::StrokeDown ||
             action == ScreenshotToolbarAction::StrokeUp) {
-          button.value = std::to_wstring(screenshotEditor_.strokeWidth) +
+          button.value = L"Stroke " +
+                         std::to_wstring(screenshotEditor_.strokeWidth) +
                          L" pixels";
         }
         button.screenRect = screenRect({layout.buttons[index].rect.left,
@@ -4610,9 +4610,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (!ScreenshotEditorActive()) return;
       if (event.screenshotDraft) screenshotDraft_ = event.screenshotDraft;
       EditorController::OutputFailed(screenshotEditor_);
-      screenshotStatus_ = event.message.empty()
-                              ? L"The screenshot could not be completed. Try again."
-                              : event.message;
+      SetScreenshotError(event.message.empty()
+                             ? L"The screenshot could not be completed. Try again."
+                             : event.message);
       RepaintWindow(captureSelectorHwnd_);
       NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_,
                      OBJID_CLIENT, CHILDID_SELF);
@@ -4637,10 +4637,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       }
       const bool saved = !event.path.empty();
-      const std::wstring detail = saved
-                                      ? L"Screenshot saved to " +
-                                            event.path.wstring()
-                                      : L"Screenshot copied to the clipboard.";
+      // The full path stays in the toast text; making the balloon open
+      // Explorer is handled by the tray code (last balloon path).
+      const std::wstring detail =
+          saved ? L"Screenshot saved to " + event.path.wstring() +
+                      (event.clipboardSucceeded
+                           ? L" and copied to the clipboard."
+                           : L"")
+                : L"Screenshot copied to the clipboard.";
       ResetScreenshotEditor();
       ShowTrayNotification(L"FeatherCast Screenshot", detail);
       return;
@@ -5007,6 +5011,36 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ResetScreenshotEditor();
   }
 
+  // The status line is an error while it still holds the text recorded here;
+  // any later status (including a cleared one) stops being drawn as an error.
+  std::wstring screenshotErrorText_;
+
+  void SetScreenshotError(std::wstring text) {
+    screenshotErrorText_ = text;
+    screenshotStatus_ = std::move(text);
+  }
+
+  // User-initiated cancel (Esc, right-click, close, Cancel button): asks
+  // before throwing away annotations. Programmatic cancels call
+  // CancelScreenshotEditor() directly.
+  void RequestCancelScreenshotEditor() {
+    if (!ScreenshotEditorActive()) return;
+    if (!screenshotEditor_.annotations.empty() && captureSelectorHwnd_) {
+      if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
+      const int answer =
+          MessageBoxW(captureSelectorHwnd_, L"Discard your annotations?",
+                      L"FeatherCast Screenshot",
+                      MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST);
+      // The editor can finish or be reset while the box is open.
+      if (!ScreenshotEditorActive()) return;
+      if (answer != IDYES) {
+        SetFocus(captureSelectorHwnd_);
+        return;
+      }
+    }
+    CancelScreenshotEditor();
+  }
+
   void CancelCaptureSelection() {
     if (ScreenshotEditorActive()) {
       CancelScreenshotEditor();
@@ -5279,6 +5313,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return !screenshotEditor_.redo.empty();
       case ScreenshotToolbarAction::Save:
       case ScreenshotToolbarAction::Copy:
+      case ScreenshotToolbarAction::SaveCopy:
         return screenshotEditor_.selection &&
                screenshotEditor_.selection->Width() >= 2 &&
                screenshotEditor_.selection->Height() >= 2;
@@ -5552,18 +5587,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (screenshotTextEditing_) FinishScreenshotTextEditing(false);
     const Rect crop = *screenshotEditor_.selection;
     if (!EditorController::BeginOutput(screenshotEditor_, destination)) {
-      screenshotStatus_ = L"Select a region at least 2 x 2 pixels first.";
+      SetScreenshotError(L"Select a region at least 2 x 2 pixels first.");
       RepaintWindow(captureSelectorHwnd_);
       return;
     }
     screenshotStatus_ = destination == Destination::File
                             ? L"Saving screenshot..."
-                            : L"Copying screenshot...";
+                            : destination == Destination::FileAndClipboard
+                                  ? L"Saving and copying screenshot..."
+                                  : L"Copying screenshot...";
     if (!captureService_.FinalizeScreenshot(
             screenshotDraft_, crop, screenshotEditor_.annotations,
             destination)) {
       EditorController::OutputFailed(screenshotEditor_);
-      screenshotStatus_ = L"The screenshot could not start. Try again.";
+      SetScreenshotError(L"The screenshot could not start. Try again.");
     }
     RepaintWindow(captureSelectorHwnd_);
     NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_,
@@ -5613,8 +5650,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         case ScreenshotToolbarAction::Copy:
           FinalizeScreenshot(Destination::Clipboard);
           return;
+        case ScreenshotToolbarAction::SaveCopy:
+          FinalizeScreenshot(Destination::FileAndClipboard);
+          return;
         case ScreenshotToolbarAction::Cancel:
-          CancelScreenshotEditor();
+          RequestCancelScreenshotEditor();
           return;
         case ScreenshotToolbarAction::ColorAccent:
         case ScreenshotToolbarAction::ColorRed:
@@ -5689,9 +5729,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SetScreenshotFocusIndex(static_cast<int>(
           std::distance(buttons.begin(), textButton)));
     }
-    screenshotStatus_ = reportEmpty && !committed
-                            ? L"Type some text before placing it."
-                            : L"";
+    if (reportEmpty && !committed) {
+      SetScreenshotError(L"Type some text before placing it.");
+    } else {
+      screenshotStatus_ = L"";
+    }
     if (captureSelectorHwnd_) {
       RepaintWindow(captureSelectorHwnd_);
       NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, captureSelectorHwnd_,
@@ -6310,8 +6352,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       focused ? 2.0f : 1.0f);
         }
         const bool highlightFill = selected || hovered;
+        // The stroke buttons show the current width between them
+        // ("Stroke -" and "4 px +") so it is visible without opening anything.
+        std::wstring buttonLabel = button.label;
+        if (action == ScreenshotToolbarAction::StrokeUp) {
+          buttonLabel = std::to_wstring(screenshotEditor_.strokeWidth) +
+                        L" px +";
+        }
         DrawCenteredButtonText(
-            button.label, button.rect,
+            buttonLabel, button.rect,
             disabled ? D2DColor(theme_.textMuted)
                      : (highContrast_ && highlightFill
                             ? HighlightTextColor()
@@ -6320,20 +6369,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                    : D2DColor(theme_.textPrimary))));
       }
 
-      const std::wstring footer = screenshotStatus_.empty()
-                                      ? (screenshotEditor_.phase ==
-                                                 feathercast::screenshot::Phase::Selecting
-                                             ? L"Drag to select a region"
-                                             : L"Drag to annotate  ·  Select to move or resize")
-                                       : screenshotStatus_;
+      // A hovered or focused toolbar button explains itself (with its
+      // shortcut) in the footer; otherwise the footer shows generic hints.
+      std::wstring toolHint;
+      {
+        int hintIndex = screenshotEditor_.hoverIndex;
+        if (hintIndex < 0 && GetFocus() == captureSelectorHwnd_) {
+          hintIndex = screenshotEditor_.focusIndex;
+        }
+        if (hintIndex >= 0 && hintIndex < static_cast<int>(buttons.size())) {
+          const auto hintAction = buttons[static_cast<size_t>(hintIndex)].action;
+          if (hintAction == ScreenshotToolbarAction::StrokeDown ||
+              hintAction == ScreenshotToolbarAction::StrokeUp) {
+            toolHint = L"Stroke width " +
+                       std::to_wstring(screenshotEditor_.strokeWidth) +
+                       L" px";
+          } else {
+            toolHint = feathercast::screenshot::ToolbarActionHint(hintAction);
+          }
+        }
+      }
+      const bool statusIsError = !screenshotStatus_.empty() &&
+                                 screenshotStatus_ == screenshotErrorText_;
+      const std::wstring footer =
+          !screenshotStatus_.empty()
+              ? screenshotStatus_
+              : (screenshotEditor_.phase ==
+                         feathercast::screenshot::Phase::Selecting
+                     ? std::wstring(L"Drag to select a region")
+                     : (!toolHint.empty()
+                            ? toolHint
+                            : (screenshotEditor_.tool ==
+                                       feathercast::screenshot::Tool::Select
+                                   ? std::wstring(L"Drag the region or its handles to move or resize  ·  Ctrl+S saves to Pictures\\FeatherCast")
+                                   : std::wstring(L"Drag to annotate  ·  Ctrl+S saves to Pictures\\FeatherCast  ·  Ctrl+C copies"))));
       const RectF footerRect{toolbar.footer.left, toolbar.footer.top,
                              toolbar.footer.right, toolbar.footer.bottom};
       DrawTextBlock(footer, footerRect,
                     centerFormat_.Get(),
-                    screenshotEditor_.phase ==
-                            feathercast::screenshot::Phase::Editing
-                        ? D2DColor(theme_.textPrimary)
-                        : EmphasisTextColor());
+                    statusIsError
+                        ? D2DColor(theme_.dangerText)
+                        : screenshotEditor_.phase ==
+                                  feathercast::screenshot::Phase::Editing
+                              ? D2DColor(theme_.textPrimary)
+                              : EmphasisTextColor());
     });
     activeRT_ = nullptr;
     activeDC_.Reset();
@@ -6772,7 +6851,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (screenshotEditor_.phase == Phase::Selecting &&
             screenshotEditor_.gestureStart) {
           if (!EditorController::FinishSelection(screenshotEditor_, point)) {
-            screenshotStatus_ = L"Select a region at least 2 x 2 pixels.";
+            SetScreenshotError(L"Select a region at least 2 x 2 pixels.");
           } else {
             screenshotStatus_.clear();
           }
@@ -6795,7 +6874,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               if (EditorController::UpdateAnnotation(screenshotEditor_, end)) {
                 if (!BeginScreenshotTextEditing()) {
                   EditorController::CancelGesture(screenshotEditor_);
-                  screenshotStatus_ = L"The text editor could not start.";
+                  SetScreenshotError(L"The text editor could not start.");
                 } else {
                   screenshotStatus_ =
                       L"Type text  ·  Enter to place  ·  Esc to cancel";
@@ -6803,7 +6882,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               }
             } else if (!EditorController::CommitAnnotation(screenshotEditor_,
                                                             point)) {
-              screenshotStatus_ = L"The annotation was too small.";
+              SetScreenshotError(L"The annotation was too small.");
             } else {
               screenshotStatus_.clear();
             }
@@ -6844,14 +6923,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (control && wParam == 'S') {
-          FinalizeScreenshot(Destination::File);
+          FinalizeScreenshot(shift ? Destination::FileAndClipboard
+                                   : Destination::File);
           return 0;
         }
         if (control && wParam == 'C') {
           FinalizeScreenshot(Destination::Clipboard);
           return 0;
         }
-        if (control && wParam == 'Z') {
+        if (control && wParam == 'Z' && !shift) {
           if (EditorController::Undo(screenshotEditor_)) {
             InvalidateScreenshotPreviewCache();
             NormalizeScreenshotFocus();
@@ -6860,7 +6940,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           }
           return 0;
         }
-        if (control && wParam == 'Y') {
+        if (control && (wParam == 'Y' || (wParam == 'Z' && shift))) {
           if (EditorController::Redo(screenshotEditor_)) {
             InvalidateScreenshotPreviewCache();
             NormalizeScreenshotFocus();
@@ -6876,7 +6956,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             InvalidateScreenshotPreviewCache();
             InvalidateRect(hwnd, nullptr, FALSE);
           } else {
-            CancelScreenshotEditor();
+            RequestCancelScreenshotEditor();
           }
           return 0;
         }
@@ -6965,7 +7045,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         return 0;
       case WM_RBUTTONUP:
-        CancelScreenshotEditor();
+        RequestCancelScreenshotEditor();
         return 0;
       case WM_CANCELMODE:
       case WM_CAPTURECHANGED:
@@ -6983,7 +7063,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case WM_CLOSE:
-        CancelScreenshotEditor();
+        RequestCancelScreenshotEditor();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);

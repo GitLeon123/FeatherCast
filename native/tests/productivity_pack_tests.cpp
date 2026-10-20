@@ -204,7 +204,13 @@ int main() {
     for (const auto [width, height] : std::vector<std::pair<float, float>>{
              {280.0f, 384.0f}, {683.0f, 384.0f}, {1366.0f, 768.0f}}) {
       const auto layout = BuildToolbarLayout(width, height);
-      assert(layout.buttons.size() == 21);
+      assert(layout.buttons.size() == 22);
+      assert(layout.buttons[19].action == ToolbarAction::Copy);
+      assert(layout.buttons[20].action == ToolbarAction::SaveCopy);
+      assert(layout.buttons[21].action == ToolbarAction::Cancel);
+      assert(std::wstring(ToolbarActionAccessibleName(ToolbarAction::Save)) == L"Save (Ctrl+S)");
+      assert(std::wstring(ToolbarActionAccessibleName(ToolbarAction::Redo)) == L"Redo (Ctrl+Y)");
+      assert(std::wstring(ToolbarActionHint(ToolbarAction::Save)).find(L"Pictures\\FeatherCast") != std::wstring::npos);
       assert(layout.rows > 0);
       assert(layout.bar.left >= 0.0f && layout.bar.right <= width &&
              layout.bar.top >= 0.0f && layout.bar.bottom <= height);

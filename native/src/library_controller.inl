@@ -117,6 +117,10 @@
     return true;
   }
 
+  // Outcome of the last queued snippet save, polled by the open Library
+  // Manager so it can replace "Saving..." with the real result.
+  std::optional<feathercast::library::OperationResult> snippetSaveOutcome_;
+
   void HandleSnippetSaveCompleted(SnippetSaveCompleted completion) {
     snippetSaveInFlight_ = false;
     if (completion.result.succeeded) {
@@ -140,6 +144,14 @@
           completion.result.message.empty()
               ? L"Snippets could not be saved."
               : completion.result.message);
+    }
+    if (!SnippetSaveActive()) {
+      snippetSaveOutcome_ = completion.result.succeeded
+          ? feathercast::library::OperationResult{true, {}}
+          : feathercast::library::OperationResult{
+                false, completion.result.message.empty()
+                           ? L"Snippets could not be saved."
+                           : completion.result.message};
     }
     if (snippetReloadAfterSave_ && !SnippetSaveActive()) {
       snippetReloadAfterSave_ = false;
@@ -190,6 +202,7 @@
       std::lock_guard lock(dataMutex_);
       snippets_ = candidate;
     }
+    snippetSaveOutcome_.reset();
     if (!QueueSnippetSave(candidate)) {
       return {false, L"The snippets worker is unavailable."};
     }
@@ -438,6 +451,13 @@
     };
     callbacks.reload = [this] { return ReloadLibraryManagerData(); };
     callbacks.openSnippetsFile = [this] { OpenSnippetsFileForLibrary(); };
+    callbacks.pollSnippetSave =
+        [this]() -> std::optional<feathercast::library::OperationResult> {
+      if (SnippetSaveActive() || !snippetSaveOutcome_) return std::nullopt;
+      auto outcome = std::move(snippetSaveOutcome_);
+      snippetSaveOutcome_.reset();
+      return outcome;
+    };
     HWND owner = settingsHwnd_ && IsWindowVisible(settingsHwnd_)
                      ? settingsHwnd_
                      : hwnd_;
