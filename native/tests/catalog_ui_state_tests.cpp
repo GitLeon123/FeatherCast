@@ -384,7 +384,77 @@ int main() {
              settingValues) == L"Off");
   assert(feathercast::settings_catalog::AccessibleValue(
              feathercast::app::HitType::OverlayWidthDown, settingValues) ==
-         L"720 DIP");
+         L"720 px");
+  {
+    using feathercast::app::HitType;
+    namespace catalog = feathercast::settings_catalog;
+    // Stored data can be cleared while the feature is off, but not while a
+    // storage operation is running.
+    catalog::CatalogContext idle;
+    for (const auto hit : {HitType::ClearClipboardData,
+                           HitType::ClearFileIndexData}) {
+      const auto* clear = catalog::Find(hit);
+      assert(clear && clear->requirement == catalog::Requirement::StorageIdle);
+      assert(catalog::Enabled(*clear, idle));
+      assert(catalog::DisabledReason(*clear, idle).empty());
+      auto busy = idle;
+      busy.storageIdle = false;
+      assert(!catalog::Enabled(*clear, busy));
+      assert(!catalog::DisabledReason(*clear, busy).empty());
+    }
+    // Disabled rows explain themselves.
+    const auto* retention = catalog::Find(HitType::ClipboardLimitDown);
+    assert(retention && !catalog::Enabled(*retention, idle));
+    assert(catalog::DisabledReason(*retention, idle) ==
+           L"Turn on Clipboard History to change this.");
+    const auto* patternRemove = catalog::Find(HitType::RemoveFileIndexPattern);
+    auto indexOn = idle;
+    indexOn.fileIndexEnabled = true;
+    assert(catalog::DisabledReason(*patternRemove, indexOn) ==
+           L"No exclusion patterns to remove.");
+    // Privacy controls are grouped: clipboard, files, phone, diagnostics, data.
+    const auto order = catalog::AccessibilityOrder(
+        feathercast::app::SettingsCategory::Privacy);
+    auto position = [&](HitType hit) {
+      return std::find(order.begin(), order.end(), hit) - order.begin();
+    };
+    assert(position(HitType::ClipboardHistoryToggle) <
+           position(HitType::ClearClipboardData));
+    assert(position(HitType::ClearClipboardData) <
+           position(HitType::FileIndexToggle));
+    assert(position(HitType::FileIndexToggle) <
+           position(HitType::ClearFileIndexData));
+    assert(position(HitType::ClearFileIndexData) <
+           position(HitType::PhoneLinkToggle));
+    assert(position(HitType::OpenPhoneWindow) <
+           position(HitType::DiagnosticsToggle));
+    assert(position(HitType::DiagnosticsToggle) <
+           position(HitType::OpenLocalDataFolder));
+    // Shortcut controls expose the assigned shortcut and the recording state.
+    feathercast::app::Settings shortcuts;
+    shortcuts.shortcut = L"Alt+Space";
+    shortcuts.screenshotRegionShortcut = L"none";
+    assert(catalog::AccessibleValue(HitType::RecordShortcut, shortcuts) ==
+           L"Alt+Space");
+    assert(catalog::AccessibleValue(HitType::RecordScreenshotRegionShortcut,
+                                    shortcuts) == L"None");
+    catalog::AccessibleValueContext recording{true, 1};
+    assert(catalog::AccessibleValue(HitType::RecordScreenshotRegionShortcut,
+                                    shortcuts, recording)
+               .starts_with(L"Recording"));
+    assert(catalog::AccessibleValue(HitType::RecordShortcut, shortcuts,
+                                    recording) == L"Alt+Space");
+    // New controls.
+    assert(catalog::Find(HitType::CurrencyRatesToggle));
+    assert(catalog::Find(HitType::ManageCommandShortcuts));
+    assert(catalog::Find(HitType::ResetAllSettings));
+    assert(catalog::Checked(HitType::CurrencyRatesToggle, shortcuts));
+    assert(catalog::Find(HitType::StartupToggle)->accessibleName ==
+           L"Launch at sign-in");
+    assert(catalog::Find(HitType::CheckUpdates)->accessibleName ==
+           L"Check for updates");
+    assert(catalog::ValidateCatalog());
+  }
   const auto generalControls = feathercast::settings_catalog::FocusOrder(
       feathercast::app::SettingsCategory::General, context);
   assert(std::count(generalControls.begin(), generalControls.end(),

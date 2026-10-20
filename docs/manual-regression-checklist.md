@@ -96,8 +96,9 @@ and then with pointer input.
 - The four capture shortcuts start unassigned, record/change and clear with
   keyboard or pointer input, reject duplicates (including the launcher
   shortcut), and persist across restart without changing the launcher shortcut.
-- Saving, success, and error banners use the permanently reserved 52-DIP area;
-  content position, scroll, hit regions, and keyboard focus do not jump.
+- Saving, success, and error banners float over the bottom of the page and
+  dismiss themselves (or on click); content position, scroll, hit regions, and
+  keyboard focus do not jump.
 - Shortcut recording, accent selection, quicklinks, folder selection, and all
   maintenance actions work.
 - Settings persist across restart without changing paths or unrelated fields.

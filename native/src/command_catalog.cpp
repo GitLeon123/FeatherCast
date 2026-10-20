@@ -223,7 +223,7 @@ const std::vector<CommandDescriptor>& Catalog() {
        L"Refresh Apps & Games", L"Rescan apps and locally installed games",
        {L"rescan", L"reload apps", L"refresh games"}},
       {L"clear-icon-cache", app::CommandKind::ClearIconCache,
-       L"Clear Icon Cache", L"Delete cached shell icons",
+       L"Clear Icon Cache", L"Clear cached shell icons",
        {L"icons", L"cache"}},
       {L"clear-recents", app::CommandKind::ClearRecents, L"Clear Recents",
        L"Forget recently used apps", {L"history", L"recent apps"}},

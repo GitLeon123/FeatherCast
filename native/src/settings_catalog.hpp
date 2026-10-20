@@ -13,7 +13,6 @@ enum class ControlKind { Toggle, Slider, Decrement, Increment, Action, Custom };
 enum class AccessibleRole { CheckButton, Slider, PushButton };
 enum class Requirement {
   Always,
-  PendingShortcut,
   ExistingShortcut,
   ExistingScreenshotFullscreenShortcut,
   ExistingScreenshotRegionShortcut,
@@ -48,7 +47,6 @@ struct CategoryDescriptor {
 };
 
 struct CatalogContext {
-  bool hasPendingShortcut = false;
   bool hasExistingShortcut = false;
   bool hasScreenshotFullscreenShortcut = false;
   bool hasScreenshotRegionShortcut = false;
@@ -71,8 +69,22 @@ const SettingDescriptor* Find(app::HitType hit);
 const CategoryDescriptor* FindCategory(app::SettingsCategory category);
 const CategoryDescriptor* FindCategory(app::HitType hit);
 bool Enabled(const SettingDescriptor& descriptor, const CatalogContext& context);
+// Short sentence telling why a control is disabled ("Turn on Clipboard
+// History to change this."); empty when the control is enabled.
+std::wstring DisabledReason(const SettingDescriptor& descriptor,
+                            const CatalogContext& context);
 bool Checked(app::HitType hit, const app::Settings& settings);
 AccessibleRole Role(const SettingDescriptor& descriptor);
+// Shortcut recording state for the value of the shortcut controls.
+// recordingTarget is -1 for the launcher shortcut and 0..3 for the capture
+// shortcuts (full screen screenshot, region screenshot, full screen recording,
+// region recording).
+struct AccessibleValueContext {
+  bool recording = false;
+  int recordingTarget = -1;
+};
+std::wstring AccessibleValue(app::HitType hit, const app::Settings& settings,
+                             const AccessibleValueContext& context);
 std::wstring AccessibleValue(app::HitType hit,
                              const app::Settings& settings);
 std::vector<app::HitType> FocusOrder(app::SettingsCategory category,
