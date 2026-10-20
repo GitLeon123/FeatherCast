@@ -37,14 +37,14 @@ class SendClipboardActivity : ComponentActivity() {
             val text = clipboard?.primaryClip?.takeIf { it.itemCount > 0 }
                 ?.getItemAt(0)?.coerceToText(activity)?.toString().orEmpty()
             if (text.isEmpty()) {
-                toast(activity, "The clipboard is empty.")
+                toast(activity, activity.getString(R.string.clipboard_empty))
                 done()
                 return
             }
             activity.lifecycleScope.launch {
                 val sent = withContext(Dispatchers.IO) { LinkManager.instance.sendClipboardText(text) }
-                val pc = LinkManager.instance.state.value.pcName.ifEmpty { "your PC" }
-                toast(activity, if (sent) "Clipboard sent to $pc" else "Not connected to $pc")
+                val pc = LinkManager.instance.state.value.pcName.ifEmpty { activity.getString(R.string.your_pc) }
+                toast(activity, if (sent) activity.getString(R.string.clipboard_sent, pc) else activity.getString(R.string.not_connected_to, pc))
                 done()
             }
         }

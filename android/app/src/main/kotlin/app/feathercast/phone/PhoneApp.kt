@@ -17,10 +17,10 @@ class PhoneApp : Application() {
         link = LinkManager(this, store)
         val channel = NotificationChannel(
             LinkService.CHANNEL_ID,
-            "Connection to PC",
+            getString(R.string.channel_link),
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Shows while FeatherCast is linked with your PC."
+            description = getString(R.string.channel_link_description)
             setShowBadge(false)
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)

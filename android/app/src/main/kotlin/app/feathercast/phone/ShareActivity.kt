@@ -18,17 +18,17 @@ class ShareActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (PhoneApp.instance.store.load() == null) {
-            SendClipboardActivity.toast(this, "Open FeatherCast and pair with your PC first.")
+            SendClipboardActivity.toast(this, getString(R.string.share_pair_first))
             finish()
             return
         }
         LinkService.start(this)
         val link = LinkManager.instance
-        val pc = link.state.value.pcName.ifEmpty { "your PC" }
+        val pc = link.state.value.pcName.ifEmpty { getString(R.string.your_pc) }
         val uris = sharedUris(intent)
         val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
         if (uris.isEmpty() && text.isEmpty()) {
-            SendClipboardActivity.toast(this, "Nothing to send.")
+            SendClipboardActivity.toast(this, getString(R.string.share_nothing))
             finish()
             return
         }
@@ -43,14 +43,14 @@ class ShareActivity : ComponentActivity() {
                             // Takes the app's own read grant while this activity still holds one.
                             link.sendUrisInBackground(uris) { sent, error ->
                                 when {
-                                    sent == uris.size -> if (sent == 1) "Sent to $pc" else "$sent files sent to $pc"
-                                    sent > 0 -> "$sent of ${uris.size} files sent. ${error.orEmpty()}"
-                                    else -> error ?: "Could not send to $pc"
+                                    sent == uris.size -> resources.getQuantityString(R.plurals.share_sent, sent, sent, pc)
+                                    sent > 0 -> getString(R.string.share_partial, sent, uris.size, error.orEmpty())
+                                    else -> error ?: getString(R.string.send_failed, pc)
                                 }
                             }
                         } else {
                             link.sendTextInBackground(text) { sent ->
-                                if (sent) "Copied to the clipboard on $pc" else "Not connected to $pc"
+                                if (sent) getString(R.string.share_text_done, pc) else getString(R.string.not_connected_to, pc)
                             }
                         }
                         finish()
