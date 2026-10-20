@@ -170,6 +170,11 @@ struct Settings {
   // Personal-data features are opt-in. privacyConsentVersion records that the
   // user has seen the disclosure, regardless of which features they enabled.
   int privacyConsentVersion = 0;
+  // Set once the first-run hint (shortcut and examples) has been shown.
+  bool onboardingShown = false;
+  // Currency conversions fetch daily rates from open.er-api.com; the cached
+  // rates keep working when this is off.
+  bool currencyRatesOnline = true;
   bool clipboardHistoryEnabled = false;
   int clipboardHistoryLimit = 50;
   // Zero keeps the existing count-only retention behavior.
@@ -442,6 +447,8 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   ReadBool(*root, "showOpenWindows", settings.showOpenWindows);
   ReadBool(*root, "showStoreApps", settings.showStoreApps);
   ReadInt(*root, "privacyConsentVersion", settings.privacyConsentVersion);
+  ReadBool(*root, "onboardingShown", settings.onboardingShown);
+  ReadBool(*root, "currencyRatesOnline", settings.currencyRatesOnline);
   ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
   ReadBool(*root, "phoneLinkEnabled", settings.phoneLinkEnabled);
   ReadBool(*root, "phoneClipboardSync", settings.phoneClipboardSync);
@@ -626,6 +633,8 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"showOpenWindows\": " << (settings.showOpenWindows ? "true" : "false") << ",\n";
   out << "  \"showStoreApps\": " << (settings.showStoreApps ? "true" : "false") << ",\n";
   out << "  \"privacyConsentVersion\": " << settings.privacyConsentVersion << ",\n";
+  out << "  \"onboardingShown\": " << (settings.onboardingShown ? "true" : "false") << ",\n";
+  out << "  \"currencyRatesOnline\": " << (settings.currencyRatesOnline ? "true" : "false") << ",\n";
   out << "  \"clipboardHistoryEnabled\": " << (settings.clipboardHistoryEnabled ? "true" : "false") << ",\n";
   out << "  \"phoneLinkEnabled\": " << (settings.phoneLinkEnabled ? "true" : "false") << ",\n";
   out << "  \"phoneClipboardSync\": " << (settings.phoneClipboardSync ? "true" : "false") << ",\n";

@@ -122,6 +122,10 @@ enum class HitType {
   RemoveFileIndexPattern,
   PhoneLinkToggle,
   OpenPhoneWindow,
+  CurrencyRatesToggle,
+  ManageCommandShortcuts,
+  ResetAllSettings,
+  DismissSettingsStatus,
 };
 
 enum class CommandKind {

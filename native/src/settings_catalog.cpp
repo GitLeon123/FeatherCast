@@ -35,13 +35,11 @@ const std::vector<SettingDescriptor>& Catalog() {
   using app::SettingsCategory;
   static const std::vector<SettingDescriptor> controls = {
       {L"shortcut.record", SettingsCategory::Shortcut, HitType::RecordShortcut,
-       ControlKind::Custom, L"Record shortcut", L"Capture a new global shortcut.",
-       L"Record global shortcut"},
-      {L"shortcut.save", SettingsCategory::Shortcut, HitType::SaveShortcut,
-       ControlKind::Action, L"Save shortcut", L"Activate the recorded shortcut.",
-       L"Save global shortcut", Requirement::PendingShortcut},
+       ControlKind::Custom, L"Record New Shortcut",
+       L"Press a new global shortcut. It applies as soon as you press it; Esc cancels.",
+       L"Record new shortcut"},
       {L"shortcut.clear", SettingsCategory::Shortcut, HitType::ClearShortcut,
-       ControlKind::Action, L"Clear shortcut", L"Disable the global shortcut.",
+       ControlKind::Action, L"Clear Shortcut", L"Disable the global shortcut.",
        L"Clear global shortcut", Requirement::ExistingShortcut},
       {L"shortcut.screenshot-fullscreen.record", SettingsCategory::Shortcut,
        HitType::RecordScreenshotFullscreenShortcut, ControlKind::Action,
@@ -86,9 +84,14 @@ const std::vector<SettingDescriptor>& Catalog() {
        L"Clear region recording shortcut",
        L"Disable the region recording shortcut.",
        L"Clear region recording shortcut", Requirement::ExistingRecordRegionShortcut},
+      {L"shortcut.command-shortcuts", SettingsCategory::Shortcut,
+       HitType::ManageCommandShortcuts, ControlKind::Action,
+       L"Command Shortcuts",
+       L"Assign global shortcuts to built-in commands.",
+       L"Manage command shortcuts"},
       {L"general.startup", SettingsCategory::General, HitType::StartupToggle,
-       ControlKind::Toggle, L"Launch at sign-in",
-       L"Launch FeatherCast when you log into Windows.", L"Start on startup"},
+       ControlKind::Toggle, L"Launch at Sign-in",
+       L"Launch FeatherCast when you sign in to Windows.", L"Launch at sign-in"},
       {L"general.updates", SettingsCategory::General, HitType::UpdateChecksToggle,
        ControlKind::Toggle, L"Automatic Update Checks",
        L"Check GitHub Releases once per day.", L"Automatic update checks"},
@@ -102,17 +105,21 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Toggle, L"Open Window Results",
        L"Include currently open windows in search results.", L"Open window results"},
       {L"results.store-apps", SettingsCategory::Results, HitType::ShowStoreAppsToggle,
-       ControlKind::Toggle, L"Store and system apps",
+       ControlKind::Toggle, L"Store and System Apps",
        L"Include AppsFolder, Store, and system alias entries.", L"Store and system apps"},
       {L"results.auto-height", SettingsCategory::Results,
        HitType::AutoFitResultHeightToggle, ControlKind::Toggle,
-       L"Auto-fit Result Height",
+       L"Auto-Fit Result Height",
        L"Resize the normal overlay to fit its results instead of keeping a fixed height.",
        L"Auto-fit result height"},
       {L"results.learning", SettingsCategory::Results, HitType::SearchLearningToggle,
        ControlKind::Toggle, L"Learn Search Choices",
        L"Save up to 256 app and command queries locally. Clipboard, phone, and file searches are excluded.",
        L"Learn search choices locally"},
+      {L"results.currency", SettingsCategory::Results, HitType::CurrencyRatesToggle,
+       ControlKind::Toggle, L"Currency Rates Online",
+       L"Download daily exchange rates from open.er-api.com for currency conversions. Cached rates keep working when off.",
+       L"Currency rates online"},
       {L"results.width.down", SettingsCategory::Results, HitType::OverlayWidthDown,
        ControlKind::Decrement, L"Overlay Width", L"Width of the search overlay window.",
        L"Decrease overlay width"},
@@ -137,9 +144,12 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Action, L"Manage Command Aliases",
        L"Assign custom keywords to built-in commands.",
        L"Manage command aliases"},
+      // Privacy is grouped Clipboard, Files, Phone, Diagnostics, Your data. The
+      // settings page draws matching section headings in this order.
       {L"privacy.clipboard", SettingsCategory::Privacy, HitType::ClipboardHistoryToggle,
        ControlKind::Toggle, L"Clipboard History",
-       L"Store copied text locally for launcher search and paste.", L"Clipboard history"},
+       L"Store copied text locally for launcher search and paste. It is encrypted for your Windows account, and apps that mark content as private, such as password managers, are skipped.",
+       L"Clipboard history"},
       {L"privacy.clipboard-limit.down", SettingsCategory::Privacy, HitType::ClipboardLimitDown,
        ControlKind::Decrement, L"Clipboard Retention",
        L"Maximum number of text entries retained locally.",
@@ -164,6 +174,11 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Action, L"Remove Excluded App",
        L"Remove an excluded app rule.",
        L"Remove excluded app from clipboard", Requirement::ExistingClipboardExcludedApp},
+      // Deleting stored data stays possible after the feature is turned off.
+      {L"privacy.clear-clipboard", SettingsCategory::Privacy, HitType::ClearClipboardData,
+       ControlKind::Action, L"Clear Clipboard History",
+       L"Delete all saved clipboard entries, including favorites.",
+       L"Clear clipboard history", Requirement::StorageIdle},
       {L"privacy.file-index", SettingsCategory::Privacy, HitType::FileIndexToggle,
        ControlKind::Toggle, L"Files & Folders Index",
        L"Index selected local folders for launcher search.", L"Files and folders index"},
@@ -203,24 +218,22 @@ const std::vector<SettingDescriptor>& Catalog() {
        HitType::RebuildFileIndex, ControlKind::Action, L"Rebuild File Index",
        L"Reconcile selected folders and rebuild searchable content.",
        L"Rebuild file index", Requirement::FileIndexEnabled},
-      {L"privacy.diagnostics", SettingsCategory::Privacy, HitType::DiagnosticsToggle,
-       ControlKind::Toggle, L"Diagnostics",
-       L"Write bounded troubleshooting logs without queries or clipboard text.",
-       L"Enable diagnostics"},
+      {L"privacy.clear-files", SettingsCategory::Privacy, HitType::ClearFileIndexData,
+       ControlKind::Action, L"Clear File Index",
+       L"Delete the stored file index. It is rebuilt only while indexing is on.",
+       L"Clear file index", Requirement::StorageIdle},
       {L"privacy.phone", SettingsCategory::Privacy, HitType::PhoneLinkToggle,
        ControlKind::Toggle, L"Phone Connection",
-       L"Link the FeatherCast Phone app over your local network.",
+       L"Listens on your local network (TCP 47800, UDP 47801) for paired phones.",
        L"Phone connection"},
       {L"privacy.phone-open", SettingsCategory::Privacy, HitType::OpenPhoneWindow,
        ControlKind::Action, L"Phone Window",
        L"Pair a phone and see its notifications, photos, and clipboard.",
        L"Open phone window"},
-      {L"privacy.clear-clipboard", SettingsCategory::Privacy, HitType::ClearClipboardData,
-       ControlKind::Action, L"Delete Clipboard Data", L"Delete saved clipboard entries.",
-       L"Delete clipboard data", Requirement::ClipboardEnabled},
-      {L"privacy.clear-files", SettingsCategory::Privacy, HitType::ClearFileIndexData,
-       ControlKind::Action, L"Delete File Index", L"Delete the disposable local file index.",
-       L"Delete file index", Requirement::FileIndexEnabled},
+      {L"privacy.diagnostics", SettingsCategory::Privacy, HitType::DiagnosticsToggle,
+       ControlKind::Toggle, L"Diagnostics",
+       L"Write bounded troubleshooting logs without queries or clipboard text.",
+       L"Enable diagnostics"},
       {L"privacy.open-data", SettingsCategory::Privacy, HitType::OpenLocalDataFolder,
        ControlKind::Action, L"Open Local Data", L"Open logs, cache, database, and updates.",
        L"Open local data folder"},
@@ -251,8 +264,12 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Action, L"Clear Icon Cache", L"Delete cached Windows Shell icons.",
        L"Clear icon cache"},
       {L"maintenance.check-updates", SettingsCategory::Maintenance, HitType::CheckUpdates,
-       ControlKind::Action, L"Check Updates", L"Check GitHub Releases now.",
+       ControlKind::Action, L"Check for Updates", L"Check GitHub Releases now.",
        L"Check for updates"},
+      {L"maintenance.reset-all", SettingsCategory::Maintenance, HitType::ResetAllSettings,
+       ControlKind::Action, L"Reset All Settings",
+       L"Restore default settings. Snippets, library items, and paired phones are kept.",
+       L"Reset all settings"},
   };
   return controls;
 }
@@ -314,9 +331,7 @@ bool Enabled(const SettingDescriptor& descriptor,
              const CatalogContext& context) {
   switch (descriptor.requirement) {
     case Requirement::Always: return true;
-    case Requirement::PendingShortcut: return context.hasPendingShortcut;
-    case Requirement::ExistingShortcut:
-      return !context.hasPendingShortcut && context.hasExistingShortcut;
+    case Requirement::ExistingShortcut: return context.hasExistingShortcut;
     case Requirement::ExistingScreenshotFullscreenShortcut:
       return context.hasScreenshotFullscreenShortcut;
     case Requirement::ExistingScreenshotRegionShortcut:
@@ -342,6 +357,57 @@ bool Enabled(const SettingDescriptor& descriptor,
   return false;
 }
 
+std::wstring DisabledReason(const SettingDescriptor& descriptor,
+                            const CatalogContext& context) {
+  if (Enabled(descriptor, context)) return L"";
+  switch (descriptor.requirement) {
+    case Requirement::Always:
+      return L"";
+    case Requirement::ExistingShortcut:
+    case Requirement::ExistingScreenshotFullscreenShortcut:
+    case Requirement::ExistingScreenshotRegionShortcut:
+    case Requirement::ExistingRecordFullscreenShortcut:
+    case Requirement::ExistingRecordRegionShortcut:
+      return L"No shortcut is set.";
+    case Requirement::ClipboardEnabled:
+      return context.clipboardEnabled
+                 ? L"Wait for the current storage operation to finish."
+                 : L"Turn on Clipboard History to change this.";
+    case Requirement::ExistingClipboardExcludedApp:
+      if (!context.clipboardEnabled) {
+        return L"Turn on Clipboard History to change this.";
+      }
+      return context.hasClipboardExcludedApps
+                 ? L"Wait for the current storage operation to finish."
+                 : L"No excluded apps to remove.";
+    case Requirement::FileIndexEnabled:
+      return context.fileIndexEnabled
+                 ? L"Wait for the current storage operation to finish."
+                 : L"Turn on Files & Folders Index to change this.";
+    case Requirement::ExistingFileIndexPattern:
+      if (!context.fileIndexEnabled) {
+        return L"Turn on Files & Folders Index to change this.";
+      }
+      return context.hasFileIndexExcludePatterns
+                 ? L"Wait for the current storage operation to finish."
+                 : L"No exclusion patterns to remove.";
+    case Requirement::ExistingFileIndexRoot:
+      if (!context.fileIndexEnabled) {
+        return L"Turn on Files & Folders Index to change this.";
+      }
+      return context.hasFileIndexRoots
+                 ? L"Wait for the current storage operation to finish."
+                 : L"No indexed folders to remove.";
+    case Requirement::StorageIdle:
+      return L"Wait for the current storage operation to finish.";
+    case Requirement::ExtensionsIdle:
+      return L"Extensions are reloading.";
+    case Requirement::CustomAccent:
+      return L"Turn off Sync Accent Color to pick a custom color.";
+  }
+  return L"";
+}
+
 bool Checked(app::HitType hit, const app::Settings& settings) {
   using app::HitType;
   switch (hit) {
@@ -359,6 +425,7 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
       return settings.fileContentIndexEnabled;
     case HitType::DiagnosticsToggle: return settings.diagnosticsEnabled;
     case HitType::PhoneLinkToggle: return settings.phoneLinkEnabled;
+    case HitType::CurrencyRatesToggle: return settings.currencyRatesOnline;
     case HitType::AccentToggle: return settings.syncAccentColor;
     default: return false;
   }
@@ -374,18 +441,41 @@ AccessibleRole Role(const SettingDescriptor& descriptor) {
 
 std::wstring AccessibleValue(app::HitType hit,
                              const app::Settings& settings) {
+  return AccessibleValue(hit, settings, AccessibleValueContext{});
+}
+
+std::wstring AccessibleValue(app::HitType hit, const app::Settings& settings,
+                             const AccessibleValueContext& context) {
   if (const auto* descriptor = Find(hit);
       descriptor && descriptor->kind == ControlKind::Toggle) {
     return Checked(hit, settings) ? L"On" : L"Off";
   }
   using app::HitType;
+  // Shortcut controls report what is assigned, or that they are listening.
+  auto shortcutValue = [&](const std::wstring& assigned, int target) {
+    if (context.recording && context.recordingTarget == target) {
+      return std::wstring(L"Recording. Press the new shortcut, or Esc to cancel.");
+    }
+    return assigned.empty() || assigned == L"none" ? std::wstring(L"None")
+                                                    : assigned;
+  };
   switch (hit) {
+    case HitType::RecordShortcut:
+      return shortcutValue(settings.shortcut, -1);
+    case HitType::RecordScreenshotFullscreenShortcut:
+      return shortcutValue(settings.screenshotFullscreenShortcut, 0);
+    case HitType::RecordScreenshotRegionShortcut:
+      return shortcutValue(settings.screenshotRegionShortcut, 1);
+    case HitType::RecordFullscreenShortcut:
+      return shortcutValue(settings.recordFullscreenShortcut, 2);
+    case HitType::RecordRegionShortcut:
+      return shortcutValue(settings.recordRegionShortcut, 3);
     case HitType::AnimationLevel:
       return std::wstring(
           feathercast::settings::AnimationLevelLabel(settings.animationLevel));
     case HitType::OverlayWidthDown:
     case HitType::OverlayWidthUp:
-      return std::to_wstring(settings.overlayWidth) + L" DIP";
+      return std::to_wstring(settings.overlayWidth) + L" px";
     case HitType::MaxResultsDown:
     case HitType::MaxResultsUp:
       return std::to_wstring(settings.maxResults);

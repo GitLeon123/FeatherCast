@@ -1391,9 +1391,13 @@ int main() {
     original.fileIndexRoots = {L"C:\\Work", L"D:\\Projects"};
     original.fileIndexExcludePatterns = {L"**\\.git\\**", L"*.tmp"};
     original.diagnosticsEnabled = true;
+    original.onboardingShown = true;
+    original.currencyRatesOnline = false;
     original.quicklinks.push_back({L"docs", L"My \"Docs\"", L"C:\\Users\\Leon\\Docs"});
 
     const fs::Settings copy = fs::ParseSettings(fs::SerializeSettings(original));
+    assert(copy.onboardingShown);
+    assert(!copy.currencyRatesOnline);
     assert(copy.shortcut == original.shortcut);
     assert(copy.recentApps == original.recentApps);
     assert(copy.pinnedApps == original.pinnedApps);
@@ -1828,6 +1832,22 @@ int main() {
       assert(feathercast::input_broker::ShouldHandleWinKey(true, enabled) ==
              (std::wstring_view(shortcutText) == L"Super"));
       assert(!feathercast::input_broker::ShouldHandleWinKey(false, enabled));
+    }
+
+    // Well-known Windows-owned Win chords are rejected up front; Win+Space and
+    // chords with extra modifiers remain assignable.
+    for (const auto* reserved :
+         {L"Win+D", L"Super+E", L"Win+L", L"Win+R", L"Win+I", L"Win+S",
+          L"Win+V", L"Win+X", L"Win+A", L"Win+N", L"Win+Tab", L"Win+1",
+          L"Win+0"}) {
+      assert(feathercast::shortcut::IsReservedWindowsShortcut(
+          ParseShortcut(reserved)));
+    }
+    for (const auto* allowed :
+         {L"Win+Space", L"Win+Shift+D", L"Ctrl+Win+L", L"Alt+D", L"Alt+Space",
+          L"Super", L"Print Screen", L"none", L"Win+K"}) {
+      assert(!feathercast::shortcut::IsReservedWindowsShortcut(
+          ParseShortcut(allowed)));
     }
 
     assert(!ToHotKeySpec(ParseShortcut(L"Super")).supported);
