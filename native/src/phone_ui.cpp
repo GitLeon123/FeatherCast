@@ -23,6 +23,7 @@
 #include "accessibility.hpp"
 #include "background_services.hpp"
 #include "motion.hpp"
+#include "phone_presentation.hpp"
 #include "text_layout_cache.hpp"
 #include "qrcodegen.hpp"
 #include "ui_renderer.hpp"
@@ -63,7 +64,7 @@ constexpr long long kToastActionMs = 8000;
 constexpr int kPairingScrollKey = 100;
 // Accessible children before the actionable controls: header status, toast.
 constexpr int kFixedAccessibleChildren = 2;
-constexpr float kTransferRowHeight = 34.0f;
+constexpr float kTransferRowHeight = 36.0f;
 constexpr size_t kMaxTransferRows = 3;
 
 // Segoe MDL2 Assets glyphs.
@@ -154,6 +155,8 @@ struct Transfer {
   std::wstring name;
   long long done = 0;
   long long total = 0;
+  long long startedAt = 0;
+  bool showPercent = false;  // sticky once the transfer proved long
 };
 
 struct NotificationItem {
@@ -313,6 +316,10 @@ struct PhoneWindow::Impl : public accessibility::Model {
   std::wstring toastActionLabel;
   std::string lastError;  // newest link error, shown on the pairing screen
   long long lastErrorAt = 0;
+  // When each phone last dropped its connection in this session, for an honest
+  // "connection lost" / "last connected" status instead of a generic wait.
+  std::map<std::string, long long> lastSeen;
+  std::string lastSeenId;  // the phone that disconnected most recently
 
   // Keyboard focus lives over the hit list; the key survives repaints.
   FocusKey focusKey;
@@ -323,6 +330,10 @@ struct PhoneWindow::Impl : public accessibility::Model {
   // Press feedback while the left button is held.
   bool pressing = false;
   D2D1_POINT_2F pressPoint{-1.0f, -1.0f};
+  // Hover never beats the keyboard: after a key moves focus, the control under a
+  // resting pointer stops looking hovered until the pointer actually moves.
+  bool hoverSuppressed = false;
+  POINT lastPointer{-1, -1};  // screen position of the last real pointer move
 
   // Short-lived presentation state. The model and hit targets change immediately.
   bool fadeMotion = true;
@@ -360,12 +371,14 @@ struct PhoneWindow::Impl : public accessibility::Model {
   ComPtr<IDWriteTextFormat> iconLargeFormat;
   ComPtr<IDWriteTextFormat> stepFormat;
   ComPtr<IDWriteTextFormat> statFormat;
+  ComPtr<IDWriteTypography> tabularFigures;  // tnum for counts, times, sizes and percents
   ui::TextLayoutCache textLayouts{128, 16 * 1024};
 
   Impl() {
     windowOpacity.Snap(1.0);
-    windowOffset.Configure(0.30, 0.82);
-    sidebarY.Configure(0.30, 0.76);
+    // Critically damped: UI springs settle without bounce.
+    windowOffset.Configure(0.25, 1.0);
+    sidebarY.Configure(0.16, 1.0);
     contentOpacity.Snap(1.0);
     toastOpacity.Snap(0.0);
   }
@@ -441,6 +454,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
         &smallWrapFormat, &smallCenterFormat, &iconFormat, &iconLargeFormat,
         &stepFormat, &statFormat};
     for (auto* format : formats) format->Reset();
+    tabularFigures.Reset();
   }
 
   static theme::Color SystemColor(int index) {
@@ -582,21 +596,37 @@ struct PhoneWindow::Impl : public accessibility::Model {
     }
   }
 
+  float DpiScale() const { return static_cast<float>(WindowDpi(hwnd)) / 96.0f; }
+
+  // Strokes the inside of `rect` on whole device pixels, so hairlines stay crisp
+  // at 125/150/175 % instead of smearing across two pixel rows.
   void Stroke(const D2D1_RECT_F& rect, D2D1_COLOR_F color, float radius, float width = 1.0f) {
     brush->SetColor(color);
+    const SnappedStroke snapped =
+        SnapStroke(rect.left, rect.top, rect.right, rect.bottom, width, DpiScale());
     target->DrawRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(rect.left + 0.5f, rect.top + 0.5f,
-                                      rect.right - 0.5f, rect.bottom - 0.5f),
+        D2D1::RoundedRect(D2D1::RectF(snapped.left, snapped.top, snapped.right, snapped.bottom),
                           radius, radius),
-        brush.Get(), width);
+        brush.Get(), snapped.width);
   }
 
+  // `tabular` turns on tabular figures so digits keep their width while they
+  // change (counts, times, sizes, percentages).
   void Text(const std::wstring& text, const D2D1_RECT_F& rect, IDWriteTextFormat* format,
-            D2D1_COLOR_F color) {
+            D2D1_COLOR_F color, bool tabular = false) {
     if (text.empty() || !format || rect.right <= rect.left) return;
     brush->SetColor(color);
     auto layout = textLayouts.Get(dwrite.Get(), text, format,
                                   rect.right - rect.left, rect.bottom - rect.top);
+    if (layout && tabular) {
+      if (!tabularFigures && SUCCEEDED(dwrite->CreateTypography(tabularFigures.GetAddressOf()))) {
+        tabularFigures->AddFontFeature({DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1});
+      }
+      // Only digits change shape, so sharing the cached layout is harmless.
+      if (tabularFigures) {
+        layout->SetTypography(tabularFigures.Get(), {0, static_cast<UINT32>(text.size())});
+      }
+    }
     if (layout) {
       target->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(),
                               brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -617,7 +647,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
     return metrics.widthIncludingTrailingWhitespace;
   }
 
-  bool Hovered(const D2D1_RECT_F& rect) const { return Contains(rect, mouse); }
+  bool Hovered(const D2D1_RECT_F& rect) const { return !hoverSuppressed && Contains(rect, mouse); }
   bool Pressed(const D2D1_RECT_F& rect) const {
     return pressing && Contains(rect, pressPoint) && Contains(rect, mouse);
   }
@@ -714,7 +744,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
     const D2D1_RECT_F track{right - 62.0f, y + 21.0f, right - 18.0f, y + 43.0f};
     auto [it, inserted] = toggleMotion.try_emplace(action);
     if (inserted) {
-      it->second.Configure(0.24, 0.78);
+      it->second.Configure(0.20, 1.0);
       it->second.Snap(on ? 1.0 : 0.0);
     }
     it->second.Retarget(on ? 1.0 : 0.0, controlMotion);
@@ -777,11 +807,37 @@ struct PhoneWindow::Impl : public accessibility::Model {
          OnAccent());
   }
 
+  // What the header says about the link right now; also polled by the tick
+  // timer so "connection lost" turns into "last connected …" on its own.
+  LinkStatus CurrentLinkStatus() const {
+    LinkFacts facts;
+    facts.enabled = state.enabled;
+    facts.running = state.running;
+    facts.pairedCount = state.devices.size();
+    facts.connected = connected;
+    facts.battery = battery;
+    facts.charging = charging;
+    facts.nowMs = NowMs();
+    const auto seen = lastSeen.find(lastSeenId);
+    if (seen != lastSeen.end()) {
+      // Only phones that are still paired count; a forgotten one is no longer awaited.
+      for (const auto& device : state.devices) {
+        if (device.id != lastSeenId) continue;
+        facts.lastSeenMs = seen->second;
+        facts.lastSeenName = Widen(device.name);
+      }
+    }
+    return DescribeLink(facts);
+  }
+
   void DrawHeader(float width) {
     currentZone = Zone::Header;
     Fill({0, 0, width, kHeaderHeight}, Surface());
     brush->SetColor(ToD2D(theme.divider));
-    target->DrawLine({0, kHeaderHeight - 0.5f}, {width, kHeaderHeight - 0.5f}, brush.Get());
+    const float scale = DpiScale();
+    const float dividerY = SnapHairlineAbove(kHeaderHeight, 1.0f, scale);
+    target->DrawLine({0, dividerY}, {width, dividerY}, brush.Get(),
+                     std::max(1.0f, std::round(scale)) / scale);
 
     const float cx = kPad + 24.0f;
     const float cy = kHeaderHeight / 2.0f;
@@ -803,35 +859,24 @@ struct PhoneWindow::Impl : public accessibility::Model {
     const float textLeft = cx + 38.0f;
     Text(title, {textLeft, 16.0f, width - 260.0f, 46.0f}, titleFormat.Get(), TextPrimary());
 
-    std::wstring status;
+    const LinkStatus link = CurrentLinkStatus();
     D2D1_COLOR_F dot = ToD2D(theme.textDim);
-    if (!state.enabled) {
-      status = L"Phone connection is off";
-    } else if (!state.running) {
-      status = L"Not available – phone connection could not start";
-      dot = ToD2D(theme.danger);
-    } else if (connected) {
-      status = L"Connected";
-      if (battery >= 0) {
-        status += L"  ·  Battery " + std::to_wstring(battery) + L"%";
-        if (charging) status += L" (charging)";
-      }
-      dot = ToD2D(theme.success);
-    } else if (state.devices.size() == 1) {
-      status = L"Waiting for your phone – open FeatherCast Phone on it";
-    } else if (paired) {
-      status = L"Waiting for one of your " + std::to_wstring(state.devices.size()) +
-               L" paired phones – open FeatherCast Phone on it";
-    } else {
-      status = L"No phone paired yet";
+    switch (link.tone) {
+      case LinkTone::Good: dot = ToD2D(theme.success); break;
+      case LinkTone::Bad: dot = ToD2D(theme.danger); break;
+      case LinkTone::Warning:
+        // Amber reads as "degraded"; high contrast has no such color, so use text.
+        dot = highContrast ? TextPrimary() : D2D1::ColorF(0.96f, 0.69f, 0.26f);
+        break;
+      case LinkTone::Neutral: break;
     }
     headerTitle = title;
-    headerStatus = status;
+    headerStatus = link.text;
     brush->SetColor(dot);
     target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(textLeft + 5.0f, 60.0f), 4.5f, 4.5f),
                         brush.Get());
-    Text(status, {textLeft + 16.0f, 50.0f, width - 260.0f, 70.0f}, smallFormat.Get(),
-         TextMuted());
+    Text(link.text, {textLeft + 16.0f, 50.0f, width - 260.0f, 70.0f}, smallFormat.Get(),
+         TextMuted(), true);
 
     if (state.enabled && state.running && paired && !pairing) {
       const float w = MeasureWidth(L"Pair new phone", bodyFormat.Get()) + 52.0f;
@@ -1105,7 +1150,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
         const std::wstring count =
             entry.count > 99 ? std::wstring(L"99+") : std::to_wstring(entry.count);
         Text(count, {row.right - 40.0f, row.top, row.right - 10.0f, row.bottom},
-             smallFormat.Get(), TextMuted());
+             smallFormat.Get(), TextMuted(), true);
       }
       Hit& hit = AddHit(row, Action::SelectTab, index++, {}, entry.label, Role::Tab);
       hit.selected = selected;
@@ -1153,7 +1198,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
     const std::wstring time = FormatTime(item.info.time);
     if (!time.empty()) meta += (meta.empty() ? L"" : L"  ·  ") + time;
     Text(meta, {textLeft, row.top + 8.0f, textRight, row.top + 26.0f}, smallFormat.Get(),
-         TextMuted());
+         TextMuted(), true);
     Text(SingleLine(Widen(item.info.title)), {textLeft, row.top + 26.0f, textRight, row.top + 46.0f},
          headingFormat.Get(), TextPrimary());
     Text(SingleLine(Widen(item.info.text)), {textLeft, row.top + 46.0f, textRight, row.top + 66.0f},
@@ -1197,7 +1242,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       }
       if (Hovered(card)) Stroke(card, ToD2D(accent, 0.7f), theme.settingsRadius + 2.0f);
       Text(std::to_wstring(stats[i].value), {x + 18, y + 12, card.right - 12, y + 50},
-           statFormat.Get(), TextPrimary());
+           statFormat.Get(), TextPrimary(), true);
       Text(stats[i].label, {x + 18, y + 52, card.right - 12, y + 74}, smallFormat.Get(),
            TextMuted());
       AddHit(card, Action::SelectTab, static_cast<int>(stats[i].tab), {},
@@ -1365,7 +1410,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       Text(name, {left + 64.0f, y + 10.0f, right - 120.0f, y + 32.0f}, headingFormat.Get(),
            TextPrimary());
       Text(FormatTime(thread.time), {right - 116.0f, y + 10.0f, right - 12.0f, y + 32.0f},
-           smallFormat.Get(), thread.unread ? Accent() : TextMuted());
+           smallFormat.Get(), thread.unread ? Accent() : TextMuted(), true);
       Text(SingleLine(Widen(thread.snippet)), {left + 64.0f, y + 32.0f, right - 12.0f, y + 54.0f},
            bodyFormat.Get(), TextMuted());
       Hit& hit = AddHit(row, Action::OpenSmsThread, static_cast<int>(i), thread.thread,
@@ -1387,7 +1432,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       Fill(row, ToD2D(theme.surfaceHover, 0.4f), theme.settingsRadius + 2.0f);
     }
     Text(FormatTime(clip.time), {left + 16, y + 8, right - 60, y + 26}, smallFormat.Get(),
-         TextMuted());
+         TextMuted(), true);
     brush->SetColor(TextPrimary());
     const std::wstring text = Widen(clip.text);
     target->PushAxisAlignedClip({left + 16, y + 26, right - 60, y + 70},
@@ -1563,9 +1608,13 @@ struct PhoneWindow::Impl : public accessibility::Model {
       Text(Widen(device.name), {left + 56, y + 12, right - 140, y + 34}, headingFormat.Get(),
            TextPrimary());
       const bool online = connected && ConnectedId() == device.id;
-      Text(online ? L"Connected now" : L"Paired " + FormatTime(device.pairedAt),
-           {left + 56, y + 34, right - 140, y + 54}, smallFormat.Get(),
-           online ? ToD2D(theme.success) : TextMuted());
+      const auto seen = lastSeen.find(device.id);
+      const std::wstring presence =
+          online ? std::wstring(L"Connected now")
+          : seen != lastSeen.end() ? L"Last connected " + FormatTime(seen->second)
+                                   : L"Paired " + FormatTime(device.pairedAt);
+      Text(presence, {left + 56, y + 34, right - 140, y + 54}, smallFormat.Get(),
+           online ? ToD2D(theme.success) : TextMuted(), true);
       const float w = MeasureWidth(L"Forget", bodyFormat.Get()) + 32.0f;
       Button(right - 14 - w, y + 14, L"Forget", Action::ForgetDevice, false, nullptr,
              device.id, true, L"Forget " + Widen(device.name));
@@ -1596,18 +1645,28 @@ struct PhoneWindow::Impl : public accessibility::Model {
   const std::string& ConnectedId() const { return connectedId; }
   std::wstring headerTitle;
   std::wstring headerStatus;
+  long long paintNow = 0;  // one clock reading per paint keeps the layout consistent
+
+  // Transfers that finish within a second never get a strip: the action's own
+  // toast already acknowledged them, and a flash of progress reads as a glitch.
+  bool TransfersShown() const {
+    return std::any_of(transfers.begin(), transfers.end(), [&](const Transfer& t) {
+      return TransferRevealed(t.startedAt, paintNow);
+    });
+  }
 
   float TransferStripHeight() const {
-    if (transfers.empty()) return 0.0f;
+    if (!TransfersShown()) return 0.0f;
     const size_t rows = std::min(transfers.size(), kMaxTransferRows);
     return 52.0f + static_cast<float>(rows) * kTransferRowHeight +
-           (transfers.size() > rows ? 22.0f : 0.0f) + 10.0f;
+           (transfers.size() > rows ? 24.0f : 0.0f) + 8.0f;
   }
 
   // Persistent strip above the toast area: one row with progress per file and a
-  // Cancel button that stops them all.
+  // Cancel button that stops them all. Sizes always show; a percentage joins
+  // them only for transfers that take ten seconds or more.
   void DrawTransferStrip(float width, float height) {
-    if (transfers.empty()) return;
+    if (!TransfersShown()) return;
     currentZone = Zone::Overlay;
     const float left = kSidebarWidth + kPad;
     const float right = width - kPad;
@@ -1618,33 +1677,46 @@ struct PhoneWindow::Impl : public accessibility::Model {
     Text(n == 1 ? std::wstring(L"Transferring 1 file")
                 : L"Transferring " + std::to_wstring(n) + L" files",
          {card.left + 16.0f, card.top + 8.0f, card.right - 120.0f, card.top + 44.0f},
-         headingFormat.Get(), TextPrimary());
+         headingFormat.Get(), TextPrimary(), true);
     const float cw = MeasureWidth(L"Cancel", bodyFormat.Get()) + 32.0f;
     Button(card.right - 12.0f - cw, card.top + 8.0f, L"Cancel", Action::CancelTransfers, false,
            nullptr, {}, false, L"Cancel file transfers");
     float y = card.top + 52.0f;
     const size_t rows = std::min(n, kMaxTransferRows);
     for (size_t i = 0; i < rows; ++i) {
-      const Transfer& transfer = transfers[i];
-      const int percent = transfer.total <= 0
-                              ? 100
-                              : static_cast<int>(std::clamp<long long>(
-                                    transfer.done * 100 / transfer.total, 0, 100));
+      Transfer& transfer = transfers[i];
+      if (!transfer.showPercent) {
+        transfer.showPercent =
+            TransferWantsPercent(transfer.startedAt, paintNow, transfer.done, transfer.total);
+      }
+      const int percent = TransferPercent(transfer.done, transfer.total);
+      std::wstring amount = TransferAmount(transfer.done, transfer.total);
+      if (transfer.showPercent && percent >= 0) {
+        amount = std::to_wstring(percent) + L"%  \u00b7  " + amount;
+      }
+      // Slack for tabular digits, which can be wider than the measured ones.
+      const float amountWidth = std::min(MeasureWidth(amount, smallFormat.Get()) + 8.0f,
+                                         (card.right - card.left) / 2.0f);
       Text(transfer.name.empty() ? std::wstring(L"File") : transfer.name,
-           {card.left + 16.0f, y, card.right - 70.0f, y + 18.0f}, smallFormat.Get(),
+           {card.left + 16.0f, y, card.right - 24.0f - amountWidth, y + 18.0f}, smallFormat.Get(),
            TextPrimary());
-      Text(std::to_wstring(percent) + L"%", {card.right - 62.0f, y, card.right - 16.0f, y + 18.0f},
-           smallFormat.Get(), TextMuted());
-      const D2D1_RECT_F bar{card.left + 16.0f, y + 21.0f, card.right - 16.0f, y + 25.0f};
+      Text(amount, {card.right - 16.0f - amountWidth, y, card.right - 16.0f, y + 18.0f},
+           smallFormat.Get(), TextMuted(), true);
+      const D2D1_RECT_F bar{card.left + 16.0f, y + 22.0f, card.right - 16.0f, y + 26.0f};
       Fill(bar, ToD2D(theme.surfaceHover, 1.0f), 2.0f);
-      Fill({bar.left, bar.top,
-            bar.left + (bar.right - bar.left) * static_cast<float>(percent) / 100.0f, bar.bottom},
-           Accent(), 2.0f);
+      // An unknown size has no honest fill; the byte count beside it still moves.
+      if (percent > 0) {
+        Fill({bar.left, bar.top,
+              bar.left + (bar.right - bar.left) * static_cast<float>(percent) / 100.0f,
+              bar.bottom},
+             Accent(), 2.0f);
+      }
       y += kTransferRowHeight;
     }
     if (n > rows) {
       Text(L"+" + std::to_wstring(n - rows) + L" more",
-           {card.left + 16.0f, y, card.right - 16.0f, y + 18.0f}, smallFormat.Get(), TextMuted());
+           {card.left + 16.0f, y, card.right - 16.0f, y + 18.0f}, smallFormat.Get(), TextMuted(),
+           true);
     }
   }
 
@@ -1775,7 +1847,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
   // Name of icon-only buttons, shown under the pointer or the keyboard focus.
   void DrawTooltip(float width, float height) {
     const Hit* hit = nullptr;
-    if (mouse.x >= 0.0f) hit = HitAt(mouse);
+    if (mouse.x >= 0.0f && !hoverSuppressed) hit = HitAt(mouse);
     if ((!hit || hit->tip.empty()) && focusVisible) hit = FocusedHit();
     if (!hit || hit->tip.empty()) return;
     const float w = MeasureWidth(hit->tip, smallFormat.Get()) + 20.0f;
@@ -1800,6 +1872,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
 
   void Paint() {
     if (!EnsureTarget()) return;
+    paintNow = NowMs();
     const D2D1_SIZE_F size = target->GetSize();
     hits.clear();
     target->BeginDraw();
@@ -1916,7 +1989,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       toast.clear();
       toastRun = nullptr;
     }
-    if (closing && !windowOpacity.Active() && !windowOffset.Active()) {
+    if (closing && !windowOpacity.Active() && (fadeMotion || !windowOffset.Active())) {
       KillTimer(hwnd, kFrameTimer);
       DestroyWindow(hwnd);
       return;
@@ -1953,7 +2026,16 @@ struct PhoneWindow::Impl : public accessibility::Model {
       ApplyWindowPresentation();
     }
     closing = false;
+    BOOL cloak = TRUE;
+    const bool cloaked = !wasVisible &&
+        SUCCEEDED(DwmSetWindowAttribute(hwnd, 13 /* DWMWA_CLOAK */, &cloak, sizeof(cloak)));
     ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    if (cloaked) {
+      // The first frame is drawn while DWM still hides the window.
+      RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+      cloak = FALSE;
+      DwmSetWindowAttribute(hwnd, 13 /* DWMWA_CLOAK */, &cloak, sizeof(cloak));
+    }
     SetForegroundWindow(hwnd);
     windowOpacity.Retarget(1.0, 0.23, fadeMotion);
     windowOffset.Retarget(0.0, spatialMotion);
@@ -2015,10 +2097,10 @@ struct PhoneWindow::Impl : public accessibility::Model {
   // ------------------------------------------------------------- actions
 
   void AnimateContentChange() {
-    if (!contentOpacity.Active()) contentOpacity.Snap(fadeMotion ? 0.45 : 1.0);
-    contentOpacity.Retarget(1.0, 0.20, fadeMotion);
-    if (!contentOffset.Active()) contentOffset.Snap(spatialMotion ? 14.0 : 0.0);
-    contentOffset.Retarget(0.0, 0.22, spatialMotion);
+    if (!contentOpacity.Active()) contentOpacity.Snap(fadeMotion ? 0.6 : 1.0);
+    contentOpacity.Retarget(1.0, 0.12, fadeMotion);
+    if (!contentOffset.Active()) contentOffset.Snap(spatialMotion ? 6.0 : 0.0);
+    contentOffset.Retarget(0.0, 0.15, spatialMotion);
     RequestFrame();
   }
 
@@ -2559,6 +2641,16 @@ struct PhoneWindow::Impl : public accessibility::Model {
       }
       case WM_MOUSEMOVE: {
         const D2D1_POINT_2F point = ToDip(lParam);
+        // Windows also sends WM_MOUSEMOVE when content moves under a resting
+        // pointer; only a real move brings hover back after keyboard use.
+        POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ClientToScreen(hwnd, &screen);
+        const bool moved = screen.x != lastPointer.x || screen.y != lastPointer.y;
+        lastPointer = screen;
+        if (hoverSuppressed && moved) {
+          hoverSuppressed = false;
+          Invalidate();
+        }
         const Hit* before = HitAt(mouse);
         mouse = point;
         const Hit* after = HitAt(mouse);
@@ -2581,6 +2673,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F point = ToDip(lParam);
         mouse = point;
+        hoverSuppressed = false;
         focusVisible = false;  // the ring is for keyboard use only
         if (HitAt(point)) {
           pressing = true;
@@ -2666,7 +2759,13 @@ struct PhoneWindow::Impl : public accessibility::Model {
         return 0;
       }
       case WM_KEYDOWN:
-        if (OnKeyDown(wParam)) return 0;
+        if (OnKeyDown(wParam)) {
+          if (mouse.x >= 0.0f && !hoverSuppressed) {
+            hoverSuppressed = true;
+            Invalidate();
+          }
+          return 0;
+        }
         break;
       case WM_TIMER:
         if (wParam == kFrameTimer) {
@@ -2684,6 +2783,21 @@ struct PhoneWindow::Impl : public accessibility::Model {
               ShowPhotoFailure(L"Your phone did not send the photo in time.", photo.info.id);
               Invalidate();
             }
+          }
+          if (IsWindowVisible(hwnd)) {
+            // "Connection lost" ages into "last connected …"; a transfer that
+            // has run a second gets its strip even before the next progress event.
+            std::wstring status = CurrentLinkStatus().text;
+            const bool statusChanged = status != headerStatus;
+            if (statusChanged) headerStatus = std::move(status);
+            const long long now = NowMs();
+            const bool stripDue =
+                !transfers.empty() && !TransfersShown() &&
+                std::any_of(transfers.begin(), transfers.end(),
+                            [&](const Transfer& t) { return TransferRevealed(t.startedAt, now); });
+            if (statusChanged || stripDue) Invalidate();
+            // Child 1 carries the status as its value.
+            if (statusChanged) NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd, OBJID_CLIENT, 1);
           }
           if (!toast.empty() && NowMs() >= toastUntil) {
             if (fadeMotion) {
@@ -2812,6 +2926,10 @@ struct PhoneWindow::Impl : public accessibility::Model {
         lastError.clear();
         break;
       case EventKind::Disconnected:
+        if (!event.deviceId.empty()) {
+          lastSeen[event.deviceId] = NowMs();
+          lastSeenId = event.deviceId;
+        }
         transfers.clear();
         connected = false;
         connectedId.clear();
@@ -2872,7 +2990,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
         auto found = std::find_if(transfers.begin(), transfers.end(),
                                   [&](const Transfer& t) { return t.id == event.id; });
         if (found == transfers.end()) {
-          transfers.push_back(Transfer{event.id, Widen(event.photo.name), 0, 0});
+          transfers.push_back(Transfer{event.id, Widen(event.photo.name), 0, 0, NowMs()});
           found = std::prev(transfers.end());
         }
         found->done = event.transferredBytes;

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cwchar>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,6 +45,7 @@ enum ControlId : int {
   IdName,
   IdKeyword,
   IdValue,
+  IdUndoDelete,
 };
 
 // Posted by the manager to itself so the initial editor opens after window
@@ -989,6 +991,10 @@ class ManagerWindow {
             DeleteItem();
             return true;
           }
+          if (message.wParam == 'Z' && GetKeyState(VK_CONTROL) < 0 && undoDelete_) {
+            UndoDelete();
+            return true;
+          }
           return false;
         },
         [this] { Close(); });
@@ -1042,7 +1048,7 @@ class ManagerWindow {
     const HFONT previous = font_;
     font_ = next;
     for (HWND control : {tabs_, list_, add_, edit_, remove_, reload_, openFile_,
-                         restore_, close_, status_, empty_}) {
+                         restore_, close_, status_, empty_, undo_}) {
       UseDefaultFont(control, font_);
     }
     if (previous) DeleteObject(previous);
@@ -1164,6 +1170,10 @@ class ManagerWindow {
     close_ = AddControl(WC_BUTTONW, L"Close", WS_TABSTOP, IDCANCEL);
     status_ = AddControl(WC_STATICW, L"", SS_LEFT, IdStatus);
     SetLiveSetting(status_, 1);
+    // Deleting needs no confirmation: the last delete can be undone instead.
+    undo_ = AddControl(WC_BUTTONW, L"Undo", WS_TABSTOP, IdUndoDelete);
+    SetAccessibleName(undo_, L"Undo delete (Ctrl+Z)");
+    ShowWindow(undo_, SW_HIDE);
     empty_ = AddControl(WC_STATICW, L"", SS_LEFT | SS_NOPREFIX, 0);
     RefreshFont();
     Refresh();
@@ -1331,7 +1341,11 @@ class ManagerWindow {
     const int listHeight = std::max(1, statusTop - listTop - px(12));
     MoveWindow(tabs_, margin, margin, contentWidth, tabHeight, TRUE);
     MoveWindow(list_, margin, listTop, contentWidth, listHeight, TRUE);
-    MoveWindow(status_, margin, statusTop, contentWidth, px(22), TRUE);
+    const int undoWidth = px(72);
+    MoveWindow(status_, margin, statusTop,
+               std::max(1, contentWidth - (undoDelete_ ? undoWidth + gap : 0)), px(22), TRUE);
+    MoveWindow(undo_, margin + contentWidth - undoWidth, statusTop - px(4), undoWidth,
+               px(28), TRUE);
     const int listColumnWidth = std::max(1, contentWidth - px(4));
     const int nameColumn = listColumnWidth * 28 / 100;
     const int keywordColumn = listColumnWidth * 20 / 100;
@@ -1548,7 +1562,7 @@ class ManagerWindow {
       savePending_ = true;
       savePollTicks_ = 0;
       SetTimer(hwnd_, kTimerSaveStatus, kSavePollMs, nullptr);
-      SetStatus(L"Saving...", false);
+      SetStatus(L"Saving\u2026", false);
       return;
     }
     // Settings-backed tabs apply immediately and persist in the background;
@@ -1586,6 +1600,7 @@ class ManagerWindow {
   template <typename Item, typename Save>
   bool Commit(std::vector<Item>& stored, std::vector<Item> candidate,
               const Save& save) {
+    ClearUndo();
     const auto result = save(candidate);
     ShowResult(result);
     if (result.succeeded) {
@@ -1678,42 +1693,74 @@ class ManagerWindow {
     Refresh(*selected);
   }
 
+  // Deletes right away and offers Undo (button or Ctrl+Z) instead of asking
+  // first: deleting is routine and the item is easy to bring back.
   void DeleteItem() {
     const auto selected = SelectedIndex();
     if (!selected || !Writable()) return;
-    const std::wstring prompt =
-        L"Delete \"" + ItemDisplayName(*selected) + L"\"?";
-    if (MessageBoxW(hwnd_, prompt.c_str(), L"FeatherCast Library",
-                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-      return;
-    }
-    const auto position = static_cast<std::ptrdiff_t>(*selected);
+    const std::wstring name = ItemDisplayName(*selected);
+    bool deleted = false;
     if (kind_ == library::ItemKind::Snippet) {
-      auto candidate = data_.snippets;
-      candidate.erase(candidate.begin() + position);
-      Commit(data_.snippets, std::move(candidate), callbacks_.saveSnippets);
+      deleted = DeleteWithUndo(data_.snippets, *selected, callbacks_.saveSnippets);
     } else if (IsLaunchItem(kind_)) {
-      auto candidate = LaunchItems();
-      candidate.erase(candidate.begin() + position);
-      Commit(LaunchItems(), std::move(candidate),
-             SaveLaunchItems());
+      deleted = DeleteWithUndo(LaunchItems(), *selected, SaveLaunchItems());
     } else if (kind_ == library::ItemKind::AppAlias) {
-      auto candidate = data_.appAliases;
-      candidate.erase(candidate.begin() + position);
-      Commit(data_.appAliases, std::move(candidate),
-             callbacks_.saveAppAliases);
+      deleted = DeleteWithUndo(data_.appAliases, *selected, callbacks_.saveAppAliases);
     } else if (IsCommandItem(kind_)) {
-      auto candidate = CommandItems();
-      candidate.erase(candidate.begin() + position);
-      Commit(CommandItems(), std::move(candidate),
-             SaveCommandItems());
+      deleted = DeleteWithUndo(CommandItems(), *selected, SaveCommandItems());
     } else {
-      auto candidate = data_.webSearches;
-      candidate.erase(candidate.begin() + position);
-      Commit(data_.webSearches, std::move(candidate),
-             callbacks_.saveWebSearches);
+      deleted = DeleteWithUndo(data_.webSearches, *selected, callbacks_.saveWebSearches);
+    }
+    if (deleted) {
+      undoName_ = name;
+      ShowWindow(undo_, SW_SHOW);
+      LayoutCurrentClient();
+      // Snippets report their own "Saving…" / "Changes saved." progress.
+      if (!savePending_) SetStatus(L"Deleted \"" + name + L"\". Press Ctrl+Z to undo.", false);
     }
     Refresh();
+  }
+
+  template <typename Item, typename Save>
+  bool DeleteWithUndo(std::vector<Item>& stored, std::size_t position, const Save& save) {
+    auto candidate = stored;
+    Item removed = candidate[position];
+    candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(position));
+    if (!Commit(stored, std::move(candidate), save)) return false;
+    // `stored` is a member of data_, so the address stays valid; any later
+    // change clears the undo before the captured state goes stale.
+    std::vector<Item>* list = &stored;
+    undoPosition_ = position;
+    undoDelete_ = [this, list, removed = std::move(removed), position, save]() {
+      auto restored = *list;
+      restored.insert(restored.begin() +
+                          static_cast<std::ptrdiff_t>(std::min(position, restored.size())),
+                      removed);
+      return Commit(*list, std::move(restored), save);
+    };
+    return true;
+  }
+
+  void UndoDelete() {
+    if (!undoDelete_ || !Writable()) return;
+    const auto undo = std::move(undoDelete_);
+    undoDelete_ = nullptr;
+    const std::size_t position = undoPosition_;
+    const std::wstring name = undoName_;
+    const bool restored = undo();  // Commit clears the undo button
+    Refresh(restored ? std::optional<std::size_t>(position) : std::nullopt);
+    if (restored && !savePending_) SetStatus(L"Restored \"" + name + L"\".", false);
+    SetFocus(list_);
+  }
+
+  void ClearUndo() {
+    if (!undoDelete_ && !(undo_ && IsWindowVisible(undo_))) return;
+    undoDelete_ = nullptr;
+    undoName_.clear();
+    if (!undo_) return;
+    if (GetFocus() == undo_) SetFocus(list_);
+    ShowWindow(undo_, SW_HIDE);
+    LayoutCurrentClient();
   }
 
   LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1794,6 +1841,7 @@ class ManagerWindow {
           }
         }
         if (header->idFrom == IdTabs && header->code == TCN_SELCHANGE) {
+          ClearUndo();
           kind_ = static_cast<library::ItemKind>(TabCtrl_GetCurSel(tabs_));
           initialAppId_.clear();
           operationStatus_.clear();
@@ -1822,6 +1870,7 @@ class ManagerWindow {
           case IdEdit: EditItem(); return 0;
           case IdDelete: DeleteItem(); return 0;
           case IdReload:
+            ClearUndo();
             if (callbacks_.reload) data_ = callbacks_.reload();
             operationStatus_.clear();
             operationStatusError_ = false;
@@ -1842,6 +1891,7 @@ class ManagerWindow {
                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
                 return 0;
               }
+              ClearUndo();
               const auto result = callbacks_.restoreDefaultWebSearches();
               ShowResult(result);
               if (callbacks_.reload) data_ = callbacks_.reload();
@@ -1850,6 +1900,9 @@ class ManagerWindow {
             return 0;
           case IdOpenFile:
             if (callbacks_.openSnippetsFile) callbacks_.openSnippetsFile();
+            return 0;
+          case IdUndoDelete:
+            UndoDelete();
             return 0;
           case IDCANCEL:
             Close();
@@ -1885,6 +1938,10 @@ class ManagerWindow {
   HWND close_ = nullptr;
   HWND status_ = nullptr;
   HWND empty_ = nullptr;
+  HWND undo_ = nullptr;
+  std::function<bool()> undoDelete_;  // puts the last deleted item back
+  std::size_t undoPosition_ = 0;
+  std::wstring undoName_;
   int columnCount_ = 3;
   bool savePending_ = false;
   int savePollTicks_ = 0;

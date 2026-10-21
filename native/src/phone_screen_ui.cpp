@@ -1,4 +1,5 @@
 #include "phone_screen_ui.hpp"
+#include "phone_presentation.hpp"
 #include "phone_screen_playback.hpp"
 #include "ui_renderer.hpp"
 #include <commctrl.h>
@@ -9,6 +10,7 @@
 #include <windowsx.h>
 #include <wrl/client.h>
 #include <array>
+#include <cmath>
 #include <deque>
 #include <mutex>
 
@@ -32,6 +34,7 @@ std::string Utf8(std::wstring_view text) {
 }
 D2D1_COLOR_F Color(theme::Color c) { return D2D1::ColorF(c.r, c.g, c.b, 1); }
 COLORREF GdiColor(theme::Color c) { return RGB(static_cast<BYTE>(c.r * 255), static_cast<BYTE>(c.g * 255), static_cast<BYTE>(c.b * 255)); }
+D2D1_COLOR_F FromGdi(COLORREF c) { return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f, GetBValue(c) / 255.0f, 1); }
 // State shared with the playback worker and the service thread. Their
 // callbacks hold it by shared_ptr, never the window, so a late frame, status or
 // keyframe request after the window is gone only lands here.
@@ -104,6 +107,7 @@ struct PhoneScreenWindow::Impl {
   ComPtr<ID2D1HwndRenderTarget> target;
   ComPtr<ID2D1SolidColorBrush> brush;
   ComPtr<ID2D1Bitmap> bitmap;
+  ComPtr<ID2D1DCRenderTarget> buttonTarget;  // antialiased rounded owner-drawn buttons
   std::shared_ptr<const phone::ScreenFrame> shownFrame;
   // Only the newest decoded frame and every status are marshalled to the UI.
   std::shared_ptr<ScreenMailbox> mailbox = std::make_shared<ScreenMailbox>();
@@ -187,7 +191,7 @@ struct PhoneScreenWindow::Impl {
     EnableWindow(controls[Stop], !sessionId.empty());
     for (int id : {Back, Home, Apps}) EnableWindow(controls[id], controlReady && !sessionId.empty());
     Caption(controls[Sound], sound ? L"Mute" : L"Unmute");
-    Caption(controls[Fullscreen], fullscreen ? L"Exit full" : L"Full screen");
+    Caption(controls[Fullscreen], fullscreen ? L"Exit full screen" : L"Full screen");
     Caption(controls[Title], deviceName.empty() ? L"Phone Screen" : Widen(deviceName));
     Caption(hwnd, L"Phone Screen — " + (deviceName.empty() ? std::wstring(L"FeatherCast") : Widen(deviceName)));
     const auto accessibleText = [&](int id, const std::wstring& text) {
@@ -198,7 +202,7 @@ struct PhoneScreenWindow::Impl {
     std::wstring status = detail.empty() ? L"Click to tap · drag to swipe · scroll to move · type directly in phone apps" : detail;
     if (!audioDetail.empty()) status += L" " + audioDetail;
     else if (audioReady) status += sound ? L" Device audio on; some apps cannot share sound." : L" Device audio muted.";
-    accessibleText(Status, status); accessibleText(EmptyTitle, phase);
+    accessibleText(Status, status); accessibleText(EmptyTitle, ScreenEmptyTitle(connected, available, phase));
     const std::wstring help = !connected ? L"Connect your Android phone in Phone Connection to share its screen."
         : !available ? L"Enable Screen sharing in the updated FeatherCast app on your phone, then choose Start."
         : sessionId.empty() ? L"Choose Start, then approve screen sharing on your phone. Every session stays on your local network."
@@ -248,7 +252,7 @@ struct PhoneScreenWindow::Impl {
     place(Start, width - 232, 16, 96, 32); place(Stop, width - 124, 16, 100, 32);
     float x = 24;
     for (const auto& [id, w] : {std::pair{Back, 64.0f}, {Home, 64.0f}, {Apps, 100.0f}, {Sound, 80.0f}}) { place(id, x, 62, w, 30); x += w + 8; }
-    place(Volume, x, 62, std::max(72.0f, width - x - 132), 30); place(Fullscreen, width - 116, 62, 92, 30);
+    place(Volume, x, 62, std::max(72.0f, width - x - 164), 30); place(Fullscreen, width - 148, 62, 124, 30);
     const float height = rc.bottom / scale;
     place(Status, 24, height - 92, width - 48, 56); place(Hint, 24, height - 32, width - 48, 20);
     const float center = (112 + height - 108) * .5f - 48;
@@ -292,7 +296,10 @@ struct PhoneScreenWindow::Impl {
       dwrite->CreateTextFormat(family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14, L"en-us", &body);
       dwrite->CreateTextFormat(family.c_str(), nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20, L"en-us", &heading);
     }
-    BOOL dark = !highContrast; DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark)); Update();
+    BOOL dark = !highContrast; DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    // The title bar continues the window surface, like the Phone window.
+    const COLORREF caption = GdiColor(theme.surface); DwmSetWindowAttribute(hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    Update();
   }
   bool Resources() {
     if (!d2d && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf()))) return false;
@@ -306,6 +313,40 @@ struct PhoneScreenWindow::Impl {
     }
     return body && heading;
   }
+  // Rounded, antialiased button body (and focus ring) like the Phone window's
+  // controls. Returns false when Direct2D is unavailable; the caller then
+  // draws the plain GDI frame.
+  bool DrawButtonFrame(HDC dc, const RECT& rc, COLORREF fill, COLORREF edge, bool focused, COLORREF ring) {
+    if (!d2d) return false;
+    if (!buttonTarget) {
+      const auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+          D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96, 96);
+      if (FAILED(d2d->CreateDCRenderTarget(&props, &buttonTarget))) return false;
+    }
+    if (FAILED(buttonTarget->BindDC(dc, &rc))) return false;
+    ComPtr<ID2D1SolidColorBrush> paint;
+    if (FAILED(buttonTarget->CreateSolidColorBrush(FromGdi(fill), &paint))) return false;
+    // Device pixels: the radius follows the DPI, strokes sit on half-pixel centres.
+    const float dpiScale = GetDpiForWindow(hwnd) / 96.0f;
+    const float width = static_cast<float>(rc.right - rc.left), height = static_cast<float>(rc.bottom - rc.top);
+    const float radius = std::min(theme.controlRadius * dpiScale, height / 2);
+    const float hairline = std::max(1.0f, std::round(dpiScale));
+    buttonTarget->BeginDraw();
+    buttonTarget->Clear(Color(theme.surface));  // what sits behind the rounded corners
+    const D2D1_RECT_F face{hairline / 2, hairline / 2, width - hairline / 2, height - hairline / 2};
+    buttonTarget->FillRoundedRectangle(D2D1::RoundedRect(face, radius, radius), paint.Get());
+    paint->SetColor(FromGdi(edge));
+    buttonTarget->DrawRoundedRectangle(D2D1::RoundedRect(face, radius, radius), paint.Get(), hairline);
+    if (focused) {
+      // Concentric with the body: inner radius = outer radius - inset.
+      const float ringWidth = std::max(2.0f, std::round(2 * dpiScale)), inset = hairline + ringWidth / 2;
+      paint->SetColor(FromGdi(ring));
+      buttonTarget->DrawRoundedRectangle(D2D1::RoundedRect({inset, inset, width - inset, height - inset},
+          std::max(0.0f, radius - inset), std::max(0.0f, radius - inset)), paint.Get(), ringWidth);
+    }
+    if (FAILED(buttonTarget->EndDraw())) { buttonTarget.Reset(); return false; }
+    return true;
+  }
   void Text(const std::wstring& text, D2D1_RECT_F rc, IDWriteTextFormat* format, theme::Color color) {
     brush->SetColor(Color(color)); target->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, rc, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
   }
@@ -314,7 +355,9 @@ struct PhoneScreenWindow::Impl {
     if (Resources()) {
       const auto size = target->GetSize(); target->BeginDraw(); target->Clear(Color(theme.surface));
       const phone::ScreenRect viewport{24, 112, size.width - 24, size.height - 108};
-      brush->SetColor(Color(theme::CompositeOver(theme.overlayBackground, theme.surface))); target->FillRectangle({viewport.left, viewport.top, viewport.right, viewport.bottom}, brush.Get());
+      const float viewportRadius = theme.settingsRadius + 2.0f;  // the Phone window's card radius
+      brush->SetColor(Color(theme::CompositeOver(theme.overlayBackground, theme.surface)));
+      target->FillRoundedRectangle(D2D1::RoundedRect({viewport.left, viewport.top, viewport.right, viewport.bottom}, viewportRadius, viewportRadius), brush.Get());
       imageRect = {};
       if (shownFrame) {
         const auto& f = *shownFrame; imageRect = phone::FitScreenRect(viewport, f.width, f.height);
@@ -322,7 +365,21 @@ struct PhoneScreenWindow::Impl {
           bitmap.Reset(); target->CreateBitmap(D2D1::SizeU(f.width, f.height), f.bgra.data(), f.width * 4,
               D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)), &bitmap);
         } else bitmap->CopyFromMemory(nullptr, f.bgra.data(), f.width * 4);
-        if (bitmap) target->DrawBitmap(bitmap.Get(), {imageRect.left, imageRect.top, imageRect.right, imageRect.bottom});
+        if (bitmap) {
+          // Painted through a bitmap brush so the screen gets rounded corners that
+          // stay inside the rounded viewport instead of poking out of it.
+          const D2D1_RECT_F image{imageRect.left, imageRect.top, imageRect.right, imageRect.bottom};
+          ComPtr<ID2D1BitmapBrush> imageBrush;
+          if (SUCCEEDED(target->CreateBitmapBrush(bitmap.Get(), &imageBrush))) {
+            imageBrush->SetTransform(D2D1::Matrix3x2F::Scale((image.right - image.left) / static_cast<float>(f.width),
+                                                             (image.bottom - image.top) / static_cast<float>(f.height)) *
+                                     D2D1::Matrix3x2F::Translation(image.left, image.top));
+            const float radius = std::min(theme.controlRadius, viewportRadius);
+            target->FillRoundedRectangle(D2D1::RoundedRect(image, radius, radius), imageBrush.Get());
+          } else {
+            target->DrawBitmap(bitmap.Get(), image);
+          }
+        }
       }
       if (FAILED(target->EndDraw())) { bitmap.Reset(); brush.Reset(); target.Reset(); }
     }
@@ -403,14 +460,19 @@ struct PhoneScreenWindow::Impl {
           edgeColor = GdiColor(theme::CompositeOver(hover ? theme.border : theme.surfaceHover, theme.surface));
           textColor = GdiColor(disabled ? theme.textDim : theme.textPrimary);
         }
-        HBRUSH bg = CreateSolidBrush(fillColor); FillRect(item->hDC, &item->rcItem, bg); DeleteObject(bg);
-        HBRUSH edge = CreateSolidBrush(edgeColor);
-        FrameRect(item->hDC, &item->rcItem, edge); DeleteObject(edge);
+        const bool focused = (item->itemState & ODS_FOCUS) != 0;
+        const COLORREF ringColor = highContrast ? GetSysColor(COLOR_WINDOWTEXT) : GdiColor(theme.textPrimary);
+        const bool rounded = DrawButtonFrame(item->hDC, item->rcItem, fillColor, edgeColor, focused, ringColor);
+        if (!rounded) {
+          HBRUSH bg = CreateSolidBrush(fillColor); FillRect(item->hDC, &item->rcItem, bg); DeleteObject(bg);
+          HBRUSH edge = CreateSolidBrush(edgeColor);
+          FrameRect(item->hDC, &item->rcItem, edge); DeleteObject(edge);
+        }
         SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, textColor);
         const auto oldFont = SelectObject(item->hDC, font); wchar_t label[64]{}; GetWindowTextW(item->hwndItem, label, 64);
         RECT textRect = item->rcItem; DrawTextW(item->hDC, label, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(item->hDC, oldFont);
-        if (item->itemState & ODS_FOCUS) { RECT focus = item->rcItem; InflateRect(&focus, -3, -3); DrawFocusRect(item->hDC, &focus); }
+        if (focused && !rounded) { RECT focus = item->rcItem; InflateRect(&focus, -3, -3); DrawFocusRect(item->hDC, &focus); }
         return TRUE;
       }
       case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: {
@@ -514,7 +576,16 @@ struct PhoneScreenWindow::Impl {
             area.top + (area.bottom - area.top - height) / 2, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
       }
     }
-    ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); SetFocus(hwnd);
+    // Cloaked until the window and its controls have painted, so the first
+    // frame on screen is the finished one, never a blank or white flash.
+    BOOL cloak = TRUE;
+    const bool cloaked = !IsWindowVisible(hwnd) && SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak)));
+    ShowWindow(hwnd, SW_SHOW);
+    if (cloaked) {
+      RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+      cloak = FALSE; DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    }
+    SetForegroundWindow(hwnd); SetFocus(hwnd);
     if (connected && available && sessionId.empty()) StartSession();
   }
 };
