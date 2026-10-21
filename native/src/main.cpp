@@ -206,6 +206,7 @@ constexpr UINT TIMER_ICON_PROMOTE = 14;
 constexpr UINT TIMER_APP_DISCOVERY_REFRESH = 16;
 constexpr UINT TIMER_START_DISMISS = 17;
 constexpr UINT TIMER_SETTINGS_STATUS = 30;
+constexpr UINT TIMER_SEARCH_BUSY = 41;
 constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
 constexpr UINT APP_DISCOVERY_REFRESH_DELAY_MS = 750;
 constexpr UINT RENDER_RECOVERY_MAX_DELAY_MS = 1000;
@@ -3903,6 +3904,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (wParam == TIMER_CLOCK_DISPLAY) {
           if (visible_ && (browseView_ == BrowseView::Timers || (actionMode_ && actionTarget_.timerRequest))) RequestSearch();
           else KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+        } else if (wParam == TIMER_SEARCH_BUSY) {
+          OnSearchBusyTimer();
         } else if (wParam == 1) {
           if (visible_) {
             if (!suppressHide_ && !startupShowRequested_ && !overlayClosing_ &&
@@ -9168,18 +9171,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // What clicking a balloon does; the target is a URL or a file path.
   enum class TrayAction { None, OpenSettings, CheckForUpdates, OpenUrl, RevealPath };
 
+  // A transient notice confirms a routine action: it plays no sound and is
+  // dropped when Windows cannot show it right away, instead of arriving late.
   void ShowTrayNotification(const std::wstring& title, const std::wstring& message,
                             TraySeverity severity = TraySeverity::Info,
                             TrayAction action = TrayAction::None,
-                            std::wstring target = {}) {
+                            std::wstring target = {}, bool transient = false) {
     if (!tray_.cbSize) return;
     NOTIFYICONDATAW notification = tray_;
-    notification.uFlags = NIF_INFO;
+    notification.uFlags = NIF_INFO | (transient ? NIF_REALTIME : 0);
     wcsncpy_s(notification.szInfoTitle, title.c_str(), _TRUNCATE);
     wcsncpy_s(notification.szInfo, message.c_str(), _TRUNCATE);
-    notification.dwInfoFlags = severity == TraySeverity::Error     ? NIIF_ERROR
-                               : severity == TraySeverity::Warning ? NIIF_WARNING
-                                                                   : NIIF_INFO;
+    notification.dwInfoFlags =
+        (severity == TraySeverity::Error     ? NIIF_ERROR
+         : severity == TraySeverity::Warning ? NIIF_WARNING
+                                             : NIIF_INFO) |
+        (transient ? NIIF_NOSOUND : 0);
     balloonAction_ = action;
     balloonTarget_ = std::move(target);
     Shell_NotifyIconW(NIM_MODIFY, &notification);
@@ -9215,6 +9222,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
     }
+  }
+
+  // Copy actions close the launcher and confirm quietly. A failed copy keeps
+  // the launcher and the typed query on screen with the cause, so the user
+  // can simply try again.
+  void FinishCopyAction(bool copied, const std::wstring& failure) {
+    if (!copied) {
+      if (visible_ && !overlayClosing_) {
+        SetOverlayStatus(StatusSeverity::Error, failure);
+      } else {
+        ShowTrayNotification(L"FeatherCast", failure, TraySeverity::Error);
+      }
+      return;
+    }
+    if (visible_ && !overlayClosing_) HideOverlay(OverlayCloseReason::Action);
+    ShowTrayNotification(L"FeatherCast", L"Copied to clipboard.", TraySeverity::Info,
+                         TrayAction::None, {}, true);
   }
 
   void LoadPersistentState() {
@@ -10644,6 +10668,44 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return searchPresentation_.Pending() || loadingFiles;
   }
 
+  // Visible "Searching..." feedback waits out a short grace period so fast
+  // searches never flash it; the previous results stay on screen meanwhile.
+  bool SearchBusyIndicatorVisible() const {
+    return searchBusyIndicator_.Visible(SearchPending(), GetTickCount64());
+  }
+
+  void NoteSearchRequested(bool alreadyPending) {
+    const ULONGLONG now = GetTickCount64();
+    searchBusyIndicator_.NoteRequest(alreadyPending, now);
+    if (hwnd_) {
+      // Repaint once the grace period ends in case the search is still busy.
+      SetTimer(hwnd_, TIMER_SEARCH_BUSY,
+               static_cast<UINT>(std::max<std::uint64_t>(
+                   USER_TIMER_MINIMUM, searchBusyIndicator_.RemainingMs(now))),
+               nullptr);
+    }
+  }
+
+  void OnSearchBusyTimer() {
+    KillTimer(hwnd_, TIMER_SEARCH_BUSY);
+    if (!visible_ || !SearchPending()) return;
+    const std::uint64_t remaining =
+        searchBusyIndicator_.RemainingMs(GetTickCount64());
+    if (remaining > 0) {
+      SetTimer(hwnd_, TIMER_SEARCH_BUSY,
+               static_cast<UINT>(std::max<std::uint64_t>(USER_TIMER_MINIMUM,
+                                                         remaining)),
+               nullptr);
+      return;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void ArmHoverGate() {
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) hoverGate_.Arm(cursor.x, cursor.y);
+  }
+
   bool ResultsActivationAllowed() const {
     return searchPresentation_.CanActivate();
   }
@@ -10686,7 +10748,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       EnsureFileIndexLoaded();
       if (!fileIndexConfigured_) ConfigureFileIndex();
     }
+    const bool alreadyPending = SearchPending();
     QueryRequest req = GatherRequest();
+    NoteSearchRequested(alreadyPending);
     if (std::abs(overlayVisualScroll_.Target() -
                  static_cast<double>(scroll_)) > 0.001) {
       RetargetOverlayScroll();
@@ -11253,6 +11317,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       pendingNavigation_.Clear();
       EnsureSelectedVisible();
     }
+    // Rows may now sit under a resting pointer, and the resize below makes
+    // Windows synthesize WM_MOUSEMOVE; neither may move the selection.
+    ArmHoverGate();
     ApplyWindowSize();
     QueueVisibleResultIcons();
     StartResultTransitions(oldPositions);
@@ -11876,8 +11943,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     // Ignore the mouse pointer until it is actually moved, so an overlay that
     // opens under the cursor does not hover-select the result beneath it.
-    GetCursorPos(&mouseAnchor_);
-    ignoreMouseUntilMove_ = true;
+    ArmHoverGate();
     lastMouseScreen_ = {-1, -1};
     queryScrollX_ = 0.0f;
 
@@ -12863,11 +12929,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void CopyPhoneTextToPc(const std::wstring& text) {
     // Remember the text so the clipboard listener does not echo it back.
     lastPhoneClipboardText_ = text;
-    if (CopyTextToClipboard(text)) {
-      HideOverlay(OverlayCloseReason::Action);
-    } else {
-      SetOverlayStatus(StatusSeverity::Error, L"Could not copy the selected text.");
-    }
+    FinishCopyAction(CopyTextToClipboard(text),
+                     L"Could not copy the text. Try again.");
   }
 
   void ActivatePhoneItem(const DisplayItem& item) {
@@ -12977,9 +13040,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::wstring EmptyResultsMessage() const {
-    if (SearchPending()) return L"Searching...";
-    const bool emptyQuery = Trim(query_).empty();
-    const auto scopedQuery = feathercast::search_scope::Parse(query_);
+    if (SearchPending()) {
+      if (SearchBusyIndicatorVisible()) return L"Searching...";
+      // During the grace period keep describing what is on screen rather
+      // than flashing a verdict about a query that has not been searched yet.
+      return hasRenderedResults_ ? EmptyResultsMessageFor(displayedQuery_)
+                                 : std::wstring{};
+    }
+    return EmptyResultsMessageFor(query_);
+  }
+
+  std::wstring EmptyResultsMessageFor(const std::wstring& query) const {
+    const bool emptyQuery = Trim(query).empty();
+    const auto scopedQuery = feathercast::search_scope::Parse(query);
     if (browseView_ == BrowseView::Clipboard) {
       if (!settings_.clipboardHistoryEnabled) return L"Clipboard history is turned off";
       return emptyQuery ? L"Clipboard history is empty"
@@ -15736,7 +15809,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // textDim is already the quietest tier that keeps 4.5:1; fading it
       // further would make the hint unreadable.
       DrawShortcutHints(
-          SearchPending() ? std::wstring(L"Searching...") : SearchHint(),
+          SearchBusyIndicatorVisible() ? std::wstring(L"Searching...") : SearchHint(),
           {hintLeft, 0.0f, width - 94.0f, resultsTop_},
           D2DColor(theme_.textDim), 1.0f, true);
     }
@@ -15943,7 +16016,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       DrawTextBlock(EmptyResultsMessage(),
                     {0, messageTop, width, messageTop + 32.0f}, centerFormat_.Get(),
                     D2DColor(theme_.textMuted));
-    } else if (SearchPending() && !showFooter && !overlayStatus_ &&
+    } else if (SearchBusyIndicatorVisible() && !showFooter && !overlayStatus_ &&
                !compactHintVisible) {
       // The footer (or compact header hint) carries "Searching..." elsewhere;
       // only this bottom pill is left, clear of the selected row's hint.
@@ -16010,7 +16083,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       footerRightFormat_.Get(), statusColor);
       } else {
         DrawShortcutHints(
-            SearchPending() && !sections_.empty() ? std::wstring(L"Searching...")
+            SearchBusyIndicatorVisible() && !sections_.empty() ? std::wstring(L"Searching...")
                                                   : SearchHint(),
             {footerHintLeft, footerTop, width - kContentInset, height},
             D2DColor(theme_.textMuted), 1.0f, true);
@@ -18594,8 +18667,42 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return SUCCEEDED(encoder->Commit());
   }
 
+  // Esc peels one layer at a time; see feathercast::ui::NextEscapeStep.
+  void HandleOverlayEscape() {
+    const auto scoped = feathercast::search_scope::Parse(query_);
+    feathercast::ui::EscapeContext context;
+    context.subView = browseView_ != BrowseView::None || actionMode_;
+    context.previewOpen = previewOpen_;
+    context.scopedQuery = scoped.recognized;
+    context.queryEmpty = query_.empty();
+    context.searchView = view_ == View::Search;
+    switch (feathercast::ui::NextEscapeStep(context)) {
+      case feathercast::ui::EscapeStep::ClosePreview:
+        ClosePreview();
+        return;
+      case feathercast::ui::EscapeStep::StripScope:
+        feathercast::ui::OverlayController::RecordUserEdit(overlayState_);
+        SetQueryText(scoped.terms);
+        return;
+      case feathercast::ui::EscapeStep::ClearQuery:
+        // Ctrl+Z brings the cleared text back.
+        feathercast::ui::OverlayController::RecordUserEdit(overlayState_);
+        SetQueryText(L"");
+        return;
+      case feathercast::ui::EscapeStep::LeaveView:
+        if (browseView_ != BrowseView::None) ExitBrowseView();
+        else ExitActionMode();
+        return;
+      case feathercast::ui::EscapeStep::Hide:
+        HideOverlay(OverlayCloseReason::ExplicitDismiss);
+        return;
+    }
+  }
+
   void OnKeyDown(UINT vk) {
     if (overlayClosing_) return;
+    // Keyboard input owns the selection until the pointer genuinely moves.
+    ArmHoverGate();
     if (confirmation_) {
       if (confirmationClosing_) return;
       if (vk == VK_ESCAPE) {
@@ -18615,18 +18722,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU) ResetCaretBlink();
     if (vk == VK_ESCAPE) {
       pendingActivation_.reset();
-      if (browseView_ != BrowseView::None) {
-        ExitBrowseView();
-      } else if (actionMode_) {
-        ExitActionMode();
-      } else if (previewOpen_) {
-        ClosePreview();
-      } else {
-        const auto scoped = feathercast::search_scope::Parse(query_);
-        if (scoped.recognized) SetQueryText(scoped.terms);
-        else if (view_ == View::Search && !query_.empty()) SetQueryText(L"");  // second Esc closes
-        else HideOverlay(OverlayCloseReason::ExplicitDismiss);
-      }
+      HandleOverlayEscape();
       return;
     }
 
@@ -18645,6 +18741,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (view_ != View::Search) return;
 
+    if (control && vk == 'Z' && !shift && UndoResultListAction()) return;
     if (control && (vk == 'Z' || vk == 'Y')) {
       SetLauncherAccessibilityFocus(
           feathercast::accessibility_projection::SearchFocus());
@@ -18997,14 +19094,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       lastMouseScreen_ = cursor;
     }
 
-    // Suppress hover until the cursor leaves the spot it occupied when the
-    // overlay opened; a window appearing under the pointer fires WM_MOUSEMOVE
+    // Suppress hover until the cursor genuinely leaves the spot it occupied
+    // when the overlay opened, the keyboard last acted, or results reflowed;
+    // a window appearing or resizing under the pointer fires WM_MOUSEMOVE
     // even though the user never moved the mouse.
-    if (ignoreMouseUntilMove_) {
+    if (hoverGate_.Armed()) {
       POINT cursor{};
       GetCursorPos(&cursor);
-      if (cursor.x == mouseAnchor_.x && cursor.y == mouseAnchor_.y) return;
-      ignoreMouseUntilMove_ = false;
+      const int slop = std::max(
+          1, static_cast<int>(std::lround(
+                 feathercast::interaction::PointerHoverGate::kDefaultSlopPixels *
+                 GetWindowScale(hwnd_))));
+      if (!hoverGate_.Admit(cursor.x, cursor.y, slop)) return;
     }
 
     if (confirmation_) {
@@ -20981,10 +21082,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         return;
       case feathercast::extensions::HostActionType::CopyText:
-        ShowTrayNotification(
-            L"FeatherCast",
-            CopyTextToClipboard(response->value) ? L"Copied to clipboard."
-                                                 : L"Could not copy to clipboard.");
+        if (!CopyTextToClipboard(response->value)) {
+          FinishCopyAction(false, L"Could not copy to the clipboard. Try again.");
+        } else if (visible_ && !overlayClosing_) {
+          // The extension kept the launcher open, so confirm in place.
+          SetOverlayStatus(StatusSeverity::Success, L"Copied to clipboard.");
+        } else {
+          ShowTrayNotification(L"FeatherCast", L"Copied to clipboard.",
+                               TraySeverity::Info, TrayAction::None, {}, true);
+        }
         return;
       case feathercast::extensions::HostActionType::SetQuery:
         SetQueryText(response->value);
@@ -21116,12 +21222,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (item.utility) {
-      if (CopyTextToClipboard(item.utility->value)) {
-        HideOverlay(OverlayCloseReason::Action);
-      } else {
-        SetOverlayStatus(StatusSeverity::Error,
-                         L"Could not copy the utility result.");
-      }
+      FinishCopyAction(CopyTextToClipboard(item.utility->value),
+                       L"Could not copy the result. Try again.");
       return;
     }
 
@@ -21161,12 +21263,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (item.isCalculator || item.isConversion) {
-      if (CopyTextToClipboard(item.calculationResult)) {
-        HideOverlay(OverlayCloseReason::Action);
-        ShowTrayNotification(L"FeatherCast", L"Copied to clipboard.");
-      } else {
-        SetOverlayStatus(StatusSeverity::Error, L"Could not copy to clipboard.");
-      }
+      FinishCopyAction(CopyTextToClipboard(item.calculationResult),
+                       L"Could not copy the result. Try again.");
       return;
     }
 
@@ -21705,16 +21803,57 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case CommandKind::RecordRegion:
         BeginCapture(feathercast::ui::CaptureShortcutTarget::RecordRegion);
         return;
-      case CommandKind::GenerateUuid:
-        if (const auto uuid = GenerateUuidText();
-            uuid && CopyTextToClipboard(*uuid)) {
-          HideOverlay(OverlayCloseReason::Action);
-        } else {
-          SetOverlayStatus(StatusSeverity::Error,
-                           L"Could not generate or copy the UUID.");
-        }
+      case CommandKind::GenerateUuid: {
+        const auto uuid = GenerateUuidText();
+        FinishCopyAction(uuid && CopyTextToClipboard(*uuid),
+                         L"Could not generate or copy the UUID. Try again.");
         return;
+      }
     }
+  }
+
+  // Settings that pin, unpin, hide, or unhide results. Those actions apply at
+  // once and offer undo instead of asking for confirmation up front.
+  struct ResultListUndo {
+    std::vector<std::wstring> pinnedApps;
+    std::vector<std::wstring> pinnedItems;
+    std::vector<std::wstring> hiddenApps;
+  };
+
+  ResultListUndo CaptureResultListUndo() const {
+    return {settings_.pinnedApps, settings_.pinnedItems, settings_.hiddenApps};
+  }
+
+  void FinishResultListAction(ResultListUndo before, const wchar_t* done) {
+    PersistSettings();
+    // Return to the list the actions were opened from, with the same item
+    // selected, so the change is visible in context.
+    if (actionMode_) {
+      ExitActionMode();
+    } else {
+      RequestSearch();
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    std::wstring text = std::wstring(done) + L" Press Ctrl+Z to undo.";
+    SetOverlayStatus(StatusSeverity::Success, text);
+    resultListUndo_.Offer(std::move(text), std::move(before));
+  }
+
+  // Ctrl+Z reverts the last pin/hide change while its notice is on screen;
+  // otherwise it falls through to undoing the last query edit.
+  bool UndoResultListAction() {
+    const std::wstring* visible =
+        overlayStatus_ ? &overlayStatus_->text : nullptr;
+    auto before = resultListUndo_.Take(visible);
+    if (!before) return false;
+    settings_.pinnedApps = std::move(before->pinnedApps);
+    settings_.pinnedItems = std::move(before->pinnedItems);
+    settings_.hiddenApps = std::move(before->hiddenApps);
+    PersistSettings();
+    RequestSearch();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    SetOverlayStatus(StatusSeverity::Info, L"Change undone.");
+    return true;
   }
 
   void ExecuteAction(DisplayItem item) {
@@ -21858,12 +21997,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (const auto* textTarget =
             std::get_if<TextActionPayload>(&item.actionTarget)) {
       if (item.action == ActionKind::CopyText) {
-        if (CopyTextToClipboard(textTarget->value)) {
-          HideOverlay(OverlayCloseReason::Action);
-        } else {
-          SetOverlayStatus(StatusSeverity::Error,
-                           L"Could not copy the selected text.");
-        }
+        FinishCopyAction(CopyTextToClipboard(textTarget->value),
+                         L"Could not copy the text. Try again.");
       } else if (item.action == ActionKind::PasteText) {
         PasteTextToLastActiveWindow(textTarget->value);
       }
@@ -21923,22 +22058,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       }
       if (item.action == ActionKind::PinInvocation) {
+        auto before = CaptureResultListUndo();
         const auto& key = aliasTarget->invocationKey;
         if (!key.empty() && !ContainsValue(settings_.pinnedItems, key)) {
           settings_.pinnedItems.insert(settings_.pinnedItems.begin(), key);
-          PersistSettings();
         }
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Pinned.");
         return;
       }
       if (item.action == ActionKind::UnpinInvocation) {
+        auto before = CaptureResultListUndo();
         RemoveValue(settings_.pinnedItems, aliasTarget->invocationKey);
-        PersistSettings();
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Unpinned.");
         return;
       }
     }
@@ -21986,15 +22117,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         RevealAppLocation(app);
         HideOverlay(OverlayCloseReason::Action);
         return;
-      case ActionKind::CopyPath:
-        CopyTextToClipboard(AppPathForActions(app));
-        HideOverlay(OverlayCloseReason::Action);
+      case ActionKind::CopyPath: {
+        const std::wstring path = AppPathForActions(app);
+        FinishCopyAction(!path.empty() && CopyTextToClipboard(path),
+                         path.empty() ? L"This item has no file path to copy."
+                                      : L"Could not copy the path. Try again.");
         return;
+      }
       case ActionKind::EditAppAlias:
         HideOverlay(OverlayCloseReason::Action);
         OpenLibraryManager(feathercast::library::ItemKind::AppAlias, id);
         return;
-      case ActionKind::Pin:
+      case ActionKind::Pin: {
+        auto before = CaptureResultListUndo();
         if (!id.empty() && !ContainsValue(settings_.pinnedApps, id)) settings_.pinnedApps.insert(settings_.pinnedApps.begin(), id);
         {
           const std::wstring invKey = feathercast::core::StableInvocationKey(L"app", id);
@@ -22002,35 +22137,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             settings_.pinnedItems.insert(settings_.pinnedItems.begin(), invKey);
           }
         }
-        PersistSettings();
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Pinned.");
         return;
-      case ActionKind::Unpin:
+      }
+      case ActionKind::Unpin: {
+        auto before = CaptureResultListUndo();
         for (const auto& key : AppKeys(app)) {
           RemoveValue(settings_.pinnedApps, key);
           RemoveValue(settings_.pinnedItems, feathercast::core::StableInvocationKey(L"app", key));
         }
-        PersistSettings();
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Unpinned.");
         return;
-      case ActionKind::Hide:
+      }
+      case ActionKind::Hide: {
+        auto before = CaptureResultListUndo();
         if (!id.empty() && !ContainsValue(settings_.hiddenApps, id)) settings_.hiddenApps.push_back(id);
-        PersistSettings();
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Hidden from search.");
         return;
-      case ActionKind::Unhide:
+      }
+      case ActionKind::Unhide: {
+        auto before = CaptureResultListUndo();
         for (const auto& key : AppKeys(app)) RemoveValue(settings_.hiddenApps, key);
-        PersistSettings();
-        actionMode_ = false;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        FinishResultListAction(std::move(before), L"Shown in search again.");
         return;
+      }
       default:
         return;
     }
@@ -23244,8 +23374,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool mouseTracking_ = false;
   std::wstring announcedLauncherStatus_;
   bool settingsMouseTracking_ = false;
-  bool ignoreMouseUntilMove_ = false;
-  POINT mouseAnchor_ = {0, 0};
+  feathercast::interaction::PointerHoverGate hoverGate_;
+  feathercast::interaction::DelayedBusyIndicator searchBusyIndicator_;
+  feathercast::interaction::StatusUndoOffer<ResultListUndo> resultListUndo_;
   int& settingsHover_ = settingsState_.hover;
   int& settingsFocusIndex_ = settingsState_.focusIndex;
   float& settingsScroll_ = settingsState_.scroll;

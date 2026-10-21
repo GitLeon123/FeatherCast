@@ -454,6 +454,27 @@ class CaptureUiController {
   static void Reset(CaptureUiState& state) { state = {}; }
 };
 
+// Esc always peels one layer: a sub-view (browse view or action panel), then
+// the preview panel, then a scope prefix ("files: report" goes to "report"),
+// then the typed search text, and only then hides the launcher.
+enum class EscapeStep { ClosePreview, StripScope, ClearQuery, LeaveView, Hide };
+
+struct EscapeContext {
+  bool subView = false;
+  bool previewOpen = false;
+  bool scopedQuery = false;
+  bool queryEmpty = true;
+  bool searchView = true;
+};
+
+constexpr EscapeStep NextEscapeStep(const EscapeContext& context) {
+  if (context.subView) return EscapeStep::LeaveView;
+  if (context.previewOpen) return EscapeStep::ClosePreview;
+  if (context.scopedQuery) return EscapeStep::StripScope;
+  if (context.searchView && !context.queryEmpty) return EscapeStep::ClearQuery;
+  return EscapeStep::Hide;
+}
+
 class OverlayController {
  public:
   static UiEffects ResetForShow(OverlayState& state, app::View view,
