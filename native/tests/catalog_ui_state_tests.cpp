@@ -2,6 +2,8 @@
 #include "accessibility_projection.hpp"
 #include "command_catalog.hpp"
 #include "settings_catalog.hpp"
+#include "settings_presentation.hpp"
+#include "shortcut.hpp"
 #include "result_icons.hpp"
 #include "test_framework.hpp"
 #include "theme.hpp"
@@ -11,6 +13,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <optional>
 
 int main() {
   feathercast::ui::HitRegions geometry;
@@ -758,6 +762,73 @@ int main() {
     assert(feathercast::ui::ResolveInstalledFontFamily(
                L"No Such Family 9F2A") == L"Segoe UI");
     assert(feathercast::ui::ResolveInstalledFontFamily(L"") == L"Segoe UI");
+  }
+  {
+    // Settings show shortcuts with Windows key names and name the owner of a
+    // conflicting chord; counts get thousands separators.
+    using namespace feathercast::settings_ui;
+    assert(ShortcutDisplayLabel(L"Control+Shift+Space") == L"Ctrl+Shift+Space");
+    assert(ShortcutDisplayLabel(L"Super+Return") == L"Win+Enter");
+    assert(ShortcutDisplayLabel(L"Super") == L"Win");
+    assert(ShortcutDisplayLabel(L"Alt+PageDown") == L"Alt+Page Down");
+    assert(ShortcutDisplayLabel(L"Print Screen") == L"Print Screen");
+    assert(ShortcutDisplayLabel(L"Control++") == L"Ctrl++");
+    assert(ShortcutDisplayLabel(L"") == L"Not set");
+    assert(ShortcutDisplayLabel(L" none ") == L"Not set");
+    assert(!ShortcutAssigned(L"NONE") && ShortcutAssigned(L"Alt+F1"));
+
+    assert(RecordingPreviewLabel(false, false, false, false) ==
+           std::wstring(L"Press keys") + kEllipsis);
+    assert(RecordingPreviewLabel(true, false, true, false) ==
+           std::wstring(L"Ctrl+Shift+") + kEllipsis);
+    assert(RecordingPreviewLabel(true, true, true, true) ==
+           std::wstring(L"Ctrl+Alt+Shift+Win+") + kEllipsis);
+
+    const std::vector<ShortcutAssignment> assignments = {
+        {L"Open FeatherCast", L"none"},
+        {L"Region screenshot", L"Control+Shift+S"},
+        {L"Lock screen", L""},
+    };
+    // The recorder exposes held modifiers so the preview can follow them.
+    feathercast::shortcut::ShortcutRecorder recorder;
+    recorder.Handle(VK_LCONTROL, true, false);
+    recorder.Handle(VK_RSHIFT, true, false);
+    {
+      const auto& held = recorder.HeldModifiers();
+      assert(held.ctrl && held.shift && !held.alt && !held.win);
+      assert(RecordingPreviewLabel(held.ctrl, held.alt, held.shift, held.win) ==
+             std::wstring(L"Ctrl+Shift+") + kEllipsis);
+    }
+    assert(recorder.Handle('K', true, false).shortcut == L"Control+Shift+K");
+    assert(!recorder.HeldModifiers().ctrl && !recorder.HeldModifiers().shift);
+
+    assert(ShortcutConflictOwner(L"control+shift+s", assignments) ==
+           std::optional<std::wstring>(L"Region screenshot"));
+    assert(!ShortcutConflictOwner(L"Control+Shift+T", assignments));
+    assert(!ShortcutConflictOwner(L"none", assignments));
+    assert(!ShortcutConflictOwner(L"", assignments));
+    assert(ShortcutConflictMessage(L"Control+Shift+S", L"Region screenshot") ==
+           L"Ctrl+Shift+S is already used by Region screenshot. Pick another "
+           L"shortcut or clear that one first.");
+
+    assert(FormatCount(0) == L"0");
+    assert(FormatCount(999) == L"999");
+    assert(FormatCount(1000) == L"1,000");
+    assert(FormatCount(12345) == L"12,345");
+    assert(FormatCount(1234567) == L"1,234,567");
+    assert(CountLabel(1, L"app", L"apps") == L"1 app");
+    assert(CountLabel(0, L"app", L"apps") == L"0 apps");
+    assert(CountLabel(25000, L"entry", L"entries") == L"25,000 entries");
+
+    // 1px hairlines land on a single device pixel at fractional scales.
+    assert(SnapToDevicePixel(10.3f, 1.0f) == 10.0f);
+    assert(std::abs(SnapToDevicePixel(10.3f, 1.5f) * 1.5f -
+                    std::round(10.3f * 1.5f)) < 0.001f);
+    assert(SnapHairlineCenter(10.0f, 1.0f) == 10.5f);
+    const float center = SnapHairlineCenter(33.0f, 1.25f) * 1.25f;
+    assert(std::abs(center - std::floor(center) - 0.5f) < 0.001f);
+    assert(std::abs(HairlineWidth(1.5f) * 1.5f - 1.0f) < 0.001f);
+    assert(HairlineWidth(0.0f) > 0.0f);
   }
   return 0;
 }

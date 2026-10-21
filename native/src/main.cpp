@@ -46,6 +46,7 @@
 #include "command_hotkeys.hpp"
 #include "settings.hpp"
 #include "settings_catalog.hpp"
+#include "settings_presentation.hpp"
 #include "settings_io.hpp"
 #include "shortcut.hpp"
 #include "input_broker_protocol.hpp"
@@ -8935,24 +8936,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return std::nullopt;
   }
 
-  bool CaptureShortcutDuplicate(const std::wstring& candidate,
-                                int ignoredIndex = -1) const {
-    if (candidate.empty() || candidate == L"none") return false;
-    if (settings_.shortcut == candidate) return true;
-    const std::array values = {
-        settings_.screenshotFullscreenShortcut,
-        settings_.screenshotRegionShortcut,
-        settings_.recordFullscreenShortcut,
-        settings_.recordRegionShortcut};
-    for (std::size_t index = 0; index < values.size(); ++index) {
-      if (static_cast<int>(index) != ignoredIndex &&
-          values[index] == candidate) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   std::wstring& CaptureShortcutSetting(std::size_t index) {
     switch (index) {
       case 0: return settings_.screenshotFullscreenShortcut;
@@ -8981,7 +8964,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!CanActivateShortcut(candidate)) {
       RegisterCaptureHotKeys();
       SetSettingsStatus(StatusSeverity::Error,
-                        candidate.display +
+                        ShortcutDisplayLabel(candidate.display) +
                             L" is used by Windows or another app. Choose a different shortcut.");
       return false;
     }
@@ -8993,13 +8976,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       CaptureShortcutSpec(index) = previousSpec;
       RegisterCaptureHotKeys();
       SetSettingsStatus(StatusSeverity::Error,
-                        L"Could not activate " + candidate.display +
+                        L"Could not activate " +
+                            ShortcutDisplayLabel(candidate.display) +
                             L". The previous shortcut was restored.");
       return false;
     }
     PersistSettings();
     SetSettingsStatus(StatusSeverity::Success,
-                      L"Shortcut set to " + candidate.display + L".");
+                      L"Shortcut set to " +
+                          ShortcutDisplayLabel(candidate.display) + L".");
     return true;
   }
 
@@ -9009,14 +8994,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::optional<std::wstring> ShortcutRejection(const ShortcutSpec& candidate,
                                                 int ignoredIndex) const {
     if (IsReservedWindowsShortcut(candidate)) {
-      return candidate.display +
+      return ShortcutDisplayLabel(candidate.display) +
              L" is reserved by Windows. Choose a different shortcut.";
     }
-    if (CaptureShortcutDuplicate(candidate.display, ignoredIndex)) {
-      return candidate.display +
-             L" is already assigned to another FeatherCast shortcut.";
+    if (const auto owner = feathercast::settings_ui::ShortcutConflictOwner(
+            candidate.display, ShortcutAssignments(ignoredIndex))) {
+      return feathercast::settings_ui::ShortcutConflictMessage(
+          candidate.display, *owner);
     }
     return std::nullopt;
+  }
+
+  static constexpr std::array<const wchar_t*, 4> kCaptureShortcutLabels{
+      L"Fullscreen Screenshot", L"Region Screenshot", L"Fullscreen Recording",
+      L"Region Recording"};
+
+  static std::wstring ShortcutDisplayLabel(std::wstring_view stored) {
+    return feathercast::settings_ui::ShortcutDisplayLabel(stored);
+  }
+
+  // Every FeatherCast chord except the one being edited (ignoredIndex is a
+  // capture row, or -1 for the launcher shortcut). Command shortcuts are
+  // included so a clash names the command instead of blaming Windows when
+  // RegisterHotKey later fails on our own registration.
+  std::vector<feathercast::settings_ui::ShortcutAssignment> ShortcutAssignments(
+      int ignoredIndex) const {
+    std::vector<feathercast::settings_ui::ShortcutAssignment> assignments;
+    if (ignoredIndex != -1) {
+      assignments.push_back({L"Open FeatherCast", settings_.shortcut});
+    }
+    const std::array values = {
+        &settings_.screenshotFullscreenShortcut,
+        &settings_.screenshotRegionShortcut,
+        &settings_.recordFullscreenShortcut, &settings_.recordRegionShortcut};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      if (static_cast<int>(index) == ignoredIndex) continue;
+      assignments.push_back({kCaptureShortcutLabels[index], *values[index]});
+    }
+    for (const auto& [stableId, chord] : settings_.commandShortcuts) {
+      const auto* command = feathercast::commands::Find(stableId);
+      assignments.push_back(
+          {command ? command->label + L" (command shortcut)" : stableId,
+           ParseShortcut(chord).display});
+    }
+    return assignments;
   }
 
   // Applies a recorded launcher shortcut immediately and rolls back when the
@@ -9030,7 +9051,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (!CanActivateShortcut(candidate)) {
       SetSettingsStatus(StatusSeverity::Error,
-                        candidate.display +
+                        ShortcutDisplayLabel(candidate.display) +
                             L" is used by Windows or another app. Choose a different shortcut.");
       return false;
     }
@@ -9044,7 +9065,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       shortcut_ = previousShortcut;
       RegisterShortcutHotKey();
       SetSettingsStatus(StatusSeverity::Error,
-                        L"Could not activate " + candidate.display +
+                        L"Could not activate " +
+                            ShortcutDisplayLabel(candidate.display) +
                             L". The previous shortcut was restored.");
       return false;
     }
@@ -9052,7 +9074,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     PersistSettings();
     UpdateTrayTooltip();
     SetSettingsStatus(StatusSeverity::Success,
-                      L"Shortcut set to " + candidate.display + L".");
+                      L"FeatherCast now opens with " +
+                          ShortcutDisplayLabel(candidate.display) + L".");
     return true;
   }
 
@@ -9087,7 +9110,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       UpdateKeyboardHook();
       RepaintWindow(settingsHwnd_);
+    } else if (IsModifier(vk)) {
+      // Held modifiers are previewed while the chord forms.
+      RepaintWindow(settingsHwnd_);
     }
+  }
+
+  // "Ctrl+Shift+..." while modifiers are held, empty otherwise.
+  std::wstring RecordingChordPreview() const {
+    const auto& held = shortcutRecorder_.HeldModifiers();
+    if (!held.ctrl && !held.alt && !held.shift && !held.win) return L"";
+    return feathercast::settings_ui::RecordingPreviewLabel(
+        held.ctrl, held.alt, held.shift, held.win);
   }
 
   size_t ClipboardHistoryLimit() const {
@@ -12417,6 +12451,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const auto effects = feathercast::ui::SettingsController::Open(
         settingsState_, SettingsCategoryFocusIndex(settingsCategory_));
     shortcutRecorder_.Reset();
+    settingsNavIndicatorPlaced_ = false;
+    settingsFocusVisible_ = false;
     ShowSettingsWindow();
     ScheduleSettingsStatusExpiry();
     ExecuteSettingsEffects(effects);
@@ -13644,6 +13680,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snap(confirmationProgress_);
     for (auto& [_, animation] : switchAnimations_) snap(animation);
     for (auto& [_, animation] : settingsHoverMotion_) snap(animation);
+    snap(settingsNavIndicator_);
     snap(gearHoverMotion_);
     for (auto& [_, element] : resultRowMotion_) snap(element.opacity);
     for (auto& [_, element] : resultHeaderMotion_) snap(element.opacity);
@@ -13877,9 +13914,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     });
   }
 
+  // Every motion painted only by the Settings window: hover fades, switch
+  // thumbs, and the sidebar selection indicator.
   bool HasSettingsHoverMotion() const {
+    const auto active = [](const auto& entry) { return entry.second.Active(); };
     return std::any_of(settingsHoverMotion_.begin(), settingsHoverMotion_.end(),
-                       [](const auto& entry) { return entry.second.Active(); });
+                       active) ||
+           std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
+                       active) ||
+           settingsNavIndicator_.Active();
   }
 
   bool HasActiveMotion() const {
@@ -14119,9 +14162,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         animating_ || animatingSelection_ || overlayVisualScroll_.Active() ||
         previewVisualScroll_.Active() || confirmationProgress_.Active() ||
         gearHoverMotion_.Active() || HasElementMotion(resultRowMotion_) ||
-        HasElementMotion(resultHeaderMotion_) ||
-        std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
-                    [](const auto& entry) { return entry.second.Active(); });
+        HasElementMotion(resultHeaderMotion_);
     const bool settingsContentMotion =
         settingsVisualScroll_.Active() || HasSettingsHoverMotion();
     const bool volumeContentMotion = volumeVisualPercent_.Active();
@@ -14162,6 +14203,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (auto& [_, animation] : settingsHoverMotion_) {
       animation.Update(deltaTime);
     }
+    settingsNavIndicator_.Update(deltaTime);
     gearHoverMotion_.Update(deltaTime);
 
     if (overlayBoundsChanged) {
@@ -16808,6 +16850,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     color.a *= alpha;
     return color;
   }
+  // The focus ring follows keyboard use (focus-visible): a mouse click still
+  // moves focus, but only Tab, arrows and other keys reveal the ring.
+  bool SettFocusRing(HitType type) const {
+    return settingsFocusVisible_ && SettFocused(type);
+  }
+
   bool SettFocused(HitType type) const {
     const auto order = SettingsFocusOrder();
     return settingsFocusIndex_ >= 0 && settingsFocusIndex_ < static_cast<int>(order.size()) &&
@@ -16832,13 +16880,101 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   D2D1_COLOR_F SettWhite() const { return D2DColor(theme_.textPrimary); }
   D2D1_COLOR_F SettGray() const { return D2DColor(theme_.textMuted); }
 
+  float SettingsScale() const {
+    return settingsHwnd_ ? GetWindowScale(settingsHwnd_) : 1.0f;
+  }
+
+  // One device pixel wide and centred on a device pixel, so dividers stay
+  // crisp at 125/150/175 % instead of smearing over two pixel rows.
+  void DrawSettingsHairline(float x0, float y0, float x1, float y1) {
+    const float scale = SettingsScale();
+    if (y0 == y1) {
+      y0 = y1 = feathercast::settings_ui::SnapHairlineCenter(y0, scale);
+      x0 = feathercast::settings_ui::SnapToDevicePixel(x0, scale);
+      x1 = feathercast::settings_ui::SnapToDevicePixel(x1, scale);
+    } else {
+      x0 = x1 = feathercast::settings_ui::SnapHairlineCenter(x0, scale);
+      y0 = feathercast::settings_ui::SnapToDevicePixel(y0, scale);
+      y1 = feathercast::settings_ui::SnapToDevicePixel(y1, scale);
+    }
+    auto brush = Brush(D2DColor(theme_.divider));
+    activeRT_->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1),
+                        brush.Get(),
+                        feathercast::settings_ui::HairlineWidth(scale));
+  }
+
+  static RectF SnapSettingsRect(RectF rect, float scale) {
+    using feathercast::settings_ui::SnapToDevicePixel;
+    return {SnapToDevicePixel(rect.left, scale),
+            SnapToDevicePixel(rect.top, scale),
+            SnapToDevicePixel(rect.right, scale),
+            SnapToDevicePixel(rect.bottom, scale)};
+  }
+
+  // Section titles use a 12 px caption: the shared section format is 11 px,
+  // below the readable minimum for the dense Settings pages. It is rebuilt
+  // whenever the shared formats are (text size or font changes), which is
+  // detected by holding the label format it was created alongside.
+  IDWriteTextFormat* SettingsSectionFormat() {
+    if (!labelFormat_) return sectionFormat_.Get();
+    if (!settingsSectionFormat_ ||
+        settingsSectionFormatSource_.Get() != labelFormat_.Get()) {
+      const float textScale = static_cast<float>(
+          feathercast::settings::ClampTextSizePercent(
+              settings_.textSizePercent)) /
+                              100.0f;
+      CreateTextFormat({12.0f * textScale, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                        16.0f * textScale},
+                       settingsSectionFormat_);
+      settingsSectionFormatSource_ = labelFormat_;
+    }
+    return settingsSectionFormat_ ? settingsSectionFormat_.Get()
+                                  : sectionFormat_.Get();
+  }
+
+  // Stepper values use tabular figures so "990" and "1,000" keep the same
+  // digit widths and the value does not jiggle while stepping.
+  void DrawSettingsNumericText(const std::wstring& text, RectF rect,
+                               IDWriteTextFormat* format, D2D1_COLOR_F color) {
+    if (!activeRT_ || !format || text.empty() || !dwriteFactory_) return;
+    if (!settingsTabularTypography_ &&
+        SUCCEEDED(dwriteFactory_->CreateTypography(
+            settingsTabularTypography_.GetAddressOf()))) {
+      settingsTabularTypography_->AddFontFeature(
+          {DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1});
+    }
+    ComPtr<IDWriteTextLayout> layout;
+    if (!settingsTabularTypography_ ||
+        FAILED(dwriteFactory_->CreateTextLayout(
+            text.c_str(), static_cast<UINT32>(text.size()), format,
+            std::max(1.0f, rect.right - rect.left),
+            std::max(1.0f, rect.bottom - rect.top), layout.GetAddressOf()))) {
+      DrawTextBlock(text, rect, format, color);
+      return;
+    }
+    layout->SetTypography(settingsTabularTypography_.Get(),
+                          {0, static_cast<UINT32>(text.size())});
+    auto brush = Brush(color);
+    activeRT_->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(),
+                              brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+  }
+
+  // An opaque mix of the primary text colour over the Settings background.
+  // Translucent fills stacked on hover or lerped toward the accent read as
+  // muddy; compositing first keeps every state a clean solid colour.
+  D2D1_COLOR_F SettingsTint(float amount) const {
+    const D2D1_COLOR_F base = D2DColor(theme_.settingsBackground);
+    const D2D1_COLOR_F ink = SettWhite();
+    return D2D1::ColorF(base.r + (ink.r - base.r) * amount,
+                        base.g + (ink.g - base.g) * amount,
+                        base.b + (ink.b - base.b) * amount, 1.0f);
+  }
+
   float DrawSettingsSection(float y, const std::wstring& title, float left, float right) {
-    DrawTextBlock(title, {left, y + 12, right, y + 30}, sectionFormat_.Get(),
-                  D2DColor(theme_.sectionText));
-    auto border = Brush(D2DColor(theme_.divider));
-    activeRT_->DrawLine(D2D1::Point2F(left, y + kSettSection - 2),
-                        D2D1::Point2F(right, y + kSettSection - 2),
-                        border.Get(), 1);
+    DrawTextBlock(title, {left, y + 12, right, y + kSettSection - 2},
+                  SettingsSectionFormat(), D2DColor(theme_.sectionText));
+    DrawSettingsHairline(left, y + kSettSection - 2, right,
+                         y + kSettSection - 2);
     return y + kSettSection;
   }
 
@@ -16913,46 +17049,62 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                         left, labelRight, enabled);
   }
 
+  // Point-to-point control motion: inside the 120-167 ms band, retargeted
+  // from the current position when toggled again mid-flight.
+  static constexpr double kSwitchSeconds = 0.140;
+
   void DrawSwitch(float y, float rowH, bool on, HitType type, float left,
                   float right, bool enabled = true) {
     const COLORREF accent = ActiveAccent();
-    const float trackLeft = right - 46.0f;
-    const float h = 26.0f;
-    const float top = y + (rowH - h) / 2.0f;
-    RectF track{trackLeft, top, right, top + h};
+    const float scale = SettingsScale();
+    const float h = 24.0f;
+    const RectF track = SnapSettingsRect(
+        {right - 44.0f, y + (rowH - h) / 2.0f, right, y + (rowH + h) / 2.0f},
+        scale);
+    const float radius = (track.bottom - track.top) * 0.5f;
     const bool hover = enabled && SettHover(type);
     auto [animation, inserted] = switchAnimations_.try_emplace(type);
     if (inserted) {
       animation->second.Snap(on ? 1.0 : 0.0);
     } else if (std::abs(animation->second.Target() - (on ? 1.0 : 0.0)) >
                0.001) {
-      animation->second.Retarget(on ? 1.0 : 0.0, 0.110,
+      animation->second.Retarget(on ? 1.0 : 0.0, kSwitchSeconds,
                                  ControlAnimationsAllowed());
       if (animation->second.Active()) RequestAnimationFrame();
     }
     const float progress = static_cast<float>(
         std::clamp(animation->second.Value(), 0.0, 1.0));
-    const D2D1_COLOR_F offColor =
-        hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface);
-    const D2D1_COLOR_F onColor = D2DColor(accent);
-    D2D1_COLOR_F trackColor = D2D1::ColorF(
-        offColor.r + (onColor.r - offColor.r) * progress,
-        offColor.g + (onColor.g - offColor.g) * progress,
-        offColor.b + (onColor.b - offColor.b) * progress,
-        offColor.a + (onColor.a - offColor.a) * progress);
+    const float hoverAmount = SettHoverAmount(type, hover);
+    // Off: a faint fill with a hairline outline and a muted thumb, so the
+    // control is visible against the page. On: solid accent, white thumb.
+    const D2D1_COLOR_F offFill = SettingsTint(0.04f + 0.06f * hoverAmount);
+    D2D1_COLOR_F trackColor = LerpColor(offFill, D2DColor(accent), progress);
     if (!enabled) trackColor.a *= 0.45f;
-    FillRound(track, 13, trackColor);
-    if (SettFocused(type) && enabled) DrawFocusFrame(track, 13);
-    const float knobX = track.left + 4.0f +
-                        (track.right - 22.0f - (track.left + 4.0f)) *
-                            progress;
-    auto knobColor = highContrast_
-                         ? D2DColor(ThemeColorFromSystem(
-                               GetSysColor(progress > 0.5f ? COLOR_HIGHLIGHTTEXT
-                                                             : COLOR_WINDOWTEXT)))
-                         : D2D1::ColorF(1, 1, 1);
+    FillRound(track, radius, trackColor);
+    if (progress < 1.0f) {
+      D2D1_COLOR_F outline = LerpColor(SettingsTint(0.34f), SettGray(),
+                                       hoverAmount);
+      outline.a *= (1.0f - progress) * (enabled ? 1.0f : 0.45f);
+      StrokeRound(feathercast::layout::Inflate(track, -0.5f, -0.5f), radius - 0.5f, outline, 1.0f);
+    }
+    if (SettFocusRing(type) && enabled) {
+      DrawFocusFrame(feathercast::layout::Inflate(track, 3.0f, 3.0f), radius + 3.0f);
+    }
+    // The thumb grows slightly as it turns on, like the Windows toggle.
+    const float knob = 14.0f + 4.0f * progress;
+    const float inset = (track.bottom - track.top - knob) * 0.5f;
+    const float travelLeft = track.left + inset;
+    const float travelRight = track.right - inset - knob;
+    const float knobX = travelLeft + (travelRight - travelLeft) * progress;
+    const float knobY = track.top + inset;
+    D2D1_COLOR_F knobColor =
+        highContrast_
+            ? D2DColor(ThemeColorFromSystem(GetSysColor(
+                  progress > 0.5f ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT)))
+            : LerpColor(SettGray(), D2D1::ColorF(1, 1, 1), progress);
     if (!enabled) knobColor.a = 0.55f;
-    FillRound({knobX, top + 4, knobX + 18, top + 22}, 9, knobColor);
+    FillRound({knobX, knobY, knobX + knob, knobY + knob}, knob * 0.5f,
+              knobColor);
     settingsHits_.push_back({{left - 8.0f, y, right, y + rowH}, type, -1, enabled});
   }
 
@@ -16979,7 +17131,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FillRound(hit, theme_.controlRadius,
                 WithAlpha(D2DColor(theme_.surfaceHover), hover));
     }
-    if (SettFocused(HitType::AnimationLevel)) {
+    if (SettFocusRing(HitType::AnimationLevel)) {
       DrawFocusFrame(hit, theme_.controlRadius);
     }
 
@@ -17026,9 +17178,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     DrawSettingsButton(plus, L"+", up, enabled);
     const float valueLeft =
         std::max(kSettSidebarWidth + kSettContentInset, minus.left - 96.0f);
-    DrawTextBlock(value, {valueLeft, cy - 11, minus.left - 12, cy + 11},
-                  footerRightFormat_.Get(),
-                  enabled ? SettWhite() : D2DColor(theme_.textDim));
+    DrawSettingsNumericText(value, {valueLeft, cy - 11, minus.left - 12, cy + 11},
+                            footerRightFormat_.Get(),
+                            enabled ? SettWhite() : D2DColor(theme_.textDim));
   }
 
   void DrawSettingsSidebar(float height) {
@@ -17036,6 +17188,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float categoryRow = SettingsCategoryRowHeight(height);
     const float categoryHeight = std::max(20.0f, categoryRow - 6.0f);
     const auto& categories = SettingsCategories();
+    // The indicator slides between categories (point-to-point motion,
+    // retargeted mid-flight) and is placed without motion when Settings
+    // opens or animation is off.
+    const float indicatorTarget =
+        kSettTop +
+        static_cast<float>(SettingsCategoryIndex(settingsCategory_)) *
+            categoryRow +
+        categoryHeight * 0.5f;
+    if (!settingsNavIndicatorPlaced_) {
+      settingsNavIndicator_.Snap(indicatorTarget);
+      settingsNavIndicatorPlaced_ = true;
+    } else if (std::abs(settingsNavIndicator_.Target() - indicatorTarget) >
+               0.01) {
+      settingsNavIndicator_.Retarget(indicatorTarget, 0.150,
+                                     SpatialAnimationsAllowed());
+      if (settingsNavIndicator_.Active()) RequestAnimationFrame();
+    }
     for (size_t i = 0; i < categories.size(); ++i) {
       const auto& descriptor = categories[i];
       const SettingsCategory category = descriptor.category;
@@ -17052,7 +17221,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         FillRound(rect, theme_.controlRadius,
                   WithAlpha(D2DColor(theme_.surfaceHover), hover));
       }
-      if (SettFocused(type)) DrawFocusFrame(rect, theme_.controlRadius);
+      if (SettFocusRing(type)) DrawFocusFrame(rect, theme_.controlRadius);
       DrawVerticallyCenteredTextBlock(
           descriptor.label.data(),
           {24.0f, top, rect.right - 12.0f, top + categoryHeight},
@@ -17061,13 +17230,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     selected ? 1.0f : hover));
       settingsHits_.push_back({rect, type});
     }
+    if (!categories.empty()) {
+      const float center = static_cast<float>(settingsNavIndicator_.Value());
+      FillRound(SnapSettingsRect({15.0f, center - 8.0f, 18.0f, center + 8.0f},
+                                 SettingsScale()),
+                1.5f, D2DColor(accent));
+    }
 
     if (height > kSettTop + categories.size() * categoryRow + 12.0f) {
-      auto divider = Brush(D2DColor(theme_.divider));
-      activeRT_->DrawLine(
-          D2D1::Point2F(kSettSidebarWidth, 68.0f),
-          D2D1::Point2F(kSettSidebarWidth, height - 12.0f),
-          divider.Get(), 1.0f);
+      DrawSettingsHairline(kSettSidebarWidth, 68.0f, kSettSidebarWidth,
+                           height - 12.0f);
     }
   }
 
@@ -17138,8 +17310,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     DrawPanelBackground(width, height, theme_.settingsRadius, PanelBackgroundKind::Settings);
 
     // Title bar (draggable region) and a compact native quick-jump field.
-    DrawTextBlock(L"Settings", {24, 16, width - 360, 42}, titleFormat_.Get(), SettWhite());
-    DrawTextBlock(L"Drag this bar to move", {24, 38, width - 360, 54}, bodyFormat_.Get(), D2DColor(theme_.textDim));
+    DrawVerticallyCenteredTextBlock(L"Settings", {24, 10, width - 360, 46},
+                                    titleFormat_.Get(), SettWhite());
     const RectF filterRect = SettingsFilterRect(width);
     const bool filterFocused = SettFocused(HitType::SettingsFilter);
     const float filterHover = SettHoverAmount(
@@ -17218,7 +17390,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       activeRT_->DrawLine(D2D1::Point2F(cx - 6, cyc - 6), D2D1::Point2F(cx + 6, cyc + 6), xBrush.Get(), 2.0f);
       activeRT_->DrawLine(D2D1::Point2F(cx - 6, cyc + 6), D2D1::Point2F(cx + 6, cyc - 6), xBrush.Get(), 2.0f);
     }
-    if (SettFocused(HitType::CloseSettings)) {
+    if (SettFocusRing(HitType::CloseSettings)) {
       DrawFocusFrame(closeBtn, theme_.controlRadius);
     }
     settingsHits_.push_back({closeBtn, HitType::CloseSettings});
@@ -17257,16 +17429,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         y = DrawSettingsSection(y, L"GLOBAL SHORTCUT", contentLeft, contentRight);
         const bool compactActions = contentWidth < 360.0f;
         const bool recordingPrimary = recording_ && recordingCaptureShortcut_ < 0;
-        const std::wstring current =
-            settings_.shortcut.empty() || settings_.shortcut == L"none"
-                ? L"None"
-                : settings_.shortcut;
+        const std::wstring current = ShortcutDisplayLabel(settings_.shortcut);
+        const std::wstring chordPreview = RecordingChordPreview();
         DrawTextBlock(L"Open FeatherCast",
                       {contentLeft, y + 12, contentRight, y + 32},
                       labelFormat_.Get(), SettWhite());
         DrawTextBlock(
             recordingPrimary
-                ? std::wstring(L"Press the new shortcut now, or press Esc to cancel.")
+                ? (chordPreview.empty()
+                       ? std::wstring(L"Press the new shortcut now, or press Esc to cancel.")
+                       : L"Recording " + chordPreview + L"  Esc cancels.")
                 : L"Current: " + current +
                       L". Allowed: modifier + key, one modifier alone, or Print Screen.",
             {contentLeft, y + 33, contentRight, y + 51}, bodyFormat_.Get(),
@@ -17283,7 +17455,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                 ? Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.28f)
                 : LerpColor(D2DColor(theme_.surface),
                             D2DColor(theme_.surfaceHover), recHover));
-        if (SettFocused(HitType::RecordShortcut)) {
+        if (SettFocusRing(HitType::RecordShortcut)) {
           DrawFocusFrame(record, theme_.controlRadius);
         } else {
           StrokeRound(record, theme_.controlRadius,
@@ -17338,8 +17510,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           const std::wstring recordLabel =
               isRecording ? L"Cancel" : (assigned ? L"Change" : L"Record");
           const std::wstring valueText =
-              isRecording ? std::wstring(L"Press the new shortcut, or Esc to cancel.")
-                          : (assigned ? *row.value : std::wstring(L"None"));
+              isRecording
+                  ? (chordPreview.empty()
+                         ? std::wstring(L"Press the new shortcut, or Esc to cancel.")
+                         : L"Recording " + chordPreview)
+                  : ShortcutDisplayLabel(*row.value);
           if (compactActions) {
             DrawTextBlock(row.label,
                           {contentLeft, y + 6.0f, contentRight, y + 27.0f},
@@ -17560,7 +17735,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawCatalogSettingRowLabel(y, settingsRowHeight_,
                                    HitType::ClipboardLimitDown, contentLeft,
                                    contentRight - 176, clipboardControls);
-        DrawStepper(y, settingsRowHeight_, std::to_wstring(ClipboardHistoryLimit()),
+        DrawStepper(y, settingsRowHeight_,
+                    feathercast::settings_ui::FormatCount(ClipboardHistoryLimit()),
                     HitType::ClipboardLimitDown, HitType::ClipboardLimitUp,
                     contentRight, clipboardControls);
         y += settingsRowHeight_;
@@ -17642,10 +17818,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                    HitType::FileIndexLimitDown, contentLeft,
                                    contentRight - 176, fileIndexControls,
                                    fileIndexStatus_ && fileIndexStatus_->limitReached
-                                       ? L"Limit reached: newest " + std::to_wstring(FileIndexLimit()) +
-                                             L" of " + std::to_wstring(fileIndexStatus_->discoveredEntries) + L" entries."
+                                       ? L"Limit reached: newest " + feathercast::settings_ui::FormatCount(FileIndexLimit()) +
+                                             L" of " + feathercast::settings_ui::FormatCount(fileIndexStatus_->discoveredEntries) + L" entries."
                                        : L"Maximum entries retained from selected folders.");
-        DrawStepper(y, settingsRowHeight_, std::to_wstring(FileIndexLimit()),
+        DrawStepper(y, settingsRowHeight_,
+                    feathercast::settings_ui::FormatCount(FileIndexLimit()),
                     HitType::FileIndexLimitDown, HitType::FileIndexLimitUp,
                     contentRight, fileIndexControls);
         y += settingsRowHeight_;
@@ -17732,12 +17909,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             [](const feathercast::extensions::PluginHealth& plugin) {
               return plugin.available;
             }));
-        DrawSettingRowLabel(
-            y, settingsRowHeight_, L"Installed Native Extensions",
-            std::to_wstring(available) + L" of " +
-                std::to_wstring(health.size()) +
-                L" available. Only install extensions you trust.",
-            contentLeft, contentRight);
+        if (health.empty()) {
+          DrawSettingRowLabel(
+              y, settingsRowHeight_, L"No Extensions Installed",
+              L"Put a trusted plugin in the Plugins folder, then reload.",
+              contentLeft, contentRight);
+        } else {
+          DrawSettingRowLabel(
+              y, settingsRowHeight_, L"Installed Native Extensions",
+              std::to_wstring(available) + L" of " +
+                  std::to_wstring(health.size()) +
+                  L" available. Only install extensions you trust.",
+              contentLeft, contentRight);
+        }
         y += settingsRowHeight_;
         for (const auto& plugin : health) {
           const std::wstring state =
@@ -17784,7 +17968,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           const float colorBoxWidth = std::min(196.0f, contentWidth);
           RectF colorBox{contentLeft, y, contentLeft + colorBoxWidth, y + 36};
           const bool colorHover = SettHover(HitType::AccentColor);
-          const bool colorFocused = SettFocused(HitType::AccentColor);
+          const bool colorFocused = SettFocusRing(HitType::AccentColor);
           FillRound(colorBox, theme_.controlRadius, D2DColor(theme_.surface));
           if (colorFocused) {
             DrawFocusFrame(colorBox, theme_.controlRadius);
@@ -17837,10 +18021,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       FillRound({width - 7, thumbY, width - 4, thumbY + thumbH}, 1.5f, D2DColor(theme_.textDim));
     }
 
-    auto helpBorder = Brush(D2DColor(theme_.divider));
-    activeRT_->DrawLine(D2D1::Point2F(kSettSidebarWidth, height - kSettHelpHeight),
-                        D2D1::Point2F(width, height - kSettHelpHeight),
-                        helpBorder.Get(), 1.0f);
+    DrawSettingsHairline(kSettSidebarWidth, height - kSettHelpHeight, width,
+                         height - kSettHelpHeight);
     DrawTextBlock(L"Tab navigate · Enter apply · Esc close",
                   {kSettSidebarWidth + kSettContentInset,
                    height - kSettHelpHeight + 8.0f, width - 18.0f,
@@ -17850,18 +18032,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void DrawSettingsButton(RectF rect, const std::wstring& text, HitType type,
                           bool enabled = true) {
+    rect = SnapSettingsRect(rect, SettingsScale());
     const bool hover = enabled && SettHover(type);
     const float hoverAmount = SettHoverAmount(type, hover);
     D2D1_COLOR_F fill = LerpColor(D2DColor(theme_.surface),
                                   D2DColor(theme_.surfaceHover), hoverAmount);
     if (!enabled) fill.a *= 0.45f;
     FillRound(rect, theme_.controlRadius, fill);
-    if (enabled && SettFocused(type)) {
+    if (enabled && SettFocusRing(type)) {
       DrawFocusFrame(rect, theme_.controlRadius);
     } else {
-      StrokeRound(rect, theme_.controlRadius,
+      // Hover lifts the fill; the outline only firms up slightly so a sweep
+      // across a row of buttons does not flash bright borders.
+      StrokeRound(feathercast::layout::Inflate(rect, -0.5f, -0.5f), theme_.controlRadius - 0.5f,
                   LerpColor(D2DColor(theme_.border),
-                            D2DColor(theme_.textMuted), hoverAmount));
+                            WithAlpha(SettWhite(), 0.18f), hoverAmount));
     }
     DrawCenteredButtonText(
         text, rect,
@@ -19012,6 +19197,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     pointerPress_ = std::move(press);
 
     if (owner == settingsHwnd_) {
+      settingsFocusVisible_ = false;
       const auto order = SettingsFocusOrder();
       const auto focused = std::find(order.begin(), order.end(), hit->type);
       if (focused != order.end()) {
@@ -19154,13 +19340,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     RECT client{};
     GetClientRect(settingsHwnd_, &client);
     const float height = static_cast<float>(client.bottom - client.top) / GetWindowScale(settingsHwnd_);
+    if (focused == HitType::SettingsFilter ||
+        focused == HitType::CloseSettings || SettingsCategoryForHit(focused)) {
+      return;
+    }
+    const float visibleBottom = height - kSettHelpHeight - 8.0f;
     for (const auto& hit : settingsHits_) {
       if (hit.type != focused) continue;
       float nextScroll = settingsScroll_;
       if (hit.rect.top < 64.0f) {
         nextScroll -= 64.0f - hit.rect.top;
-      } else if (hit.rect.bottom > height - 8.0f) {
-        nextScroll += hit.rect.bottom - (height - 8.0f);
+      } else if (hit.rect.bottom > visibleBottom) {
+        nextScroll += hit.rect.bottom - visibleBottom;
       }
       feathercast::ui::SettingsController::SetScroll(
           settingsState_, nextScroll, SettingsMaxScroll());
@@ -19465,6 +19656,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void HandleSettingsKeyDown(UINT vk) {
     if (recording_) return;
+    if (!settingsFocusVisible_) {
+      settingsFocusVisible_ = true;
+      RepaintWindow(settingsHwnd_);
+    }
     const auto order = SettingsFocusOrder();
     if (order.empty()) return;
     settingsFocusIndex_ = std::clamp(
@@ -22901,6 +23096,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::motion::PendingNavigation pendingNavigation_;
   std::map<HitType, feathercast::motion::ScalarAnimation> switchAnimations_;
   std::map<HitType, feathercast::motion::ScalarAnimation> settingsHoverMotion_;
+  // Vertical centre (DIP) of the sidebar's selected-category indicator.
+  feathercast::motion::ScalarAnimation settingsNavIndicator_;
+  bool settingsNavIndicatorPlaced_ = false;
+  // Focus-visible: the Settings focus ring shows after keyboard input only.
+  bool settingsFocusVisible_ = false;
+  ComPtr<IDWriteTextFormat> settingsSectionFormat_;
+  ComPtr<IDWriteTextFormat> settingsSectionFormatSource_;
+  ComPtr<IDWriteTypography> settingsTabularTypography_;
   feathercast::motion::ScalarAnimation gearHoverMotion_;
   struct ResultElementMotion {
     feathercast::motion::ScalarAnimation offsetY;
