@@ -68,6 +68,7 @@
 #include "window_activation.hpp"
 #include "performance_governor.hpp"
 #include "text_layout_cache.hpp"
+#include "visual_craft.hpp"
 
 #include <windows.h>
 #include <malloc.h>
@@ -8498,6 +8499,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     calculationResultFormat_.Reset();
     subFormat_.Reset();
     sectionFormat_.Reset();
+    keycapFormat_.Reset();
     footerFormat_.Reset();
     footerRightFormat_.Reset();
     titleFormat_.Reset();
@@ -8585,7 +8587,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // Compact-native role ramp: size, weight, and leading work together so
     // hierarchy does not depend on size alone and every repeated role keeps
     // the same vertical rhythm across overlay, settings, and previews.
-    CreateTextFormat(textStyle(18.0f, DWRITE_FONT_WEIGHT_NORMAL, 25.0f), inputFormat_);
+    // Leading stays on the 4 px grid; captions never go below 12 px.
+    CreateTextFormat(textStyle(18.0f, DWRITE_FONT_WEIGHT_NORMAL, 24.0f), inputFormat_);
     CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_MEDIUM, 20.0f), rowFormat_);
     CreateTextFormat(textStyle(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 22.0f),
                      calculationResultFormat_);
@@ -8593,14 +8596,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       calculationResultFormat_->SetTextAlignment(
           DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
-    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 17.0f), subFormat_);
-    CreateTextFormat(textStyle(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0f),
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f), subFormat_);
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 16.0f),
                      sectionFormat_);
     CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f), footerFormat_);
     CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f),
                      footerRightFormat_);
     if (footerRightFormat_) {
       footerRightFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    // Keycap caption: 12 px medium, centred inside its cap.
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_MEDIUM, 16.0f),
+                     keycapFormat_);
+    if (keycapFormat_) {
+      keycapFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+      keycapFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     CreateTextFormat(textStyle(17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 23.0f), titleFormat_);
     CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 20.0f), labelFormat_);
@@ -8812,7 +8822,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool EnsureRenderResources() {
     EnsureTextFormats();
     return inputFormat_ && rowFormat_ && calculationResultFormat_ &&
-           subFormat_ && sectionFormat_ && footerFormat_ &&
+           subFormat_ && sectionFormat_ && keycapFormat_ && footerFormat_ &&
            footerRightFormat_ && titleFormat_ && labelFormat_ && bodyFormat_ &&
            buttonFormat_ && centerFormat_ && emojiFormat_ &&
            volumeValueFormat_;
@@ -11074,8 +11084,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       double opacity = existed ? 1.0 : kResultEnterOpacity;
       if (existed && previous) opacity = previous->opacity.Value();
       motion.opacity.Snap(opacity);
-      motion.offsetY.Retarget(0.0, kResultTransitionSeconds, spatial);
-      motion.opacity.Retarget(1.0, kResultTransitionSeconds, true);
+      motion.offsetY.Retarget(0.0, kResultTransitionSeconds, spatial,
+                              feathercast::motion::Easing::PointToPoint);
+      motion.opacity.Retarget(1.0, kResultFadeSeconds, true);
     };
 
     float y = resultsTop_;
@@ -11838,13 +11849,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         animating_ = false;
         overlayRevealTimeline_.Reset();
       }
-      overlayOpacity_.Retarget(1.0, kSurfaceOpenSeconds,
+      overlayOpacity_.Retarget(1.0, kSurfaceFadeInSeconds,
                                FadeAnimationsAllowed() &&
                                    (wasClosing || revealWasInProgress),
-                               feathercast::motion::Easing::OutQuint);
+                               feathercast::motion::Easing::OutCubic);
       overlaySurfaceScale_.Retarget(1.0, kSurfaceOpenSeconds,
                                     SpatialAnimationsAllowed(),
-                                    feathercast::motion::Easing::OutQuint);
+                                    kSurfaceOpenEasing);
     }
 
     // Prepare the reveal's zero-progress frame while the HWND is still hidden.
@@ -11974,9 +11985,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       overlayOpacity_.Snap(overlayOpacity_.Value());
       overlayOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
                                FadeAnimationsAllowed(),
-                               feathercast::motion::Easing::InCubic);
+                               feathercast::motion::Easing::OutCubic);
       if (SpatialAnimationsAllowed()) {
-        overlaySurfaceScale_.Retarget(kSurfaceScaleStart,
+        overlaySurfaceScale_.Retarget(kSurfaceScaleEnd,
                                       kSurfaceCloseSeconds, true,
                                       feathercast::motion::Easing::InCubic);
       } else {
@@ -12315,9 +12326,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       volumeOpacity_.Snap(volumeOpacity_.Value());
       volumeOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
                               FadeAnimationsAllowed(),
-                               feathercast::motion::Easing::InCubic);
+                               feathercast::motion::Easing::OutCubic);
       if (SpatialAnimationsAllowed()) {
-        volumeSurfaceScale_.Retarget(kSurfaceScaleStart,
+        volumeSurfaceScale_.Retarget(kSurfaceScaleEnd,
                                      kSurfaceCloseSeconds, true,
                                       feathercast::motion::Easing::InCubic);
       } else {
@@ -12501,9 +12512,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       settingsOpacity_.Snap(settingsOpacity_.Value());
       settingsOpacity_.Retarget(0.0, kSurfaceCloseSeconds,
                                 FadeAnimationsAllowed(),
-                               feathercast::motion::Easing::InCubic);
+                               feathercast::motion::Easing::OutCubic);
       if (SpatialAnimationsAllowed()) {
-        settingsSurfaceScale_.Retarget(kSurfaceScaleStart,
+        settingsSurfaceScale_.Retarget(kSurfaceScaleEnd,
                                        kSurfaceCloseSeconds, true,
                                       feathercast::motion::Easing::InCubic);
       } else {
@@ -13423,21 +13434,37 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   // Spring response, not duration: how quickly the pill reaches the row.
   // Critically damped, so it settles without overshoot.
-  static constexpr double kSelectionKeyboardResponseSeconds = 0.190;
-  // Entrances decelerate into place; exits accelerate away and are
-  // shorter, so dismissing never feels like it lags behind the key press.
-  static constexpr double kSurfaceOpenSeconds = 0.160;
-  static constexpr double kSurfaceCloseSeconds = 0.100;
-  static constexpr double kSurfaceScaleStart = 0.96;
+  static constexpr double kSelectionKeyboardResponseSeconds =
+      feathercast::motion::tokens::kSelectionSpringResponseSeconds;
+  // Entrances decelerate into place (scale) behind a near-instant fade, so a
+  // hotkey-summoned panel is readable on the first frames; exits are
+  // opacity-led and shorter, so dismissing never lags behind the key press.
+  static constexpr double kSurfaceOpenSeconds =
+      feathercast::motion::tokens::kEntranceSeconds;
+  static constexpr double kSurfaceFadeInSeconds =
+      feathercast::motion::tokens::kMicroFadeSeconds;
+  static constexpr double kSurfaceCloseSeconds =
+      feathercast::motion::tokens::kExitSeconds;
+  static constexpr double kSurfaceScaleStart =
+      feathercast::motion::tokens::kEntranceScale;
+  static constexpr double kSurfaceScaleEnd =
+      feathercast::motion::tokens::kExitScale;
+  static constexpr auto kSurfaceOpenEasing =
+      feathercast::motion::Easing::Decelerate;
   // Scroll and resize use springs so a new wheel notch or keystroke that
   // retargets them mid-flight keeps the current velocity (no pulsing).
-  static constexpr double kSelectionPointerResponseSeconds = 0.120;
+  static constexpr double kSelectionPointerResponseSeconds =
+      feathercast::motion::tokens::kSelectionPointerResponseSeconds;
   static constexpr double kOverlayResizeResponseSeconds = 0.200;
   static constexpr double kSettingsResizeResponseSeconds = 0.220;
   static constexpr double kOverlayScrollResponseSeconds = 0.130;
   static constexpr double kSettingsScrollResponseSeconds = 0.140;
   static constexpr double kPreviewScrollResponseSeconds = 0.140;
-  static constexpr double kResultTransitionSeconds = 0.140;
+  // Rows that stay move point-to-point; rows that arrive only micro-fade.
+  static constexpr double kResultTransitionSeconds =
+      feathercast::motion::tokens::kPointToPointSeconds;
+  static constexpr double kResultFadeSeconds =
+      feathercast::motion::tokens::kMicroFadeSeconds;
   // New rows only cross-fade from mostly visible. Rows often arrive in a
   // second batch just after opening (the window list refreshes on show),
   // and a deep fade or rise there reads as the panel opening a second time.
@@ -13545,15 +13572,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (SpatialAnimationsAllowed()) {
       scale.Snap(kSurfaceScaleStart);
-      scale.Retarget(1.0, kSurfaceOpenSeconds, true,
-                     feathercast::motion::Easing::OutQuint);
+      scale.Retarget(1.0, kSurfaceOpenSeconds, true, kSurfaceOpenEasing);
     } else {
       scale.Snap(1.0);
     }
     if (FadeAnimationsAllowed()) {
       opacity.Snap(0.0);
-      opacity.Retarget(1.0, kSurfaceOpenSeconds, true,
-                       feathercast::motion::Easing::OutQuint);
+      opacity.Retarget(1.0, kSurfaceFadeInSeconds, true,
+                       feathercast::motion::Easing::OutCubic);
     } else {
       opacity.Snap(1.0);
     }
@@ -13690,17 +13716,34 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     StopSelectionAnimation();
   }
 
+  // True when this selection change comes from keyboard auto-repeat, judged
+  // by the spacing of key messages against the user's repeat rate.
+  bool SelectionKeyRepeating() {
+    UINT speed = 31;
+    if (!SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &speed, 0)) speed = 31;
+    selectionRepeatCadence_.SetThreshold(
+        feathercast::motion::KeyRepeatCadence::ThresholdForRepeatInterval(
+            feathercast::motion::KeyboardRepeatIntervalSeconds(speed)));
+    return selectionRepeatCadence_.Step(
+        static_cast<std::uint32_t>(GetMessageTime()));
+  }
+
   void StartSelectionAnimationFrom(std::optional<float> previousY,
                                    double responseSeconds) {
     const auto targetY = SelectedRowTop();
-    if (!SpatialAnimationsAllowed() || !previousY || !targetY) {
+    // A held arrow key moves the selection on every auto-repeat. A glide
+    // would trail the real selection by rows, so repeats snap the pill and
+    // only isolated presses animate.
+    const bool keyboard = responseSeconds == kSelectionKeyboardResponseSeconds;
+    const bool repeating = keyboard && SelectionKeyRepeating();
+    if (!keyboard) selectionRepeatCadence_.Reset();
+    if (!SpatialAnimationsAllowed() || !previousY || !targetY || repeating) {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
       return;
     }
-    // A held arrow key retargets before the previous move settles. Keeping the
-    // spring's velocity through the retarget is what turns a burst of key
-    // repeats into one continuous glide instead of a stutter of restarts.
+    // A quick second press retargets before the previous move settles;
+    // keeping the spring's velocity through the retarget avoids a restart.
     selectionSpring_.Configure(responseSeconds, 1.0);
     // previousY is the on-screen position read before the scroll target
     // changed. The visual scroll is animated too, so it is still accurate.
@@ -14497,7 +14540,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             std::clamp(volumeVisualPercent_.Value(), 0.0, 100.0);
         DrawTextBlock(std::to_wstring(static_cast<int>(std::lround(visualPercent))) + L"%",
                       volumeLayout.value,
-                      volumeValueFormat_.Get(), D2DColor(theme_.textPrimary));
+                      volumeValueFormat_.Get(), D2DColor(theme_.textPrimary), true);
 
         const RectF track = volumeLayout.track;
         FillRound(track, 6.0f, D2DColor(theme_.surface));
@@ -14679,15 +14722,176 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void DrawPanelBackground(float width, float height, float radius,
                            PanelBackgroundKind kind) {
-    const RectF panel{0.5f, 0.5f, width - 0.5f, height - 0.5f};
+    const RectF panel{0.0f, 0.0f, width, height};
     const bool settings = kind == PanelBackgroundKind::Settings;
     feathercast::theme::Color background =
         settings ? theme_.settingsBackground : theme_.overlayBackground;
     background.a = 1.0f;
 
-    // Keep only the pixels outside the rounded silhouette transparent.
+    // Keep only the pixels outside the rounded silhouette transparent. The
+    // border is a single device pixel on the innermost edge of the panel at
+    // every scale, instead of a 1 DIP stroke smeared across two pixels.
     FillRound(panel, radius, D2DColor(background));
-    StrokeRound(panel, radius, D2DColor(theme_.border), 1.0f);
+    StrokeHairlineRound(panel, radius, D2DColor(theme_.border));
+  }
+
+  // Device pixels per DIP on the active render target.
+  float DeviceScale() const {
+    if (!activeRT_) return 1.0f;
+    float dpiX = 96.0f;
+    float dpiY = 96.0f;
+    activeRT_->GetDpi(&dpiX, &dpiY);
+    return feathercast::visual::SafeScale(dpiY / 96.0f);
+  }
+
+  float SnapToPixel(float dip) const {
+    return feathercast::visual::SnapToPixelEdge(dip, DeviceScale());
+  }
+
+  RectF SnapRect(RectF rect) const {
+    return feathercast::visual::SnapRectToPixels(rect, DeviceScale());
+  }
+
+  // A one-device-pixel horizontal rule whose top edge sits on the pixel row
+  // nearest to `y`. Filled rather than stroked so it is never antialiased.
+  void DrawHorizontalHairline(float left, float right, float y,
+                              D2D1_COLOR_F color) {
+    const float scale = DeviceScale();
+    const float top = feathercast::visual::SnapToPixelEdge(y, scale);
+    FillRect({feathercast::visual::SnapToPixelEdge(left, scale), top,
+              feathercast::visual::SnapToPixelEdge(right, scale),
+              top + feathercast::visual::HairlineWidth(scale)},
+             color);
+  }
+
+  // Rounded border on the innermost device pixel of `rect`.
+  void StrokeHairlineRound(RectF rect, float radius, D2D1_COLOR_F color) {
+    const float scale = DeviceScale();
+    const float pixels = feathercast::visual::HairlinePixels(scale);
+    const RectF inside =
+        feathercast::visual::InsideStrokeRect(rect, scale, pixels);
+    const float inset = pixels * 0.5f / scale;
+    StrokeRound(inside, std::max(0.0f, radius - inset), color, pixels / scale);
+  }
+
+  // Draws a bitmap into a pixel-aligned rectangle of whole device pixels with
+  // high-quality downsampling. Icons are cached at 64 px and shown at 24 DIP;
+  // linear filtering samples only four texels and shimmers at that ratio.
+  void DrawCrispBitmap(ID2D1Bitmap* bitmap, RectF rect, float opacity = 1.0f,
+                       const D2D1_RECT_F* source = nullptr) {
+    if (!bitmap || !activeRT_) return;
+    const RectF snapped =
+        feathercast::visual::SnapSizedRectToPixels(rect, DeviceScale());
+    const D2D1_RECT_F destination = ToD2D(snapped);
+    if (activeDC_) {
+      activeDC_->DrawBitmap(bitmap, &destination, opacity,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            source, nullptr);
+      return;
+    }
+    activeRT_->DrawBitmap(bitmap, destination, opacity,
+                          D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, source);
+  }
+
+  float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* format) {
+    if (text.empty() || !format || !dwriteFactory_) return 0.0f;
+    auto layout = textLayoutCache_.Get(
+        dwriteFactory_.Get(), text, format, 4096.0f, 64.0f,
+        {feathercast::ui::TextLayoutStyle::MeasureSingleLine});
+    if (!layout) return 0.0f;
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(layout->GetMetrics(&metrics))) return 0.0f;
+    return metrics.widthIncludingTrailingWhitespace;
+  }
+
+  struct ShortcutHintLayout {
+    std::vector<feathercast::visual::ShortcutHintPart> parts;
+    std::vector<std::vector<float>> keyWidths;
+    std::vector<float> labelWidths;
+    std::size_t visibleParts = 0;
+    float width = 0.0f;
+  };
+
+  // Measures " · "-separated hints and keeps the leading parts that fit.
+  ShortcutHintLayout LayoutShortcutHints(const std::wstring& hint,
+                                         float available) {
+    ShortcutHintLayout layout;
+    if (!keycapFormat_ || !footerFormat_) return layout;
+    const auto metrics = feathercast::visual::ScaledKeycapMetrics(
+        feathercast::layout::TextMetrics(settings_.textSizePercent).scale);
+    layout.parts = feathercast::visual::ParseShortcutHints(hint);
+    std::vector<float> partWidths;
+    for (const auto& part : layout.parts) {
+      std::vector<float> keys;
+      for (const auto& key : part.keys) {
+        keys.push_back(MeasureTextWidth(key, keycapFormat_.Get()));
+      }
+      const float label = MeasureTextWidth(part.label, footerFormat_.Get());
+      partWidths.push_back(
+          feathercast::visual::ShortcutHintPartWidth(keys, label, metrics));
+      layout.keyWidths.push_back(std::move(keys));
+      layout.labelWidths.push_back(label);
+    }
+    layout.visibleParts =
+        feathercast::visual::FittingHintParts(partWidths, available, metrics);
+    for (std::size_t i = 0; i < layout.visibleParts; ++i) {
+      layout.width += (i > 0 ? metrics.partGap : 0.0f) + partWidths[i];
+    }
+    return layout;
+  }
+
+  // Draws shortcut hints as keycaps followed by their labels ("Enter open",
+  // "Tab actions"), vertically centred in `rect` and aligned to its right or
+  // left edge. Parts that are plain text ("Downloading...") draw as labels.
+  // Returns the drawn width.
+  float DrawShortcutHints(const std::wstring& hint, RectF rect,
+                          D2D1_COLOR_F textColor, float opacity,
+                          bool alignRight) {
+    if (hint.empty() || opacity <= 0.0f) return 0.0f;
+    const ShortcutHintLayout layout =
+        LayoutShortcutHints(hint, rect.right - rect.left);
+    if (layout.visibleParts == 0) return 0.0f;
+    const float textScale =
+        feathercast::layout::TextMetrics(settings_.textSizePercent).scale;
+    const auto metrics = feathercast::visual::ScaledKeycapMetrics(textScale);
+    const float centerY = (rect.top + rect.bottom) * 0.5f;
+    const float capTop = SnapToPixel(centerY - metrics.height * 0.5f);
+    const float capBottom = capTop + SnapToPixel(metrics.height);
+    const float labelHeight = 16.0f * textScale;
+    const float labelTop = centerY - labelHeight * 0.5f;
+    const D2D1_COLOR_F text = WithAlpha(textColor, opacity);
+    // A subtle tint of the text colour reads as a key on any background,
+    // including the selection pill; high contrast keeps an outline only.
+    const D2D1_COLOR_F capFill =
+        WithAlpha(textColor, 0.10f * opacity);
+    const D2D1_COLOR_F capBorder = WithAlpha(
+        textColor, (highContrast_ ? 1.0f : 0.16f) * opacity);
+    float x = alignRight ? rect.right - layout.width : rect.left;
+    for (std::size_t i = 0; i < layout.visibleParts; ++i) {
+      if (i > 0) x += metrics.partGap;
+      const auto& part = layout.parts[i];
+      for (std::size_t k = 0; k < part.keys.size(); ++k) {
+        if (k > 0) x += metrics.chordGap;
+        const float capWidth = std::max(
+            metrics.minWidth, layout.keyWidths[i][k] + metrics.paddingX * 2.0f);
+        const RectF cap = SnapRect({x, capTop, x + capWidth, capBottom});
+        if (!highContrast_) FillRound(cap, metrics.radius, capFill);
+        StrokeHairlineRound(cap, metrics.radius, capBorder);
+        DrawTextBlock(part.keys[k], cap, keycapFormat_.Get(), text);
+        x += capWidth;
+      }
+      if (!part.label.empty()) {
+        if (!part.keys.empty()) x += metrics.labelGap;
+        const float labelWidth = layout.labelWidths[i];
+        // A little slack keeps DirectWrite from trimming the last glyph.
+        DrawTextBlock(part.label,
+                      {x, labelTop, x + labelWidth + 2.0f,
+                       labelTop + labelHeight},
+                      footerFormat_.Get(), text);
+        x += labelWidth;
+      }
+    }
+    return layout.width;
   }
 
   // Set the render target for the current frame, and grab its ID2D1DeviceContext
@@ -14701,12 +14905,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
-  void DrawTextBlock(const std::wstring& text, RectF rect, IDWriteTextFormat* format, D2D1_COLOR_F color) {
+  // `tabularFigures` gives digits one shared advance width, for values that
+  // update in place or line up in a column (results, times, percentages).
+  void DrawTextBlock(const std::wstring& text, RectF rect, IDWriteTextFormat* format, D2D1_COLOR_F color,
+                     bool tabularFigures = false) {
     if (!activeRT_ || !format || text.empty()) return;
     auto brush = Brush(color);
+    feathercast::ui::TextLayoutOptions options;
+    options.tabularFigures = tabularFigures;
     auto layout = textLayoutCache_.Get(
         dwriteFactory_.Get(), text, format, rect.right - rect.left,
-        rect.bottom - rect.top);
+        rect.bottom - rect.top, options);
     if (layout) {
       const auto origin = D2D1::Point2F(rect.left, rect.top);
       if (activeDC_) {
@@ -15386,10 +15595,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void DrawPreviewPane(RectF rect) {
-    FillRound(rect, 8.0f, D2DColor(theme_.surface));
-    StrokeRound(rect, 8.0f, D2DColor(theme_.border));
-    const float left = rect.left + 18.0f;
-    const float right = rect.right - 18.0f;
+    rect = SnapRect(rect);
+    FillRound(rect, theme_.controlRadius, D2DColor(theme_.surface));
+    StrokeHairlineRound(rect, theme_.controlRadius, D2DColor(theme_.border));
+    const float left = rect.left + 16.0f;
+    const float right = rect.right - 16.0f;
     if (!previewResult_) {
       DrawTextBlock(L"Loading preview...",
                     {left, rect.top + 22.0f, right, rect.top + 52.0f},
@@ -15437,10 +15647,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         const float drawHeight = preview.height * scale;
         const float x = left + (availableWidth - drawWidth) / 2.0f;
         const float y = contentTop + (availableHeight - drawHeight) / 2.0f;
-        activeRT_->DrawBitmap(
-            previewBitmap_.Get(),
-             D2D1::RectF(x, y, x + drawWidth, y + drawHeight), 1.0f,
-             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        DrawCrispBitmap(previewBitmap_.Get(),
+                        {x, y, x + drawWidth, y + drawHeight});
       } else {
         DrawTextBlock(L"Preparing image preview...",
                       {left, contentTop + 12.0f, right, contentTop + 44.0f},
@@ -15525,12 +15733,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     activeRT_->PopAxisAlignedClip();
     if (compactHintVisible) {
-      auto hintColor = D2DColor(theme_.textDim);
-      hintColor.a *= 0.82f;
-      DrawVerticallyCenteredTextBlock(
+      // textDim is already the quietest tier that keeps 4.5:1; fading it
+      // further would make the hint unreadable.
+      DrawShortcutHints(
           SearchPending() ? std::wstring(L"Searching...") : SearchHint(),
           {hintLeft, 0.0f, width - 94.0f, resultsTop_},
-          footerRightFormat_.Get(), hintColor);
+          D2DColor(theme_.textDim), 1.0f, true);
     }
 
     float caretX = fieldLeft;
@@ -15553,13 +15761,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     const bool showCaret = searchFocused && CaretPhase();
     if (showCaret) {
-      auto caretBrush = Brush(D2DColor(accent));
-      activeRT_->DrawLine(
-          D2D1::Point2F(caretX, launcherLayout.query.top + 5.0f),
-          D2D1::Point2F(caretX, launcherLayout.query.bottom - 5.0f),
-          caretBrush.Get(),
-          1.5f
-      );
+      // A whole number of device pixels (about 1.5 DIP, never thinner than
+      // the system caret width setting) so the caret stays sharp at every
+      // scale instead of blurring across two pixel columns.
+      const float deviceScale = DeviceScale();
+      UINT systemCaretPixels = 1;
+      if (!SystemParametersInfoW(SPI_GETCARETWIDTH, 0, &systemCaretPixels, 0)) {
+        systemCaretPixels = 1;
+      }
+      const float caretPixels = std::max(
+          {1.0f, std::round(1.5f * deviceScale),
+           static_cast<float>(std::min<UINT>(systemCaretPixels, 16))});
+      const float caretLeft = feathercast::visual::SnapToPixelEdge(
+          caretX - caretPixels * 0.5f / deviceScale, deviceScale);
+      FillRect(SnapRect({caretLeft, launcherLayout.query.top + 5.0f,
+                         caretLeft + caretPixels / deviceScale,
+                         launcherLayout.query.bottom - 5.0f}),
+               D2DColor(accent));
     }
     activeRT_->PopAxisAlignedClip();
 
@@ -15588,9 +15806,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                               : D2DColor(theme_.textMuted));
 
     if (!settings_.compactMode || !query_.empty()) {
-      auto border = Brush(D2DColor(theme_.border));
-      activeRT_->DrawLine(D2D1::Point2F(0, resultsTop_),
-                          D2D1::Point2F(width, resultsTop_), border.Get(), 1);
+      const float inset = feathercast::visual::HairlineWidth(DeviceScale());
+      DrawHorizontalHairline(inset, width - inset, resultsTop_,
+                             D2DColor(theme_.border));
     }
 
     if (settings_.compactMode && query_.empty() && !actionMode_ && browseView_ == BrowseView::None) return;
@@ -15655,12 +15873,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                     D2D1::IdentityMatrix(), headerOpacity),
               nullptr);
         }
-        const float sectionTextHeight = 15.0f *
+        const float sectionTextHeight = 16.0f *
             feathercast::layout::TextMetrics(settings_.textSizePercent).scale;
         const float sectionTextTop =
             headerY + (sectionHeaderHeight_ - sectionTextHeight) * 0.5f;
         DrawTextBlock(section.title,
-                      {12, sectionTextTop, resultsRight - 12,
+                      {kContentInset, sectionTextTop,
+                       resultsRight - kContentInset,
                        sectionTextTop + sectionTextHeight},
                       sectionFormat_.Get(), D2DColor(theme_.sectionText));
         if (headerLayer) activeRT_->PopLayer();
@@ -15753,22 +15972,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (showFooter) {
-      auto border = Brush(D2DColor(theme_.divider));
-      activeRT_->DrawLine(D2D1::Point2F(0, height - 40.0f), D2D1::Point2F(width, height - 40.0f), border.Get(), 1.0f);
+      const float inset = feathercast::visual::HairlineWidth(DeviceScale());
+      DrawHorizontalHairline(inset, width - inset, height - 40.0f,
+                             D2DColor(theme_.divider));
       // The left side advertises the two global shortcuts in plain search when
       // there is room; otherwise the hint on the right gets the whole footer.
       const float footerScale =
           feathercast::layout::TextMetrics(settings_.textSizePercent).scale;
       const bool plainSearch = !actionMode_ && browseView_ == BrowseView::None;
-      const float shortcutsWidth = 230.0f * footerScale;
+      const std::wstring globalShortcuts = L"Ctrl+K actions · Ctrl+, settings";
+      const float shortcutsWidth =
+          LayoutShortcutHints(globalShortcuts, width).width;
+      constexpr float kFooterGap = 24.0f;
       const bool showShortcuts =
-          plainSearch && width >= shortcutsWidth + 16.0f + 12.0f + 400.0f * footerScale;
+          plainSearch && shortcutsWidth > 0.0f &&
+          width >= shortcutsWidth + kContentInset * 2.0f + kFooterGap +
+                       400.0f * footerScale;
+      // The 40 DIP footer band below its divider.
+      const float footerTop = height - 40.0f;
       if (showShortcuts) {
-        DrawTextBlock(L"Ctrl+K actions · Ctrl+, settings",
-                      {16, height - 28.0f, 16.0f + shortcutsWidth, height - 12.0f},
-                      footerFormat_.Get(), D2DColor(theme_.textMuted));
+        DrawShortcutHints(globalShortcuts,
+                          {kContentInset, footerTop,
+                           kContentInset + shortcutsWidth, height},
+                          D2DColor(theme_.textMuted), 1.0f, false);
       }
-      const float footerHintLeft = showShortcuts ? 16.0f + shortcutsWidth + 12.0f : 16.0f;
+      const float footerHintLeft =
+          showShortcuts ? kContentInset + shortcutsWidth + kFooterGap
+                        : kContentInset;
       if (overlayStatus_) {
         const D2D1_COLOR_F statusColor =
             overlayStatus_->severity == StatusSeverity::Error
@@ -15779,11 +16009,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                        height - 12.0f},
                       footerRightFormat_.Get(), statusColor);
       } else {
-        DrawTextBlock(
+        DrawShortcutHints(
             SearchPending() && !sections_.empty() ? std::wstring(L"Searching...")
                                                   : SearchHint(),
-            {footerHintLeft, height - 28.0f, width - 16.0f, height - 12.0f},
-            footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+            {footerHintLeft, footerTop, width - kContentInset, height},
+            D2DColor(theme_.textMuted), 1.0f, true);
       }
     }
   }
@@ -15839,8 +16069,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                               D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                               D2D1::IdentityMatrix(), progress),
         nullptr);
-    FillRound(dialog, theme_.overlayRadius, D2DColor(theme_.overlayBackground));
-    StrokeRound(dialog, theme_.overlayRadius, D2DColor(theme_.border));
+    const RectF dialogCard = SnapRect(dialog);
+    FillRound(dialogCard, theme_.overlayRadius, D2DColor(theme_.overlayBackground));
+    StrokeHairlineRound(dialogCard, theme_.overlayRadius, D2DColor(theme_.border));
 
     DrawTextBlock(confirmation_->title,
                   {dialog.left + 24.0f, dialog.top + 24.0f, dialog.right - 24.0f, dialog.top + 50.0f},
@@ -15886,11 +16117,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   // Keep the glass surface and search controls stationary while all app rows
-  // fade and rise from one shared reveal clock. The total reveal duration is
-  // intentionally unchanged; rows no longer appear one after another.
-  static constexpr double kRowAnimTotalMs = 210.0;
+  // fade and rise from one shared reveal clock. The reveal lasts as long as
+  // the surface entrance and uses the same decelerate curve; rows never
+  // appear one after another.
+  static constexpr double kRowAnimTotalMs =
+      feathercast::motion::tokens::kEntranceSeconds * 1000.0;
   static constexpr float kRowAnimSlidePx = 6.0f;
   static constexpr float kSelectionLeadStretch = 7.0f;
+  // Side gutter for overlay content: section headers line up with the row
+  // icons (8 DIP row inset + 12 DIP icon inset), and row hints, the footer
+  // and the calculator column end the same distance from the right edge.
+  static constexpr float kContentInset = 20.0f;
+  // Inset of row content from the row (pill) edge, giving kContentInset.
+  static constexpr float kRowContentInset = 12.0f;
 
   RowAnim ComputeRowAnim() const {
     if (!animating_) return {1.0f, 0.0f};
@@ -15898,7 +16137,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         overlayRevealTimeline_.ElapsedSeconds() * 1000.0;
     const double t = feathercast::motion::NormalizedProgress(
         revealElapsedMs / 1000.0, kRowAnimTotalMs / 1000.0);
-    const double eased = feathercast::motion::EaseOutCubic(t);
+    const double eased = feathercast::motion::Ease(
+        feathercast::motion::Easing::Decelerate, t);
     // The surface opacity and the content reveal share one visible opacity.
     // Compensate for the surface fade here so rows do not fade twice and then
     // appear to pop in near the end of the opening animation.
@@ -15958,10 +16198,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // visible without relying on the fill alone; row text is checked against
     // this color (see TextOnSelectedPill).
     selectedPill_ = Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.30f, 1.0f);
+    // At rest every edge lands on a device pixel; while the pill glides it
+    // keeps subpixel positions so the motion stays smooth.
+    if (!animatingSelection_) rect = SnapRect(rect);
     const auto drawPill = [&] {
       FillRound(rect, theme_.rowRadius, selectedPill_);
-      FillRound({rect.left + 3.0f, rect.top + 10.0f, rect.left + 6.0f,
-                 rect.bottom - 10.0f},
+      FillRound(SnapRect({rect.left + 3.0f, rect.top + 10.0f, rect.left + 6.0f,
+                          rect.bottom - 10.0f}),
                 1.5f, highContrast_ ? D2DColor(theme_.textPrimary) : D2DColor(accent));
     };
     if (anim.opacity < 1.0f || anim.dy != 0.0f) {
@@ -16079,8 +16322,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void DrawMarkdownDetail(const DisplayItem& item, RectF rect) {
-    FillRound(rect, theme_.rowRadius, D2DColor(theme_.surface));
-    StrokeRound(rect, theme_.rowRadius, D2DColor(theme_.border));
+    rect = SnapRect(rect);
+    FillRound(rect, theme_.controlRadius, D2DColor(theme_.surface));
+    StrokeHairlineRound(rect, theme_.controlRadius, D2DColor(theme_.border));
 
     const float left = rect.left + 12.0f;
     const float right = rect.right - 12.0f;
@@ -16162,8 +16406,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         activeRT_->PushLayer(
             D2D1::LayerParameters(D2D1::InfiniteRect(), clip.Get()), nullptr);
       }
-      activeRT_->DrawBitmap(bitmap.Get(), ToD2D(rect), 1.0f,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, source);
+      DrawCrispBitmap(bitmap.Get(), rect, 1.0f, &source);
       if (clip) activeRT_->PopLayer();
     } else {
       constexpr float kGlyph = 28.0f;
@@ -16236,9 +16479,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                 settings_.textSizePercent)
                                 .scale;
     const float growth = std::max(0.0f, textScale - 1.0f);
-    const float titleTop = rowRect.top + 8.0f - 4.0f * growth;
+    // Title (20 px line) and subtitle (16 px line) are centred as one block,
+    // so the space above and below them is equal at every text size.
+    const float textBlockHeight = 20.0f * textScale + 1.0f + 16.0f * textScale;
+    const float titleTop = SnapToPixel(
+        rowRect.top + std::max(2.0f, (resultRowHeight_ - textBlockHeight) * 0.5f));
     const float titleBottom = titleTop + 20.0f * textScale;
     const float subtitleTop = titleBottom + 1.0f;
+    const float contentRight = rowRect.right - kRowContentInset;
 
     if (item.isSymbol) {
       // Draw the symbol/emoji itself, large, in the left tile - the only place it
@@ -16260,10 +16508,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                      rowRect.bottom},
                     subFormat_.Get(), mutedText);
       if (coverage > 0.0f && rowRect.right - rowRect.left > 520.0f) {
-        DrawTextBlock(ActionHint(item),
-                      {rowRect.right - 330, rowRect.top + 16,
-                       rowRect.right - 10, rowRect.bottom},
-                      footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
+        DrawShortcutHints(ActionHint(item),
+                          {rowRect.right - 168.0f, titleTop, contentRight,
+                           titleBottom},
+                          mutedText, coverage, true);
       }
       return;
     }
@@ -16272,7 +16520,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float iconY = rowRect.top + (resultRowHeight_ - 24.0f) * 0.5f;
     auto bitmap = IconBitmap(renderData.iconKey);
     if (bitmap) {
-      activeRT_->DrawBitmap(bitmap.Get(), D2D1::RectF(iconX, iconY, iconX + 24, iconY + 24), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+      DrawCrispBitmap(bitmap.Get(), {iconX, iconY, iconX + 24, iconY + 24});
     } else {
       FillRound({iconX, iconY, iconX + 24, iconY + 24}, 6, D2DColor(theme_.iconTile));
       DrawResultIcon(feathercast::ui::ResolveResultIcon(item),
@@ -16283,7 +16531,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isCalculator || item.isConversion) {
       constexpr float kTextGap = 16.0f;
       const float contentLeft = rowRect.left + 52.0f;
-      const float contentRight = rowRect.right - 10.0f;
       const float contentWidth = std::max(0.0f, contentRight - contentLeft);
       const float resultWidth =
           std::clamp(contentWidth * 0.42f, 160.0f, 300.0f);
@@ -16294,39 +16541,49 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // left and reserve a stable, right-aligned column for the answer. The
       // disjoint rectangles ensure long expressions are clipped before they
       // can overlap the result.
+      // Tabular figures keep digits in place as the answer updates per
+      // keystroke.
       DrawTextBlock(item.calculationExpression,
                     {contentLeft, titleTop, expressionRight, titleBottom},
-                    rowFormat_.Get(), primaryText);
+                    rowFormat_.Get(), primaryText, true);
       DrawTextBlock(item.calculationResult,
                     {resultLeft, titleTop, contentRight, titleBottom},
                     calculationResultFormat_.Get(),
-                    primaryText);
+                    primaryText, true);
       if (coverage > 0.0f) {
-        DrawTextBlock(ActionHint(item),
-                      {resultLeft, subtitleTop, contentRight,
-                       rowRect.bottom},
-                      footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
+        DrawShortcutHints(ActionHint(item),
+                          {resultLeft, subtitleTop, contentRight,
+                           subtitleTop + 16.0f * textScale},
+                          mutedText, coverage, true);
       }
       return;
     }
 
     const bool showHint = coverage > 0.0f && rowRect.right - rowRect.left > 520.0f;
+    const std::wstring hint = showHint ? ActionHint(item) : std::wstring();
+    const float hintWidth =
+        showHint ? LayoutShortcutHints(hint, 200.0f * textScale).width : 0.0f;
+    // Values that count or measure (timers, utilities) keep fixed-width
+    // digits so they do not jitter while they update.
+    const bool tabular = item.timerRequest.has_value() ||
+                         item.utility.has_value() ||
+                         browseView_ == BrowseView::Timers;
     // Narrow the title gradually so a long name's ellipsis slides with the
     // pill rather than truncating all at once.
     const float titleRight =
-        rowRect.right - (showHint ? 14.0f + 186.0f * textScale * coverage : 14.0f);
+        contentRight - (hintWidth > 0.0f ? (hintWidth + 12.0f) * coverage : 0.0f);
     DrawTextBlock(renderData.name,
                   {rowRect.left + 52, titleTop, titleRight, titleBottom},
-                  rowFormat_.Get(), primaryText);
+                  rowFormat_.Get(), primaryText, tabular);
     DrawTextBlock(renderData.source,
-                  {rowRect.left + 52, subtitleTop, rowRect.right - 14,
+                  {rowRect.left + 52, subtitleTop, contentRight,
                    rowRect.bottom},
-                  subFormat_.Get(), mutedText);
-    if (showHint) {
-      DrawTextBlock(ActionHint(item),
-                    {rowRect.right - (14.0f + 178.0f * textScale), titleTop,
-                     rowRect.right - 14, titleBottom},
-                    footerRightFormat_.Get(), WithAlpha(mutedText, coverage));
+                  subFormat_.Get(), mutedText, tabular);
+    if (hintWidth > 0.0f) {
+      DrawShortcutHints(hint,
+                        {contentRight - hintWidth, titleTop, contentRight,
+                         titleBottom},
+                        mutedText, coverage, true);
     }
   }
 
@@ -22932,6 +23189,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   float visualSelectedY_ = -1.0f;
   bool animatingSelection_ = false;
   feathercast::motion::Spring selectionSpring_;
+  feathercast::motion::KeyRepeatCadence selectionRepeatCadence_;
   feathercast::ui::CaptureUiState captureUiState_;
   feathercast::screenshot::EditorState screenshotEditor_;
   ScreenshotToolbarAction screenshotColorAction_ =
@@ -23150,6 +23408,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   ComPtr<IDWriteTextFormat> calculationResultFormat_;
   ComPtr<IDWriteTextFormat> subFormat_;
   ComPtr<IDWriteTextFormat> sectionFormat_;
+  ComPtr<IDWriteTextFormat> keycapFormat_;
   ComPtr<IDWriteTextFormat> footerFormat_;
   ComPtr<IDWriteTextFormat> footerRightFormat_;
   ComPtr<IDWriteTextFormat> titleFormat_;
