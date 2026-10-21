@@ -246,6 +246,9 @@ class ShortcutRecorder {
     return {};
   }
 
+  // Modifiers currently held while recording, for a live chord preview.
+  const PressedModifiers& HeldModifiers() const { return modifiers_; }
+
  private:
   void OnModifierDown(UINT generic) {
     const bool hadModifiers = AnyModifierPressed();
