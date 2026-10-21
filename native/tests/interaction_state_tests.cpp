@@ -360,5 +360,122 @@ int main() {
     assert(pending.Apply(10, 0) == 0);
   }
 
+  {
+    // Hover never beats the keyboard: a resting or barely nudged pointer is
+    // ignored until it leaves the slop square around its anchor.
+    feathercast::interaction::PointerHoverGate gate;
+    assert(!gate.Armed());
+    assert(gate.Admit(10, 10));
+    gate.Arm(100, 200);
+    assert(gate.Armed());
+    assert(!gate.Admit(100, 200));
+    assert(!gate.Admit(102, 198));
+    assert(!gate.Admit(98, 202));
+    assert(gate.Armed());
+    assert(gate.Admit(103, 200));
+    assert(!gate.Armed());
+    // Once open, the gate stays open until it is armed again.
+    assert(gate.Admit(100, 200));
+    gate.Arm(50, 50);
+    assert(!gate.Admit(50, 50, 8));
+    assert(!gate.Admit(57, 43, 8));
+    assert(gate.Admit(50, 58, 8));
+    gate.Arm(0, 0);
+    // A non-positive slop still requires an actual pixel of movement.
+    assert(!gate.Admit(0, 0, 0));
+    assert(gate.Admit(-1, 0, 0));
+    gate.Arm(5, 5);
+    gate.Disarm();
+    assert(gate.Admit(5, 5));
+  }
+
+  {
+    // "Searching..." only appears after the grace period, and a request that
+    // continues pending work keeps the original start time.
+    feathercast::interaction::DelayedBusyIndicator busy(500);
+    assert(!busy.Visible(true, 0));
+    assert(busy.RemainingMs(0) == 500);
+    busy.NoteRequest(false, 1000);
+    assert(!busy.Visible(true, 1000));
+    assert(!busy.Visible(true, 1499));
+    assert(busy.RemainingMs(1200) == 300);
+    assert(busy.Visible(true, 1500));
+    assert(busy.RemainingMs(1600) == 0);
+    assert(!busy.Visible(false, 1600));
+    busy.NoteRequest(true, 1700);
+    assert(busy.Visible(true, 1700));
+    // A fresh request after the previous one finished restarts the clock.
+    busy.NoteRequest(false, 2000);
+    assert(!busy.Visible(true, 2100));
+    assert(busy.Visible(true, 2500));
+    // A clock that appears to go backwards never shows the indicator early.
+    assert(!busy.Visible(true, 1900));
+    assert(busy.RemainingMs(1900) == 500);
+    feathercast::interaction::DelayedBusyIndicator defaults;
+    assert(defaults.DelayMs() ==
+           feathercast::interaction::DelayedBusyIndicator::kDefaultDelayMs);
+    defaults.NoteRequest(true, 10);
+    assert(!defaults.Visible(true, 10));
+  }
+
+  {
+    // An undo offer is only honored while its status message is on screen.
+    feathercast::interaction::StatusUndoOffer<int> undo;
+    const std::wstring hidden = L"Hidden from search. Press Ctrl+Z to undo.";
+    const std::wstring other = L"Ranking reset for this item.";
+    assert(!undo.Available(&hidden));
+    assert(!undo.Take(&hidden));
+    undo.Offer(hidden, 7);
+    assert(undo.Available(&hidden));
+    assert(!undo.Available(nullptr));
+    assert(!undo.Available(&other));
+    const auto taken = undo.Take(&hidden);
+    assert(taken && *taken == 7);
+    assert(!undo.Available(&hidden));
+    assert(!undo.Take(&hidden));
+    // A withdrawn offer cannot be redeemed when the same text returns.
+    undo.Offer(hidden, 8);
+    assert(!undo.Take(nullptr));
+    assert(!undo.Take(&hidden));
+    undo.Offer(hidden, 9);
+    undo.Clear();
+    assert(!undo.Available(&hidden));
+  }
+
+  {
+    using feathercast::ui::EscapeContext;
+    using feathercast::ui::EscapeStep;
+    using feathercast::ui::NextEscapeStep;
+    // Root search: clear typed text first, then hide.
+    assert(NextEscapeStep({.queryEmpty = false}) == EscapeStep::ClearQuery);
+    assert(NextEscapeStep({.queryEmpty = true}) == EscapeStep::Hide);
+    // A scope prefix is peeled before the remaining terms.
+    assert(NextEscapeStep({.scopedQuery = true, .queryEmpty = false}) ==
+           EscapeStep::StripScope);
+    // The preview panel closes before the query is touched.
+    assert(NextEscapeStep({.previewOpen = true, .scopedQuery = true,
+                           .queryEmpty = false}) == EscapeStep::ClosePreview);
+    // A sub-view is the outermost layer: Esc goes back, keeping its text.
+    assert(NextEscapeStep({.subView = true, .previewOpen = true,
+                           .queryEmpty = false}) == EscapeStep::LeaveView);
+    assert(NextEscapeStep({.subView = true}) == EscapeStep::LeaveView);
+    // Outside the search view, typed text does not hold the launcher open.
+    assert(NextEscapeStep({.queryEmpty = false, .searchView = false}) ==
+           EscapeStep::Hide);
+
+    feathercast::ui::OverlayState state;
+    state.query = L"chr";
+    state.caret = 3;
+    state.selected = 4;
+    // Esc clears the query as one undoable edit, so Ctrl+Z restores it.
+    feathercast::ui::OverlayController::RecordUserEdit(state);
+    const auto effects = feathercast::ui::OverlayController::SetQuery(state, L"");
+    assert(feathercast::ui::HasEffect(effects,
+                                      feathercast::ui::UiEffect::RequestSearch));
+    assert(state.query.empty() && state.caret == 0 && state.selected == 0);
+    feathercast::ui::OverlayController::UndoQueryEdit(state);
+    assert(state.query == L"chr" && state.caret == 3);
+  }
+
   return 0;
 }
