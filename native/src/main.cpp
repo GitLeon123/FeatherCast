@@ -16624,8 +16624,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     subFormat_.Get(), mutedText);
       if (coverage > 0.0f && rowRect.right - rowRect.left > 520.0f) {
         DrawShortcutHints(ActionHint(item),
-                          {rowRect.right - 168.0f, titleTop, contentRight,
-                           titleBottom},
+                          {rowRect.right - 168.0f, rowRect.top, contentRight,
+                           rowRect.top + resultRowHeight_},
                           mutedText, coverage, true);
       }
       return;
@@ -16695,9 +16695,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                    rowRect.bottom},
                   subFormat_.Get(), mutedText, tabular);
     if (hintWidth > 0.0f) {
+      // Centre the hint on the row, not on the title line, so it stays
+      // vertically centred next to the icon.
       DrawShortcutHints(hint,
-                        {contentRight - hintWidth, titleTop, contentRight,
-                         titleBottom},
+                        {contentRight - hintWidth, rowRect.top,
+                         contentRight, rowRect.top + resultRowHeight_},
                         mutedText, coverage, true);
     }
   }
