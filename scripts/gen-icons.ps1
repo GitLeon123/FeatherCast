@@ -66,7 +66,7 @@ Write-Host "Icons generated in $buildDir : icon.ico, icon.png"
 $resDir = Join-Path $PSScriptRoot "..\android\app\src\main\res"
 $source = [System.Drawing.Bitmap]::FromFile((Resolve-Path $assetPath))
 # Bounds of the rounded-square artwork inside the transparent source margin.
-$content = New-Object System.Drawing.Rectangle(35, 30, 1184, 1194)
+$content = New-Object System.Drawing.Rectangle(36, 35, 1181, 1181)
 $densities = @{ "mdpi" = 1.0; "hdpi" = 1.5; "xhdpi" = 2.0; "xxhdpi" = 3.0; "xxxhdpi" = 4.0 }
 foreach ($density in $densities.Keys) {
   $scale = $densities[$density]
