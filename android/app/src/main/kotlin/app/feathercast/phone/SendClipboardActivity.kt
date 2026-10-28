@@ -42,7 +42,11 @@ class SendClipboardActivity : ComponentActivity() {
                 return
             }
             activity.lifecycleScope.launch {
-                val sent = withContext(Dispatchers.IO) { LinkManager.instance.sendClipboardText(text) }
+                val sent = withContext(Dispatchers.IO) {
+                    // The tile may have just started the service; give the link a moment.
+                    LinkManager.instance.awaitConnection()
+                    LinkManager.instance.sendClipboardText(text)
+                }
                 val pc = LinkManager.instance.state.value.pcName.ifEmpty { activity.getString(R.string.your_pc) }
                 toast(activity, if (sent) activity.getString(R.string.clipboard_sent, pc) else activity.getString(R.string.not_connected_to, pc))
                 done()

@@ -35,9 +35,14 @@ class LinkStore(context: Context) {
     init {
         // Sharing used to start switched on. Phones that were paired before the defaults
         // changed keep exactly what they had; only unset keys on new pairings start off.
-        if (!prefs.contains("sharingChosen") && prefs.contains("linkKey")) {
-            val edit = prefs.edit().putBoolean("sharingChosen", true)
-            LEGACY_ON_BY_DEFAULT.forEach { if (!prefs.contains(it)) edit.putBoolean(it, true) }
+        // The marker makes this run once: a new pairing whose sharing step is still
+        // pending also lacks "sharingChosen" and must not be switched on after a restart.
+        if (!prefs.getBoolean(SHARING_MIGRATED, false)) {
+            val edit = prefs.edit().putBoolean(SHARING_MIGRATED, true)
+            if (!prefs.contains("sharingChosen") && prefs.contains("linkKey")) {
+                edit.putBoolean("sharingChosen", true)
+                LEGACY_ON_BY_DEFAULT.forEach { if (!prefs.contains(it)) edit.putBoolean(it, true) }
+            }
             edit.apply()
         }
     }
@@ -71,7 +76,8 @@ class LinkStore(context: Context) {
         if (prefs.getString("pcId", null) != pc.pcId) {
             (OPTIONAL_SWITCHES + SHARING_SWITCHES + "sharingChosen").forEach { edit.remove(it) }
         }
-        edit.putString("pcId", pc.pcId)
+        edit.putBoolean(SHARING_MIGRATED, true)
+            .putString("pcId", pc.pcId)
             .putString("pcName", pc.pcName)
             .putString("host", pc.host)
             .putInt("port", pc.port)
@@ -202,6 +208,7 @@ class LinkStore(context: Context) {
 
     private companion object {
         const val KEY_ALIAS = "feathercast-link-key"
+        const val SHARING_MIGRATED = "sharingMigrated"
         val LEGACY_ON_BY_DEFAULT = listOf("sendNotifications", "sendPhotos", "clipboardSync")
         val SHARING_SWITCHES = listOf("sendNotifications", "sendPhotos", "clipboardSync", "receiveFiles", "allowRing", "mediaControl")
         val OPTIONAL_SWITCHES = listOf("smsAccess", "callAlerts", "storageAccess", "screenSharing", "remoteControl")

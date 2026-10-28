@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Parcelable
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import app.feathercast.phone.ui.FeatherTheme
@@ -64,13 +65,14 @@ class ShareActivity : ComponentActivity() {
     private fun sharedUris(intent: Intent): List<Uri> {
         @Suppress("DEPRECATION")
         return when (intent.action) {
+            // Another app chooses the extras, so read them untyped and keep only Uris.
             Intent.ACTION_SEND -> listOfNotNull(
                 if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                else intent.getParcelableExtra(Intent.EXTRA_STREAM),
+                else intent.getParcelableExtra<Parcelable>(Intent.EXTRA_STREAM) as? Uri,
             )
             Intent.ACTION_SEND_MULTIPLE ->
                 (if (Build.VERSION.SDK_INT >= 33) intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                else intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)) ?: emptyList()
+                else intent.getParcelableArrayListExtra<Parcelable>(Intent.EXTRA_STREAM)?.filterIsInstance<Uri>()) ?: emptyList()
             else -> emptyList()
         }
     }

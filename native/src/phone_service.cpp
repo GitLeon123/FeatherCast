@@ -1278,7 +1278,8 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
     std::string pcId;
     {
       std::lock_guard lock(mutex_);
-      anyDevice = !devices_.empty() || !pairingToken_.empty();
+      anyDevice = !devices_.empty() ||
+                  (!pairingToken_.empty() && NowMs() <= pairingExpiresAt_);
       pcId = pcId_;
     }
     if (anyDevice && udp != INVALID_SOCKET) {
@@ -1488,23 +1489,39 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
       return reject("bad-key", "The phone key could not be used.");
     }
     bool consumed = false;
+    std::optional<PairedDevice> replaced;
     {
       std::lock_guard lock(mutex_);
       if (pairingToken_ == token && NowMs() <= pairingExpiresAt_) {
         pairingToken_.clear();
         pairingExpiresAt_ = 0;
-        std::erase_if(devices_, [&](const auto& existing) { return existing.id == deviceId; });
+        if (auto it = std::ranges::find(devices_, deviceId, &PairedDevice::id); it != devices_.end()) {
+          replaced = std::move(*it);
+          devices_.erase(it);
+        }
         devices_.push_back(device);
         consumed = true;
       }
     }
     if (!consumed) return reject("expired", "This pairing code has already been used or replaced.");
     if (!SaveState()) {
-      std::lock_guard lock(mutex_);
-      std::erase_if(devices_, [&](const auto& existing) {
-        return existing.id == deviceId && existing.linkKey == device.linkKey;
-      });
+      {
+        // reject() takes mutex_ itself, so release it first.
+        std::lock_guard lock(mutex_);
+        std::erase_if(devices_, [&](const auto& existing) {
+          return existing.id == deviceId && existing.linkKey == device.linkKey;
+        });
+        // Keep the previous pairing working; it is still the one on disk.
+        if (replaced) devices_.push_back(std::move(*replaced));
+      }
       return reject("storage-error", "Could not save the pairing on the PC. Show a new code and try again.");
+    }
+    if (replaced) {
+      // Sessions on the old key can no longer be authenticated.
+      std::lock_guard lock(mutex_);
+      for (const auto& other : sessions_) {
+        if (other->deviceId == deviceId) other->Close();
+      }
     }
     Event event;
     event.kind = EventKind::Paired;
@@ -1771,6 +1788,12 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
         std::lock_guard lock(mutex_);
         if (auto pending = pendingFiles_.find(result.progress.reference); pending != pendingFiles_.end()) {
           pending->second.deadline = SteadyMs() + kRequestTimeoutMs;
+        }
+        // A photo still streaming in is not late.
+        if (result.progress.purpose == "photo") {
+          if (auto photo = pendingPhotos_.find(result.progress.reference); photo != pendingPhotos_.end()) {
+            photo->second = SteadyMs() + kRequestTimeoutMs;
+          }
         }
       }
       Event progress;

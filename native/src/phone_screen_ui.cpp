@@ -93,7 +93,7 @@ struct PhoneScreenWindow::Impl {
   ScreenCallbacks callbacks;
   bool connected = false, available = false, sound = true, fullscreen = false;
   bool controlReady = false, keyboardReady = false, audioReady = false, mouseHeld = false;
-  int generation = 0, lastX = 0, lastY = 0;
+  int generation = 0, lastX = 0, lastY = 0, wheelAccum = 0;
   std::string deviceName, sessionId;
   std::wstring detail, phase = L"Ready to share", audioDetail;
   WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
@@ -309,9 +309,10 @@ struct PhoneScreenWindow::Impl {
       RECT rc{}; GetClientRect(hwnd, &rc);
       if (FAILED(d2d->CreateHwndRenderTarget(D2D1::RenderTargetProperties(), D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(rc.right, rc.bottom)), &target))) return false;
       target->SetDpi(96 * scale, 96 * scale);
-      if (FAILED(target->CreateSolidColorBrush(Color(theme.textPrimary), &brush))) return false;
+      // Without a brush the next call would accept the target and draw with null.
+      if (FAILED(target->CreateSolidColorBrush(Color(theme.textPrimary), &brush))) { target.Reset(); return false; }
     }
-    return body && heading;
+    return body && heading && brush;
   }
   // Rounded, antialiased button body (and focus ring) like the Phone window's
   // controls. Returns false when Direct2D is unavailable; the caller then
@@ -509,7 +510,14 @@ struct PhoneScreenWindow::Impl {
       case WM_MOUSEWHEEL: {
         POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; ScreenToClient(hwnd, &p);
         const auto mapped = phone::ScreenCoordinates(imageRect, p.x / scale, p.y / scale);
-        if (controlReady && mapped) { lastX = mapped->first; lastY = mapped->second; Input("scroll", std::clamp(GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA, -10, 10)); } return 0;
+        if (controlReady && mapped) {
+          lastX = mapped->first; lastY = mapped->second;
+          // Precision touchpads send fractions of a notch; accumulate until a whole step.
+          wheelAccum += GET_WHEEL_DELTA_WPARAM(wp);
+          const int steps = wheelAccum / WHEEL_DELTA;
+          wheelAccum -= steps * WHEEL_DELTA;
+          if (steps != 0) Input("scroll", std::clamp(steps, -10, 10));
+        } return 0;
       }
       case WM_RBUTTONUP: if (controlReady) Input("back"); return 0;
       case WM_CAPTURECHANGED: case WM_KILLFOCUS: CancelInput(); return 0;

@@ -123,7 +123,14 @@ bool PersistenceService::SaveSettingsAndWait(settings::Settings settings,
     if (error) *error = L"The persistence worker is unavailable.";
     return false;
   }
-  auto [succeeded, detail] = ready.get();
+  Result result;
+  try {
+    result = ready.get();
+  } catch (const std::future_error&) {
+    // Shutdown discarded the queued save before it ran.
+    result = {false, L"The persistence worker is stopping."};
+  }
+  auto& [succeeded, detail] = result;
   if (!succeeded && error) *error = std::move(detail);
   return succeeded;
 }

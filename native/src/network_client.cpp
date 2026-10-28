@@ -134,17 +134,22 @@ std::optional<std::string> HttpsGet(const std::wstring& host,
       !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
     return std::nullopt;
   }
+  constexpr std::size_t kMaxBodyBytes = 2 * 1024 * 1024;
   std::string body;
-  DWORD available = 0;
-  while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+  for (;;) {
+    DWORD available = 0;
+    // A failed read is a broken connection; a partial body is not a result.
+    if (!WinHttpQueryDataAvailable(request, &available)) return std::nullopt;
+    if (available == 0) break;
+    if (body.size() + available > kMaxBodyBytes) return std::nullopt;
     std::string chunk(available, '\0');
     DWORD read = 0;
     if (!WinHttpReadData(request, chunk.data(), available, &read)) {
-      break;
+      return std::nullopt;
     }
+    if (read == 0) break;
     chunk.resize(read);
     body += chunk;
-    if (body.size() > 2 * 1024 * 1024) break;
   }
   return body;
 }

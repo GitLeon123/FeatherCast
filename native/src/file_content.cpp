@@ -196,7 +196,8 @@ Extraction Extract(const std::filesystem::path& path, std::size_t maxBytes,
                        ? DecodeCodePage(bytes.data() + bomOffset,
                                         bytes.size() - bomOffset, CP_UTF8,
                                         MB_ERR_INVALID_CHARS)
-                       : DecodeCodePage(bytes.data(), bytes.size(), CP_ACP, 0);
+                       : DecodeCodePage(bytes.data() + bomOffset,
+                                        bytes.size() - bomOffset, CP_ACP, 0);
     if (!decoded) {
       result.state = State::Binary;
       return result;

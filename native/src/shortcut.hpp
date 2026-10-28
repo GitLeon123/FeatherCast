@@ -254,6 +254,8 @@ class ShortcutRecorder {
     const bool hadModifiers = AnyModifierPressed();
     const bool alreadyPressed = IsModifierPressed(generic);
     SetModifier(generic, true);
+    // Holding a modifier auto-repeats its key-down; that is not a chord.
+    if (alreadyPressed) return;
 
     if (!hadModifiers && !alreadyPressed) {
       singleModifierCandidate_ = generic;

@@ -666,9 +666,20 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
     if ((++interactionYieldCounter & 63u) == 0) Sleep(1);
   };
 
+  // A root nested inside another is walked on its own, so the outer walk
+  // stops at it; a root listed twice is walked once. Either way no file is
+  // indexed twice.
+  std::set<std::wstring> rootKeys;
+  for (const auto& configured : request.roots) {
+    rootKeys.insert(filesystem_semantics::PathKey(configured));
+  }
+  std::set<std::wstring> walkedRoots;
+
   for (const auto& configured : request.roots) {
     if (token.stop_requested() || !IsCurrent(request.generation)) return status;
     YieldDuringInteraction();
+    const std::wstring rootKey = filesystem_semantics::PathKey(configured);
+    if (!walkedRoots.insert(rootKey).second) continue;
     const std::filesystem::path root(configured);
     std::error_code rootError;
     if (!FixedLocalRoot(root) ||
@@ -707,7 +718,9 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
               IsOperationalDataDirectory(path, dataKey)) {
             continue;
           }
-          pending.push_back(path);
+          if (!rootKeys.contains(filesystem_semantics::PathKey(path.wstring()))) {
+            pending.push_back(path);
+          }
         }
         const auto normalizedPath = path.lexically_normal();
 

@@ -536,8 +536,10 @@ struct PhoneWindow::Impl : public accessibility::Model {
   }
 
   bool EnsureTarget() {
-    if (target) return true;
+    // Formats are dropped on theme changes while the target stays alive, so
+    // recreate them before taking the early return.
     if (!EnsureFactories()) return false;
+    if (target) return true;
     RECT client{};
     GetClientRect(hwnd, &client);
     const UINT dpi = WindowDpi(hwnd);
@@ -2924,6 +2926,9 @@ struct PhoneWindow::Impl : public accessibility::Model {
         photosRequested = false;
         photosLoaded = false;
         lastError.clear();
+        // A new session replaces the old one without a Disconnected event, and
+        // the old session's transfers ended with it.
+        transfers.clear();
         break;
       case EventKind::Disconnected:
         if (!event.deviceId.empty()) {
@@ -3044,6 +3049,11 @@ struct PhoneWindow::Impl : public accessibility::Model {
             if (existing.info.id == info.id) {
               item.info.thumbJpeg = existing.info.thumbJpeg;
               item.thumb = existing.thumb;
+              item.thumbFailed = existing.thumbFailed;
+              // Keep an in-flight download so its PhotoSaved still opens the photo.
+              item.downloading = existing.downloading;
+              item.downloadingSince = existing.downloadingSince;
+              break;
             }
           }
           next.push_back(std::move(item));

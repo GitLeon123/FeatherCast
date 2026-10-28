@@ -183,6 +183,8 @@ constexpr UINT WM_BROKER_STATE_CHANGED = WM_APP + 26;
 // runs on the UI thread. wParam = vk, lParam = KeyEventFlags.
 constexpr UINT WM_HOOK_RECORD_SHORTCUT_KEY = WM_APP + 27;
 constexpr UINT WM_HOOK_RECORDING_CONTROL_KEY = WM_APP + 28;
+// Posted by the paste worker when the target window could not be focused.
+constexpr UINT WM_PASTE_NOT_DELIVERED = WM_APP + 29;
 constexpr LPARAM kHookKeyDown = 0x1;
 constexpr LPARAM kHookKeyUp = 0x2;
 constexpr LPARAM kHookShiftDown = 0x4;
@@ -206,6 +208,7 @@ constexpr UINT TIMER_ANIMATION_FRAME = 13;
 constexpr UINT TIMER_ICON_PROMOTE = 14;
 constexpr UINT TIMER_APP_DISCOVERY_REFRESH = 16;
 constexpr UINT TIMER_START_DISMISS = 17;
+constexpr UINT TIMER_TRAY_RETRY = 18;
 constexpr UINT TIMER_SETTINGS_STATUS = 30;
 constexpr UINT TIMER_SEARCH_BUSY = 41;
 constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
@@ -1257,6 +1260,8 @@ void ClampSettings(Settings& settings) {
       std::clamp(settings.clipboardHistoryLimit, MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
   settings.fileIndexMaxEntries =
       std::clamp(settings.fileIndexMaxEntries, MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
+  // 0 keeps entries forever; the UI steps top out at 365 days.
+  settings.clipboardRetentionDays = std::clamp(settings.clipboardRetentionDays, 0, 3650);
 }
 
 COLORREF ColorRefFromHex(const std::wstring& hex, COLORREF fallback = RGB(0x5b, 0x6c, 0xff)) {
@@ -2766,6 +2771,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     // While Settings records a shortcut every key is swallowed and replayed to
     // the recorder on the UI thread, in order.
     if (config.recordingShortcut) {
+      // Keep modifier tracking current, or a modifier released while recording
+      // would still count as held for the next shortcut match.
+      if (IsModifier(vk) && (down || up)) SetHookModifier(vk, down);
       if (target && (down || up)) {
         PostMessageW(target, WM_HOOK_RECORD_SHORTCUT_KEY, vk,
                      down ? kHookKeyDown : kHookKeyUp);
@@ -3894,7 +3902,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (taskbarCreatedMessage_ && msg == taskbarCreatedMessage_) {
       RemoveTray();
-      CreateTray();
+      // Explorer can announce the taskbar before it accepts icons; retry briefly.
+      trayRetriesLeft_ = CreateTray() ? 0 : 10;
+      if (trayRetriesLeft_ > 0) SetTimer(hwnd_, TIMER_TRAY_RETRY, 1000, nullptr);
       return 0;
     }
     switch (msg) {
@@ -3902,9 +3912,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         ExpireTimers();
         return 0;
       case WM_TIMER:
-        if (wParam == TIMER_CLOCK_DISPLAY) {
-          if (visible_ && (browseView_ == BrowseView::Timers || (actionMode_ && actionTarget_.timerRequest))) RequestSearch();
-          else KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+        if (wParam == TIMER_TRAY_RETRY) {
+          if (tray_.cbSize || CreateTray() || --trayRetriesLeft_ <= 0) {
+            KillTimer(hwnd_, TIMER_TRAY_RETRY);
+            trayRetriesLeft_ = 0;
+          }
+        } else if (wParam == TIMER_CLOCK_DISPLAY) {
+          if (visible_ && (browseView_ == BrowseView::Timers || (actionMode_ && actionTarget_.timerRequest))) {
+            RequestSearch();
+          } else {
+            KillTimer(hwnd_, TIMER_CLOCK_DISPLAY);
+            timerDisplayArmed_ = false;
+          }
         } else if (wParam == TIMER_SEARCH_BUSY) {
           OnSearchBusyTimer();
         } else if (wParam == 1) {
@@ -4358,6 +4377,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         extensionReloadPending_ = false;
         SetSettingsStatus(StatusSeverity::Success, L"Extensions reloaded.");
         return 0;
+      case WM_PASTE_NOT_DELIVERED:
+        ShowTrayNotification(L"FeatherCast Paste",
+                             L"The text is on the clipboard. Press Ctrl+V to paste it.");
+        return 0;
       case WM_BACKGROUND_TASK_ERROR:
         extensionReloadPending_ = false;
         SetSettingsStatus(
@@ -4463,11 +4486,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (observation.phoneAllowed) ForwardClipboardToPhone(*observation.text);
       // Text FeatherCast placed itself (copied results, paste helpers) does
       // not go into the history.
-      const bool internal = internalClipboardSequence_ != 0 &&
-                            observation.sequence == internalClipboardSequence_;
+      const DWORD internalSequence = internalClipboardSequence_.load();
+      const bool internal = internalSequence != 0 && observation.sequence == internalSequence;
       if (ClipboardHistoryActive() && !internal) {
         HandleClipboardText(std::move(*observation.text));
       }
+    }
+    // A copy that arrived while the previous read was in flight was skipped;
+    // read the clipboard again so it is not lost.
+    if (!clipboard.events.empty() && clipboardUpdateDirty_) {
+      clipboardUpdateDirty_ = false;
+      OnClipboardUpdate();
     }
     auto phone = drain(phoneEvents_, 8);
     for (auto& event : phone.events) {
@@ -4781,7 +4810,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               if (!event.succeeded) {
                 ReportPersistenceFailure(L"Timers could not be saved. " + Utf8ToWide(event.error.message));
                 SetOverlayStatus(StatusSeverity::Error, L"Timers could not be saved. Open Settings for details.");
-              } else if (!event.expiredNames.empty()) {
+              }
+              // The timers finished either way; a failed save must not hide that.
+              if (!event.expiredNames.empty()) {
                 std::wstring names;
                 for (const auto& name : event.expiredNames) {
                   if (!names.empty()) names += L", ";
@@ -4851,6 +4882,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     event.error.message.empty()
                         ? L"Local data could not be saved."
                         : Utf8ToWide(event.error.message));
+              } else if (settings_.clipboardHistoryEnabled) {
+                // The age cutoff is applied in the database only; reload so
+                // expired entries leave the in-memory history too.
+                persistence_.LoadClipboard(ClipboardHistoryLimit(),
+                                           settings_.clipboardRetentionDays);
               }
             } else if constexpr (std::is_same_v<
                                      Event,
@@ -9449,8 +9485,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::optional<DiscoveryResult> PerformDiscovery(
       const DiscoveryRequest& request, std::stop_token stopToken) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    ScopeExit uninitialize([] { CoUninitialize(); });
+    const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+    ScopeExit uninitialize([comReady] { if (comReady) CoUninitialize(); });
     auto apps = DiscoverApps(stopToken, request.generation);
     if (!apps || DiscoveryCanceled(stopToken, request.generation)) {
       return std::nullopt;
@@ -15964,6 +16000,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               static_cast<float>(overlayVisualScroll_.Value());
     int rowIndex = 0;
     activeRT_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, resultsRight, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    const std::size_t firstResultHit = hits_.size();
     DrawSelectionPill(resultsRight);
     for (const auto& section : sections_) {
       float headerY = y;
@@ -16038,6 +16075,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       y = bodyTop + SectionBodyHeight(section.items.size());
     }
     activeRT_->PopAxisAlignedClip();
+    hits_.ClipFrom(firstResultHit, resultsTop, resultsBottom);
 
     if (detailItem) {
       DrawMarkdownDetail(*detailItem, {resultsRight + 4.0f, resultsTop + 8.0f, width - 8.0f, resultsBottom - 8.0f});
@@ -20654,7 +20692,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settings_.privacyConsentVersion = 1;
         settings_.clipboardHistoryEnabled = !settings_.clipboardHistoryEnabled;
         if (settings_.clipboardHistoryEnabled) {
-          if (!persistence_.LoadClipboard(ClipboardHistoryLimit())) {
+          if (!persistence_.LoadClipboard(ClipboardHistoryLimit(),
+                                          settings_.clipboardRetentionDays)) {
             ReportPersistenceFailure(
                 L"The persistence worker is unavailable.");
           }
@@ -20840,10 +20879,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           if (settings_.fileIndexRoots.empty()) {
             settings_.fileIndexRoots = ResolvedFileIndexRoots();
           }
-          const std::wstring normalized = Lower(*folder);
           const bool exists = std::any_of(
               settings_.fileIndexRoots.begin(), settings_.fileIndexRoots.end(),
-              [&](const std::wstring& root) { return Lower(root) == normalized; });
+              [&](const std::wstring& root) {
+                return feathercast::filesystem_semantics::SamePath(root, *folder);
+              });
           if (!exists) settings_.fileIndexRoots.push_back(*folder);
           PersistSettings();
           if (settings_.fileIndexEnabled) ConfigureFileIndex();
@@ -20973,10 +21013,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         break;
       case HitType::OpenLocalDataFolder:
         launchExecutor_.Submit([path = LocalDataPath()](std::stop_token) {
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr,
                         SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         break;
       case HitType::ReloadExtensions:
@@ -20986,10 +21026,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         launchExecutor_.Submit([path = UserDataPath() / L"plugins"](std::stop_token) {
           std::error_code ec;
           std::filesystem::create_directories(path, ec);
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr,
                         SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         break;
       case HitType::ClearRecents:
@@ -21433,7 +21473,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           item.runCommand.kind == feathercast::run_command::Kind::OpenTarget;
       if (!launchExecutor_.Submit([this, runCommand = item.runCommand, opening,
                                    query = query_](std::stop_token) {
-        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
         bool launched = true;
         if (runCommand.kind == feathercast::run_command::Kind::OpenTarget) {
           launched = reinterpret_cast<INT_PTR>(
@@ -21450,7 +21490,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             opening ? L"Windows could not open that target."
                     : L"Windows could not run that command.",
             query);
-        CoUninitialize();
+        if (comReady) CoUninitialize();
       })) {
         overlayLaunchPending_ = false;
         SetOverlayStatus(StatusSeverity::Error,
@@ -21470,13 +21510,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       overlayLaunchPending_ = true;
       if (!launchExecutor_.Submit([this, url = item.webSearchUrl,
                                    query = query_](std::stop_token) {
-        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
         const bool launched =
             reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", url.c_str(),
                                                     nullptr, nullptr, SW_SHOWNORMAL)) > 32;
         NotifyOverlayLaunchCompleted(
             launched, L"Windows could not open the web search.", query);
-        CoUninitialize();
+        if (comReady) CoUninitialize();
       })) {
         overlayLaunchPending_ = false;
         SetOverlayStatus(StatusSeverity::Error,
@@ -21519,10 +21559,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     auto appPtr = std::make_shared<AppEntry>(item.app);
     if (!launchExecutor_.Submit([this, appPtr, asAdmin, id = PrimaryAppId(item.app)](std::stop_token stopToken) {
       if (stopToken.stop_requested()) return;
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
       const bool ok = this->LaunchApp(*appPtr, asAdmin);
       if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok, asAdmin);
-      CoUninitialize();
+      if (comReady) CoUninitialize();
     })) {
       ShowTrayNotification(L"FeatherCast Launch Failed",
                            L"The background launch worker is unavailable.",
@@ -21858,17 +21898,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::OpenDataFolder:
         launchExecutor_.Submit([path = UserDataPath()](std::stop_token) {
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         HideOverlay(OverlayCloseReason::Action);
         return;
       case CommandKind::OpenLocalDataFolder:
         launchExecutor_.Submit([path = LocalDataPath()](std::stop_token) {
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         HideOverlay(OverlayCloseReason::Action);
         return;
@@ -21885,9 +21925,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case CommandKind::OpenSnippetsFile:
         EnsureSnippetsFile();
         launchExecutor_.Submit([path = SnippetsPath()](std::stop_token) {
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         HideOverlay(OverlayCloseReason::Action);
         return;
@@ -21903,9 +21943,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           return;
         }
         launchExecutor_.Submit([path = ThemePath()](std::stop_token) {
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         });
         HideOverlay(OverlayCloseReason::Action);
         return;
@@ -22299,10 +22339,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         auto appPtr = std::make_shared<AppEntry>(app);
         if (!launchExecutor_.Submit([this, appPtr, runAsAdmin, id](std::stop_token stopToken) {
           if (stopToken.stop_requested()) return;
-          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
           const bool ok = this->LaunchApp(*appPtr, runAsAdmin);
           if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok, runAsAdmin);
-          CoUninitialize();
+          if (comReady) CoUninitialize();
         })) {
           ShowTrayNotification(L"FeatherCast Launch Failed",
                                L"The background launch worker is unavailable.",
@@ -22411,9 +22451,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       observation.excluded = true;
       return;
     }
-    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(hwnd_)) {
-      return;
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
+    // The copying app often still holds the clipboard right after the update
+    // notification; this runs on a worker, so waiting briefly is fine.
+    bool opened = false;
+    for (int attempt = 0; attempt < 8 && !(opened = OpenClipboard(hwnd_) != FALSE);
+         ++attempt) {
+      Sleep(15);
     }
+    if (!opened) return;
     ScopeExit closeClipboard([] { CloseClipboard(); });
     if (OpenClipboardDword(historyFormat) == 0u) {
       observation.excluded = true;
@@ -22939,8 +22985,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const auto exclusions = settings_.clipboardExcludedApps;
     const HWND foreground = GetForegroundWindow();
     if (clipboardUpdatePending_.exchange(true, std::memory_order_acq_rel)) {
+      clipboardUpdateDirty_ = true;
       return;
     }
+    clipboardUpdateDirty_ = false;
     if (!launchExecutor_.Submit(
             [this, exclusions, foreground](std::stop_token stopToken) {
               if (stopToken.stop_requested()) return;
@@ -22980,12 +23028,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     // Read after closing so the number matches what the clipboard update
     // worker sees for this change.
-    if (placed) internalClipboardSequence_ = GetClipboardSequenceNumber();
+    if (placed) internalClipboardSequence_.store(GetClipboardSequenceNumber());
     return placed;
   }
 
-  void SendPasteShortcut() {
+  // Waits for the user to let go of modifiers so the target sees a plain Ctrl+V
+  // rather than, say, Ctrl+Shift+V (paste as plain text).
+  static bool WaitForModifiersReleased(const std::stop_token& stopToken) {
+    constexpr int kModifiers[] = {VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN};
+    for (int waited = 0; waited <= 1000; waited += 20) {
+      if (stopToken.stop_requested()) return false;
+      bool held = false;
+      for (const int key : kModifiers) held = held || (GetAsyncKeyState(key) & 0x8000) != 0;
+      if (!held) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+  }
+
+  bool SendPasteShortcut() {
     INPUT inputs[4]{};
+    // Tagged so our own keyboard hook ignores the synthetic chord.
+    for (auto& input : inputs) input.ki.dwExtraInfo = kOurInputTag;
     inputs[0].type = INPUT_KEYBOARD;
     inputs[0].ki.wVk = VK_CONTROL;
     inputs[1].type = INPUT_KEYBOARD;
@@ -22996,7 +23060,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     inputs[3].type = INPUT_KEYBOARD;
     inputs[3].ki.wVk = VK_CONTROL;
     inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT));
+    return SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT)) ==
+           std::size(inputs);
   }
 
   void PasteTextToLastActiveWindow(const std::wstring& text) {
@@ -23017,6 +23082,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     HideOverlay(OverlayCloseReason::Action);
     if (!CopyTextToClipboard(text)) {
+      // CopyTextToClipboard empties the clipboard first; put the user's data back.
+      if (previousClipboard) RestoreClipboard(hwnd_, *previousClipboard);
       ShowTrayNotification(L"FeatherCast Paste", L"FeatherCast could not place the text on the clipboard.");
       return;
     }
@@ -23027,11 +23094,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             [this, target, previousClipboard = std::move(previousClipboard),
              temporarySequence](std::stop_token stopToken) {
               if (stopToken.stop_requested()) return;
-              if (target && IsWindow(target)) {
-                FocusWindow(target);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                if (stopToken.stop_requested()) return;
-                SendPasteShortcut();
+              // Without a focused target, Ctrl+V would land in whatever window is in
+              // front, so leave the text on the clipboard for the user instead.
+              if (!target || !IsWindow(target) || !FocusWindow(target)) {
+                PostMessageW(hwnd_, WM_PASTE_NOT_DELIVERED, 0, 0);
+                return;
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+              if (stopToken.stop_requested()) return;
+              if (!WaitForModifiersReleased(stopToken)) {
+                if (!stopToken.stop_requested()) PostMessageW(hwnd_, WM_PASTE_NOT_DELIVERED, 0, 0);
+                return;
+              }
+              if (!SendPasteShortcut()) {
+                PostMessageW(hwnd_, WM_PASTE_NOT_DELIVERED, 0, 0);
+                return;
               }
 
               std::this_thread::sleep_for(std::chrono::milliseconds(400));
@@ -23041,7 +23118,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               }
 
               if (previousClipboard) {
-                RestoreClipboard(hwnd_, *previousClipboard);
+                // Putting the user's own data back is not a new copy for the history.
+                if (RestoreClipboard(hwnd_, *previousClipboard)) {
+                  internalClipboardSequence_.store(GetClipboardSequenceNumber());
+                }
               } else if (OpenClipboard(hwnd_)) {
                 EmptyClipboard();
                 CloseClipboard();
@@ -23401,6 +23481,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool onboardingPending_ = false;
   bool hookFailureNotified_ = false;
   UINT taskbarCreatedMessage_ = 0;
+  int trayRetriesLeft_ = 0;
   bool trayVersion4_ = false;
   ULONGLONG recordingElapsedTick_ = 0;
   ULONG shellChangeNotifyId_ = 0;
@@ -23607,6 +23688,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::atomic<bool> windowRefreshPending_ = false;
   std::atomic<bool> iconCacheClearPending_ = false;
   std::atomic<bool> clipboardUpdatePending_ = false;
+  bool clipboardUpdateDirty_ = false;  // UI thread only
   feathercast::runtime::LaunchService launchExecutor_;
   std::optional<StorageOperationKind> pendingStorageOperation_;
   std::mutex completedLaunchMutex_;
@@ -23660,7 +23742,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::vector<ClipboardEntry> clipboardHistory_;
   unsigned long long clipboardSerial_ = 0;
   // Clipboard sequence number after FeatherCast last placed text itself.
-  DWORD internalClipboardSequence_ = 0;
+  // Written by the paste worker after restoring the clipboard.
+  std::atomic<DWORD> internalClipboardSequence_ = 0;
   CurrencyRates currencyRates_;
   std::wstring localeCurrency_ = DetectLocaleCurrency();
   feathercast::extensions::ExtensionManager extensions_;

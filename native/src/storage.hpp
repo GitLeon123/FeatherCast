@@ -518,7 +518,10 @@ class Storage {
     sqlite3_bind_int(update.get(), 1, pinned ? 1 : 0);
     sqlite3_bind_int64(update.get(), 2, id);
     sqlite3_bind_int(update.get(), 3, pinned ? 1 : 0);
-    if (sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
+    if (sqlite3_step(update.get()) != SQLITE_DONE) {
+      CaptureError(); Exec("ROLLBACK;"); return false;
+    }
+    if (sqlite3_changes(db_) == 0) {
       SetError(SQLITE_CONSTRAINT, "The entry is unavailable or the limit of 100 favorites has been reached.");
       Exec("ROLLBACK;"); return false;
     }
@@ -714,9 +717,14 @@ class Storage {
         CaptureError();
         return false;
       }
-      while (sqlite3_step(read.get()) == SQLITE_ROW) {
+      int readStatus = SQLITE_ROW;
+      while ((readStatus = sqlite3_step(read.get())) == SQLITE_ROW) {
         rows.emplace_back(sqlite3_column_int64(read.get(), 0),
                           ColumnText(read.get(), 1), ColumnText(read.get(), 2));
+      }
+      if (readStatus != SQLITE_DONE) {
+        CaptureError();
+        return false;
       }
 
       Statement update;
@@ -764,7 +772,8 @@ class Storage {
                 "content_bytes INTEGER NOT NULL DEFAULT 0,"
                 "scan_generation INTEGER NOT NULL DEFAULT 0"
                 ");") ||
-          !Exec("INSERT INTO file_index "
+          // The new path column is case-insensitive, so case-only duplicates collapse.
+          !Exec("INSERT OR IGNORE INTO file_index "
                 "(path,name,is_directory,icon_key,last_write_time,size,indexed_at) "
                 "SELECT path,name,is_directory,icon_key,last_write_time,size,indexed_at "
                 "FROM file_index_v2;") ||

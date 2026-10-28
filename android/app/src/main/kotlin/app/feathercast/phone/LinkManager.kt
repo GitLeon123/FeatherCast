@@ -32,6 +32,7 @@ import app.feathercast.protocol.PcMessage
 import app.feathercast.protocol.PhoneMessages
 import app.feathercast.protocol.message
 import app.feathercast.protocol.readAtMost
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -178,6 +179,11 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             Result.failure(IOException(pairingMessage(error.code, error.message)))
         } catch (error: IOException) {
             Result.failure(IOException(s(R.string.pair_unreachable, invite.pcName)))
+        } catch (_: java.security.GeneralSecurityException) {
+            // The Keystore could not seal the link key on this device.
+            Result.failure(IOException(s(R.string.pair_failed)))
+        } catch (_: java.security.ProviderException) {
+            Result.failure(IOException(s(R.string.pair_failed)))
         }
     }
 
@@ -261,7 +267,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     /** Gives a freshly started service a moment to connect. */
-    private suspend fun awaitConnection() {
+    suspend fun awaitConnection() {
         withTimeoutOrNull(3_000) { while (!isConnected) delay(100) }
     }
 
@@ -410,6 +416,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 delay(1_000)
                 continue
             }
+            // A blocking connect outlives cancellation; do not overwrite the state an unpair set.
+            currentCoroutineContext().ensureActive()
             _state.update { it.copy(status = LinkStatus.Offline, detail = s(R.string.detail_looking_for, pc.pcName), reconnecting = false) }
             // Wait for a beacon from the PC, a nudge, or the backoff to pass.
             val found = withTimeoutOrNull(backoff) { awaitBeaconOrWake(pc.pcId) }
@@ -682,6 +690,10 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                 ?: throw IOException(s(R.string.transfer_pc_not_confirmed))
             result.first?.let { throw IOException(it) }
             _state.update { it.copy(transferStatus = s(R.string.transfer_saved_on_pc, name), transferActive = false) }
+        } catch (error: CancellationException) {
+            // The link or the user ended the transfer; that is not a failure to show.
+            _state.update { it.copy(transferActive = false) }
+            throw error
         } catch (error: Exception) {
             sendToSession(active, message("file.cancel") { put("id", id) })
             _state.update { it.copy(transferStatus = error.message ?: s(R.string.transfer_failed), transferActive = false) }

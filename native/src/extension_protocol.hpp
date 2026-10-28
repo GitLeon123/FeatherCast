@@ -319,12 +319,25 @@ inline ManifestLoadResult ParseManifestJson(const std::string& json, const std::
   Manifest manifest;
   manifest.manifestPath = manifestPath;
   manifest.directory = manifestPath.parent_path();
-  manifest.enabled = JsonBool(json, "enabled", true);
 
-  const auto id = JsonString(json, "id");
-  const auto name = JsonString(json, "name");
-  const auto version = JsonString(json, "version");
-  const auto dll = JsonString(json, "dll");
+  // Read top-level members only, so a nested object (an author block, say)
+  // cannot supply the id or the dll path.
+  const auto root = json::Parse(json);
+  if (!root || root->type != json::Value::Type::Object) {
+    return {std::nullopt, L"plugin.json is not a JSON object"};
+  }
+  const auto* enabled = root->Find("enabled");
+  manifest.enabled = enabled && enabled->type == json::Value::Type::Bool ? enabled->boolean : true;
+
+  const auto text = [&](std::string_view key) -> std::optional<std::string> {
+    const auto* member = root->Find(key);
+    if (!member || member->type != json::Value::Type::String) return std::nullopt;
+    return member->str;
+  };
+  const auto id = text("id");
+  const auto name = text("name");
+  const auto version = text("version");
+  const auto dll = text("dll");
   if (!id || !name || !version || !dll || id->empty() || name->empty() || version->empty() || dll->empty()) {
     return {std::nullopt, L"plugin.json is missing required id, name, version, or dll"};
   }
@@ -332,7 +345,7 @@ inline ManifestLoadResult ParseManifestJson(const std::string& json, const std::
   manifest.id = Utf8ToWide(*id);
   manifest.name = Utf8ToWide(*name);
   manifest.version = Utf8ToWide(*version);
-  if (auto desc = JsonString(json, "description")) manifest.description = Utf8ToWide(*desc);
+  if (auto desc = text("description")) manifest.description = Utf8ToWide(*desc);
 
   if (!IsValidPluginId(manifest.id)) {
     return {std::nullopt, L"plugin id contains invalid path characters"};

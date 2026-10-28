@@ -58,8 +58,9 @@ object Ringer {
             val uri = RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_ALARM)
                 ?: RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val created = MediaPlayer()
             player = try {
-                MediaPlayer().apply {
+                created.apply {
                     setAudioAttributes(
                         AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_ALARM)
@@ -72,6 +73,7 @@ object Ringer {
                     start()
                 }
             } catch (_: Exception) {
+                created.release()
                 null
             }
             vibrate(context, true)

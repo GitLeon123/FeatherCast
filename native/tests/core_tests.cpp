@@ -184,6 +184,8 @@ int main() {
 
     const auto tangent = TryEvaluate(L"tan(45)");
     assert(tangent && std::fabs(tangent->value - 1.0) < 0.000001);
+    assert(!TryEvaluate(L"tan(90)"));
+    assert(!TryEvaluate(L"tan(-270)"));
 
     const auto root = TryEvaluate(L"sqrt(16)");
     assert(root && root->display == L"4");
@@ -232,6 +234,8 @@ int main() {
     assert(hex && hex->display == L"255");
     const auto hexSum = TryEvaluate(L"0x10 + 1");
     assert(hexSum && hexSum->display == L"17");
+    // Beyond 2^53 the value would silently differ from what was typed.
+    assert(!TryEvaluate(L"0x20000000000001"));
     const auto times = TryEvaluate(L"3x4");
     assert(times && times->display == L"12");
   }
@@ -373,6 +377,11 @@ int main() {
     const auto extracted = ExtractSha256Hex(
         "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  file.txt");
     assert(extracted && *extracted == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // A 128-digit (SHA-512) run is not split into a SHA-256.
+    assert(!ExtractSha256Hex(std::string(128, 'a') + "  file.txt"));
+    const auto prefixed = ExtractSha256Hex(
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(prefixed && prefixed->size() == 64);
     const auto signerPins = feathercast::updater::ParseSignerThumbprints(
         L"BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD;"
         L"invalid");
@@ -440,6 +449,14 @@ int main() {
     const auto outside = ParseManifestJson("{\"id\":\"escape\",\"name\":\"Escape\",\"version\":\"1\",\"dll\":\"..\\\\escape.dll\"}",
                                            pluginDir / L"escape.json");
     assert(!outside.manifest);
+
+    // Nested objects must not supply top-level fields; \u escapes decode.
+    const auto nested = ParseManifestJson(
+        "{\"author\":{\"name\":\"Bob\",\"id\":\"x\"},\"id\":\"nested\","
+        "\"name\":\"Caf\\u00e9\",\"version\":\"1\",\"dll\":\"nested.dll\"}",
+        pluginDir / L"nested.json");
+    assert(nested.manifest && nested.manifest->id == L"nested");
+    assert(nested.manifest->name == L"Café");
 
     const auto exePluginDir = tempRoot / L"exe" / L"plugins" / L"sample";
     WriteUtf8(exePluginDir / L"plugin.json",
