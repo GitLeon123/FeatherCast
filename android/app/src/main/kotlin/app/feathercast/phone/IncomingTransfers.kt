@@ -13,6 +13,17 @@ class IncomingTransfers(private val context: Context) : AutoCloseable {
     private data class Incoming(val start: FileStart, val sequence: FileSequence, val file: File, val output: FileOutputStream,
         val cancelled: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(), var finishing: Boolean = false)
     private val files = mutableMapOf<String, Incoming>()
+    // Transfers that failed or were cancelled, newest last. The PC was told (or
+    // told us), so their frames still on the way need no second answer.
+    private val ended = ArrayDeque<String>()
+
+    private fun markEnded(id: String) {
+        if (id.isEmpty() || id in ended) return
+        ended.addLast(id)
+        if (ended.size > 64) ended.removeFirst()
+    }
+
+    @Synchronized fun ended(id: String): Boolean = id in ended
 
     @Synchronized fun begin(start: FileStart) {
         if (files.size >= MAX_STREAM_TRANSFERS || start.id in files) throw IOException("Too many transfers in progress.")
@@ -22,6 +33,7 @@ class IncomingTransfers(private val context: Context) : AutoCloseable {
         val file = File.createTempFile("fc-receive-", ".part", context.cacheDir)
         try { files[start.id] = Incoming(start, FileSequence(start.size), file, FileOutputStream(file)) }
         catch (error: Exception) { file.delete(); throw error }
+        ended.remove(start.id)
     }
 
     @Synchronized fun chunk(id: String, offset: Long, bytes: ByteArray): Pair<FileStart, Long> {
@@ -65,7 +77,9 @@ class IncomingTransfers(private val context: Context) : AutoCloseable {
             incoming.cancelled.set(true)
             try { incoming.output.close() } catch (_: IOException) { }
             incoming.file.delete()
+            markEnded(incoming.start.id)
         }
+        markEnded(id)
     }
     override fun close() = cancel()
 }

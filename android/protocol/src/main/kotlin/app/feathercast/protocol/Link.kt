@@ -213,6 +213,8 @@ class LinkSession private constructor(
     val pcName: String,
     val host: String,
     val fileStreamSupported: Boolean = false,
+    /** The PC understands photo.full answers that only carry an error. */
+    val photoErrorsSupported: Boolean = false,
 ) : Closeable {
     private val input: InputStream = socket.getInputStream()
     private val dataInput = DataInputStream(input)
@@ -282,6 +284,7 @@ class LinkSession private constructor(
                     welcome.str("pcName").ifEmpty { challenge.str("pcName") },
                     host,
                     (welcome["fileStream"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
+                    (welcome["photoErrors"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true",
                 )
             } catch (error: Exception) {
                 socket.close()

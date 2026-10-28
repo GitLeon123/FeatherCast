@@ -558,6 +558,9 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             return
         }
         if (type == "file.begin" || type == "file.chunk" || type == "file.end") {
+            // Frames of a transfer that already failed here, or was cancelled,
+            // were answered once; the PC stops sending on that answer.
+            if (type != "file.begin" && incoming.ended(transferId)) return
             try {
                 // Backpressure: at most one received chunk is awaiting a disk write.
                 withContext(incomingWrites + bulkJobs) {
@@ -594,7 +597,11 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
             is PcMessage.Clipboard -> onPcClipboard(msg.text, msg.time)
             is PcMessage.ClipboardHistory -> onPcHistory(msg.items)
             is PcMessage.PhotosRequest -> if (store.sendPhotos) inBackground { sendPhotoList(active, msg.limit) }
-            is PcMessage.PhotoRequest -> if (store.sendPhotos) inBackground { sendFullPhoto(active, msg.id) }
+            is PcMessage.PhotoRequest -> if (store.sendPhotos) {
+                inBackground { sendFullPhoto(active, msg.id) }
+            } else {
+                sendPhotoError(active, msg.id, "Allow sending photos in FeatherCast on your phone.")
+            }
             is PcMessage.NotificationDismiss -> NotifyListener.dismiss(msg.key)
             is PcMessage.NotificationAction -> NotifyListener.performAction(msg.key, msg.index, msg.text)
             is PcMessage.FileSend -> inBackground { onFileFromPc(active, msg.id, msg.name, payload.binary) }
@@ -626,6 +633,7 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
                     }
                 }
             } else inBackground { StorageBridge.read(msg.path).let { (json, bytes) -> sendToSession(active, json, bytes) } }
+            PcMessage.Ping -> sendToSession(active, message("pong"))
             PcMessage.Pong -> Unit
             is PcMessage.ScreenStart -> ScreenBridge.request(context, msg.request, active)
             is PcMessage.ScreenStop -> ScreenBridge.stop(context, id = msg.sessionId)
@@ -701,7 +709,8 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     /** The features this phone can serve right now, so the PC hides the rest. */
     private fun features(): List<String> = buildList {
         add("file.stream.v1")
-        if (NotifyListener.hasAccess(context)) add(Features.NOTIFICATION_ACTIONS)
+        // Dismissing and actions need the bound listener, not only the permission.
+        if (NotifyListener.hasAccess(context) && NotifyListener.connected()) add(Features.NOTIFICATION_ACTIONS)
         if (store.receiveFiles && !IncomingFiles.needsPermission(context)) add(Features.RECEIVE_FILES)
         if (store.allowRing) add(Features.RING)
         if (store.mediaControl && NotifyListener.hasAccess(context)) add(Features.MEDIA)
@@ -767,12 +776,19 @@ class LinkManager(private val context: Context, private val store: LinkStore) {
     }
 
     private fun sendFullPhoto(active: LinkSession, id: String) {
-        val photo = id.toLongOrNull()?.let { PhotoSource.find(context, it) } ?: return
-        val bytes = PhotoSource.fullBytes(context, photo, MAX_SEND_BYTES) ?: return
+        val photo = id.toLongOrNull()?.let { PhotoSource.find(context, it) }
+            ?: return sendPhotoError(active, id, "The photo is no longer on your phone.")
+        val bytes = PhotoSource.fullBytes(context, photo, MAX_SEND_BYTES)
+            ?: return sendPhotoError(active, id, "The photo is too large or could not be read.")
         sendToSession(active, message("photo.full") {
             put("id", id)
             put("name", photo.name)
         }, bytes)
+    }
+
+    /** Tells the PC at once why a photo is not coming, instead of letting its request time out. */
+    private fun sendPhotoError(active: LinkSession, id: String, error: String) {
+        if (active.photoErrorsSupported) sendToSession(active, PhoneMessages.photoError(id, error))
     }
 
     companion object {

@@ -25,15 +25,29 @@ class NotifyListener : NotificationListenerService() {
     private val iconCache = ConcurrentHashMap<String, ByteArray>()
     private val labelCache = ConcurrentHashMap<String, String>()
     private val actions = ConcurrentHashMap<String, Array<Notification.Action>>()
+    // Post time of each notification sent to the PC, by key. Only the worker uses
+    // these two, so the PC alerts once per post, also across reconnects.
+    private val forwarded = HashMap<String, Long>()
+    private var snapshotSent = false
 
     override fun onListenerConnected() {
         active = this
         sendSnapshot()
         MediaWatcher.start(applicationContext)
+        LinkManager.instance.refreshStatus()  // notification actions work again
     }
 
     override fun onListenerDisconnected() {
         if (active === this) active = null
+        LinkManager.instance.refreshStatus()
+        // The system unbinds listeners after app updates or under memory
+        // pressure; ask to be bound again while access is still granted.
+        if (hasAccess(this)) {
+            try {
+                NotificationListenerService.requestRebind(component(this))
+            } catch (_: Exception) {
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -43,7 +57,12 @@ class NotifyListener : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (!forwardingEnabled() || !shouldForward(sbn)) return
-        worker.execute { post(sbn) }
+        worker.execute {
+            // An update the app posts as "only alert once" stays quiet on the PC too.
+            val quietUpdate = sbn.key in forwarded &&
+                (sbn.notification.flags and Notification.FLAG_ONLY_ALERT_ONCE) != 0
+            post(sbn, alert = !quietUpdate)
+        }
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
@@ -51,6 +70,7 @@ class NotifyListener : NotificationListenerService() {
         // On the same worker as post(), so a queued post cannot re-add the key afterwards.
         worker.execute {
             actions.remove(sbn.key)
+            forwarded.remove(sbn.key)
             LinkManager.instance.send(message("notification.removed") { put("key", sbn.key) })
         }
     }
@@ -69,7 +89,7 @@ class NotifyListener : NotificationListenerService() {
         return !title.isNullOrBlank() || !text.isNullOrBlank()
     }
 
-    private fun post(sbn: StatusBarNotification) {
+    private fun post(sbn: StatusBarNotification, alert: Boolean) {
         if (!forwardingEnabled()) return
         val extras = sbn.notification.extras
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
@@ -82,12 +102,14 @@ class NotifyListener : NotificationListenerService() {
             if (label.isBlank() || action.actionIntent == null) null
             else ActionInfo(index, label.take(40), action.remoteInputs?.any { it.allowFreeFormInput } == true)
         }
-        LinkManager.instance.send(
+        val sent = LinkManager.instance.send(
             PhoneMessages.notificationPosted(
                 sbn.key, sbn.packageName, appLabel(sbn.packageName), title.take(200), text.take(1000), sbn.postTime, infos,
+                alert,
             ),
             appIcon(sbn.packageName),
         )
+        if (sent) forwarded[sbn.key] = sbn.postTime
     }
 
     /** Runs a notification button; [text] fills its reply field, if any. */
@@ -139,7 +161,15 @@ class NotifyListener : NotificationListenerService() {
         } catch (_: Exception) {
             emptyArray()
         }
-        current.filter(::shouldForward).sortedBy { it.postTime }.takeLast(50).forEach(::post)
+        // Only posts the PC was not sent yet (they arrived while the link was down)
+        // alert. The first snapshot of this listener cannot tell, so it is quiet.
+        val shown = HashMap(forwarded)
+        val announce = snapshotSent
+        snapshotSent = true
+        forwarded.clear()
+        current.filter(::shouldForward).sortedBy { it.postTime }.takeLast(50).forEach {
+            post(it, alert = announce && shown[it.key] != it.postTime)
+        }
     }
 
     fun dismissKey(key: String) {
@@ -157,6 +187,9 @@ class NotifyListener : NotificationListenerService() {
             NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
 
         fun component(context: Context) = ComponentName(context, NotifyListener::class.java)
+
+        /** True while the system has the listener bound, so dismissing and actions work. */
+        fun connected(): Boolean = active != null
 
         /** Resends all current notifications, e.g. right after connecting. */
         fun sendSnapshot() {

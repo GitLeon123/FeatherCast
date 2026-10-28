@@ -1,6 +1,7 @@
 #include "settings_catalog.hpp"
 
 #include "core.hpp"
+#include "web_search.hpp"
 
 #include <set>
 
@@ -113,6 +114,21 @@ const std::vector<SettingDescriptor>& Catalog() {
        ControlKind::Toggle, L"Learn Search Choices",
        L"Save up to 256 app and command queries locally. Clipboard, phone, and file searches are excluded.",
        L"Learn search choices locally"},
+      {L"results.web-fallback", SettingsCategory::Results,
+       HitType::WebSearchFallbackToggle, ControlKind::Toggle,
+       L"Web Search Fallback",
+       L"Offer a web search when nothing local matches. Searches only run after you press Enter.",
+       L"Web search fallback"},
+      {L"results.web-fallback-engine.down", SettingsCategory::Results,
+       HitType::WebSearchEngineDown, ControlKind::Decrement,
+       L"Fallback Search Engine",
+       L"Search engine keyword used by the web search fallback.",
+       L"Previous fallback search engine"},
+      {L"results.web-fallback-engine.up", SettingsCategory::Results,
+       HitType::WebSearchEngineUp, ControlKind::Increment,
+       L"Fallback Search Engine",
+       L"Search engine keyword used by the web search fallback.",
+       L"Next fallback search engine"},
       {L"results.width.down", SettingsCategory::Results, HitType::OverlayWidthDown,
        ControlKind::Decrement, L"Overlay Width", L"Width of the search overlay window.",
        L"Decrease overlay width"},
@@ -353,6 +369,8 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
     case HitType::ShowWindowsToggle: return settings.showOpenWindows;
     case HitType::ShowStoreAppsToggle: return settings.showStoreApps;
     case HitType::SearchLearningToggle: return settings.searchLearningEnabled;
+    case HitType::WebSearchFallbackToggle:
+      return settings.webSearchFallbackEnabled;
     case HitType::ClipboardHistoryToggle: return settings.clipboardHistoryEnabled;
     case HitType::FileIndexToggle: return settings.fileIndexEnabled;
     case HitType::FileContentIndexToggle:
@@ -389,6 +407,13 @@ std::wstring AccessibleValue(app::HitType hit,
     case HitType::MaxResultsDown:
     case HitType::MaxResultsUp:
       return std::to_wstring(settings.maxResults);
+    case HitType::WebSearchEngineDown:
+    case HitType::WebSearchEngineUp:
+      if (const auto* engine = web_search::ResolveEngine(
+              settings.searchEngines, settings.webSearchFallbackEngine)) {
+        return web_search::EngineName(engine->first, engine->second);
+      }
+      return L"None";
     case HitType::ClipboardLimitDown:
     case HitType::ClipboardLimitUp:
       return std::to_wstring(settings.clipboardHistoryLimit) + L" entries";

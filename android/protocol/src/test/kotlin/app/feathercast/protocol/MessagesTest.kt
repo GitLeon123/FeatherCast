@@ -22,6 +22,14 @@ class MessagesTest {
             ),
         )
         assertEquals(
+            """{"type":"notification.posted","key":"k2","app":"com.whatsapp","appName":"WhatsApp","title":"Anna","text":"Hi","time":1000,"alert":false}""",
+            PhoneMessages.notificationPosted("k2", "com.whatsapp", "WhatsApp", "Anna", "Hi", 1000, alert = false),
+        )
+        assertEquals(
+            """{"type":"photo.full","id":"p1","error":"The photo is no longer on your phone."}""",
+            PhoneMessages.photoError("p1", "The photo is no longer on your phone."),
+        )
+        assertEquals(
             """{"type":"file.received","id":"ab12","name":"a.txt","ok":false,"error":"Storage full"}""",
             PhoneMessages.fileReceived("ab12", "a.txt", false, "Storage full"),
         )
@@ -64,6 +72,7 @@ class MessagesTest {
 
     @Test
     fun pcToPhoneFixtures() {
+        assertEquals(PcMessage.Ping, PcMessage.parse("""{"type":"ping"}"""))
         assertEquals(
             PcMessage.NotificationAction("k1", 0, "On my way"),
             PcMessage.parse("""{"type":"notification.action","key":"k1","i":0,"text":"On my way"}"""),

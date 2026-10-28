@@ -64,40 +64,116 @@ inline std::wstring Format(long long milliseconds) {
   return std::to_wstring(seconds / 3600) + L":" + two(seconds / 60 % 60) + L":" + two(seconds % 60);
 }
 
+// Milliseconds per unit word ("s", "sec", "minutes", "hr"), or 0.
+inline long long UnitFactor(const std::wstring& unit) {
+  for (const auto* name : {L"s", L"sec", L"secs", L"second", L"seconds"}) {
+    if (unit == name) return 1000;
+  }
+  for (const auto* name : {L"m", L"min", L"mins", L"minute", L"minutes"}) {
+    if (unit == name) return 60000;
+  }
+  for (const auto* name : {L"h", L"hr", L"hrs", L"hour", L"hours"}) {
+    if (unit == name) return 3600000;
+  }
+  return 0;
+}
+
+// Durations are <number><unit> pairs, glued ("1h30m") or spaced ("10 min").
+// A lone number without any unit means minutes ("timer 5"). The first token
+// that is not part of the duration starts the name, so "timer 10m 2 eggs" is
+// a ten-minute timer named "2 eggs".
 // No side effects while typing: only Enter activates the returned request.
 inline std::optional<Request> Parse(const std::wstring& query) {
-  std::size_t pos = 0;
-  while (pos < query.size() && std::iswspace(query[pos])) ++pos;
-  const auto start = pos;
-  while (pos < query.size() && !std::iswspace(query[pos])) ++pos;
-  std::wstring prefix = query.substr(start, pos - start);
-  std::transform(prefix.begin(), prefix.end(), prefix.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-  if (prefix != L"timer") return std::nullopt;
-  Request request{Action::Invalid};
-  long long total = 0;
-  while (pos < query.size()) {
+  auto lower = [](std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return text;
+  };
+  struct Token {
+    std::size_t start = 0;
+    std::wstring text;
+  };
+  std::vector<Token> tokens;
+  for (std::size_t pos = 0; pos < query.size();) {
     while (pos < query.size() && std::iswspace(query[pos])) ++pos;
-    if (pos == query.size()) break;
-    if (query[pos] < L'0' || query[pos] > L'9') {
-      if (total == 0) return request;
-      request.name = query.substr(pos);
-      while (!request.name.empty() && std::iswspace(request.name.back())) request.name.pop_back();
-      break;
-    }
-    long long value = 0;
-    while (pos < query.size() && query[pos] >= L'0' && query[pos] <= L'9') {
-      const int digit = query[pos++] - L'0';
-      if (value > (std::numeric_limits<long long>::max() - digit) / 10) return request;
-      value = value * 10 + digit;
-    }
-    if (pos == query.size()) return request;
-    const auto unit = std::towlower(query[pos++]);
-    const long long factor = unit == L'h' ? 3600000 : unit == L'm' ? 60000 : unit == L's' ? 1000 : 0;
-    if (!factor || value > (std::numeric_limits<long long>::max() / 10000 - total) / factor) return request;
-    total += value * factor;
-    if (pos < query.size() && !std::iswspace(query[pos]) && (query[pos] < L'0' || query[pos] > L'9')) return request;
+    const auto start = pos;
+    while (pos < query.size() && !std::iswspace(query[pos])) ++pos;
+    if (pos > start) tokens.push_back({start, lower(query.substr(start, pos - start))});
   }
-  if (total <= 0) return request;
+  if (tokens.empty() || tokens.front().text != L"timer") return std::nullopt;
+
+  Request request{Action::Invalid};
+  constexpr long long kLimit = std::numeric_limits<long long>::max() / 10000;
+  long long total = 0;
+  auto add = [&](long long value, long long factor) {
+    if (value > (kLimit - total) / factor) return false;
+    total += value * factor;
+    return true;
+  };
+  bool sawDuration = false;
+  std::size_t index = 1;
+  for (; index < tokens.size(); ++index) {
+    const std::wstring& text = tokens[index].text;
+    // Split the token into <digits><letters> pairs ("1h30m"). A token of bare
+    // digits ("10") takes its unit from the next token, if there is one.
+    long long tokenTotal = 0;
+    long long bareValue = -1;
+    bool valid = true;
+    for (std::size_t pos = 0; valid && pos < text.size();) {
+      if (text[pos] < L'0' || text[pos] > L'9') {
+        valid = false;
+        break;
+      }
+      const auto numberStart = pos;
+      long long value = 0;
+      while (pos < text.size() && text[pos] >= L'0' && text[pos] <= L'9') {
+        const int digit = text[pos++] - L'0';
+        if (value > (std::numeric_limits<long long>::max() - digit) / 10) return request;
+        value = value * 10 + digit;
+      }
+      const auto unitStart = pos;
+      while (pos < text.size() && std::iswalpha(text[pos])) ++pos;
+      if (unitStart == pos) {
+        // Digits without letters are only valid as the whole token.
+        valid = numberStart == 0 && pos == text.size();
+        if (valid) bareValue = value;
+        break;
+      }
+      const long long factor = UnitFactor(text.substr(unitStart, pos - unitStart));
+      if (!factor || value > (kLimit - tokenTotal) / factor) {
+        if (factor) return request;
+        valid = false;
+        break;
+      }
+      tokenTotal += value * factor;
+    }
+    if (!valid) break;
+    if (bareValue < 0) {
+      if (!add(tokenTotal, 1)) return request;
+      sawDuration = true;
+      continue;
+    }
+    if (index + 1 < tokens.size()) {
+      if (const long long factor = UnitFactor(tokens[index + 1].text)) {
+        if (!add(bareValue, factor)) return request;
+        sawDuration = true;
+        ++index;
+        continue;
+      }
+    }
+    // A number without a unit is minutes only as the whole duration;
+    // after a duration it starts the name ("timer 10m 2 eggs").
+    if (!sawDuration) {
+      if (!add(bareValue, 60000)) return request;
+      sawDuration = true;
+      ++index;
+    }
+    break;
+  }
+  if (!sawDuration || total <= 0) return request;
+  if (index < tokens.size()) {
+    request.name = query.substr(tokens[index].start);
+    while (!request.name.empty() && std::iswspace(request.name.back())) request.name.pop_back();
+  }
   request.action = Action::Create;
   request.duration = total;
   if (request.name.empty()) request.name = L"Timer";

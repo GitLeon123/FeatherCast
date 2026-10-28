@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -104,126 +108,289 @@ std::filesystem::path TemporaryDownloadPath(
   return temp;
 }
 
+struct Timeouts {
+  int resolve = 0;
+  int connect = 0;
+  int send = 0;
+  int receive = 0;
+};
+
+// One HTTPS GET on an asynchronous WinHTTP request. Every step that can block
+// (proxy discovery, DNS, connect, TLS, headers, body) waits for its completion
+// callback or for a stop request, whichever comes first. A stop closes the
+// request, which makes WinHTTP cancel the outstanding operation, so stopping
+// the owning service never waits out a network timeout. Only the calling
+// thread touches the handles. What the callback touches lives in shared state
+// the callback keeps alive until WinHTTP reports the request handle closed, so
+// a late callback (or a canceled read still filling the buffer) never reaches
+// freed memory.
+class AsyncHttpsRequest {
+ public:
+  static constexpr DWORD kReadChunk = 64 * 1024;
+
+  AsyncHttpsRequest(const std::wstring& host, INTERNET_PORT port,
+                    const std::wstring& path, Timeouts timeouts) {
+    session_ = WinHttpOpen(L"FeatherCast/1.0",
+                           WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
+                           WINHTTP_FLAG_ASYNC);
+    if (!session_) return;
+    WinHttpSetTimeouts(session_, timeouts.resolve, timeouts.connect,
+                       timeouts.send, timeouts.receive);
+    connect_ = WinHttpConnect(session_, host.c_str(), port, 0);
+    if (!connect_) return;
+    HINTERNET request = WinHttpOpenRequest(
+        connect_, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!request) return;
+    auto context = std::make_unique<CallbackContext>(CallbackContext{state_});
+    DWORD_PTR contextValue = reinterpret_cast<DWORD_PTR>(context.get());
+    if (!WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &contextValue,
+                          sizeof(contextValue)) ||
+        WinHttpSetStatusCallback(
+            request, &AsyncHttpsRequest::OnStatus,
+            WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS |
+                WINHTTP_CALLBACK_FLAG_HANDLES,
+            0) == WINHTTP_INVALID_STATUS_CALLBACK) {
+      // No callback was installed, so none will run for this handle.
+      WinHttpCloseHandle(request);
+      return;
+    }
+    // From here on the HANDLE_CLOSING callback owns and deletes the context.
+    context.release();
+    contextValue_ = contextValue;
+    request_ = request;
+  }
+
+  ~AsyncHttpsRequest() {
+    CloseRequest();
+    if (connect_) WinHttpCloseHandle(connect_);
+    if (session_) WinHttpCloseHandle(session_);
+  }
+
+  AsyncHttpsRequest(const AsyncHttpsRequest&) = delete;
+  AsyncHttpsRequest& operator=(const AsyncHttpsRequest&) = delete;
+
+  [[nodiscard]] bool IsOpen() const noexcept { return request_ != nullptr; }
+  [[nodiscard]] HINTERNET Handle() const noexcept { return request_; }
+
+  // Sends the request and waits for the response headers.
+  bool Send(std::stop_token stopToken) {
+    const DWORD_PTR context = contextValue_;
+    if (!Run(stopToken, [&] {
+          return WinHttpSendRequest(request_, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                    WINHTTP_NO_REQUEST_DATA, 0, 0,
+                                    context) != FALSE;
+        })) {
+      return false;
+    }
+    return Run(stopToken, [&] {
+             return WinHttpReceiveResponse(request_, nullptr) != FALSE;
+           }).has_value();
+  }
+
+  // Bytes ready to read, 0 at the end of the body, or nullopt when the
+  // connection broke or the request was stopped.
+  std::optional<DWORD> QueryDataAvailable(std::stop_token stopToken) {
+    // Asynchronous WinHTTP reports the count through the callback only.
+    return Run(stopToken, [&] {
+      return WinHttpQueryDataAvailable(request_, nullptr) != FALSE;
+    });
+  }
+
+  // Reads up to `wanted` bytes (at most kReadChunk). The view stays valid
+  // until the next call on this request.
+  std::optional<std::string_view> Read(DWORD wanted,
+                                       std::stop_token stopToken) {
+    if (!request_) return std::nullopt;
+    char* data = state_->buffer.data();
+    const DWORD size = std::min(wanted, kReadChunk);
+    const auto read = Run(stopToken, [&] {
+      return WinHttpReadData(request_, data, size, nullptr) != FALSE;
+    });
+    if (!read || *read > size) return std::nullopt;
+    return std::string_view(data, *read);
+  }
+
+ private:
+  struct State {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    bool done = false;
+    bool succeeded = false;
+    DWORD value = 0;
+    bool closed = false;
+    // Sized once and never reallocated: a canceled read may still write into
+    // it until the handle has closed.
+    std::vector<char> buffer = std::vector<char>(kReadChunk);
+  };
+
+  struct CallbackContext {
+    std::shared_ptr<State> state;
+  };
+
+  static void CALLBACK OnStatus(HINTERNET, DWORD_PTR contextValue,
+                                DWORD status, LPVOID information,
+                                DWORD informationLength) {
+    auto* context = reinterpret_cast<CallbackContext*>(contextValue);
+    if (!context) return;
+    State& state = *context->state;
+    {
+      // Notify while holding the lock: the waiting thread may destroy its
+      // request as soon as it sees the result.
+      std::lock_guard lock(state.mutex);
+      switch (status) {
+        case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+        case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+          state.done = true;
+          state.succeeded = true;
+          state.value = 0;
+          break;
+        case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
+          state.done = true;
+          state.succeeded = information != nullptr;
+          state.value = information ? *static_cast<const DWORD*>(information)
+                                    : 0;
+          break;
+        case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+          state.done = true;
+          state.succeeded = true;
+          state.value = informationLength;
+          break;
+        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+          state.done = true;
+          state.succeeded = false;
+          state.value = 0;
+          break;
+        case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+          state.closed = true;
+          break;
+        default:
+          return;
+      }
+      state.cv.notify_all();
+    }
+    // HANDLE_CLOSING is the last callback for the handle.
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) delete context;
+  }
+
+  // Starts one asynchronous operation and waits for its completion. A stop
+  // request closes the request, which cancels the operation.
+  template <typename Start>
+  std::optional<DWORD> Run(std::stop_token stopToken, Start start) {
+    if (!request_ || stopToken.stop_requested()) return std::nullopt;
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->done = false;
+      state_->succeeded = false;
+      state_->value = 0;
+    }
+    // A call that fails right away queues no completion.
+    if (!start()) return std::nullopt;
+    std::unique_lock lock(state_->mutex);
+    if (!state_->cv.wait(lock, stopToken, [&] { return state_->done; })) {
+      lock.unlock();
+      CloseRequest();
+      return std::nullopt;
+    }
+    if (!state_->succeeded) return std::nullopt;
+    return state_->value;
+  }
+
+  void CloseRequest() {
+    if (!request_) return;
+    WinHttpCloseHandle(request_);
+    request_ = nullptr;
+    // Close the connection and session only after the request has gone, but
+    // never let a misbehaving network stack hold shutdown hostage; the shared
+    // state outlives this object either way.
+    std::unique_lock lock(state_->mutex);
+    state_->cv.wait_for(lock, std::chrono::seconds(2),
+                        [&] { return state_->closed; });
+  }
+
+  std::shared_ptr<State> state_ = std::make_shared<State>();
+  HINTERNET session_ = nullptr;
+  HINTERNET connect_ = nullptr;
+  HINTERNET request_ = nullptr;
+  DWORD_PTR contextValue_ = 0;
+};
+
+// Reads a complete response body. Any failure, a body larger than maxBytes,
+// or one shorter than the declared Content-Length is an error rather than a
+// partial result.
+std::optional<std::string> ReadBody(AsyncHttpsRequest& request,
+                                    std::size_t maxBytes,
+                                    std::stop_token stopToken) {
+  if (!request.Send(stopToken) || !IsSuccessful(request.Handle())) {
+    return std::nullopt;
+  }
+  const auto declaredLength = DeclaredContentLength(request.Handle());
+  if (declaredLength && *declaredLength > maxBytes) return std::nullopt;
+  std::string body;
+  for (;;) {
+    // A failing query is a broken connection, not the end of the body.
+    const auto available = request.QueryDataAvailable(stopToken);
+    if (!available) return std::nullopt;
+    if (*available == 0) break;
+    if (body.size() + *available > maxBytes) return std::nullopt;
+    const auto chunk = request.Read(*available, stopToken);
+    if (!chunk) return std::nullopt;
+    if (chunk->empty()) break;
+    body.append(chunk->data(), chunk->size());
+  }
+  if (declaredLength && body.size() != *declaredLength) return std::nullopt;
+  return body;
+}
+
+constexpr Timeouts kRequestTimeouts{8000, 8000, 8000, 8000};
+constexpr Timeouts kDownloadTimeouts{10000, 10000, 30000, 30000};
+
 }  // namespace
 
 std::optional<std::string> HttpsGet(const std::wstring& host,
-                                    const std::wstring& path) {
-  HINTERNET session = WinHttpOpen(
-      L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) return std::nullopt;
-  ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
-  WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
-  HINTERNET connect = WinHttpConnect(
-      session, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-  if (!connect) return std::nullopt;
-  ScopeExit closeConnect([&] { WinHttpCloseHandle(connect); });
-  HINTERNET request = WinHttpOpenRequest(
-      connect, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
-      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-  if (!request) return std::nullopt;
-  ScopeExit closeRequest([&] { WinHttpCloseHandle(request); });
+                                    const std::wstring& path,
+                                    std::stop_token stopToken) {
+  if (stopToken.stop_requested()) return std::nullopt;
+  AsyncHttpsRequest request(host, INTERNET_DEFAULT_HTTPS_PORT, path,
+                            kRequestTimeouts);
+  if (!request.IsOpen()) return std::nullopt;
   static constexpr wchar_t kGitHubHeaders[] =
       L"Accept: application/vnd.github+json\r\n"
       L"X-GitHub-Api-Version: 2022-11-28";
   WinHttpAddRequestHeaders(
-      request, kGitHubHeaders, static_cast<DWORD>(-1),
+      request.Handle(), kGitHubHeaders, static_cast<DWORD>(-1),
       WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-  if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-      !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
-    return std::nullopt;
-  }
-  std::string body;
-  DWORD available = 0;
-  while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
-    std::string chunk(available, '\0');
-    DWORD read = 0;
-    if (!WinHttpReadData(request, chunk.data(), available, &read)) {
-      break;
-    }
-    chunk.resize(read);
-    body += chunk;
-    if (body.size() > 2 * 1024 * 1024) break;
-  }
-  return body;
+  return ReadBody(request, 2 * 1024 * 1024, stopToken);
 }
 
 std::optional<std::string> HttpsGetUrl(const std::wstring& url,
-                                       std::size_t maxBytes) {
+                                       std::size_t maxBytes,
+                                       std::stop_token stopToken) {
   const auto parts = ParseHttpsUrl(url);
-  if (!parts) return std::nullopt;
-  HINTERNET session = WinHttpOpen(
-      L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) return std::nullopt;
-  ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
-  WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
-  HINTERNET connect = WinHttpConnect(
-      session, parts->host.c_str(), parts->port, 0);
-  if (!connect) return std::nullopt;
-  ScopeExit closeConnect([&] { WinHttpCloseHandle(connect); });
-  HINTERNET request = WinHttpOpenRequest(
-      connect, L"GET", parts->path.c_str(), nullptr, WINHTTP_NO_REFERER,
-      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-  if (!request) return std::nullopt;
-  ScopeExit closeRequest([&] { WinHttpCloseHandle(request); });
-  if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-      !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
-    return std::nullopt;
-  }
-  const auto declaredLength = DeclaredContentLength(request);
-  std::string body;
-  for (;;) {
-    DWORD available = 0;
-    // A failing query is a broken connection, not the end of the body.
-    if (!WinHttpQueryDataAvailable(request, &available)) return std::nullopt;
-    if (available == 0) break;
-    if (body.size() + available > maxBytes) return std::nullopt;
-    std::string chunk(available, '\0');
-    DWORD read = 0;
-    if (!WinHttpReadData(request, chunk.data(), available, &read)) {
-      return std::nullopt;
-    }
-    if (read == 0) break;
-    chunk.resize(read);
-    body += chunk;
-  }
-  if (declaredLength && body.size() != *declaredLength) return std::nullopt;
-  return body;
+  if (!parts || stopToken.stop_requested()) return std::nullopt;
+  AsyncHttpsRequest request(parts->host, parts->port, parts->path,
+                            kRequestTimeouts);
+  if (!request.IsOpen()) return std::nullopt;
+  return ReadBody(request, maxBytes, stopToken);
 }
 
 bool HttpsDownloadToFile(const std::wstring& url,
                          const std::filesystem::path& destination,
                          std::stop_token stopToken, std::size_t maxBytes) {
   const auto parts = ParseHttpsUrl(url);
-  if (!parts) return false;
+  if (!parts || stopToken.stop_requested()) return false;
   std::error_code ec;
   std::filesystem::create_directories(destination.parent_path(), ec);
   const auto temp = TemporaryDownloadPath(destination);
-  HINTERNET session = WinHttpOpen(
-      L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) return false;
-  ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
-  WinHttpSetTimeouts(session, 10000, 10000, 30000, 30000);
-  HINTERNET connect = WinHttpConnect(
-      session, parts->host.c_str(), parts->port, 0);
-  if (!connect) return false;
-  ScopeExit closeConnect([&] { WinHttpCloseHandle(connect); });
-  HINTERNET request = WinHttpOpenRequest(
-      connect, L"GET", parts->path.c_str(), nullptr, WINHTTP_NO_REFERER,
-      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-  if (!request) return false;
-  ScopeExit closeRequest([&] { WinHttpCloseHandle(request); });
-  if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-      !WinHttpReceiveResponse(request, nullptr) || !IsSuccessful(request)) {
+  AsyncHttpsRequest request(parts->host, parts->port, parts->path,
+                            kDownloadTimeouts);
+  if (!request.IsOpen()) return false;
+  if (!request.Send(stopToken) || !IsSuccessful(request.Handle())) {
     return false;
   }
   // A declared size is checked up front and against what actually arrived.
-  const auto declaredLength = DeclaredContentLength(request);
+  const auto declaredLength = DeclaredContentLength(request.Handle());
   if (declaredLength && (*declaredLength == 0 || *declaredLength > maxBytes)) {
     return false;
   }
@@ -239,22 +406,20 @@ bool HttpsDownloadToFile(const std::wstring& url,
     if (!completed) DeleteFileW(temp.c_str());
   });
 
-  std::vector<char> buffer(64 * 1024);
   unsigned long long total = 0;
   for (;;) {
     if (stopToken.stop_requested()) return false;
-    DWORD available = 0;
     // A failing query is a broken connection, not the end of the body.
-    if (!WinHttpQueryDataAvailable(request, &available)) return false;
-    if (available == 0) break;
-    DWORD read = 0;
-    const DWORD wanted =
-        std::min(available, static_cast<DWORD>(buffer.size()));
-    if (!WinHttpReadData(request, buffer.data(), wanted, &read)) return false;
-    if (read == 0) break;
+    const auto available = request.QueryDataAvailable(stopToken);
+    if (!available) return false;
+    if (*available == 0) break;
+    const auto chunk = request.Read(*available, stopToken);
+    if (!chunk) return false;
+    if (chunk->empty()) break;
+    const auto read = static_cast<DWORD>(chunk->size());
     if (total + read > maxBytes) return false;
     DWORD written = 0;
-    if (!WriteFile(file, buffer.data(), read, &written, nullptr) ||
+    if (!WriteFile(file, chunk->data(), read, &written, nullptr) ||
         written != read) {
       return false;
     }

@@ -25,10 +25,14 @@ struct Command {
   std::wstring detail;
 };
 
+// Strips one pair of quotes around the whole value ("C:\My App\x.exe"). A
+// command that quotes several arguments ("C:\app.exe" "my file.txt") starts
+// and ends with a quote too, so the pair only counts when the quote does not
+// appear anywhere in between.
 inline std::wstring StripMatchingQuotes(std::wstring value) {
   value = feathercast::core::Trim(std::move(value));
-  if (value.size() >= 2 && ((value.front() == L'"' && value.back() == L'"') ||
-                            (value.front() == L'\'' && value.back() == L'\''))) {
+  if (value.size() >= 2 && (value.front() == L'"' || value.front() == L'\'') &&
+      value.back() == value.front() && value.find(value.front(), 1) == value.size() - 1) {
     value = value.substr(1, value.size() - 2);
   }
   return feathercast::core::Trim(std::move(value));

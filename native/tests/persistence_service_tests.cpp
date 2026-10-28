@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -146,9 +147,47 @@ int main() {
 
   settings.quicklinks.push_back(
       {L"docs", L"Documentation", L"https://example.com/docs"});
-  std::wstring blockingError;
-  assert(service.SaveSettingsAndWait(settings, &blockingError));
-  assert(blockingError.empty());
+  assert(service.SaveSettings(settings));
+
+  {
+    // Deleting one clipboard entry emits the refreshed history without it.
+    {
+      std::lock_guard lock(mutex);
+      events.clear();
+    }
+    assert(service.StoreClipboard(L"keep me", L"keep me", 2, 20));
+    assert(service.StoreClipboard(L"delete me", L"delete me", 3, 20));
+    std::optional<long long> deleteId;
+    {
+      std::unique_lock lock(mutex);
+      assert(cv.wait_for(lock, std::chrono::seconds(5), [&] {
+        std::size_t stored = 0;
+        for (const auto& event : events) {
+          const auto* entry = std::get_if<persistence::ClipboardStored>(&event);
+          if (!entry || !entry->entry) continue;
+          ++stored;
+          if (entry->entry->text == L"delete me") deleteId = entry->entry->id;
+        }
+        return stored == 2;
+      }));
+      events.clear();
+    }
+    assert(deleteId);
+    assert(service.DeleteClipboard(*deleteId, 20));
+    std::unique_lock lock(mutex);
+    assert(cv.wait_for(lock, std::chrono::seconds(5), [&] {
+      return std::any_of(events.begin(), events.end(), [](const auto& event) {
+        return std::holds_alternative<persistence::ClipboardLoaded>(event);
+      });
+    }));
+    const auto loaded = std::find_if(events.begin(), events.end(), [](const auto& event) {
+      return std::holds_alternative<persistence::ClipboardLoaded>(event);
+    });
+    const auto& history = std::get<persistence::ClipboardLoaded>(*loaded);
+    assert(history.error.code == SQLITE_OK);
+    assert(history.entries.size() == 1);
+    assert(history.entries.front().text == L"keep me");
+  }
 
   {
     // A file the scanner skipped as unchanged has no stored text in this
@@ -198,6 +237,89 @@ int main() {
   assert(loaded.value.shortcut == L"Ctrl+Shift+Space");
   assert(loaded.value.quicklinks.size() == 1);
   assert(loaded.value.quicklinks[0].keyword == L"docs");
+
+  {
+    // Stop(true) still completes queued writes, but abandons a queued file
+    // index merge instead of reading file contents and storing them while
+    // the app exits; the next start rescans anyway.
+    const auto shutdownRoot = root / L"shutdown";
+    const auto mergeRoot = shutdownRoot / L"merge-root";
+    std::filesystem::create_directories(mergeRoot);
+    const auto mergeFile = mergeRoot / L"skipped.txt";
+    {
+      std::ofstream output(mergeFile, std::ios::binary);
+      output << "skipped content";
+    }
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool blocking = false;
+    bool released = false;
+    bool merged = false;
+    persistence::PersistenceService shutdownService(
+        shutdownRoot / L"settings.json", shutdownRoot / L"feathercast.db",
+        [&](persistence::Event event) {
+          std::unique_lock lock(gateMutex);
+          if (std::holds_alternative<persistence::ClipboardStored>(event)) {
+            blocking = true;
+            gateCv.notify_all();
+            gateCv.wait(lock, [&] { return released; });
+          } else if (std::holds_alternative<persistence::FileIndexMerged>(
+                         event)) {
+            merged = true;
+          }
+        });
+    shutdownService.Start();
+    // Hold the worker inside a task so the merge and the save stay queued.
+    assert(shutdownService.StoreClipboard(L"hold", L"hold", 1, 20));
+    {
+      std::unique_lock lock(gateMutex);
+      assert(gateCv.wait_for(lock, std::chrono::seconds(5),
+                             [&] { return blocking; }));
+    }
+    feathercast::storage::FileIndexEntry entry;
+    entry.path = mergeFile.wstring();
+    entry.name = L"skipped.txt";
+    entry.root = mergeRoot.wstring();
+    entry.lastWriteTime = 5;
+    entry.size = 15;
+    entry.indexedAt = 1000;
+    entry.contentState =
+        static_cast<int>(feathercast::file_content::State::Indexed);
+    entry.contentBytes = 15;
+    entry.contentUnchanged = true;
+    assert(shutdownService.MergeFileIndex({entry}, {mergeRoot.wstring()},
+                                          {mergeRoot.wstring()}, 100, 92, {}));
+    feathercast::settings::Settings shutdownSettings;
+    shutdownSettings.shortcut = L"Alt+Shift+Space";
+    assert(shutdownService.SaveSettings(shutdownSettings));
+
+    std::thread stopper([&] { shutdownService.Stop(true); });
+    // Submissions are refused once shutdown has begun, which happens only
+    // after the deferrable work was told to stop.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (shutdownService.LoadTimers() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(std::chrono::steady_clock::now() < deadline);
+    {
+      std::lock_guard lock(gateMutex);
+      released = true;
+    }
+    gateCv.notify_all();
+    stopper.join();
+
+    assert(!merged);
+    const auto shutdownLoaded =
+        feathercast::settings_io::LoadSettingsFile(shutdownRoot / L"settings.json");
+    assert(shutdownLoaded.status == feathercast::settings::ParseStatus::Valid);
+    assert(shutdownLoaded.value.shortcut == L"Alt+Shift+Space");
+    feathercast::storage::Storage check;
+    assert(check.Open(shutdownRoot / L"feathercast.db"));
+    assert(check.LoadFileIndex(100).empty());
+    check.Close();
+  }
 
   {
     // Durable replacement: the data is flushed, the temp file never lingers,

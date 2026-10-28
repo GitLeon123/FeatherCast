@@ -5,10 +5,13 @@
 // resolved against a caller-supplied rate table (code -> units per 1 USD); the
 // network fetch and caching of that table live in the host application.
 
+#include "calculator.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
 #include <iomanip>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -41,21 +44,14 @@ inline std::wstring Upper(std::wstring value) {
   return value;
 }
 
+// At most six decimals for everyday magnitudes and six significant digits
+// below one, so "1 b to tb" reads 1e-12 rather than 0.
 inline std::wstring FormatNumber(double value) {
-  if (!std::isfinite(value)) return L"";
-  if (std::fabs(value) < 0.0000000001) value = 0.0;
-  std::wostringstream stream;
   const double magnitude = std::fabs(value);
-  if (magnitude != 0.0 && (magnitude < 0.0001 || magnitude >= 1000000000000.0)) {
-    stream << std::setprecision(6) << value;
-    return stream.str();
+  if (magnitude >= 1.0 && magnitude < 1e15) {
+    return calculator::FormatSignificant(value, 15, 6);
   }
-  stream << std::fixed << std::setprecision(6) << value;
-  std::wstring out = stream.str();
-  while (!out.empty() && out.back() == L'0') out.pop_back();
-  if (!out.empty() && out.back() == L'.') out.pop_back();
-  if (out == L"-0") out = L"0";
-  return out;
+  return calculator::FormatSignificant(value, 6);
 }
 
 // A measurement unit identified by its category and factor to the category's
@@ -80,7 +76,9 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     add({L"mi", L"mile", L"miles"}, L"length", 1609.344);
     add({L"yd", L"yard", L"yards"}, L"length", 0.9144);
     add({L"ft", L"foot", L"feet"}, L"length", 0.3048);
-    add({L"inch", L"inches"}, L"length", 0.0254);
+    // "in" is also a connector; TryConvert only reads it as a unit where a
+    // unit belongs ("5 in to cm").
+    add({L"in", L"inch", L"inches"}, L"length", 0.0254);
     add({L"nmi", L"nauticalmile"}, L"length", 1852.0);
     // Mass (base: gram)
     add({L"g", L"gram", L"grams"}, L"mass", 1.0);
@@ -91,8 +89,10 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     add({L"t", L"tonne", L"tonnes", L"ton"}, L"mass", 1000000.0);
     add({L"st", L"stone", L"stones"}, L"mass", 6350.29318);
     // Temperature (special handling via tempCode)
-    t[L"c"] = t[L"celsius"] = Unit{L"temp", 0.0, L"c"};
-    t[L"f"] = t[L"fahrenheit"] = Unit{L"temp", 0.0, L"f"};
+    // The degree sign (U+00B0) and its common look-alike, the masculine
+    // ordinal (U+00BA), may prefix C and F ("100\u00B0F to C").
+    for (const auto* name : {L"c", L"celsius", L"\u00B0c", L"\u00BAc"}) t[name] = Unit{L"temp", 0.0, L"c"};
+    for (const auto* name : {L"f", L"fahrenheit", L"\u00B0f", L"\u00BAf"}) t[name] = Unit{L"temp", 0.0, L"f"};
     t[L"k"] = t[L"kelvin"] = Unit{L"temp", 0.0, L"k"};
     // Data (base: byte, decimal SI plus binary IEC)
     add({L"b", L"byte", L"bytes"}, L"data", 1.0);
@@ -116,10 +116,10 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     add({L"day", L"days"}, L"time", 86400.0);
     add({L"week", L"weeks"}, L"time", 604800.0);
     // Speed (base: meter/second)
-    add({L"mps"}, L"speed", 1.0);
-    add({L"kmh", L"kph"}, L"speed", 0.277777778);
-    add({L"mph"}, L"speed", 0.44704);
-    add({L"knot", L"knots"}, L"speed", 0.514444444);
+    add({L"m/s", L"mps"}, L"speed", 1.0);
+    add({L"km/h", L"kmh", L"kph", L"kmph"}, L"speed", 1000.0 / 3600.0);
+    add({L"mph", L"mi/h"}, L"speed", 0.44704);
+    add({L"kn", L"knot", L"knots"}, L"speed", 1852.0 / 3600.0);
     // Volume (base: liter)
     add({L"l", L"liter", L"liters", L"litre", L"litres"}, L"volume", 1.0);
     add({L"ml", L"milliliter", L"milliliters"}, L"volume", 0.001);
@@ -150,6 +150,12 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     return t;
   }();
   return table;
+}
+
+// Display name of a temperature unit: "\u00B0C", "\u00B0F" or "K".
+inline std::wstring TemperatureSymbol(const std::wstring& code) {
+  if (code == L"k") return L"K";
+  return code == L"f" ? L"\u00B0F" : L"\u00B0C";
 }
 
 inline double ToCelsius(double value, const std::wstring& code) {
@@ -186,43 +192,23 @@ inline bool IsConnector(const std::wstring& token) {
 }
 
 // Parses the decimal number at the start of `text` ("5", "-3,5", "1.5e3",
-// "10km") and returns its length, or 0 when there is none. A single '.' or ','
-// is the decimal separator, as in the calculator, so "1,5 km" is one and a
-// half kilometers. Unlike wcstod this never reads hex ("0x"), "inf" or "nan",
-// and a second separator ("1.000,5") rejects the number instead of silently
-// cutting it short.
-inline size_t ParseAmount(const std::wstring& text, double& value) {
-  auto digit = [&](size_t index) {
-    return index < text.size() && text[index] >= L'0' && text[index] <= L'9';
-  };
+// "10km") and returns its length, or 0 when there is none. Separators follow
+// the calculator (calculator::ReadDecimal): `decimal` is the locale's decimal
+// point, the other separator groups thousands only in a well-formed grouped
+// number ("1,000 km" with '.' as the decimal) and otherwise is a decimal point
+// too, so "1,5 km" is one and a half kilometers everywhere. Malformed mixes
+// ("1.000,5" with '.' as the decimal) are rejected rather than guessed.
+// Unlike wcstod this never reads hex ("0x"), "inf" or "nan". An exponent needs
+// digits, so "5eur" stays 5 followed by "eur".
+inline size_t ParseAmount(const std::wstring& text, double& value,
+                          wchar_t decimal = calculator::UserDecimalSeparator()) {
   size_t pos = 0;
-  if (pos < text.size() && (text[pos] == L'+' || text[pos] == L'-')) ++pos;
-  bool hasDigit = false;
-  bool hasSeparator = false;
-  while (pos < text.size()) {
-    if (digit(pos)) {
-      hasDigit = true;
-      ++pos;
-    } else if ((text[pos] == L'.' || text[pos] == L',') && !hasSeparator) {
-      hasSeparator = true;
-      ++pos;
-    } else {
-      break;
-    }
-  }
-  if (!hasDigit) return 0;
-  if (pos < text.size() && (text[pos] == L'.' || text[pos] == L',')) return 0;
-  // An exponent needs digits, so "5eur" stays 5 followed by "eur".
-  if (pos < text.size() && (text[pos] == L'e' || text[pos] == L'E')) {
-    size_t exponent = pos + 1;
-    if (exponent < text.size() && (text[exponent] == L'+' || text[exponent] == L'-')) ++exponent;
-    if (digit(exponent)) {
-      while (digit(exponent)) ++exponent;
-      pos = exponent;
-    }
-  }
-  std::wstring number = text.substr(0, pos);
-  std::replace(number.begin(), number.end(), L',', L'.');
+  const bool hasSign = pos < text.size() && (text[pos] == L'+' || text[pos] == L'-');
+  if (hasSign) ++pos;
+  std::wstring number;
+  if (!calculator::ReadDecimal(text, pos, decimal, number)) return 0;
+  calculator::ReadExponent(text, pos, number);
+  if (hasSign) number.insert(number.begin(), text.front());
   wchar_t* end = nullptr;
   value = std::wcstod(number.c_str(), &end);
   if (end != number.c_str() + number.size() || !std::isfinite(value)) return 0;
@@ -230,9 +216,23 @@ inline size_t ParseAmount(const std::wstring& text, double& value) {
 }
 
 // True when the token begins with a parseable number (e.g. "5", "-3.2", "10km").
-inline bool LeadingNumber(const std::wstring& token) {
+inline bool LeadingNumber(const std::wstring& token,
+                          wchar_t decimal = calculator::UserDecimalSeparator()) {
   double ignored = 0.0;
-  return ParseAmount(token, ignored) > 0;
+  return ParseAmount(token, ignored, decimal) > 0;
+}
+
+// English words that are also ISO codes ("top", "try", "all", "mad", "pen")
+// must not turn "top 10" into a currency conversion. Without an explicit
+// connector a lowercase code only counts when it is one of these common ones;
+// capitals and currency symbols always count.
+inline bool IsCommonCurrencyCode(const std::wstring& lower) {
+  static constexpr const wchar_t* kCodes[] = {
+      L"usd", L"eur", L"gbp", L"jpy", L"chf", L"cad", L"aud", L"cny",
+      L"inr", L"sek", L"nok", L"dkk", L"pln", L"czk", L"huf", L"brl",
+      L"mxn", L"krw", L"rub", L"zar", L"nzd", L"sgd", L"hkd"};
+  return std::any_of(std::begin(kCodes), std::end(kCodes),
+                     [&](const wchar_t* code) { return lower == code; });
 }
 
 // Common single-character currency symbols mapped to their ISO-4217 code. Both
@@ -277,9 +277,11 @@ inline std::wstring ExpandCurrencySymbols(const std::wstring& text) {
 // accepts a currency-first amount ("USD 5"), "=" as a connector ("USD 5 = GBP"),
 // and a lone currency ("USD 5") which converts to defaultCurrency when supplied.
 // Returns nullopt for anything that is not a recognized cross-unit/currency
-// conversion, leaving plain arithmetic to the calculator.
+// conversion, leaving plain arithmetic to the calculator. `decimalSeparator`
+// is the locale's decimal point ('.' or ','); tests pass it explicitly.
 inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::wstring, double>& rates = {},
-                                        const std::wstring& defaultCurrency = L"") {
+                                        const std::wstring& defaultCurrency = L"",
+                                        wchar_t decimalSeparator = calculator::UserDecimalSeparator()) {
   const std::wstring original = Trim(std::move(input));
   if (original.empty()) return std::nullopt;
 
@@ -293,7 +295,8 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   }
   {
     std::vector<std::wstring> head = SplitTokens(normalized);
-    if (head.size() >= 2 && !LeadingNumber(head[0]) && LeadingNumber(head[1])) {
+    if (head.size() >= 2 && !LeadingNumber(head[0], decimalSeparator) &&
+        LeadingNumber(head[1], decimalSeparator)) {
       std::swap(head[0], head[1]);
       normalized.clear();
       for (size_t i = 0; i < head.size(); ++i) {
@@ -306,7 +309,7 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   // Parse the leading numeric amount.
   normalized = Trim(std::move(normalized));
   double amount = 0.0;
-  const size_t numberLength = ParseAmount(normalized, amount);
+  const size_t numberLength = ParseAmount(normalized, amount, decimalSeparator);
   if (numberLength == 0) return std::nullopt;
 
   std::wstring remainder = Trim(normalized.substr(numberLength));
@@ -323,6 +326,7 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   const std::vector<std::wstring> tokens = SplitTokens(remainder);
   std::wstring fromToken;
   std::wstring toToken;
+  bool explicitConnector = false;
   if (tokens.size() == 1) {
     // A lone currency ("5 USD") converts to the caller's locale currency, unless
     // they are the same (which would be a pointless "5 EUR = 5 EUR").
@@ -339,6 +343,7 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
       if (IsConnector(Lower(tokens[i]))) {
         fromToken = tokens[i - 1];
         toToken = tokens[i + 1];
+        explicitConnector = true;
         break;
       }
     }
@@ -350,10 +355,16 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   // Currency conversion takes priority when both tokens are known codes.
   if (!rates.empty()) {
     // A code that is also spelled like a unit ("cup" vs. the Cuban peso CUP)
-    // means the unit unless it is written in capitals.
+    // means the unit unless it is written in capitals. Without a connector
+    // ("top 10", "10 try"), a lowercase code must be a common one.
     auto currencyRate = [&](const std::wstring& token) {
       const std::wstring code = Upper(token);
-      if (token != code && table.contains(Lower(token))) return rates.end();
+      if (token != code) {
+        const std::wstring lower = Lower(token);
+        if (table.contains(lower) || (!explicitConnector && !IsCommonCurrencyCode(lower))) {
+          return rates.end();
+        }
+      }
       return rates.find(code);
     };
     const auto fromRate = currencyRate(fromToken);
@@ -384,7 +395,10 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   }
 
   if (!std::isfinite(converted)) return std::nullopt;
-  const std::wstring display = FormatNumber(converted) + L" " + Lower(toToken);
+  const std::wstring unitName = fromUnit->second.category == L"temp"
+                                    ? TemperatureSymbol(toUnit->second.tempCode)
+                                    : Lower(toToken);
+  const std::wstring display = FormatNumber(converted) + L" " + unitName;
   return Result{original, display, converted};
 }
 

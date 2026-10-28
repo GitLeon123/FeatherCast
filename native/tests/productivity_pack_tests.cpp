@@ -42,11 +42,13 @@ void AssertTextActions(const feathercast::app::DisplayItem& item,
                        const std::wstring& expectedValue) {
   const auto actions = feathercast::commands::BuildActions(
       item, feathercast::app::Settings{});
-  assert(actions.size() == (item.isClipboard ? 3 : (item.isSnippet ? 5 : 2)));
+  assert(actions.size() == (item.isClipboard ? 4 : (item.isSnippet ? 5 : 2)));
   assert(actions[0].action == feathercast::app::ActionKind::CopyText);
+  assert(actions[0].commandDetail.find(L"Ctrl+C") != std::wstring::npos);
   assert(actions[1].action == feathercast::app::ActionKind::PasteText);
   for (const auto& action : actions) {
-    if (action.action == feathercast::app::ActionKind::PinClipboard) {
+    if (action.action == feathercast::app::ActionKind::PinClipboard ||
+        action.action == feathercast::app::ActionKind::DeleteClipboard) {
       assert(std::get<feathercast::app::ClipboardEntry>(action.actionTarget).text == expectedValue);
       continue;
     }
@@ -101,6 +103,145 @@ void TestCommandHotKeysSkipTakenChords() {
   UnregisterHotKey(nullptr, 0x2F01);
 }
 
+const feathercast::app::DisplayItem* FindAction(
+    const std::vector<feathercast::app::DisplayItem>& actions,
+    feathercast::app::ActionKind kind) {
+  const auto found = std::find_if(actions.begin(), actions.end(), [&](const auto& item) {
+    return item.isAction && item.action == kind;
+  });
+  return found == actions.end() ? nullptr : &*found;
+}
+
+// Clipboard delete, file actions, window task actions, hidden app listing,
+// and the Ctrl+C hints that the actions panel shows.
+void TestResultActionAdditions() {
+  using feathercast::app::ActionKind;
+  const feathercast::app::Settings noSettings;
+
+  feathercast::app::DisplayItem clip;
+  clip.isClipboard = true;
+  clip.clipboard = {L"42", L"secret", L"secret", 1, false};
+  const auto clipActions = feathercast::commands::BuildActions(clip, noSettings);
+  const auto* remove = FindAction(clipActions, ActionKind::DeleteClipboard);
+  assert(remove && remove->commandName == L"Delete Entry");
+  assert(remove->commandDetail.find(L"Ctrl+Delete") != std::wstring::npos);
+  assert(std::get<feathercast::app::ClipboardEntry>(remove->actionTarget).id == L"42");
+
+  feathercast::app::DisplayItem file;
+  file.app.id = L"file:C:\\Docs\\report.txt";
+  file.app.name = L"report.txt";
+  file.app.path = L"C:\\Docs\\report.txt";
+  file.app.launchTarget = file.app.path;
+  file.app.source = L"file";
+  file.app.launchType = feathercast::app::LaunchType::Exe;
+  auto fileActions = feathercast::commands::BuildActions(file, noSettings);
+  assert(HasAction(fileActions, ActionKind::OpenWith));
+  assert(HasAction(fileActions, ActionKind::ShowProperties));
+  const auto* copyFile = FindAction(fileActions, ActionKind::CopyFile);
+  assert(copyFile && copyFile->commandName == L"Copy File");
+  const auto* copyPath = FindAction(fileActions, ActionKind::CopyPath);
+  assert(copyPath && copyPath->commandDetail.find(L"Ctrl+C") != std::wstring::npos);
+  assert(!HasAction(fileActions, ActionKind::Pin));
+  assert(!HasAction(fileActions, ActionKind::Hide));
+  assert(!HasAction(fileActions, ActionKind::Unpin));
+  assert(!HasAction(fileActions, ActionKind::Unhide));
+  // Keys saved by older versions can still be removed.
+  feathercast::app::Settings stale;
+  stale.pinnedApps = {file.app.id};
+  stale.hiddenApps = {file.app.path};
+  fileActions = feathercast::commands::BuildActions(file, stale);
+  assert(HasAction(fileActions, ActionKind::Unpin));
+  assert(HasAction(fileActions, ActionKind::Unhide));
+  file.app.fileIsDirectory = true;
+  fileActions = feathercast::commands::BuildActions(file, noSettings);
+  assert(!HasAction(fileActions, ActionKind::OpenWith));
+  copyFile = FindAction(fileActions, ActionKind::CopyFile);
+  assert(copyFile && copyFile->commandName == L"Copy Folder");
+  assert(HasAction(fileActions, ActionKind::ShowProperties));
+
+  feathercast::app::DisplayItem app;
+  app.app.id = L"app:test";
+  app.app.name = L"Test App";
+  app.app.source = L"start-menu";
+  app.app.launchType = feathercast::app::LaunchType::Exe;
+  app.app.launchTarget = L"C:\\Apps\\Test App.exe";
+  const auto appActions = feathercast::commands::BuildActions(app, noSettings);
+  assert(HasAction(appActions, ActionKind::Pin));
+  assert(HasAction(appActions, ActionKind::Hide));
+  assert(!HasAction(appActions, ActionKind::CopyFile));
+  assert(!HasAction(appActions, ActionKind::OpenWith));
+
+  // End Task is refused for FeatherCast and for processes Windows needs.
+  feathercast::app::WindowEntry window;
+  window.pid = 4242;
+  window.processName = L"notepad";
+  assert(feathercast::commands::CanEndTask(window, 1));
+  assert(!feathercast::commands::CanEndTask(window, 4242));
+  for (const auto* name : {L"explorer", L"Explorer.EXE", L"csrss", L"dwm",
+                           L"winlogon", L"svchost", L"FeatherCast", L"lsass"}) {
+    window.processName = name;
+    assert(!feathercast::commands::CanEndTask(window, 1));
+  }
+  window.processName.clear();
+  assert(!feathercast::commands::CanEndTask(window, 1));
+  window.processName = L"notepad";
+  window.pid = 0;
+  assert(!feathercast::commands::CanEndTask(window, 1));
+  window.pid = 4;
+  assert(!feathercast::commands::CanEndTask(window, 1));
+
+  // The Always on Top label follows the live WS_EX_TOPMOST style.
+  const HWND topmost = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"STATIC",
+                                       L"FeatherCast topmost test", WS_POPUP,
+                                       0, 0, 10, 10, nullptr, nullptr, nullptr, nullptr);
+  assert(topmost);
+  feathercast::app::DisplayItem windowItem;
+  windowItem.isWindow = true;
+  windowItem.window.hwnd = topmost;
+  windowItem.window.pid = GetCurrentProcessId();
+  windowItem.window.name = L"FeatherCast topmost test";
+  windowItem.window.processName = L"feathercastproductivitypacktests";
+  auto windowActions = feathercast::commands::BuildActions(windowItem, noSettings);
+  const auto* onTop = FindAction(windowActions, ActionKind::ToggleAlwaysOnTop);
+  assert(onTop && onTop->commandName == L"Turn Off Always on Top");
+  // The test process is the current process, so End Task is not offered.
+  assert(!HasAction(windowActions, ActionKind::EndTask));
+  assert(SetWindowPos(topmost, HWND_NOTOPMOST, 0, 0, 0, 0,
+                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE));
+  windowActions = feathercast::commands::BuildActions(windowItem, noSettings);
+  onTop = FindAction(windowActions, ActionKind::ToggleAlwaysOnTop);
+  assert(onTop && onTop->commandName == L"Always on Top");
+  windowItem.window.pid = GetCurrentProcessId() + 1;
+  windowActions = feathercast::commands::BuildActions(windowItem, noSettings);
+  const auto* endTask = FindAction(windowActions, ActionKind::EndTask);
+  assert(endTask && std::get_if<feathercast::app::WindowEntry>(&endTask->actionTarget));
+  DestroyWindow(topmost);
+
+  // Hidden apps resolve to known apps, list unknown keys, and de-duplicate.
+  std::vector<feathercast::app::AppEntry> apps(2);
+  apps[0].id = L"app:alpha";
+  apps[0].name = L"Alpha";
+  apps[0].path = L"C:\\Alpha.lnk";
+  apps[1].id = L"app:beta";
+  apps[1].name = L"Beta";
+  feathercast::app::Settings hidden;
+  hidden.hiddenApps = {L"app:alpha", L"C:\\Alpha.lnk", L"app:gone", L"app:gone", L""};
+  const auto hiddenActions = feathercast::commands::BuildHiddenAppActions(apps, hidden);
+  assert(hiddenActions.size() == 2);
+  assert(hiddenActions[0].action == ActionKind::Unhide);
+  assert(hiddenActions[0].commandName == L"Alpha");
+  assert(std::get<feathercast::app::AppEntry>(hiddenActions[0].actionTarget).id == L"app:alpha");
+  assert(hiddenActions[1].commandName == L"app:gone");
+  assert(std::get<feathercast::app::AppEntry>(hiddenActions[1].actionTarget).id == L"app:gone");
+  assert(feathercast::commands::BuildHiddenAppActions(apps, noSettings).empty());
+
+  // The command catalog offers the new system commands.
+  const auto* hibernate = feathercast::commands::Find(feathercast::app::CommandKind::Hibernate);
+  assert(hibernate && hibernate->confirmation);
+  assert(feathercast::commands::Find(feathercast::app::CommandKind::KeepAwake));
+  assert(feathercast::commands::Find(feathercast::app::CommandKind::HiddenApps));
+}
+
 }  // namespace
 
 int main() {
@@ -114,6 +255,7 @@ int main() {
   using feathercast::ui::PixelRect;
 
   TestCommandHotKeysSkipTakenChords();
+  TestResultActionAdditions();
 
   {
     const auto printScreen = feathercast::shortcut::ParseShortcut(L"Print Screen");

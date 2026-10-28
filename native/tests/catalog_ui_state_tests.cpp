@@ -106,6 +106,12 @@ int main() {
       std::pair{L"time-utilities", ResultIcon::Clock},
       std::pair{L"uuid", ResultIcon::Code},
       std::pair{L"web-search", ResultIcon::WebSearch},
+      std::pair{L"run-command", ResultIcon::Terminal},
+      std::pair{L"text-utilities", ResultIcon::Code},
+      std::pair{L"color-converter", ResultIcon::Palette},
+      std::pair{L"screenshots", ResultIcon::Copy},
+      std::pair{L"screen-recording", ResultIcon::Monitor},
+      std::pair{L"file-preview", ResultIcon::Eye},
       std::pair{L"emoji", ResultIcon::Smile},
       std::pair{L"symbols", ResultIcon::Symbols},
       std::pair{L"files", ResultIcon::FolderSearch},
@@ -122,6 +128,9 @@ int main() {
       std::pair{L"windows-settings", ResultIcon::Gear},
       std::pair{L"plugins", ResultIcon::Puzzle},
       std::pair{L"shortcut", ResultIcon::Keyboard},
+      std::pair{L"hidden-apps", ResultIcon::EyeOff},
+      std::pair{L"file-actions", ResultIcon::File},
+      std::pair{L"keep-awake", ResultIcon::Monitor},
   };
   assert(capabilityIcons.size() == feathercast::capabilities::Catalog().size());
   for (const auto& [stableId, expected] : capabilityIcons) {
@@ -187,6 +196,9 @@ int main() {
       std::pair{CommandKind::CancelPhoneTransfers, ResultIcon::Close},
       std::pair{CommandKind::ManageAutomation, ResultIcon::Terminal},
       std::pair{CommandKind::PhoneScreen, ResultIcon::Phone},
+      std::pair{CommandKind::HiddenApps, ResultIcon::EyeOff},
+      std::pair{CommandKind::Hibernate, ResultIcon::Moon},
+      std::pair{CommandKind::KeepAwake, ResultIcon::Monitor},
   };
   assert(commandIcons.size() == feathercast::commands::Catalog().size());
   for (const auto& [kind, expected] : commandIcons) {
@@ -226,6 +238,13 @@ int main() {
       std::pair{ActionKind::MoveWindowNextDisplay, ResultIcon::MultiMonitor},
       std::pair{ActionKind::CopyText, ResultIcon::Copy},
       std::pair{ActionKind::PasteText, ResultIcon::Clipboard},
+      std::pair{ActionKind::DeleteClipboard, ResultIcon::Trash},
+      std::pair{ActionKind::EndTask, ResultIcon::Close},
+      std::pair{ActionKind::ToggleAlwaysOnTop, ResultIcon::Pin},
+      std::pair{ActionKind::CopyFile, ResultIcon::Copy},
+      std::pair{ActionKind::ShowProperties, ResultIcon::Gear},
+      std::pair{ActionKind::OpenWith, ResultIcon::ExternalLink},
+      std::pair{ActionKind::ManageHiddenApps, ResultIcon::EyeOff},
   };
   for (const auto& [kind, expected] : actionIcons) {
     feathercast::app::DisplayItem item;
@@ -259,7 +278,9 @@ int main() {
            std::pair{feathercast::app::UtilityKind::LocalTime, ResultIcon::Clock},
            std::pair{feathercast::app::UtilityKind::LocalDate, ResultIcon::Calendar},
            std::pair{feathercast::app::UtilityKind::IsoWeek, ResultIcon::CalendarWeek},
-           std::pair{feathercast::app::UtilityKind::UnixTime, ResultIcon::Code}}) {
+           std::pair{feathercast::app::UtilityKind::UnixTime, ResultIcon::Code},
+           std::pair{feathercast::app::UtilityKind::Text, ResultIcon::Code},
+           std::pair{feathercast::app::UtilityKind::Color, ResultIcon::Palette}}) {
     internal = {};
     internal.utility = feathercast::app::UtilityResult{kind};
     assert(feathercast::ui::ResolveResultIcon(internal) == expected);
@@ -541,10 +562,11 @@ int main() {
          settings.recordingCaptureShortcut == -1);
 
   feathercast::ui::OverlayState history;
+  // Multi-character inserts (pastes) are separate undo steps.
   for (int index = 0; index < 40; ++index) {
-    feathercast::ui::OverlayController::InsertText(history, L"x");
+    feathercast::ui::OverlayController::InsertText(history, L"xy");
   }
-  assert(history.query.size() == 40 && history.queryUndo.size() == 32);
+  assert(history.query.size() == 80 && history.queryUndo.size() == 32);
   history.imeComposition = L"pending";
   for (int index = 0; index < 32; ++index) {
     const auto effects =
@@ -552,9 +574,59 @@ int main() {
     assert(feathercast::ui::HasEffect(
         effects, feathercast::ui::UiEffect::RequestSearch));
   }
-  assert(history.query.size() == 8 && history.imeComposition.empty());
+  assert(history.query.size() == 16 && history.imeComposition.empty());
   feathercast::ui::OverlayController::RedoQueryEdit(history);
-  assert(history.query.size() == 9);
+  assert(history.query.size() == 18);
+
+  // Typed characters coalesce per word, so one undo removes a word, not a
+  // letter; deleting coalesces the same way and a caret move splits steps.
+  feathercast::ui::OverlayState typed;
+  for (const wchar_t ch : std::wstring(L"hello world")) {
+    feathercast::ui::OverlayController::InsertText(typed, std::wstring(1, ch));
+  }
+  assert(typed.queryUndo.size() == 2);
+  feathercast::ui::OverlayController::UndoQueryEdit(typed);
+  assert(typed.query == L"hello ");
+  feathercast::ui::OverlayController::RedoQueryEdit(typed);
+  assert(typed.query == L"hello world");
+  for (int index = 0; index < 3; ++index) {
+    feathercast::ui::OverlayController::RecordUserEdit(
+        typed, feathercast::ui::QueryEditKind::Deleting);
+    feathercast::text_edit::ErasePrevious(typed.query, typed.caret);
+    feathercast::ui::OverlayController::EndUserEdit(typed);
+  }
+  assert(typed.query == L"hello wo" && typed.queryUndo.size() == 3);
+  feathercast::ui::OverlayController::MoveCaret(typed, 0, false);
+  feathercast::ui::OverlayController::InsertText(typed, L"x");
+  feathercast::ui::OverlayController::MoveCaret(typed, typed.query.size(), false);
+  feathercast::ui::OverlayController::InsertText(typed, L"y");
+  assert(typed.query == L"xhello woy" && typed.queryUndo.size() == 5);
+  feathercast::ui::OverlayController::UndoQueryEdit(typed);
+  feathercast::ui::OverlayController::UndoQueryEdit(typed);
+  feathercast::ui::OverlayController::UndoQueryEdit(typed);
+  assert(typed.query == L"hello world");
+
+  // Pasting into the single-line query never inserts line breaks or tabs.
+  assert(feathercast::text_edit::SingleLine(L"first line\r\n") == L"first line");
+  assert(feathercast::text_edit::SingleLine(L"a\r\n\r\nb\tc") == L"a b c");
+  assert(feathercast::text_edit::SingleLine(L"  keep  inner  ") == L"keep  inner");
+  assert(feathercast::text_edit::SingleLine(L"x \n y") == L"x y");
+  assert(feathercast::text_edit::SingleLine(L"p\u2029q") == L"p q");
+  assert(feathercast::text_edit::SingleLine(L"\r\n\t").empty());
+  // Double-click selects the word (or the run of spaces) under the caret.
+  {
+    using feathercast::text_edit::WordAt;
+    using Range = std::pair<size_t, size_t>;
+    const std::wstring words = L"open  vs code";
+    assert(WordAt(words, 0) == Range(0, 4));
+    assert(WordAt(words, 2) == Range(0, 4));
+    assert(WordAt(words, 4) == Range(4, 6));
+    assert(WordAt(words, 6) == Range(6, 8));
+    assert(WordAt(words, words.size()) == Range(9, 13));
+    assert(WordAt(L"", 0) == Range(0, 0));
+    const std::wstring emoji = L"a \U0001F600b";
+    assert(WordAt(emoji, 3) == Range(2, 5));
+  }
   feathercast::ui::OverlayController::InsertText(history, L"new");
   assert(!feathercast::ui::OverlayController::CanRedoQueryEdit(history));
   const auto programmedHistorySize = history.queryUndo.size();

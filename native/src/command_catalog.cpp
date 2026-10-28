@@ -2,6 +2,7 @@
 #include "discovery.hpp"
 
 #include <algorithm>
+#include <cwctype>
 #include <set>
 #include <utility>
 
@@ -227,6 +228,9 @@ const std::vector<CommandDescriptor>& Catalog() {
        {L"icons", L"cache"}},
       {L"clear-recents", app::CommandKind::ClearRecents, L"Clear Recents",
        L"Forget recently used apps", {L"history", L"recent apps"}},
+      {L"hidden-apps", app::CommandKind::HiddenApps, L"Hidden Apps",
+       L"Show and unhide apps removed from results",
+       {L"hidden", L"unhide", L"show apps", L"restore", L"hide"}},
       {L"open-settings-folder", app::CommandKind::OpenDataFolder,
        L"Open Settings Folder", L"Open roaming FeatherCast configuration",
        {L"settings json", L"snippets", L"theme", L"plugins"}},
@@ -259,6 +263,16 @@ const std::vector<CommandDescriptor>& Catalog() {
        ConfirmationDescriptor{L"Put this PC to sleep?",
                               L"Your computer will go to sleep immediately.",
                               L"Sleep"}},
+      {L"hibernate-pc", app::CommandKind::Hibernate, L"Hibernate PC",
+       L"Save your session to disk and power off",
+       {L"hibernate", L"hibernation", L"suspend to disk", L"power"},
+       ConfirmationDescriptor{L"Hibernate this PC?",
+                              L"Your session is saved to disk and the computer turns off.",
+                              L"Hibernate"}},
+      {L"keep-awake", app::CommandKind::KeepAwake, L"Keep Awake",
+       L"Prevent sleep and display timeout until turned off",
+       {L"caffeine", L"awake", L"no sleep", L"prevent sleep", L"stay on",
+        L"display", L"amphetamine"}},
       {L"mute-audio", app::CommandKind::MuteAudio, L"Mute Audio",
        L"Toggle system audio mute",
        {L"mute", L"unmute", L"toggle", L"sound", L"volume", L"audio"}},
@@ -430,16 +444,34 @@ std::vector<app::DisplayItem> BuildActions(
     actions.push_back(ActionItem(app::ActionKind::MaximizeRestore,
                                  L"Maximize or Restore Window",
                                  L"Toggle window state", target));
+    const bool topmost =
+        target.window.hwnd && IsWindow(target.window.hwnd) &&
+        (GetWindowLongPtrW(target.window.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    actions.push_back(ActionItem(
+        app::ActionKind::ToggleAlwaysOnTop,
+        topmost ? L"Turn Off Always on Top" : L"Always on Top",
+        topmost ? L"Let other windows cover this window again"
+                : L"Keep this window above other windows",
+        target));
     actions.push_back(ActionItem(app::ActionKind::ArrangeWindow,
                                  L"Arrange Window...",
                                  L"Choose a half, third, quarter, or display", target));
     actions.push_back(ActionItem(app::ActionKind::CloseWindow, L"Close Window",
                                  L"Send close request", target));
+    if (CanEndTask(target.window, GetCurrentProcessId())) {
+      actions.push_back(ActionItem(
+          app::ActionKind::EndTask, L"End Task...",
+          L"Force " + (target.window.processName.empty()
+                           ? target.window.name
+                           : target.window.processName) +
+              L" to quit; unsaved work is lost",
+          target));
+    }
     return actions;
   }
   if (target.isCalculator || target.isConversion) {
     actions.push_back(TextActionItem(app::ActionKind::CopyText, L"Copy Result",
-                                     L"Copy the result to the clipboard",
+                                     L"Copy the result to the clipboard · Ctrl+C",
                                      target.calculationResult));
     actions.push_back(TextActionItem(
         app::ActionKind::CopyText, L"Copy Expression and Result",
@@ -450,6 +482,8 @@ std::vector<app::DisplayItem> BuildActions(
                                      target.calculationResult));
     return actions;
   }
+  // Informational utility rows ("Invalid JSON") have nothing to copy.
+  if (target.utility && target.utility->value.empty()) return actions;
   if (target.isSnippet || target.isClipboard || target.isSymbol ||
       target.utility) {
     std::wstring value;
@@ -458,7 +492,7 @@ std::vector<app::DisplayItem> BuildActions(
     else if (target.isSymbol) value = target.symbol.value;
     else value = target.utility->value;
     actions.push_back(TextActionItem(app::ActionKind::CopyText, L"Copy",
-                                     L"Copy this value to the clipboard", value));
+                                     L"Copy this value to the clipboard · Ctrl+C", value));
     actions.push_back(TextActionItem(app::ActionKind::PasteText, L"Paste",
                                      L"Paste this value into the previous app", value));
     if (target.isClipboard) {
@@ -467,6 +501,10 @@ std::vector<app::DisplayItem> BuildActions(
                                 L"Keep this entry when older history is removed", L"");
       pin.actionTarget = target.clipboard;
       actions.push_back(std::move(pin));
+      auto remove = TextActionItem(app::ActionKind::DeleteClipboard, L"Delete Entry",
+                                   L"Remove this entry from clipboard history · Ctrl+Delete", L"");
+      remove.actionTarget = target.clipboard;
+      actions.push_back(std::move(remove));
     } else if (target.isSnippet) {
       AppendInvocationActions(actions, target, settings);
     }
@@ -478,7 +516,8 @@ std::vector<app::DisplayItem> BuildActions(
     AppendInvocationActions(actions, target, settings);
     return actions;
   }
-  if (target.app.source == L"file") {
+  const bool isFile = target.app.source == L"file";
+  if (isFile) {
     actions.push_back(ActionItem(app::ActionKind::Preview, L"Preview",
                                  L"Show text, image, or metadata preview",
                                  target));
@@ -491,6 +530,18 @@ std::vector<app::DisplayItem> BuildActions(
   }
   actions.push_back(ActionItem(app::ActionKind::Open, L"Open",
                                L"Launch " + target.app.name, target));
+  if (isFile && !target.app.path.empty()) {
+    if (!target.app.fileIsDirectory) {
+      actions.push_back(ActionItem(app::ActionKind::OpenWith, L"Open With...",
+                                   L"Choose the app that opens this file", target));
+    }
+    actions.push_back(ActionItem(
+        app::ActionKind::CopyFile,
+        target.app.fileIsDirectory ? L"Copy Folder" : L"Copy File",
+        L"Copy to the clipboard so you can paste it in Explorer", target));
+    actions.push_back(ActionItem(app::ActionKind::ShowProperties, L"Properties",
+                                 L"Show the Windows properties dialog", target));
+  }
   if (target.app.source != L"file" && target.app.source != L"quicklink") {
     actions.push_back(ActionItem(app::ActionKind::ResetRanking,
                                 L"Reset Ranking",
@@ -512,7 +563,9 @@ std::vector<app::DisplayItem> BuildActions(
   if (!target.app.path.empty() || !target.app.targetPath.empty() ||
       !target.app.launchTarget.empty()) {
     actions.push_back(ActionItem(app::ActionKind::CopyPath, L"Copy Path",
-                                 L"Copy app shortcut or target path", target));
+                                 isFile ? L"Copy the full path · Ctrl+C"
+                                        : L"Copy app shortcut or target path · Ctrl+C",
+                                 target));
   }
   if (!target.app.id.empty() && target.app.source != L"quicklink" &&
       target.app.source != L"file") {
@@ -520,23 +573,76 @@ std::vector<app::DisplayItem> BuildActions(
                                  L"Add or Edit Alias",
                                  L"Choose another search name for this app", target));
   }
+  // Indexed files are not filtered by the pinned or hidden app lists, so
+  // offer only the undo actions for keys that were saved earlier.
   if (target.app.source == L"quicklink") {
     AppendInvocationActions(actions, target, settings);
-  } else {
-    actions.push_back(
-        HasAppKey(settings.pinnedApps, target.app)
-            ? ActionItem(app::ActionKind::Unpin, L"Unpin",
-                         L"Remove from pinned apps", target)
-            : ActionItem(app::ActionKind::Pin, L"Pin",
-                         L"Keep near the top of results", target));
+  } else if (HasAppKey(settings.pinnedApps, target.app)) {
+    actions.push_back(ActionItem(app::ActionKind::Unpin, L"Unpin",
+                                 L"Remove from pinned apps", target));
+  } else if (!isFile) {
+    actions.push_back(ActionItem(app::ActionKind::Pin, L"Pin",
+                                 L"Keep near the top of results", target));
   }
-  actions.push_back(
-      HasAppKey(settings.hiddenApps, target.app)
-          ? ActionItem(app::ActionKind::Unhide, L"Unhide",
-                       L"Show in launcher results", target)
-          : ActionItem(app::ActionKind::Hide, L"Hide",
-                       L"Remove from launcher results", target));
+  if (HasAppKey(settings.hiddenApps, target.app)) {
+    actions.push_back(ActionItem(app::ActionKind::Unhide, L"Unhide",
+                                 L"Show in launcher results", target));
+  } else if (!isFile) {
+    actions.push_back(ActionItem(app::ActionKind::Hide, L"Hide",
+                                 L"Remove from launcher results", target));
+  }
   return actions;
+}
+
+std::vector<app::DisplayItem> BuildHiddenAppActions(
+    const std::vector<app::AppEntry>& apps, const app::Settings& settings) {
+  std::vector<app::DisplayItem> actions;
+  std::set<const app::AppEntry*> listed;
+  std::set<std::wstring> listedKeys;
+  for (const auto& key : settings.hiddenApps) {
+    if (key.empty() || !listedKeys.insert(key).second) continue;
+    const std::vector<std::wstring> keys{key};
+    const auto match = std::find_if(apps.begin(), apps.end(),
+                                    [&](const app::AppEntry& entry) {
+                                      return HasAppKey(keys, entry);
+                                    });
+    app::DisplayItem target;
+    if (match != apps.end()) {
+      if (!listed.insert(&*match).second) continue;
+      target.app = *match;
+    } else {
+      // The app is no longer installed or discovered; the key still hides it.
+      target.app.id = key;
+      target.app.name = key;
+    }
+    std::wstring name = target.app.name.empty() ? key : target.app.name;
+    actions.push_back(ActionItem(
+        app::ActionKind::Unhide, name,
+        match != apps.end() ? L"Unhide · show in launcher results again"
+                            : L"Unhide · not currently installed or found",
+        target));
+  }
+  return actions;
+}
+
+bool CanEndTask(const app::WindowEntry& window, DWORD currentProcessId) {
+  if (window.pid == 0 || window.pid == 4 || window.pid == currentProcessId) {
+    return false;
+  }
+  std::wstring stem = window.processName;
+  if (stem.empty()) return false;
+  if (const auto slash = stem.find_last_of(L"\\/"); slash != std::wstring::npos) {
+    stem.erase(0, slash + 1);
+  }
+  std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t ch) {
+    return static_cast<wchar_t>(std::towlower(ch));
+  });
+  if (stem.size() > 4 && stem.ends_with(L".exe")) stem.resize(stem.size() - 4);
+  static const std::set<std::wstring> kProtected = {
+      L"system", L"registry", L"smss", L"csrss", L"wininit", L"winlogon",
+      L"services", L"lsass", L"lsaiso", L"svchost", L"dwm", L"fontdrvhost",
+      L"logonui", L"sihost", L"explorer", L"feathercast"};
+  return !kProtected.contains(stem);
 }
 
 bool IsPersonalizableInvocation(const app::DisplayItem& item) {

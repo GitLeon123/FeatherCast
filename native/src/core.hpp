@@ -66,6 +66,30 @@ inline std::wstring LowerInvariant(const std::wstring& value) {
   return out;
 }
 
+// Stroke and dotless letters have no NFD decomposition, so they keep their
+// mark. Map the common ones to the base letter, preserving case so the folded
+// text still lines up with BoundaryText.
+inline wchar_t FoldStrokeLetter(wchar_t ch) {
+  switch (ch) {
+    case L'Ø': return L'O';  // Ø
+    case L'ø': return L'o';  // ø
+    case L'Đ': return L'D';  // Đ
+    case L'đ': return L'd';  // đ
+    case L'Ħ': return L'H';  // Ħ
+    case L'ħ': return L'h';  // ħ
+    case L'ı': return L'i';  // ı
+    case L'Ŀ': case L'Ł': return L'L';  // Ŀ Ł
+    case L'ŀ': case L'ł': case L'ƚ': return L'l';  // ŀ ł ƚ
+    case L'Ŧ': return L'T';  // Ŧ
+    case L'ŧ': return L't';  // ŧ
+    case L'ƀ': return L'b';  // ƀ
+    case L'Ɨ': return L'I';  // Ɨ
+    case L'Ǥ': return L'G';  // Ǥ
+    case L'ǥ': return L'g';  // ǥ
+    default: return ch;
+  }
+}
+
 inline std::wstring FoldDiacritics(const std::wstring& value) {
   if (value.empty()) return L"";
   const int needed = NormalizeString(NormalizationD, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -79,9 +103,16 @@ inline std::wstring FoldDiacritics(const std::wstring& value) {
   std::wstring out;
   out.reserve(decomposed.size());
   for (const wchar_t ch : decomposed) {
+    if (const wchar_t base = FoldStrokeLetter(ch); base != ch) {
+      out.push_back(base);
+      continue;
+    }
+    // Windows also flags real letters (ø, ł, ı) as diacritics; only marks
+    // that are not letters themselves are dropped.
     WORD type = 0;
     if (GetStringTypeW(CT_CTYPE3, &ch, 1, &type) &&
-        (type & (C3_NONSPACING | C3_DIACRITIC | C3_VOWELMARK)) != 0) {
+        (type & (C3_NONSPACING | C3_DIACRITIC | C3_VOWELMARK)) != 0 &&
+        (type & C3_ALPHA) == 0) {
       continue;
     }
     out.push_back(ch);
@@ -89,21 +120,56 @@ inline std::wstring FoldDiacritics(const std::wstring& value) {
   return out;
 }
 
-inline std::wstring Normalize(const std::wstring& value) {
+// Trims `value` in place and, with `collapse`, turns every internal
+// whitespace run into a single space.
+inline void TrimWhitespaceInPlace(std::wstring& value, bool collapse = true) {
+  size_t length = 0;
+  bool pendingSpace = false;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const wchar_t ch = value[i];
+    if (std::iswspace(ch)) {
+      if (length != 0) {
+        if (!collapse) value[length++] = ch;
+        pendingSpace = collapse;
+      }
+      continue;
+    }
+    if (pendingSpace) {
+      value[length++] = L' ';
+      pendingSpace = false;
+    }
+    value[length++] = ch;
+  }
+  if (!collapse) {
+    while (length != 0 && std::iswspace(value[length - 1])) --length;
+  }
+  value.resize(length);
+}
+
+// Folds before lowercasing so "İ" (I + combining dot) ends up as "i".
+inline std::wstring NormalizeText(const std::wstring& value,
+                                  bool collapseWhitespace) {
   // Plain ASCII can bypass the Windows Unicode calls. Windows classifies the
   // caret and grave accent as diacritics, so those stay on the Unicode path to
   // preserve the existing folding rules even in otherwise ASCII text.
+  std::wstring normalized;
   if (std::all_of(value.begin(), value.end(),
                   [](wchar_t ch) {
                     return ch < 0x80 && ch != L'^' && ch != L'`';
                   })) {
-    std::wstring normalized = Trim(value);
+    normalized = value;
     for (auto& ch : normalized) {
       if (ch >= L'A' && ch <= L'Z') ch += L'a' - L'A';
     }
-    return normalized;
+  } else {
+    normalized = LowerInvariant(FoldDiacritics(value));
   }
-  return Trim(FoldDiacritics(LowerInvariant(value)));
+  TrimWhitespaceInPlace(normalized, collapseWhitespace);
+  return normalized;
+}
+
+inline std::wstring Normalize(const std::wstring& value) {
+  return NormalizeText(value, true);
 }
 
 enum class AliasValidationError : unsigned char {
@@ -170,7 +236,9 @@ inline bool SetUniqueAlias(
 
 inline std::wstring StableInvocationKey(std::wstring_view kind,
                                         const std::wstring& stableId) {
-  const std::wstring normalized = Normalize(stableId);
+  // Persisted keys keep internal whitespace as it was; only queries and
+  // display text collapse it.
+  const std::wstring normalized = NormalizeText(stableId, false);
   if (kind.empty() || normalized.empty()) return L"";
   return std::wstring(kind) + L":" + normalized;
 }
@@ -205,20 +273,23 @@ inline std::wstring Acronym(const std::wstring& value) {
 // Case-preserved copy of `value` whose indices line up with `normalized`
 // (Normalize(value)), so BoundaryBefore can see camelCase humps at positions
 // found in the normalized text. Normalization can change the length (Hangul
-// syllables decompose into jamo, precomposed accents lose their marks), so the
-// same decomposition and mark stripping is applied without the case mapping.
-// If the lengths still disagree, the normalized text is the safe fallback: it
-// keeps every word separator, only camelCase boundaries are lost.
+// syllables decompose into jamo, precomposed accents lose their marks,
+// whitespace runs collapse), so the same decomposition, mark stripping and
+// whitespace collapsing is applied without the case mapping. If the lengths
+// still disagree, the normalized text is the safe fallback: it keeps every
+// word separator, only camelCase boundaries are lost.
 inline std::wstring BoundaryText(const std::wstring& value,
                                  const std::wstring& normalized) {
-  std::wstring trimmed = Trim(value);
+  std::wstring trimmed = value;
+  TrimWhitespaceInPlace(trimmed);
   if (trimmed.size() == normalized.size() &&
       std::all_of(trimmed.begin(), trimmed.end(),
                   [](wchar_t ch) { return ch < 0x80; })) {
     // ASCII never decomposes; equal lengths mean no mark was stripped.
     return trimmed;
   }
-  std::wstring folded = Trim(FoldDiacritics(trimmed));
+  std::wstring folded = FoldDiacritics(trimmed);
+  TrimWhitespaceInPlace(folded);
   if (folded.size() != normalized.size()) return normalized;
   return folded;
 }

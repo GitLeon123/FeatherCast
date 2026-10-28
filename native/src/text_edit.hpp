@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <string>
+#include <utility>
 
 namespace feathercast::text_edit {
 
@@ -67,6 +68,27 @@ inline size_t NextWord(const std::wstring& text, size_t position) {
   return position;
 }
 
+// The run of non-space characters (or of spaces) around position, for
+// double-click word selection. At the end of the text it is the last run.
+inline std::pair<size_t, size_t> WordAt(const std::wstring& text, size_t position) {
+  if (text.empty()) return {0, 0};
+  position = SnapToCodePoint(text, position);
+  const size_t probe =
+      position < text.size() ? position : PreviousCodePoint(text, position);
+  const bool space = std::iswspace(text[probe]) != 0;
+  size_t start = probe;
+  while (start > 0) {
+    const size_t previous = PreviousCodePoint(text, start);
+    if ((std::iswspace(text[previous]) != 0) != space) break;
+    start = previous;
+  }
+  size_t end = NextCodePoint(text, probe);
+  while (end < text.size() && (std::iswspace(text[end]) != 0) == space) {
+    end = NextCodePoint(text, end);
+  }
+  return {start, end};
+}
+
 // Both erase helpers remove a whole surrogate pair when position is inside
 // one, so they never leave an unpaired surrogate behind, and they leave
 // position on the code point boundary where the removed text started.
@@ -86,6 +108,33 @@ inline bool EraseNext(std::wstring& text, size_t& position) {
   if (next == position) return false;
   text.erase(position, next - position);
   return true;
+}
+
+// Pasted text for a single-line field: every run of line breaks, tabs and
+// other control characters, with the spaces around it, becomes one space,
+// and the ends are trimmed, so a copied line's trailing "\r\n" never starts
+// an invisible second line.
+inline std::wstring SingleLine(const std::wstring& text) {
+  std::wstring result;
+  result.reserve(text.size());
+  bool pendingSpace = false;
+  for (const wchar_t ch : text) {
+    if (ch < 32 || ch == 127 || ch == 0x2028 || ch == 0x2029) {
+      while (!result.empty() && result.back() == L' ') result.pop_back();
+      pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace) {
+      if (ch == L' ') continue;
+      if (!result.empty()) result.push_back(L' ');
+      pendingSpace = false;
+    }
+    result.push_back(ch);
+  }
+  const size_t first = result.find_first_not_of(L' ');
+  if (first == std::wstring::npos) return {};
+  const size_t last = result.find_last_not_of(L' ');
+  return result.substr(first, last - first + 1);
 }
 
 }  // namespace feathercast::text_edit

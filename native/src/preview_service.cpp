@@ -176,7 +176,19 @@ void PreviewService::Invalidate(std::uint64_t generation) {
 
 void PreviewService::WorkerLoop(std::stop_token token) {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-  CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  // Only image decoding needs COM. Without it DecodeImage fails and the pane
+  // says the image could not be decoded, so a failed initialization is not
+  // fatal, but only a successful one may be balanced by CoUninitialize.
+  const bool comInitialized =
+      SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+  // An exception escaping this thread terminates the app, so neither a
+  // failing preview nor a failing sink may leave the loop.
+  const auto report = [this](std::exception_ptr error) noexcept {
+    try {
+      if (errors_) errors_(error);
+    } catch (...) {
+    }
+  };
   for (;;) {
     Request request;
     {
@@ -188,18 +200,37 @@ void PreviewService::WorkerLoop(std::stop_token token) {
       request = std::move(*pending_);
       pending_.reset();
     }
+    std::optional<Result> result;
     try {
-      auto result = Build(request, token);
-      if (!token.stop_requested() &&
-          generation_.load(std::memory_order_acquire) == request.generation &&
-          sink_) {
-        sink_(std::move(result));
-      }
+      result = Build(request, token);
     } catch (...) {
-      if (errors_) errors_(std::current_exception());
+      report(std::current_exception());
+      // The pane shows "Loading preview..." until a result for the current
+      // generation arrives, so a failed build must still answer.
+      try {
+        Result failed;
+        failed.generation = request.generation;
+        failed.kind = Kind::Error;
+        failed.path = request.path;
+        failed.title = request.path.filename().wstring();
+        failed.detail = L"The preview could not be loaded.";
+        result = std::move(failed);
+      } catch (...) {
+        report(std::current_exception());
+      }
+    }
+    if (!result || token.stop_requested() ||
+        generation_.load(std::memory_order_acquire) != request.generation ||
+        !sink_) {
+      continue;
+    }
+    try {
+      sink_(std::move(*result));
+    } catch (...) {
+      report(std::current_exception());
     }
   }
-  CoUninitialize();
+  if (comInitialized) CoUninitialize();
 }
 
 Result PreviewService::Build(const Request& request,

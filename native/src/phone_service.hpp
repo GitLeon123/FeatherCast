@@ -45,6 +45,7 @@ struct NotificationInfo {
   long long time = 0;
   std::vector<NotificationAction> actions;
   Bytes iconPng;
+  bool alert = true;  // false when the phone already announced it (snapshot, quiet update)
 };
 
 struct PhotoInfo {
@@ -261,6 +262,8 @@ class PhoneService {
   void SettleRequest(Event& event);
   // Reports photo and file requests the phone did not answer in time.
   void ExpireRequests();
+  // Pings the phone when it has been quiet for a while.
+  void KeepAlive();
   std::vector<Event> TakeExpiredLocked(bool all);  // mutex_ held
   void EmitAll(std::vector<Event> events);
 

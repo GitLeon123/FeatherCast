@@ -146,7 +146,7 @@ Android 14+ photo access is reported as Full, Selected or Denied. Selected acces
 
 The PC advertises `fileStream: true` in `welcome`; the phone advertises `file.stream.v1` in `status.features`. Each sender uses streaming only when its peer advertises support. Otherwise, the legacy single-frame messages remain available, limited to 40 MiB.
 
-Both directions use `file.begin{id,name,size,purpose,ref?}`, followed by `file.chunk{id,offset}` with at most 256 KiB of binary data and `file.end{id}`. Purpose is `file`, `storage` or `photo`; storage transfers reference the requested path. Receivers validate exact offsets, declared lengths (0–8 GiB), transfer IDs and up to four concurrent incoming transfers. The sender waits for `file.received{id,name,ok,error?}` for confirmation.
+Both directions use `file.begin{id,name,size,purpose,ref?}`, followed by `file.chunk{id,offset}` with at most 256 KiB of binary data and `file.end{id}`. Purpose is `file`, `storage` or `photo`; storage transfers reference the requested path. Receivers validate exact offsets, declared lengths (0–8 GiB), transfer IDs and up to four concurrent incoming transfers. The sender waits for `file.received{id,name,ok,error?}` for confirmation. Only the first `file.received` per transfer counts; later or unknown ones are ignored. Once a receiver has rejected or cancelled a transfer, it drops the chunks and `file.end` still on the way for that ID without answering again, so one failure produces one error on each side.
 
 Windows names streamed files like legacy ones: a storage file after the requested path, never a name the phone reports, and a photo with the extension its bytes call for. It writes hidden temporary files in the destination folder and publishes the completed file without overwriting an existing download; temporary files that an earlier FeatherCast process left behind are removed when the service starts. Android stages in app cache, then saves through pending MediaStore downloads (or the legacy downloads path before Android 10). Android needs enough free storage for both staging and the final copy. Errors, cancellation and disconnect delete active partial data. Windows also expires inactive receiving transfers after five minutes, checked on incoming traffic.
 
@@ -164,22 +164,34 @@ Windows names streamed files like legacy ones: a storage file after the requeste
 - Unauthenticated connections (pairing, handshakes, APK downloads) are limited to
   eight at a time and three per IP address.
 - Session handshake: `hello{deviceId, nonce}` → `challenge{nonce, pcName}` →
-  `auth{mac}` → `welcome{mac, pcName, fileStream?}`. After that every frame is
+  `auth{mac}` → `welcome{mac, pcName, fileStream?, photoErrors?}`. After that every frame is
   `AES-GCM([u32 jsonLength][json][binary])`.
+- Keepalive: the phone sends `ping` every 20 seconds and the PC answers `pong`. The PC
+  also sends `ping` after 25 seconds without traffic from the phone (the phone answers
+  `pong`) and enables TCP keepalive, then drops a session that stays silent for 75 seconds.
+- The PC shows "<phone> is connected." only for a new connection, not when the same
+  phone reconnects within two minutes.
 - Screen sessions use `hello{deviceId, nonce, screen}` on a second socket,
   authenticated with the single-use key delivered by `screen.start`. The
   challenge/auth/welcome exchange and encrypted framing remain the same.
-- Phone → PC: `status{battery, charging, name, features[]}`, `ping`,
-  `notification.posted{…, actions[{i, title, reply}]}` (PNG icon as binary),
+- Phone → PC: `status{battery, charging, name, features[]}`, `ping`, `pong`,
+  `notification.posted{…, actions[{i, title, reply}], alert?}` (PNG icon as binary),
   `notification.removed`, `notifications.reset`, `clipboard.set`,
-  `clipboard.history.request`, `photos.list`, `photo.thumb`, `photo.full`, `file.send`,
+  `clipboard.history.request`, `photos.list`, `photo.thumb`, `photo.full{id, error?}`, `file.send`,
   `file.received{id, name, ok, error?}`, `ring.state{ringing}`,
   `media.state{app, appName, title, artist, playing, pos, dur, posAt, vol, volMax}`
   (JPEG cover as binary, only when the track changes), `media.none`,
   `sms.threads{items}`, `sms.messages{thread, items}`, `sms.received`, `sms.sent{ref, ok}`,
   `call.state{state, number, name}`, `files.list{path, items, error?}`,
   `file.data{path, name, error?}` (file as binary).
-- PC → phone: `pong`, `clipboard.set`, `clipboard.history`, `photos.request`,
+- `notification.posted` carries `alert: false` when the post must not raise a PC toast:
+  snapshots resent after a reconnect, and updates the app posted as "only alert once".
+  It defaults to `true`. The PC also toasts each notification key and post time once,
+  also across `notifications.reset`.
+- `photo.full` answers every `photo.request`. When the phone cannot send the photo
+  (sending turned off, photo deleted or unreadable) and the PC advertised `photoErrors`,
+  it answers `photo.full{id, error}` without binary, so the PC does not wait for a timeout.
+- PC → phone: `ping`, `pong`, `clipboard.set`, `clipboard.history`, `photos.request`,
   `photo.request`, `notification.dismiss`, `notification.action{key, i, text?}`,
   `file.send{id, name}` (file as binary), `ring.start`, `ring.stop`,
   `media.command{cmd, pos?}`, `media.volume{vol}`, `sms.threads.request`,

@@ -2,6 +2,7 @@
 
 #include "calculator.hpp"
 #include "capability_catalog.hpp"
+#include "color_utilities.hpp"
 #include "converter.hpp"
 #include "core.hpp"
 #include "emoji.hpp"
@@ -10,10 +11,13 @@
 #include "search_scope.hpp"
 #include "symbols.hpp"
 #include "settings_catalog.hpp"
+#include "text_utilities.hpp"
+#include "web_search.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#include <iterator>
 #include <map>
 #include <set>
 #include <utility>
@@ -148,21 +152,41 @@ std::string UrlEncode(const std::wstring& text) {
 DisplayItem WebSearchDisplay(const std::wstring& keyword,
                              const std::wstring& engineTemplate,
                              const std::wstring& terms) {
-  std::wstring url = engineTemplate;
-  const std::wstring encoded = extensions::Utf8ToWide(UrlEncode(terms));
-  if (const std::size_t position = url.find(L"%s");
-      position != std::wstring::npos) {
-    url.replace(position, 2, encoded);
-  } else {
-    url += encoded;
-  }
+  // Every "%s" is replaced, so templates that repeat the query work too.
+  const std::wstring url = web_search::ExpandTemplate(
+      engineTemplate, extensions::Utf8ToWide(UrlEncode(terms)));
   DisplayItem item;
   item.isWebSearch = true;
   item.webSearchUrl = url;
-  item.webSearchLabel = L"Search " + keyword + L" for \"" + terms + L"\"";
+  item.webSearchLabel = L"Search " + web_search::EngineName(keyword, engineTemplate) +
+                        L" for “" + terms + L"”";
   item.commandDetail = url;
   item.commandKeywords = {L"web", L"search", keyword, terms};
   return item;
+}
+
+// The last row of a root search that found nothing better: no exact or strong
+// match and no instant answer (keyword search, calculator, conversion,
+// utilities, timer, color).
+std::optional<DisplayItem> WebSearchFallback(const QueryRequest& request,
+                                             const std::wstring& trimmed,
+                                             bool strongMatch,
+                                             const std::vector<Section>& sections) {
+  if (!request.webSearchFallback || strongMatch || trimmed.size() < 2) {
+    return std::nullopt;
+  }
+  static constexpr std::wstring_view kAnswered[] = {
+      L"Web Search", L"Calculator", L"Conversion", L"Utilities", L"Timer", L"Color"};
+  for (const auto& section : sections) {
+    if (std::find(std::begin(kAnswered), std::end(kAnswered), section.title) !=
+        std::end(kAnswered)) {
+      return std::nullopt;
+    }
+  }
+  const auto* engine = web_search::ResolveEngine(request.searchEngines,
+                                                 request.webSearchFallbackEngine);
+  if (!engine) return std::nullopt;
+  return WebSearchDisplay(engine->first, engine->second, trimmed);
 }
 
 DisplayItem RunCommandDisplay(const run_command::Command& command) {
@@ -194,6 +218,27 @@ DisplayItem UtilityDisplay(const clock_utilities::Result& utility,
   item.commandDetail = L"Local utility - " + utility.value;
   item.commandKeywords = utility.keywords;
   item.commandKeywords.push_back(utility.value);
+  return item;
+}
+
+DisplayItem TextUtilityDisplay(const text_utilities::Result& result) {
+  DisplayItem item;
+  item.utility = UtilityResult{UtilityKind::Text, result.stableId, result.title,
+                               result.value, result.keywords, result.detail,
+                               std::nullopt};
+  item.commandDetail = result.detail;
+  item.commandKeywords = result.keywords;
+  return item;
+}
+
+DisplayItem ColorDisplay(const color_utilities::Result& result) {
+  DisplayItem item;
+  item.utility = UtilityResult{UtilityKind::Color, result.stableId, result.title,
+                               result.value, result.keywords, result.detail,
+                               result.swatch};
+  item.commandDetail = result.detail;
+  item.commandKeywords = result.keywords;
+  item.commandKeywords.push_back(result.value);
   return item;
 }
 
@@ -315,9 +360,18 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     return output;
   };
   auto addSection = [&](std::wstring title, std::vector<DisplayItem> items) {
-    if (!items.empty()) {
-      sections.push_back({std::move(title), std::move(items)});
+    if (items.empty()) return;
+    // One section per title: a later "Best match" joins the first instead of
+    // rendering a second header, and expansion state stays unambiguous.
+    for (auto& section : sections) {
+      if (section.title == title) {
+        section.items.insert(section.items.end(),
+                             std::make_move_iterator(items.begin()),
+                             std::make_move_iterator(items.end()));
+        return;
+      }
     }
+    sections.push_back({std::move(title), std::move(items)});
   };
 
   if (request.compactClear) {
@@ -417,7 +471,12 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       for (const auto index : order) hits.push_back(request.actions[index]);
       addSection(L"Actions", take(hits));
     }
-  } else if (const auto suggestions = search_scope::Suggestions(request.query);
+  } else if (const auto suggestions =
+                 // Inside a scope ("@apps @") an "@" is search text, not a
+                 // request for scope suggestions.
+                 request.scope == search_scope::Scope::All
+                     ? search_scope::Suggestions(request.query)
+                     : std::vector<const search_scope::Descriptor*>{};
              !suggestions.empty()) {
     std::vector<DisplayItem> items;
     for (const auto* descriptor : suggestions) {
@@ -551,6 +610,16 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
                    take({UtilityDisplay(*utility,
                                         UtilityKindFor(utility->stableId))},
                         1));
+      }
+      if (const auto colors = color_utilities::Evaluate(trimmed); !colors.empty()) {
+        std::vector<DisplayItem> items;
+        for (const auto& color : colors) items.push_back(ColorDisplay(color));
+        addSection(L"Color", take(items));
+      }
+      if (const auto texts = text_utilities::Evaluate(trimmed); !texts.empty()) {
+        std::vector<DisplayItem> items;
+        for (const auto& text : texts) items.push_back(TextUtilityDisplay(text));
+        addSection(L"Utilities", take(items));
       }
       if (const auto timer = timers::Parse(request.query)) {
         DisplayItem item;
@@ -741,7 +810,8 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       if (hasLaunchableApps) {
         addSection(L"Apps", takeRanked(apps, 80));
         addSection(L"Games", takeRanked(games, 80));
-      } else if (!hits.empty() && explicitMatches.empty()) {
+      } else if (!hits.empty() && explicitMatches.empty() &&
+                 aliasInvocations.empty()) {
         addSection(L"Best match", takeMatches({matches[best(hits)].index}, 1));
       }
       if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
@@ -755,6 +825,12 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       addSection(L"Open windows", takeRanked(windows, 40));
       addSection(L"System & Store apps", takeRanked(system, 80));
       addSection(L"Other matches", takeRanked(other, 40));
+      if (const auto fallback = WebSearchFallback(
+              request, trimmed,
+              !aliasInvocations.empty() || !explicitMatches.empty() || strongAppMatch,
+              sections)) {
+        addSection(L"Search the web", take({*fallback}, 1));
+      }
     }
   }
 

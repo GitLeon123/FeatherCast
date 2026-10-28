@@ -58,6 +58,12 @@ struct StoreChanges {
   bool status = false;        // battery, charging, or feature list
   bool lowBattery = false;    // the battery just dropped to the alert level
   bool incomingCall = false;  // a call just started ringing
+  // Connected: worth telling the user, not the same phone coming back after
+  // a short drop (asleep, Wi-Fi roaming) or replacing a stale connection.
+  bool announceConnection = false;
+  // NotificationPosted: new to the user, not one already shown or resent by
+  // the phone after a reconnect.
+  bool alertNotification = false;
   std::string failedSmsRef;   // an SMS sent from the PC failed
   std::string thumbId;        // photo whose thumbnail arrived
   std::string savedPhotoId;   // photo whose full image was saved
@@ -69,11 +75,19 @@ class PhoneStore {
   static constexpr std::size_t kMaxNotificationIcons = 30;
   static constexpr std::size_t kMaxClips = 50;
   static constexpr std::size_t kMaxSmsThreads = 200;
+  // The same phone back within this long of its disconnect is a short drop.
+  static constexpr long long kQuietReconnectMs = 2 * 60 * 1000;
+  static constexpr std::size_t kMaxAlertedNotifications = 256;
 
   StoreChanges Apply(const Event& event, long long nowMs) {
     StoreChanges changes;
     switch (event.kind) {
-      case EventKind::Connected:
+      case EventKind::Connected: {
+        const bool samePhone = !dataDeviceId_.empty() && event.deviceId == dataDeviceId_;
+        const long long offlineMs = nowMs - disconnectedAt_;
+        const bool resumed = samePhone &&
+            (connected_ || (disconnectedAt_ > 0 && offlineMs >= 0 && offlineMs < kQuietReconnectMs));
+        changes.announceConnection = !resumed;
         if (!dataDeviceId_.empty() && event.deviceId != dataDeviceId_) {
           Clear();
           changes.notifications = changes.photos = changes.clips = true;
@@ -84,8 +98,10 @@ class PhoneStore {
         connected_ = true;
         changes.connection = true;
         break;
+      }
       case EventKind::Disconnected:
         connected_ = false;
+        disconnectedAt_ = nowMs;
         for (auto& photo : photos_) {
           if (photo.downloading) changes.photos = true;
           photo.downloading = false;
@@ -114,6 +130,15 @@ class PhoneStore {
         break;
       }
       case EventKind::NotificationPosted: {
+        // A post is identified by its key and posting time. The phone resends
+        // current notifications after every reconnect with their original time.
+        const std::pair<std::string, long long> post{event.notification.key, event.notification.time};
+        const bool seen = std::find(alerted_.begin(), alerted_.end(), post) != alerted_.end();
+        changes.alertNotification = event.notification.alert && !seen;
+        if (!seen) {
+          alerted_.push_back(post);
+          if (alerted_.size() > kMaxAlertedNotifications) alerted_.pop_front();
+        }
         RemoveNotification(event.notification.key);
         StoredNotification item;
         item.info = event.notification;
@@ -314,6 +339,7 @@ class PhoneStore {
 
   void Clear() {
     notifications_.clear();
+    alerted_.clear();
     photos_.clear();
     clips_.clear();
     photosFetchedAt_ = 0;
@@ -485,12 +511,16 @@ class PhoneStore {
   }
 
   std::deque<StoredNotification> notifications_;
+  // Posts already shown, oldest first. Kept across notification resets and
+  // reconnects of the same phone.
+  std::deque<std::pair<std::string, long long>> alerted_;
   std::vector<StoredPhoto> photos_;
   std::deque<StoredClip> clips_;
   std::uint64_t clipSerial_ = 0;
   std::string dataDeviceId_;
   std::string deviceName_;
   bool connected_ = false;
+  long long disconnectedAt_ = 0;  // Unix milliseconds of the last Disconnected
   long long photosFetchedAt_ = 0;
   std::string photosError_;
   std::string photosAccess_;

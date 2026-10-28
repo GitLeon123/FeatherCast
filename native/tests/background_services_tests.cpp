@@ -1,4 +1,7 @@
+#include <winsock2.h>
+
 #include "background_services.hpp"
+#include "network_client.hpp"
 #include "test_framework.hpp"
 
 #include <windows.h>
@@ -13,7 +16,100 @@
 #include <fstream>
 #include <mutex>
 
+namespace {
+
+// Stopping an operation whose HTTPS request is stuck in the TLS handshake (a
+// local listener accepts the connection and never answers) must end it right
+// away rather than after the 8 s / 30 s WinHTTP timeouts. Everything stays on
+// the loopback interface.
+void TestNetworkRequestsStopPromptly() {
+  using namespace std::chrono_literals;
+  WSADATA wsa{};
+  assert(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+  const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  assert(listener != INVALID_SOCKET);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  assert(bind(listener, reinterpret_cast<const sockaddr*>(&address),
+              sizeof(address)) == 0);
+  assert(listen(listener, 4) == 0);
+  int addressLength = sizeof(address);
+  assert(getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                     &addressLength) == 0);
+  const std::wstring url = L"https://127.0.0.1:" +
+                           std::to_wstring(ntohs(address.sin_port)) +
+                           L"/never-answers";
+  const auto destination =
+      std::filesystem::temp_directory_path() /
+      (L"feathercast-network-stop-" + std::to_wstring(GetCurrentProcessId())) /
+      L"download.bin";
+
+  // A request that is already stopped gives up before touching the network.
+  {
+    std::stop_source stopped;
+    stopped.request_stop();
+    const auto started = std::chrono::steady_clock::now();
+    assert(!feathercast::network::HttpsGetUrl(url, 1024, stopped.get_token()));
+    assert(!feathercast::network::HttpsGet(L"127.0.0.1", L"/",
+                                           stopped.get_token()));
+    assert(!feathercast::network::HttpsDownloadToFile(url, destination,
+                                                      stopped.get_token()));
+    assert(std::chrono::steady_clock::now() - started < 1s);
+  }
+
+  std::vector<SOCKET> accepted;
+  const auto stopWhileBlocked =
+      [&](std::function<bool(std::stop_token)> request) {
+    std::atomic<bool> finished = false;
+    std::atomic<bool> succeeded = false;
+    feathercast::runtime::SingleOperationService<int> operation([](int) {});
+    assert(operation.Run([&](std::stop_token token) -> std::optional<int> {
+      succeeded = request(token);
+      finished = true;
+      return std::nullopt;
+    }));
+    // Wait for WinHTTP to connect, then give it time to send its TLS hello
+    // and block on the answer. A proxy could keep it from connecting at all;
+    // the stop must be prompt either way.
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(listener, &readable);
+    timeval timeout{5, 0};
+    const bool connected = select(0, &readable, nullptr, nullptr, &timeout) == 1;
+    if (connected) {
+      accepted.push_back(accept(listener, nullptr, nullptr));
+      std::this_thread::sleep_for(200ms);
+      assert(!finished);
+    }
+    const auto stopRequested = std::chrono::steady_clock::now();
+    operation.Stop();
+    assert(std::chrono::steady_clock::now() - stopRequested < 2s);
+    assert(finished && !succeeded);
+  };
+  stopWhileBlocked([&](std::stop_token token) {
+    return feathercast::network::HttpsGetUrl(url, 1024, token).has_value();
+  });
+  stopWhileBlocked([&](std::stop_token token) {
+    return feathercast::network::HttpsDownloadToFile(url, destination, token);
+  });
+  std::error_code ec;
+  assert(!std::filesystem::exists(destination, ec));
+  std::filesystem::remove_all(destination.parent_path(), ec);
+
+  for (const SOCKET client : accepted) {
+    if (client != INVALID_SOCKET) closesocket(client);
+  }
+  closesocket(listener);
+  WSACleanup();
+}
+
+}  // namespace
+
 int main() {
+  TestNetworkRequestsStopPromptly();
+
   const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   assert(SUCCEEDED(coResult));
   {

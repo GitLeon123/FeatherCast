@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
 
@@ -22,6 +23,10 @@ namespace {
 
 constexpr long long kPairingLifetimeMs = 5 * 60 * 1000;
 constexpr DWORD kSessionIdleTimeoutMs = 75 * 1000;
+// The phone pings every 20 seconds while it runs, but its timers stop while it
+// sleeps. After this long without a frame from it the PC pings instead; the
+// frame wakes the phone, which answers, so neither read timeout ends the link.
+constexpr long long kKeepAliveAfterMs = 25 * 1000;
 constexpr auto kHandshakeTimeout = std::chrono::seconds(20);
 constexpr auto kHttpTransferTimeout = std::chrono::minutes(5);
 constexpr DWORD kHttpSendTimeoutMs = 30 * 1000;
@@ -35,8 +40,9 @@ constexpr std::size_t kMaxPendingHandshakes = 8;
 constexpr std::size_t kMaxPendingPerAddress = 3;
 constexpr std::size_t kMaxQueuedMessages = 1024;
 constexpr std::size_t kMaxQueuedBytes = 64 * 1024 * 1024;
-// The phone sends nothing when it cannot deliver a photo or file, so requests
-// that get no answer end with an error instead of spinning forever.
+// Older phone apps send nothing when they cannot deliver a photo (newer ones
+// answer photo.full with an error), so requests that get no answer end with
+// an error instead of spinning forever.
 constexpr long long kRequestTimeoutMs = 2 * 60 * 1000;
 constexpr auto kBeaconInterval = std::chrono::seconds(3);
 
@@ -365,10 +371,14 @@ struct PhoneService::Session {
   std::uint32_t address = 0;  // IPv4 peer, network byte order
   bool pending = false;       // holds an unauthenticated slot; guarded by mutex_
   std::atomic<bool> fileStreamSupported = false;
+  // Steady milliseconds of the last bytes from the phone and the last ping to it.
+  std::atomic<long long> lastReceivedMs = 0;
+  std::atomic<long long> lastPingMs = 0;
   std::atomic<std::uint64_t> transferEpoch = 0;
   std::atomic<std::size_t> outgoingTransfers = 0;
   std::mutex cancellationMutex;
   std::map<std::string, std::shared_ptr<std::atomic<bool>>> cancellations;
+  transfer::Receipts receipts;  // files sent to the phone; guarded by cancellationMutex
   std::atomic<std::shared_ptr<transfer::Receiver>> incomingTransfers;
 
   // Everything sent after the handshake goes through one writer thread, in
@@ -863,12 +873,14 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
   {
     std::lock_guard cancellationLock(session->cancellationMutex);
     session->cancellations[id] = cancelled;
+    session->receipts.Expect(id);
   }
   std::erase_if(workers_, [](const Worker& worker) { return worker.done->load(); });
   if (workers_.size() >= kMaxWorkers) {
     --session->outgoingTransfers;
     std::lock_guard cancellationLock(session->cancellationMutex);
     session->cancellations.erase(id);
+    session->receipts.Settle(id);
     return fail("Too many phone transfers are in progress.");
   }
   workers_.push_back(Worker{
@@ -918,7 +930,12 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
           }
           ok = ok && session->transferEpoch.load() == epoch && !cancelled->load() && offset == static_cast<long long>(size);
           if (ok) ok = SendToSession(session, Json("file.end").Str("id", id).Build(), {}, true);
+          bool answered = false;  // the phone refused the file and its receipt said why
           if (!ok) {
+            std::lock_guard lock(session->cancellationMutex);
+            answered = !session->receipts.Settle(id);
+          }
+          if (!ok && !answered) {
             SendToSession(session, Json("file.cancel").Str("id", id).Build());
             Event error;
             error.kind = EventKind::Error;
@@ -933,6 +950,10 @@ std::string PhoneService::SendFile(const std::wstring& path, std::string* error)
         const bool read = bytes.has_value();
         // Waits until the file was written to the connection or the link failed.
         if (!read || !SendToSession(session, message::FileSend(id, name), std::move(*bytes), true)) {
+          {
+            std::lock_guard lock(session->cancellationMutex);
+            session->receipts.Settle(id);
+          }
           Event event;
           event.kind = EventKind::Error;
           event.id = id;
@@ -1084,6 +1105,22 @@ void PhoneService::ExpireRequests() {
     expired = TakeExpiredLocked(false);
   }
   EmitAll(std::move(expired));
+}
+
+// A sleeping phone sends nothing, so the PC asks. Any frame resets the phone's
+// read timeout, and its "pong" resets this side's.
+void PhoneService::KeepAlive() {
+  std::shared_ptr<Session> session;
+  {
+    std::lock_guard lock(mutex_);
+    session = active_;
+  }
+  if (!session) return;
+  const long long now = SteadyMs();
+  if (now - session->lastReceivedMs.load() < kKeepAliveAfterMs ||
+      now - session->lastPingMs.load() < kKeepAliveAfterMs) return;
+  session->lastPingMs = now;
+  SendToSession(session, message::Ping());
 }
 
 void PhoneService::EmitScreenState(std::string id, std::string state, std::string detail) {
@@ -1241,6 +1278,12 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
     BOOL noDelay = TRUE;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+    // TCP keep-alive probes find a phone that left without closing the link
+    // (Wi-Fi lost) and keep idle routers from dropping the connection.
+    tcp_keepalive keepAlive{1, 30 * 1000, 5 * 1000};
+    DWORD keepAliveBytes = 0;
+    WSAIoctl(client, SIO_KEEPALIVE_VALS, &keepAlive, sizeof(keepAlive), nullptr, 0,
+             &keepAliveBytes, nullptr, nullptr);
     auto done = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard lock(mutex_);
     std::erase_if(workers_, [](const Worker& worker) { return worker.done->load(); });
@@ -1263,11 +1306,14 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
 }
 
 void PhoneService::BeaconLoop(std::stop_token stop) {
+  // Without a UDP socket there is no beacon, but request timeouts and
+  // keep-alive pings still run.
   const SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (udp == INVALID_SOCKET) return;
   BOOL broadcast = TRUE;
-  setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
-             reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+  if (udp != INVALID_SOCKET) {
+    setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
+               reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+  }
   std::mutex waitMutex;
   std::condition_variable_any wake;
   while (!stop.stop_requested()) {
@@ -1278,7 +1324,7 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
       anyDevice = !devices_.empty() || !pairingToken_.empty();
       pcId = pcId_;
     }
-    if (anyDevice) {
+    if (anyDevice && udp != INVALID_SOCKET) {
       const std::string beacon = BuildBeacon(pcId, port_);
       std::vector<ULONG> targets{htonl(INADDR_BROADCAST)};
       for (const auto& adapter : EnumerateAdapters()) {
@@ -1294,10 +1340,11 @@ void PhoneService::BeaconLoop(std::stop_token stop) {
       }
     }
     ExpireRequests();
+    KeepAlive();
     std::unique_lock lock(waitMutex);
     wake.wait_for(lock, stop, kBeaconInterval, [] { return false; });
   }
-  closesocket(udp);
+  if (udp != INVALID_SOCKET) closesocket(udp);
 }
 
 // Returns the unauthenticated-connection slot AcceptLoop reserved for the
@@ -1349,6 +1396,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t addr
     }
     const int received = recv(socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
     if (received <= 0) break;
+    session->lastReceivedMs = SteadyMs();
     if (first) {
       firstBytes.insert(firstBytes.end(), buffer, buffer + received);
       if (firstBytes.size() < 4) continue;
@@ -1586,6 +1634,7 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
                               .Str("mac", Base64UrlEncode(pcMac))
                               .Str("pcName", config_.pcName)
                               .Bool("fileStream", true)
+                              .Bool("photoErrors", true)  // photo.full may carry an error instead
                               .Build();
     if (!session->screenId.empty()) {
       std::lock_guard lock(mutex_);
@@ -1731,6 +1780,9 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
     } else {
       result = incoming->Finish(JsonString(*root, "id"));
     }
+    // Chunks still on the way after the first error, which the phone was told
+    // about (or told us about), get no answer and no second error.
+    if (result.quiet) return;
     if (!result.error.empty() || result.complete) {
       Event event;
       event.id = result.progress.id;
@@ -1797,13 +1849,27 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
       }
       SaveState();
     }
+  } else if (event.kind == EventKind::FileDelivered) {
+    // Only the first receipt for a file this connection sent counts. A phone
+    // that refuses a stream answers every chunk already on the way; the first
+    // answer carries the reason and stops the rest of the stream.
+    std::lock_guard lock(session->cancellationMutex);
+    if (!session->receipts.Settle(event.id)) return;
+    if (!event.ok) {
+      if (const auto found = session->cancellations.find(event.id);
+          found != session->cancellations.end()) found->second->store(true);
+    }
   } else if (event.kind == EventKind::PhotoSaved ||
              event.kind == EventKind::FileSaved ||
              event.kind == EventKind::RemoteFileSaved) {
     const bool incomingFile = event.kind == EventKind::FileSaved;
     SettleRequest(event);
-    if (event.kind == EventKind::RemoteFileSaved && !event.text.empty()) {
-      event.kind = EventKind::Error;  // the phone could not read the file
+    if ((event.kind == EventKind::RemoteFileSaved || event.kind == EventKind::PhotoSaved) &&
+        !event.text.empty()) {
+      event.kind = EventKind::Error;  // the phone could not read the file or photo
+    } else if (event.kind == EventKind::PhotoSaved && payload->binary.empty()) {
+      event.kind = EventKind::Error;
+      event.text = "Your phone sent an empty photo.";
     } else if (payload->binary.size() > kMaxTransferBytes) {
       event.kind = EventKind::Error;
       event.text = "The file from your phone is larger than 40 MB.";

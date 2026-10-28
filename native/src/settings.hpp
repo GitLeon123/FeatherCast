@@ -149,6 +149,9 @@ struct Settings {
   bool searchLearningEnabled = false;
   // Optional local preferences for app/command queries only, capped at 256.
   std::map<std::wstring, std::wstring> learnedQueryActions;
+  // Query -> confirmation order (larger is more recent), so the cap evicts
+  // the least recently confirmed choice. Queries missing here count as oldest.
+  std::map<std::wstring, long long> learnedQueryRecency;
   bool compactMode = false;
   bool autoFitResultHeight = true;
   AnimationLevel animationLevel = AnimationLevel::Full;
@@ -190,6 +193,10 @@ struct Settings {
   // Web search prefixes: keyword -> URL template containing "%s" for the query.
   std::map<std::wstring, std::wstring> searchEngines =
       DefaultSearchEngines();
+  // Offer "Search <engine> for ..." as the last result when a query finds
+  // little or nothing. The engine is a keyword from searchEngines.
+  bool webSearchFallbackEnabled = true;
+  std::wstring webSearchFallbackEngine = L"g";
   std::vector<Quicklink> quicklinks;
   std::vector<Quicklink> scripts;
   std::vector<Quicklink> workspaces;
@@ -208,6 +215,31 @@ struct Settings {
     };
   }
 };
+
+inline constexpr std::size_t kMaximumLearnedQueries = 256;
+
+// Drops recency stamps of forgotten queries, then evicts the least recently
+// confirmed choices (unstamped first, ties alphabetical) until at most `limit`
+// remain.
+inline void TrimLearnedQueries(Settings& settings,
+                               std::size_t limit = kMaximumLearnedQueries) {
+  auto& actions = settings.learnedQueryActions;
+  auto& recency = settings.learnedQueryRecency;
+  std::erase_if(recency, [&](const auto& entry) { return !actions.contains(entry.first); });
+  if (actions.size() <= limit) return;
+  std::vector<std::pair<long long, std::wstring>> order;
+  order.reserve(actions.size());
+  for (const auto& entry : actions) {
+    const auto stamp = recency.find(entry.first);
+    order.emplace_back(stamp == recency.end() ? 0 : stamp->second, entry.first);
+  }
+  const auto excess = static_cast<std::ptrdiff_t>(order.size() - limit);
+  std::partial_sort(order.begin(), order.begin() + excess, order.end());
+  for (auto it = order.begin(); it != order.begin() + excess; ++it) {
+    actions.erase(it->second);
+    recency.erase(it->second);
+  }
+}
 
 enum class ParseStatus {
   Missing,
@@ -404,9 +436,18 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
         entry.first.front() == L'@' || entry.first.front() == L'>' || entry.first.front() == L':' || entry.second.size() > 2048;
   });
   if (!settings.searchLearningEnabled) settings.learnedQueryActions.clear();
-  while (settings.learnedQueryActions.size() > 256) {
-    settings.learnedQueryActions.erase(settings.learnedQueryActions.begin());
+  // Stamps stay far below 2^53 so incrementing the newest one never overflows.
+  if (const Value* recency = root->Find("learnedQueryRecency");
+      recency && recency->type == Value::Type::Object) {
+    for (const auto& member : recency->object) {
+      if (member.value.type != Value::Type::Number) continue;
+      const auto stamp = feathercast::json::ToInteger<long long>(member.value.number);
+      if (stamp && *stamp >= 0 && *stamp <= (1LL << 53)) {
+        settings.learnedQueryRecency[Utf8ToWide(member.key)] = *stamp;
+      }
+    }
   }
+  TrimLearnedQueries(settings);
   if (const Value* stats = root->Find("usageStats"); stats && stats->type == Value::Type::Object) {
     for (const auto& member : stats->object) {
       if (member.value.type != Value::Type::Object) continue;
@@ -459,10 +500,22 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   settings.fileIndexExcludePatterns =
       ReadStringArray(*root, "fileIndexExcludePatterns");
   ReadBool(*root, "diagnosticsEnabled", settings.diagnosticsEnabled);
+  // Keywords are matched in lowercase ("G cats" looks up "g"), so a keyword
+  // saved as "G" is stored as "g"; an exact lowercase entry wins a collision.
   if (const Value* engines = root->Find("searchEngines");
       engines && engines->type == Value::Type::Object) {
-    settings.searchEngines = ReadStringObject(*root, "searchEngines");
+    settings.searchEngines.clear();
+    for (auto& [keyword, url] : ReadStringObject(*root, "searchEngines")) {
+      std::wstring lower = feathercast::core::Lower(keyword);
+      if (lower == keyword) {
+        settings.searchEngines[std::move(lower)] = url;
+      } else {
+        settings.searchEngines.try_emplace(std::move(lower), url);
+      }
+    }
   }
+  ReadBool(*root, "webSearchFallbackEnabled", settings.webSearchFallbackEnabled);
+  ReadString(*root, "webSearchFallbackEngine", settings.webSearchFallbackEngine);
   if (const Value* links = root->Find("quicklinks"); links && links->type == Value::Type::Array) {
     for (const auto& element : links->array) {
       if (element.type != Value::Type::Object) continue;
@@ -593,6 +646,17 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"learnedQueryActions\": ";
   detail::WriteStringObject(out, settings.learnedQueryActions);
   out << ",\n";
+  out << "  \"learnedQueryRecency\": {";
+  {
+    bool first = true;
+    for (const auto& [query, stamp] : settings.learnedQueryRecency) {
+      if (!settings.learnedQueryActions.contains(query)) continue;
+      if (!first) out << ", ";
+      first = false;
+      out << "\"" << JsonEscape(query) << "\": " << stamp;
+    }
+  }
+  out << "},\n";
   out << "  \"usageStats\": {";
   {
     bool first = true;
@@ -651,6 +715,10 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"searchEngines\": ";
   detail::WriteStringObject(out, settings.searchEngines);
   out << ",\n";
+  out << "  \"webSearchFallbackEnabled\": "
+      << (settings.webSearchFallbackEnabled ? "true" : "false") << ",\n";
+  out << "  \"webSearchFallbackEngine\": \""
+      << JsonEscape(settings.webSearchFallbackEngine) << "\",\n";
   out << "  \"quicklinks\": [";
   {
     bool first = true;

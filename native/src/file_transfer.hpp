@@ -5,6 +5,8 @@
 #include "extension_protocol.hpp"
 
 #include <windows.h>
+#include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -40,10 +42,55 @@ struct Result {
   std::string error;
   bool complete = false;
   bool reportProgress = true;
+  // A frame of a transfer that already failed or was cancelled, and the peer
+  // knows: it needs no answer, error, or receipt.
+  bool quiet = false;
+};
+
+// Small bounded list of transfer ids, oldest first.
+class IdList {
+ public:
+  static constexpr std::size_t kLimit = 64;
+  void Add(const std::string& id) {
+    if (!ValidId(id) || Contains(id)) return;
+    ids_.push_back(id);
+    if (ids_.size() > kLimit) ids_.pop_front();
+  }
+  // True when id was listed; it no longer is.
+  bool Remove(const std::string& id) {
+    const auto found = std::find(ids_.begin(), ids_.end(), id);
+    if (found == ids_.end()) return false;
+    ids_.erase(found);
+    return true;
+  }
+  bool Contains(const std::string& id) const {
+    return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+  }
+
+ private:
+  std::deque<std::string> ids_;
+};
+
+// Outgoing transfers whose receipt is still expected. A phone that refuses a
+// stream answers every chunk that was already on the way, so only the first
+// receipt of a transfer counts; repeats, and receipts for a transfer that
+// already ended here with its own error, are dropped. Not thread safe.
+class Receipts {
+ public:
+  void Expect(const std::string& id) { pending_.Add(id); }
+  // True, once, for an expected receipt. Also called when the sender gives up,
+  // so a later answer for that transfer is dropped.
+  bool Settle(const std::string& id) { return pending_.Remove(id); }
+  bool Pending(const std::string& id) const { return pending_.Contains(id); }
+
+ private:
+  IdList pending_;
 };
 
 // The receiving session owns this bounded set of temporary files. Failed,
 // cancelled, and disconnected transfers never publish a partially written file.
+// After the first error of a transfer, which the caller reports to the peer,
+// its frames still on the way come back quiet.
 class Receiver {
  public:
   explicit Receiver(std::wstring directory) : directory_(std::move(directory)) {}
@@ -63,6 +110,7 @@ class Receiver {
         (progress.purpose != "file" && progress.purpose != "storage" && progress.purpose != "photo") ||
         files_.contains(progress.id) || files_.size() >= kMaximumConcurrent) {
       result.error = "Invalid transfer or too many transfers in progress.";
+      if (!files_.contains(progress.id)) ended_.Add(progress.id);
       return result;
     }
     auto file = std::make_unique<Incoming>();
@@ -79,8 +127,10 @@ class Receiver {
     if (error || file->handle == INVALID_HANDLE_VALUE) {
       file->temporary.clear();
       result.error = "Could not create a temporary file in Downloads.";
+      ended_.Add(progress.id);
       return result;
     }
+    ended_.Remove(progress.id);
     files_.emplace(progress.id, std::move(file));
     return result;
   }
@@ -93,7 +143,9 @@ class Receiver {
     result.progress.id = id;
     const auto found = files_.find(id);
     if (found == files_.end()) {
-      result.error = "The transfer is no longer active.";
+      result.quiet = ended_.Contains(id);
+      if (!result.quiet) result.error = "The transfer is no longer active.";
+      ended_.Add(id);
       return result;
     }
     auto& file = *found->second;
@@ -106,6 +158,7 @@ class Receiver {
         written != bytes.size()) {
       result.error = "Invalid file chunk or the file could not be written.";
       files_.erase(found);
+      ended_.Add(id);
       return result;
     }
     if (file.head.size() < kHeadBytes) {
@@ -129,7 +182,9 @@ class Receiver {
     result.progress.id = std::string(id);
     const auto found = files_.find(std::string(id));
     if (found == files_.end()) {
-      result.error = "The transfer is no longer active.";
+      result.quiet = ended_.Contains(result.progress.id);
+      if (!result.quiet) result.error = "The transfer is no longer active.";
+      ended_.Add(result.progress.id);
       return result;
     }
     auto& file = *found->second;
@@ -158,6 +213,7 @@ class Receiver {
       if (!result.complete) result.error = "Could not publish the received file in Downloads.";
     }
     files_.erase(found);
+    ended_.Add(result.progress.id);  // a repeated end needs no second answer
     return result;
   }
 
@@ -171,6 +227,8 @@ class Receiver {
       cancelled.push_back(found->second->progress);
       files_.erase(found);
     }
+    for (const auto& progress : cancelled) ended_.Add(progress.id);
+    if (!id.empty()) ended_.Add(std::string(id));
     return cancelled;
   }
   void RequestCancel() { cancelRequested_.store(true); }
@@ -181,7 +239,12 @@ class Receiver {
 
  private:
   void CollectCancelled() {
-    if (cancelRequested_.exchange(false)) files_.clear();
+    // The PC tells the phone when it cancels everything. A transfer that only
+    // went stale is not marked: its next frame gets an error, so the phone stops.
+    if (cancelRequested_.exchange(false)) {
+      for (const auto& [id, unused] : files_) ended_.Add(id);
+      files_.clear();
+    }
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::minutes(5);
     std::erase_if(files_, [&](const auto& entry) { return entry.second->lastActivity < cutoff; });
   }
@@ -203,6 +266,7 @@ class Receiver {
   };
   std::wstring directory_;
   std::map<std::string, std::unique_ptr<Incoming>> files_;
+  IdList ended_;  // transfers whose end the peer was told about, or told us
   std::mutex mutex_;
   std::atomic<bool> cancelRequested_ = false;
 };

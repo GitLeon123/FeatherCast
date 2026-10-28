@@ -42,6 +42,22 @@ struct IndexStatus {
   std::wstring message;
 };
 
+// A root's change watch can break (an unsupported file system, an
+// inaccessible root, a failed read). Each consecutive failure waits longer
+// before the watchers restart and the roots are rescanned; after
+// kMaxWatchRetries failures without a delivered notification in between the
+// root stays unwatched, like a network root, until the index is reconfigured
+// or rebuilt. Buffer overflows are not failures, but consecutive overflows
+// space out their rescans with the same delays.
+inline constexpr std::size_t kMaxWatchRetries = 8;
+constexpr std::chrono::milliseconds WatchRetryDelay(std::size_t attempt) {
+  constexpr std::chrono::milliseconds kInitial{250};
+  constexpr std::chrono::milliseconds kMax{60'000};
+  auto delay = kInitial;
+  for (std::size_t i = 1; i < attempt && delay < kMax; ++i) delay *= 2;
+  return delay < kMax ? delay : kMax;
+}
+
 bool IsFixedLocalIndexRoot(const std::filesystem::path& path);
 bool MatchesRelativePathExclusion(
     std::wstring_view relativePath,
@@ -95,6 +111,9 @@ class FileIndexService {
   void RestartWatchers(const IndexRequest& request);
   void StopWatchers();
   void ScheduleWatchRefresh(bool restartWatchers = false);
+  // Called by a watcher whose watch broke; see WatchRetryDelay.
+  void ScheduleWatchRetry(const std::wstring& root);
+  void ClearWatchFailures(const std::wstring& root);
   // Requires mutex_. Drops the content records, also for a scan in flight,
   // so the next scan reads every file again.
   void ForgetContentRecords();
@@ -123,6 +142,9 @@ class FileIndexService {
   std::size_t retryAttempts_ = 0;
   bool probeOnly_ = false;
   std::vector<std::wstring> unavailableRoots_;
+  // Consecutive watch failures per root, cleared by a delivered notification
+  // from that root and by explicit requests.
+  std::unordered_map<std::wstring, std::size_t> watchFailures_;
   // Content results of the last delivered scan, keyed by path. The epoch
   // changes whenever they are dropped, so a scan that was running at that
   // moment does not store its results.

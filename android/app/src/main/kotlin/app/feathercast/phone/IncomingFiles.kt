@@ -62,8 +62,17 @@ object IncomingFiles {
             // right-to-left override could disguise the real file name and extension.
             .filter { !it.isISOControl() && Character.getType(it) != Character.FORMAT.toInt() && it !in "<>:\"|?*" }
             .trimStart('.')
-            .take(120)
-        return clean.ifEmpty { "file-from-pc" }
+        return shorten(clean, 120).ifEmpty { "file-from-pc" }
+    }
+
+    /** Cuts [name] to [limit] UTF-16 units, keeping a short extension and never splitting a surrogate pair. */
+    private fun shorten(name: String, limit: Int): String {
+        if (name.length <= limit) return name
+        val dot = name.lastIndexOf('.')
+        val extension = if (dot > 0 && name.length - dot <= 16) name.substring(dot) else ""
+        var end = limit - extension.length
+        if (Character.isHighSurrogate(name[end - 1])) end--
+        return name.substring(0, end) + extension
     }
 
     private fun mimeType(name: String): String =

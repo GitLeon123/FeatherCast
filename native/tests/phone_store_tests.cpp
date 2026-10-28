@@ -289,6 +289,56 @@ void TestNotifications() {
   assert(store.Notifications().empty());
 }
 
+void TestReconnectAnnouncements() {
+  const long long start = 1'700'000'000'000;
+  Event disconnected;
+  disconnected.kind = EventKind::Disconnected;
+  PhoneStore store;
+  // The first connection is announced; a short drop of the same phone is not.
+  assert(store.Apply(Connected("a", "Pixel"), start).announceConnection);
+  store.Apply(disconnected, start + 1000);
+  auto changes = store.Apply(Connected("a", "Pixel"), start + 1000 + 30'000);
+  assert(changes.connection && !changes.announceConnection && store.Connected());
+  // A new connection replacing a stale one arrives without a disconnect.
+  assert(!store.Apply(Connected("a", "Pixel"), start + 60'000).announceConnection);
+  // Offline for longer than the quiet window, or another phone: announced.
+  store.Apply(disconnected, start + 100'000);
+  assert(store.Apply(Connected("a", "Pixel"), start + 100'000 + PhoneStore::kQuietReconnectMs)
+             .announceConnection);
+  assert(store.Apply(Connected("b", "Galaxy"), start + 200'000).announceConnection);
+  store.Apply(disconnected, start + 300'000);
+  assert(store.Apply(Connected("a", "Pixel"), start + 301'000).announceConnection);
+  // A clock that went backwards is not a short drop.
+  store.Apply(disconnected, start + 400'000);
+  assert(store.Apply(Connected("a", "Pixel"), start + 300'000).announceConnection);
+
+  // Notifications alert once per post; the snapshot after a reconnect resends
+  // them with their original time.
+  assert(store.Apply(Notification("n1", 100), start).alertNotification);
+  assert(store.Apply(Notification("n2", 200), start).alertNotification);
+  Event reset;
+  reset.kind = EventKind::NotificationsReset;
+  store.Apply(disconnected, start + 500'000);
+  store.Apply(Connected("a", "Pixel"), start + 510'000);
+  store.Apply(reset, start + 510'000);
+  changes = store.Apply(Notification("n1", 100), start + 510'000);
+  assert(changes.notifications && !changes.alertNotification);
+  assert(!store.Apply(Notification("n2", 200), start + 510'000).alertNotification);
+  assert(store.Notifications().size() == 2);
+  // A new post of the same key alerts, unless the phone marked it quiet.
+  assert(store.Apply(Notification("n1", 300), start).alertNotification);
+  auto quiet = Notification("n3", 400);
+  quiet.notification.alert = false;
+  changes = store.Apply(quiet, start);
+  assert(changes.notifications && !changes.alertNotification);
+  assert(store.Notifications().size() == 3);
+  // ...and once marked quiet it stays shown, not alerted later.
+  assert(!store.Apply(Notification("n3", 400), start).alertNotification);
+  // Another phone starts over.
+  store.Apply(Connected("c", "Other"), start + 600'000);
+  assert(store.Apply(Notification("n1", 100), start).alertNotification);
+}
+
 void TestClipsAndDeviceSwitch() {
   PhoneStore store;
   store.Apply(Connected("a", "Pixel"), 0);
@@ -511,6 +561,7 @@ int main() {
   TestSms();
   TestRemoteFiles();
   TestNotifications();
+  TestReconnectAnnouncements();
   TestClipsAndDeviceSwitch();
   TestPhotos();
   TestGridMath();

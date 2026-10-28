@@ -87,6 +87,9 @@ enum class HitType {
   ShowWindowsToggle,
   ShowStoreAppsToggle,
   SearchLearningToggle,
+  WebSearchFallbackToggle,
+  WebSearchEngineDown,
+  WebSearchEngineUp,
   ClipboardHistoryToggle,
   ClipboardLimitDown,
   ClipboardLimitUp,
@@ -175,6 +178,9 @@ enum class CommandKind {
   CancelPhoneTransfers,
   ManageAutomation,
   PhoneScreen,
+  HiddenApps,
+  Hibernate,
+  KeepAwake,
 };
 
 struct ConfirmationDialog {
@@ -312,6 +318,13 @@ enum class ActionKind {
   SendToPhone,
   OpenPhoneFile,
   SavePhoneFile,
+  DeleteClipboard,
+  EndTask,
+  ToggleAlwaysOnTop,
+  CopyFile,
+  ShowProperties,
+  OpenWith,
+  ManageHiddenApps,
 };
 
 struct RectF {
@@ -426,14 +439,21 @@ enum class UtilityKind {
   LocalDate,
   IsoWeek,
   UnixTime,
+  Text,
+  Color,
 };
 
 struct UtilityResult {
   UtilityKind kind = UtilityKind::LocalTime;
   std::wstring stableId;
   std::wstring title;
+  // Copied on Enter. Empty for informational rows such as "Invalid JSON".
   std::wstring value;
   std::vector<std::wstring> keywords;
+  // Subtitle shown instead of the value (text utilities, colors).
+  std::wstring detail;
+  // 0xRRGGBBAA color swatch drawn in place of the icon.
+  std::optional<std::uint32_t> swatch;
 };
 
 struct TextActionPayload {
@@ -664,6 +684,7 @@ struct SnapshotBuildResult {
 
 struct DiscoveryRequest {
   std::uint64_t generation = 0;
+  bool allowCache = false;
 };
 
 struct DiscoveryResult {
@@ -691,6 +712,10 @@ struct QueryRequest {
   bool fileIndexingEnabled = false;
   bool fileIndexLimitReached = false;
   std::map<std::wstring, std::wstring> searchEngines;
+  // Offer a "Search the web" row when root search finds little; the engine
+  // is a searchEngines keyword.
+  bool webSearchFallback = false;
+  std::wstring webSearchFallbackEngine;
   std::map<std::wstring, double> currencyRates;
   std::wstring defaultCurrency;
   std::set<std::wstring> expandedSections;

@@ -83,6 +83,9 @@ object PhoneMessages {
         text: String,
         time: Long,
         actions: List<ActionInfo> = emptyList(),
+        // False for a notification the PC already announced (the snapshot after
+        // a reconnect, or a quiet update); the PC then shows it without a toast.
+        alert: Boolean = true,
     ) = message("notification.posted") {
         put("key", key)
         put("app", app)
@@ -90,6 +93,7 @@ object PhoneMessages {
         put("title", title)
         put("text", text)
         put("time", time)
+        if (!alert) put("alert", false)
         if (actions.isNotEmpty()) {
             putJsonArray("actions") {
                 for (action in actions) {
@@ -101,6 +105,12 @@ object PhoneMessages {
                 }
             }
         }
+    }
+
+    /** Answers photo.request when the photo cannot be sent; only when the PC welcomed photoErrors. */
+    fun photoError(id: String, error: String) = message("photo.full") {
+        put("id", id)
+        put("error", error)
     }
 
     fun fileReceived(id: String, name: String, ok: Boolean, error: String = "") = message("file.received") {
@@ -218,6 +228,7 @@ sealed class PcMessage {
     data object CallSilence : PcMessage()
     data class FilesListRequest(val path: String) : PcMessage()
     data class FileRequest(val path: String) : PcMessage()
+    data object Ping : PcMessage()
     data object Pong : PcMessage()
     data class ScreenStart(val request: ScreenRequest) : PcMessage()
     data class ScreenStop(val sessionId: String) : PcMessage()
@@ -227,6 +238,7 @@ sealed class PcMessage {
         fun parse(json: String, now: Long = System.currentTimeMillis()): PcMessage? {
             val root = parseJson(json) ?: return null
             return when (root.str("type")) {
+                "ping" -> Ping
                 "pong" -> Pong
                 "screen.start" -> {
                     val id = root.str("session")

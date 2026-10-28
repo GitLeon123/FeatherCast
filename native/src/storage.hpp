@@ -526,6 +526,18 @@ class Storage {
     return true;
   }
 
+  // Removes one clipboard history entry. Deleting an id that is already gone
+  // succeeds, so a repeated delete is harmless.
+  bool DeleteClipboardEntry(long long id) {
+    if (!db_) return false;
+    Statement remove;
+    if (!remove.Prepare(db_, "DELETE FROM clipboard_history WHERE id=?;")) { CaptureError(); return false; }
+    sqlite3_bind_int64(remove.get(), 1, id);
+    if (sqlite3_step(remove.get()) != SQLITE_DONE) { CaptureError(); return false; }
+    lastError_ = {};
+    return true;
+  }
+
   timers::State LoadTimers() {
     timers::State state;
     if (!db_) return state;

@@ -17,6 +17,12 @@ ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
   if (id == L"time-utilities") return ResultIcon::Clock;
   if (id == L"uuid") return ResultIcon::Code;
   if (id == L"web-search") return ResultIcon::WebSearch;
+  if (id == L"text-utilities") return ResultIcon::Code;
+  if (id == L"color-converter") return ResultIcon::Palette;
+  if (id == L"run-command") return ResultIcon::Terminal;
+  if (id == L"screenshots") return ResultIcon::Copy;
+  if (id == L"screen-recording") return ResultIcon::Monitor;
+  if (id == L"file-preview") return ResultIcon::Eye;
   if (id == L"emoji") return ResultIcon::Smile;
   if (id == L"symbols") return ResultIcon::Symbols;
   if (id == L"files") return ResultIcon::FolderSearch;
@@ -33,6 +39,9 @@ ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
   if (id == L"windows-settings") return ResultIcon::Gear;
   if (id == L"plugins") return ResultIcon::Puzzle;
   if (id == L"shortcut") return ResultIcon::Keyboard;
+  if (id == L"hidden-apps") return ResultIcon::EyeOff;
+  if (id == L"file-actions") return ResultIcon::File;
+  if (id == L"keep-awake") return ResultIcon::Monitor;
   if (id == L"empty:more-tools") return ResultIcon::Compass;
   return ResultIcon::App;
 }
@@ -53,6 +62,9 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
     case CommandKind::CancelPhoneTransfers: return ResultIcon::Close;
     case CommandKind::ManageAutomation: return ResultIcon::Terminal;
     case CommandKind::PhoneScreen: return ResultIcon::Phone;
+    case CommandKind::HiddenApps: return ResultIcon::EyeOff;
+    case CommandKind::Hibernate: return ResultIcon::Moon;
+    case CommandKind::KeepAwake: return ResultIcon::Monitor;
     case CommandKind::Settings: return ResultIcon::Gear;
     case CommandKind::Quit: return ResultIcon::Exit;
     case CommandKind::Restart:
@@ -144,6 +156,13 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::None: return ResultIcon::Actions;
     case ActionKind::ResetRanking: return ResultIcon::HistoryOff;
     case ActionKind::ConfigureCommandShortcut: return ResultIcon::Keyboard;
+    case ActionKind::DeleteClipboard: return ResultIcon::Trash;
+    case ActionKind::EndTask: return ResultIcon::Close;
+    case ActionKind::ToggleAlwaysOnTop: return ResultIcon::Pin;
+    case ActionKind::CopyFile: return ResultIcon::Copy;
+    case ActionKind::ShowProperties: return ResultIcon::Gear;
+    case ActionKind::OpenWith: return ResultIcon::ExternalLink;
+    case ActionKind::ManageHiddenApps: return ResultIcon::EyeOff;
   }
   return ResultIcon::Actions;
 }
@@ -190,6 +209,8 @@ ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
       case app::UtilityKind::LocalDate: return ResultIcon::Calendar;
       case app::UtilityKind::IsoWeek: return ResultIcon::CalendarWeek;
       case app::UtilityKind::UnixTime: return ResultIcon::Code;
+      case app::UtilityKind::Text: return ResultIcon::Code;
+      case app::UtilityKind::Color: return ResultIcon::Palette;
     }
   }
   if (item.isWindow) return ResultIcon::Windows;

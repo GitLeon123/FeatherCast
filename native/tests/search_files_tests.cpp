@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -306,6 +307,29 @@ int main() {
   }
 
   {
+    // Broken watches back off exponentially up to a minute, with the first
+    // retry as quick as the normal change debounce.
+    using feathercast::files::WatchRetryDelay;
+    using std::chrono::milliseconds;
+    static_assert(WatchRetryDelay(0) == milliseconds(250));
+    static_assert(WatchRetryDelay(1) == milliseconds(250));
+    static_assert(WatchRetryDelay(2) == milliseconds(500));
+    static_assert(WatchRetryDelay(3) == milliseconds(1000));
+    static_assert(WatchRetryDelay(8) == milliseconds(32000));
+    static_assert(WatchRetryDelay(9) == milliseconds(60000));
+    static_assert(WatchRetryDelay(1000) == milliseconds(60000));
+    std::chrono::milliseconds total{0};
+    for (std::size_t attempt = 1;
+         attempt <= feathercast::files::kMaxWatchRetries; ++attempt) {
+      assert(WatchRetryDelay(attempt) >= WatchRetryDelay(attempt - 1));
+      total += WatchRetryDelay(attempt);
+    }
+    // A watch that keeps failing gives up after about a minute, instead of
+    // rescanning its roots forever.
+    assert(total < std::chrono::minutes(2));
+  }
+
+  {
     const auto indexedRoot = root / L"indexed-root";
     auto deep = indexedRoot;
     for (int level = 0; level < 6; ++level) {
@@ -566,6 +590,51 @@ int main() {
     assert(result.generation == 21);
     assert(result.kind == feathercast::preview::Kind::Error);
     preview.Stop();
+  }
+
+  {
+    // A throwing result sink and a throwing error sink must not end the
+    // worker thread (which would terminate the app): the next request still
+    // gets an answer.
+    const auto previewPath = root / L"preview-sink.txt";
+    WriteBytes(previewPath, {'o', 'k'});
+    std::mutex mutex;
+    std::condition_variable ready;
+    int calls = 0;
+    int errors = 0;
+    feathercast::preview::PreviewService preview(
+        [&](feathercast::preview::Result) {
+          int call = 0;
+          {
+            std::lock_guard lock(mutex);
+            call = ++calls;
+          }
+          ready.notify_one();
+          if (call == 1) throw std::runtime_error("sink failed");
+        },
+        [&](std::exception_ptr) {
+          {
+            std::lock_guard lock(mutex);
+            ++errors;
+          }
+          throw std::runtime_error("error sink failed");
+        });
+    preview.Start();
+    assert(preview.Load({30, previewPath, L""}));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(3),
+                            [&] { return calls == 1; }));
+    }
+    assert(preview.Load({31, previewPath, L""}));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(3),
+                            [&] { return calls == 2; }));
+      assert(errors == 1);
+    }
+    preview.Stop();
+    std::filesystem::remove(previewPath, error);
   }
 
   {

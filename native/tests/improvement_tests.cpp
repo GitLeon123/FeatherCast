@@ -69,8 +69,51 @@ int main() {
   settings.usageStats[appItem.app.id] = {10, 123};
   search_preferences::Reset(settings, appItem);
   assert(settings.learnedQueryActions.empty());
+  assert(settings.learnedQueryRecency.empty());
   assert(settings.recentApps.empty());
   assert(settings.usageStats.empty());
+  {
+    // At the cap, the least recently confirmed query makes room.
+    app::Settings capped;
+    capped.searchLearningEnabled = true;
+    for (std::size_t i = 0; i < search_preferences::kMaximumChoices; ++i) {
+      search_preferences::Remember(capped, L"query " + std::to_wstring(i), appItem);
+    }
+    search_preferences::Remember(capped, L"query 0", appItem);
+    search_preferences::Remember(capped, L"fresh", appItem);
+    assert(capped.learnedQueryActions.size() == search_preferences::kMaximumChoices);
+    assert(capped.learnedQueryActions.contains(L"query 0"));
+    assert(!capped.learnedQueryActions.contains(L"query 1"));
+    assert(capped.learnedQueryActions.contains(L"fresh"));
+    // Recency survives a save and keeps driving eviction afterwards.
+    auto reloaded = settings::ParseSettingsDocument(settings::SerializeSettings(capped)).value;
+    assert(reloaded.learnedQueryActions == capped.learnedQueryActions);
+    assert(reloaded.learnedQueryRecency == capped.learnedQueryRecency);
+    search_preferences::Remember(reloaded, L"newer", appItem);
+    assert(!reloaded.learnedQueryActions.contains(L"query 2"));
+    assert(reloaded.learnedQueryActions.contains(L"query 0"));
+    // Normalize turns line breaks into spaces; such queries are still skipped.
+    search_preferences::Remember(reloaded, L"two\nlines", appItem);
+    assert(!reloaded.learnedQueryActions.contains(L"two lines"));
+
+    // The load-time cap also evicts the oldest, not the first by name.
+    app::Settings overfull;
+    overfull.searchLearningEnabled = true;
+    for (int i = 0; i <= 256; ++i) {
+      overfull.learnedQueryActions[L"q" + std::to_wstring(i)] = L"key";
+      overfull.learnedQueryRecency[L"q" + std::to_wstring(i)] = 1000 - i;
+    }
+    overfull.learnedQueryRecency[L"stale"] = 5000;
+    const auto trimmed = settings::ParseSettingsDocument(settings::SerializeSettings(overfull)).value;
+    assert(trimmed.learnedQueryActions.size() == 256);
+    assert(trimmed.learnedQueryActions.contains(L"q0"));
+    assert(!trimmed.learnedQueryActions.contains(L"q256"));
+    assert(!trimmed.learnedQueryRecency.contains(L"stale"));
+    // Files written before recency existed still load.
+    const auto legacy = settings::ParseSettingsDocument(
+        R"({"searchLearningEnabled": true, "learnedQueryActions": {"b": "x", "a": "y"}})").value;
+    assert(legacy.learnedQueryActions.size() == 2 && legacy.learnedQueryRecency.empty());
+  }
 
   const auto photoEvent = phone::ParseSessionMessage(
       *json::Parse(R"({"type":"photos.list","access":"denied","error":"Allow photo access","items":[]})"), {}, 42);

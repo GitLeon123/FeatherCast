@@ -42,6 +42,14 @@ core::SearchItem BuildSearchItem(
     const std::map<std::wstring, std::wstring>& aliases = {});
 std::vector<app::DisplayItem> BuildActions(
     const app::DisplayItem& target, const app::Settings& settings);
+// One Unhide action per hidden app key, resolved against the known apps so
+// the list shows real names; keys with no matching app are still listed so
+// they can be removed. An app matched by several keys is listed once.
+std::vector<app::DisplayItem> BuildHiddenAppActions(
+    const std::vector<app::AppEntry>& apps, const app::Settings& settings);
+// False for FeatherCast itself and for processes Windows needs to keep
+// running, so End Task is never offered for them.
+bool CanEndTask(const app::WindowEntry& window, DWORD currentProcessId);
 bool IsPersonalizableInvocation(const app::DisplayItem& item);
 bool RecordsRecentActivation(const app::DisplayItem& item);
 bool ValidateCatalog(std::wstring* error = nullptr);

@@ -75,10 +75,12 @@ Memory, CPU and latency depend on hardware, indexed data and enabled features. S
 - **Comprehensive App Indexing**: Automatically scans Start Menu shortcuts (system & per-user) and Windows `AppsFolder` packages with intelligent deduplication and shell icon caching.
 - **Zero-Login Game Launcher**: Detects installed games across **Steam, Epic Games, GOG Galaxy, EA app, Ubisoft Connect, Battle.net, and Xbox / Microsoft Store** directly from local registry keys and launcher manifests. No accounts, no credentials, and no external API requests needed.
 - **Dedicated Games Hub**: Type `@games` or launch the dedicated Games browser to view your complete local library with provider badges and cached cover art.
+- **Hide and unhide apps**: **Hide** an app from its actions to keep it out of results. Search **Hidden Apps** to see everything you hid and bring it back with **Unhide**.
 
 ### 🪟 Window Management & Multitasking
 - **Fuzzy Window Switching**: Search all active top-level windows and switch immediately—even restoring minimized windows smoothly into the foreground.
 - **Snap & Move Actions**: Open result actions (`Tab`, `Right`, or `Ctrl+K`) on any window result to tile it to the left or right half, center it on screen, or move it to the next connected monitor.
+- **Always on Top & End Task**: Pin any window above the others with **Always on Top** (the action shows **Turn Off Always on Top** while it is on), or force-quit a frozen app with **End Task...** after a confirmation. FeatherCast itself and Windows system processes are never offered, and apps running as administrator report that Windows denied access.
 
 ### 🔍 Scoped Search & Instant File Previews
 - **Modular Search Scopes**: Narrow down results instantly by typing leading tokens:
@@ -93,10 +95,12 @@ Memory, CPU and latency depend on hardware, indexed data and enabled features. S
 - **Visible index coverage**: The default limit retains the newest 5,000 eligible entries. Settings reports when that limit is reached; an empty `@files` search offers the relevant indexing settings.
 - **Privacy-Safe Full-Text Search (FTS5)**: Fast content matching for text and source code (up to 2 MiB per file, capped at 256 MiB total token database). Stores only search tokens, never raw file contents or text excerpts.
 - **Instant Preview Pane (`Ctrl+Space`)**: Inspect file metadata, highlighted source code, or images (BMP, GIF, ICO, JPEG, PNG, TIFF up to 25 MiB and 40 MP) without launching external programs.
+- **File actions**: File and folder results offer **Open With...** (files only), **Copy File** / **Copy Folder** (paste it in Explorer like a normal copy), **Properties**, **Copy Path**, and **Open File Location**.
 
 ### 📋 Clipboard History & Snippets
 - **Encrypted history**: Optional clipboard history uses user-scoped Windows DPAPI encryption at rest. DPAPI protection is tied to the Windows user account; hardware-backed protection is not guaranteed. User-authored snippets remain readable JSON.
 - **Favorites & Pinning**: Pin up to 100 frequent snippets or credentials. Pinned items stay at the top and survive automatic history cleanup.
+- **Delete single entries**: Remove one history entry with **Delete Entry** in its actions or `Ctrl+Delete` in the list; the selection moves to the next entry.
 - **Custom Snippets & Quicklinks**: Manage text expansions and custom URL shortcuts in the native Library manager (**Settings > Library**) or edit `%APPDATA%\FeatherCast\snippets.json`.
 - **Search preferences**: Exact aliases and exact names take priority. Optional local query learning remembers up to 256 choices; **Reset Ranking** forgets an item's learned choices and recent usage.
 - **Scripts, workspaces and command shortcuts**: Search **Manage Automation** to add PowerShell files, groups of launch targets, or global command shortcuts. See [automation](docs/automation.md).
@@ -108,7 +112,10 @@ Memory, CPU and latency depend on hardware, indexed data and enabled features. S
   - Timers continue tracking across Windows sleep cycles and launcher restarts. Overdue timers trigger native Windows toast notifications upon return.
   - Stopwatch auto-saves state when FeatherCast closes and resumes upon launch.
 - **System & Media Controls**: Mute, adjust volume, play/pause media playback, show desktop, or deep-link directly into specific Windows Settings pages.
-- **Developer Helpers**: Instant generation of UUIDs, Unix timestamps, ISO week numbers, and date/time calculations.
+- **Power commands**: Lock, sleep, **Hibernate PC** (listed only when hibernation is enabled in Windows), restart, or shut down, with a confirmation for anything that ends your session. **Keep Awake** stops the PC and display from sleeping until you choose **Turn Off Keep Awake** or quit FeatherCast.
+- **Developer Helpers**: Instant generation of UUIDs, Unix timestamps, ISO week numbers, and date/time calculations. Type `base64`, `base64d`, `urlencode`, `urldecode`, `md5`, `sha1`, `sha256`, `hash`, or `json` followed by text to encode, decode, hash, format, or minify it locally, then press `Enter` to copy the result.
+- **Color Converter**: Type `#ff8800`, `rgb(255 136 0 / 50%)`, or `hsl(32, 100%, 50%)` to get the HEX, RGB, and HSL spellings next to a color swatch.
+- **Web Search & Run Command**: Keyword prefixes (`g`, `ddg`, `yt`, `gh`, `w`) search the web, and `>` runs a shell command or opens a URL, file, or folder. When a query finds nothing better, a **Search the web** row comes last; choose its engine or turn it off in **Settings > Results**. Nothing leaves your PC until you press `Enter` on a web result.
 
 ### 📸 Screen Capture & Silent Screen Recording
 - **Native Screenshot Studio**: Press `Print Screen` or your configured shortcut to trigger a cross-monitor region selector.
@@ -153,6 +160,10 @@ Type `@` in the search bar or use any of the dedicated scope tokens to filter yo
 | `@commands` | System actions, volume, media & Windows settings | `@commands Display Settings`, `@commands Volume Up` |
 | `@clipboard` | DPAPI-encrypted clipboard history entries | `@clipboard invoice`, `@clipboard auth token` |
 | `@snippets` | Custom text expansions & templates | `@snippets email-signature`, `@snippets meeting-notes` |
+| `>` | Run a shell command or open a URL, file, or folder | `> notepad`, `> https://example.com` |
+| `g`, `ddg`, `yt`, `gh`, `w` | Web search with a configured engine keyword | `g cast iron care`, `gh feathercast` |
+| *(Color literal)* | HEX, RGB, and HSL color conversion with a swatch | `#ff8800`, `hsl(210 50% 40%)` |
+| `base64`, `urlencode`, `sha256`, `hash`, `json`, … | Local text encoding, hashing, and JSON formatting | `sha256 hello`, `json {"a":1}` |
 
 ---
 
@@ -166,6 +177,8 @@ Type `@` in the search bar or use any of the dedicated scope tokens to filter yo
 | **Launch App / Focus Window** | `Enter` |
 | **Run as Administrator** | `Ctrl+Shift+Enter` |
 | **Open Action Panel** | `Tab`, `Right`, or `Ctrl+K` |
+| **Copy Selected Result** (value, text, or path) | `Ctrl+C` *(when no query text is selected)* |
+| **Delete Clipboard Entry** | `Ctrl+Delete` |
 | **Return / Step Back** | `Left` or `Esc` (clears active scope first) |
 | **Dismiss Overlay** | `Esc` |
 | **Open Settings** | Gear icon or System Tray menu |

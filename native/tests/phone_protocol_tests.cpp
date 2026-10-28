@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "dpapi_scope.hpp"
+#include "file_transfer.hpp"
 #include "phone_crypto.hpp"
 #include "phone_messages.hpp"
 #include "phone_protocol.hpp"
@@ -292,6 +293,22 @@ void TestMessageFixtures() {
     assert(info.actions.size() == 2 && info.actions[0].reply && !info.actions[1].reply);
     assert(info.actions[1].index == 1 && info.actions[1].title == "Mark as read");
     assert(info.iconPng.size() == 2);
+    assert(info.alert);  // older phone apps never send the flag
+  }
+  {
+    const auto event = ParseFixture(
+        R"({"type":"notification.posted","key":"k2","app":"com.whatsapp","appName":"WhatsApp","title":"Anna","text":"Hi","time":1000,"alert":false})");
+    assert(event.kind == EventKind::NotificationPosted);
+    assert(event.notification.key == "k2" && !event.notification.alert);
+    assert(event.notification.actions.empty());
+  }
+  {
+    const auto event = ParseFixture(
+        R"({"type":"photo.full","id":"p1","error":"The photo is no longer on your phone."})");
+    assert(event.kind == EventKind::PhotoSaved && event.photo.id == "p1");
+    assert(event.text == "The photo is no longer on your phone.");
+    const auto sent = ParseFixture(R"({"type":"photo.full","id":"p1","name":"a.jpg"})", Bytes{1});
+    assert(sent.kind == EventKind::PhotoSaved && sent.text.empty());
   }
   {
     const auto event = ParseFixture(
@@ -366,6 +383,7 @@ void TestMessageFixtures() {
   }
 
   // PC → phone.
+  assert(message::Ping() == R"({"type":"ping"})");
   assert(message::NotificationAction("k1", 0, "On my way") ==
          R"({"type":"notification.action","key":"k1","i":0,"text":"On my way"})");
   assert(message::NotificationAction("k1", 1, "") ==
@@ -395,6 +413,77 @@ void TestMessageFixtures() {
   assert(RemotePathParent("/Download/Music") == "/Download");
   assert(RemotePathParent("/Download") == "/");
   assert(RemotePathParent("/") == "/");
+}
+
+// A peer that refuses a stream answers once; the frames already on the way
+// must not produce an answer or an error each.
+void TestTransferEndings() {
+  {
+    transfer::Receipts receipts;
+    receipts.Expect("t1");
+    receipts.Expect("bad id!");  // never a valid transfer id
+    assert(receipts.Pending("t1") && !receipts.Pending("bad id!"));
+    assert(receipts.Settle("t1"));
+    assert(!receipts.Settle("t1") && !receipts.Pending("t1"));
+    assert(!receipts.Settle("unknown"));
+    for (int i = 0; i < 100; ++i) receipts.Expect("t" + std::to_string(i));
+    assert(!receipts.Pending("t0") && receipts.Pending("t99"));  // bounded, oldest dropped
+  }
+  {
+    transfer::IdList ids;
+    ids.Add("a");
+    ids.Add("a");
+    assert(ids.Contains("a") && ids.Remove("a") && !ids.Remove("a"));
+  }
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("feathercast-transfer-endings-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::remove_all(dir);
+  {
+    transfer::Receiver receiver(dir.wstring());
+    const auto begin = [&](const std::string& id) {
+      return receiver.Begin(*feathercast::json::Parse(
+          Json("file.begin").Str("id", id).Str("name", id + ".bin").Str("purpose", "file").Int("size", 4).Build()),
+          id + ".bin");
+    };
+    const auto chunk = [&](const std::string& id, long long offset) {
+      return receiver.Chunk(*feathercast::json::Parse(
+          Json("file.chunk").Str("id", id).Int("offset", offset).Build()), Bytes{1, 2});
+    };
+    // The first bad chunk is an error; the rest of that stream is quiet.
+    assert(begin("a").error.empty());
+    auto result = chunk("a", 2);
+    assert(!result.error.empty() && !result.quiet);
+    result = chunk("a", 4);
+    assert(result.quiet && result.error.empty() && !result.complete);
+    result = receiver.Finish("a");
+    assert(result.quiet && result.error.empty() && !result.complete);
+    // A transfer this side never saw gets one error, then silence.
+    result = chunk("ghost", 0);
+    assert(!result.error.empty() && !result.quiet);
+    assert(chunk("ghost", 2).quiet);
+    // Cancelled by the peer, or by this side for everything: quiet afterwards.
+    assert(begin("b").error.empty());
+    assert(receiver.Cancel("b").size() == 1);
+    assert(chunk("b", 0).quiet && receiver.Finish("b").quiet);
+    assert(receiver.Cancel("c").empty());
+    assert(chunk("c", 0).quiet);
+    assert(begin("d").error.empty());
+    receiver.RequestCancel();
+    receiver.Maintain();
+    assert(chunk("d", 0).quiet);
+    // A completed transfer answers a repeated end quietly.
+    assert(begin("e").error.empty());
+    assert(chunk("e", 0).error.empty() && chunk("e", 2).error.empty());
+    result = receiver.Finish("e");
+    assert(result.complete && std::filesystem::file_size(result.path) == 4);
+    assert(receiver.Finish("e").quiet);
+    // An id that ended can start again as a new transfer.
+    assert(begin("a").error.empty());
+    assert(chunk("a", 0).error.empty());
+    result = chunk("a", 0);  // wrong offset: reported again, not swallowed
+    assert(!result.error.empty() && !result.quiet);
+  }
+  std::filesystem::remove_all(dir);
 }
 
 void TestServiceEndToEnd() {
@@ -586,6 +675,23 @@ void TestServiceEndToEnd() {
     const auto photo = waitFor(EventKind::PhotoSaved);
     assert(photo && photo->photo.id == "p9" &&
            std::filesystem::path(photo->path).filename() == L"p.jpg");
+    // A photo the phone cannot send is answered with a reason, at once.
+    assert(service.RequestPhoto("p8"));
+    assert(phone.ReadSealed());
+    phone.SendSealed(Json("photo.full").Str("id", "p8").Str("error", "The photo is no longer on your phone.").Build());
+    {
+      std::unique_lock lock(mutex);
+      assert(cv.wait_for(lock, std::chrono::seconds(5), [&] {
+        return std::any_of(events.begin(), events.end(), [](const Event& event) {
+          return event.kind == EventKind::Error && event.photo.id == "p8" &&
+                 event.text == "The photo is no longer on your phone.";
+        });
+      }));
+      assert(std::none_of(events.begin(), events.end(), [](const Event& event) {
+        return event.kind == EventKind::PhotoSaved;
+      }));
+      std::erase_if(events, [](const Event& event) { return event.photo.id == "p8"; });
+    }
 
     // A storage answer carries the path the phone resolved; the event reports the
     // path that was requested and the file is named after it, not the phone's name.
@@ -624,6 +730,19 @@ void TestServiceEndToEnd() {
     phone.SendSealed(Json("file.received").Str("id", transferId).Bool("ok", true).Build());
     const auto delivered = waitFor(EventKind::FileDelivered);
     assert(delivered && delivered->ok && delivered->id == transferId);
+    // Only the first receipt counts: a phone refusing a stream answers every
+    // chunk on the way, and unknown ids are not reported either.
+    phone.SendSealed(Json("file.received").Str("id", transferId).Bool("ok", false).Str("error", "again").Build());
+    phone.SendSealed(Json("file.received").Str("id", "never-sent").Bool("ok", true).Build());
+    phone.SendSealed(Json("clipboard.set").Str("text", "after receipts").Build());
+    const auto afterReceipts = waitFor(EventKind::Clipboard);  // frames are handled in order
+    assert(afterReceipts && afterReceipts->text == "after receipts");
+    {
+      std::lock_guard lock(mutex);
+      assert(std::none_of(events.begin(), events.end(), [](const Event& event) {
+        return event.kind == EventKind::FileDelivered;
+      }));
+    }
 
     // Header/body gather writes preserve consecutive empty and large legacy
     // transfers, including binary NULs and multiple TCP receive fragments.
@@ -1056,6 +1175,7 @@ int main() {
   TestFraming();
   TestCrypto();
   TestMessageFixtures();
+  TestTransferEndings();
   TestScreenPackets();
   TestSavedFileNames();
   TestLimits();

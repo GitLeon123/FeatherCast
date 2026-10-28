@@ -37,9 +37,11 @@ class LinkService : Service() {
         try {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(link.state.value), type)
         } catch (_: Exception) {
+            showReconnectPrompt(this)
             stopSelf()
             return START_NOT_STICKY
         }
+        NotificationManagerCompat.from(this).cancel(RECONNECT_NOTIFICATION_ID)
         if (PhoneApp.instance.store.load() == null || !LocalNetworkAccess.allowed(this)) {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -126,12 +128,37 @@ class LinkService : Service() {
     companion object {
         const val CHANNEL_ID = "link"
         const val NOTIFICATION_ID = 1
+        const val RECONNECT_NOTIFICATION_ID = 2
 
         fun start(context: Context) {
             try {
                 context.startForegroundService(Intent(context, LinkService::class.java))
             } catch (_: Exception) {
                 // Background start restrictions: the app starts it again when opened.
+                showReconnectPrompt(context)
+            }
+        }
+
+        /** Tells the user the link is not running when Android refused to start it in the background. */
+        fun showReconnectPrompt(context: Context) {
+            if (PhoneApp.instance.store.load() == null) return
+            val open = PendingIntent.getActivity(
+                context, 2,
+                Intent(context, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_feathercast)
+                .setContentTitle("Tap to reconnect FeatherCast")
+                .setContentText("Android stopped the connection to your PC.")
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .build()
+            try {
+                NotificationManagerCompat.from(context).notify(RECONNECT_NOTIFICATION_ID, notification)
+            } catch (_: SecurityException) {
             }
         }
 

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cwctype>
 #include <optional>
 #include <string>
 #include <utility>
@@ -56,6 +57,10 @@ struct QuerySnapshot {
   std::optional<std::size_t> selectionAnchor;
 };
 
+// Consecutive typing, or consecutive deleting, at one spot is a single undo
+// step; any other edit always starts a new one.
+enum class QueryEditKind { Other, Typing, Deleting };
+
 struct OverlayState {
   app::View view = app::View::Search;
   std::wstring query;
@@ -76,6 +81,8 @@ struct OverlayState {
   std::optional<NavigationState> pendingNavigationRestore;
   std::vector<QuerySnapshot> queryUndo;
   std::vector<QuerySnapshot> queryRedo;
+  QueryEditKind lastEdit = QueryEditKind::Other;
+  std::size_t lastEditCaret = 0;
 };
 
 struct SettingsState {
@@ -481,6 +488,7 @@ class OverlayController {
     state.pendingNavigationRestore.reset();
     state.queryUndo.clear();
     state.queryRedo.clear();
+    state.lastEdit = QueryEditKind::Other;
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
 
@@ -488,6 +496,7 @@ class OverlayController {
     state.query = std::move(query);
     state.imeComposition.clear();
     state.caret = state.query.size();
+    state.lastEdit = QueryEditKind::Other;
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
@@ -559,6 +568,7 @@ class OverlayController {
     } else {
       state.selectionAnchor.reset();
     }
+    if (next != state.caret) state.lastEdit = QueryEditKind::Other;
     state.caret = next;
     return Effect(UiEffect::Invalidate);
   }
@@ -571,9 +581,21 @@ class OverlayController {
     return true;
   }
 
-  static void RecordUserEdit(OverlayState& state) {
-    PushSnapshot(state.queryUndo, Snapshot(state));
+  // Call before changing the query, then EndUserEdit after it, so the next
+  // edit of the same kind can join this undo step.
+  static void RecordUserEdit(OverlayState& state,
+                             QueryEditKind kind = QueryEditKind::Other) {
+    const bool continues = kind != QueryEditKind::Other &&
+                           state.lastEdit == kind &&
+                           state.lastEditCaret == state.caret &&
+                           !SelectionRange(state) && !state.queryUndo.empty();
+    if (!continues) PushSnapshot(state.queryUndo, Snapshot(state));
     state.queryRedo.clear();
+    state.lastEdit = kind;
+  }
+
+  static void EndUserEdit(OverlayState& state) {
+    state.lastEditCaret = state.caret;
   }
 
   static UiEffects UndoQueryEdit(OverlayState& state) {
@@ -625,6 +647,7 @@ class OverlayController {
     state.scroll = 0;
     state.selectionRestorationAllowed = false;
     state.status.reset();
+    state.lastEdit = QueryEditKind::Other;
   }
 
   static void DeleteSelectionWithoutHistory(
@@ -641,7 +664,16 @@ class OverlayController {
   static UiEffects InsertText(OverlayState& state, const std::wstring& text,
                               std::size_t maxCharacters = 4096) {
     ClampCaret(state);
-    RecordUserEdit(state);
+    // One typed character joins the current word's undo step; the first
+    // letter after a space, a paste or a replaced selection starts a new one.
+    const bool typing =
+        !text.empty() && text_edit::NextCodePoint(text, 0) == text.size() &&
+        !SelectionRange(state);
+    const bool wordStart = typing && state.caret > 0 &&
+                           std::iswspace(state.query[state.caret - 1]) &&
+                           !std::iswspace(text[0]);
+    if (wordStart) state.lastEdit = QueryEditKind::Other;
+    RecordUserEdit(state, typing ? QueryEditKind::Typing : QueryEditKind::Other);
     if (const auto range = SelectionRange(state)) {
       DeleteSelectionWithoutHistory(state, *range);
     }
@@ -652,6 +684,7 @@ class OverlayController {
         text.substr(0, text_edit::ClipToCodePoints(text, room));
     state.query.insert(state.caret, clipped);
     state.caret += clipped.size();
+    EndUserEdit(state);
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;

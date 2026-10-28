@@ -9,6 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <variant>
 #include <vector>
@@ -107,14 +108,19 @@ class PersistenceService {
   bool LoadFileIndexAsync(std::size_t limit, std::uint64_t generation);
 
   void Start();
+  // With drainPending, queued writes (settings, clipboard, timers) still
+  // complete. File index loads and merges are deferrable: they are skipped or
+  // abandoned without writing, since the next start rescans the roots anyway
+  // and a large merge could otherwise hold up shutdown for a long time.
   void Stop(bool drainPending = true);
 
   bool SaveSettings(settings::Settings settings);
-  bool SaveSettingsAndWait(settings::Settings settings,
-                           std::wstring* error = nullptr);
   bool PruneClipboard(std::size_t limit, std::size_t retentionDays = 0);
   bool PinClipboard(long long id, bool pinned, std::size_t limit,
                     std::size_t retentionDays = 0);
+  // Deletes one clipboard entry; the refreshed history arrives as
+  // ClipboardLoaded.
+  bool DeleteClipboard(long long id, std::size_t limit);
   bool LoadTimers();
   bool SaveTimers(timers::State state, std::vector<std::wstring> expiredNames = {});
   bool MergeFileIndex(std::vector<storage::FileIndexEntry> entries,
@@ -133,6 +139,8 @@ class PersistenceService {
   void Emit(Event event) const;
   void EmitWorkerFailure(const std::wstring& operation) const;
   void SettingsSaveLoop(std::stop_token stopToken);
+  // Token for work that Stop() abandons even while draining.
+  std::stop_token DeferrableStopToken();
 
   std::filesystem::path settingsPath_;
   std::filesystem::path databasePath_;
@@ -143,6 +151,9 @@ class PersistenceService {
   std::mutex settingsMutex_;
   std::optional<settings::Settings> pendingSettings_;
   bool settingsSaveScheduled_ = false;
+
+  std::mutex deferrableMutex_;
+  std::stop_source deferrableStop_;
 };
 
 }  // namespace feathercast::persistence

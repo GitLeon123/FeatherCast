@@ -33,9 +33,28 @@ int main() {
   assert(parsed && parsed->action == timers::Action::Create && parsed->duration == 5402000 && parsed->name == L"Tea");
   assert(timers::Parse(L"timer 2m30s")->duration == 150000);
   assert(!timers::Parse(L"timers"));
-  for (const auto* invalid : {L"timer", L"timer 0s", L"timer -1m", L"timer 1.5h", L"timer 9999999999999999999999999h", L"timer 30", L"timer 5monkeys"}) {
+  for (const auto* invalid : {L"timer", L"timer 0s", L"timer 0", L"timer -1m", L"timer 1.5h", L"timer 9999999999999999999999999h",
+                              L"timer 9999999999999 hours", L"timer 5monkeys", L"timer 1h30", L"timer Tea"}) {
     assert(timers::Parse(invalid)->action == timers::Action::Invalid);
   }
+  // Unit words, spaced units, and a bare number meaning minutes.
+  auto timer = [](const wchar_t* query, long long duration, const wchar_t* name) {
+    const auto request = timers::Parse(query);
+    return request && request->action == timers::Action::Create && request->duration == duration && request->name == name;
+  };
+  assert(timer(L"timer 5min", 300000, L"Timer"));
+  assert(timer(L"timer 10 min", 600000, L"Timer"));
+  assert(timer(L"timer 30sec", 30000, L"Timer"));
+  assert(timer(L"timer 1 h", 3600000, L"Timer"));
+  assert(timer(L"Timer 2 Minutes Pasta", 120000, L"Pasta"));
+  assert(timer(L"timer 5", 300000, L"Timer"));
+  assert(timer(L"timer 30", 1800000, L"Timer"));
+  assert(timer(L"timer 5 Eggs  ", 300000, L"Eggs"));
+  assert(timer(L"timer 10m Tea", 600000, L"Tea"));
+  assert(timer(L"timer 1h 30m Break", 5400000, L"Break"));
+  assert(timer(L"timer 2m30s", 150000, L"Timer"));
+  // After a duration, a bare number starts the name.
+  assert(timer(L"timer 10m 2 eggs", 600000, L"2 eggs"));
   timers::State state;
   const auto request = *timers::Parse(L"timer 2s Tea");
   assert(timers::Apply(state, request, 1000, 10));
@@ -171,7 +190,10 @@ int main() {
   clip.isClipboard = true;
   clip.clipboard = {L"1", L"text", L"preview", 1, true};
   const auto actions = commands::BuildActions(clip, {});
-  assert(actions.back().action == app::ActionKind::UnpinClipboard);
+  const auto& unpin = actions[actions.size() - 2];
+  assert(unpin.action == app::ActionKind::UnpinClipboard);
+  assert(std::get<app::ClipboardEntry>(unpin.actionTarget).id == L"1");
+  assert(actions.back().action == app::ActionKind::DeleteClipboard);
   assert(std::get<app::ClipboardEntry>(actions.back().actionTarget).id == L"1");
 
   app::SearchSnapshot snapshot;

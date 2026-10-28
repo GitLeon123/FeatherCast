@@ -66,6 +66,9 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     info.title = JsonString(root, "title");
     info.text = JsonString(root, "text");
     info.time = JsonInt(root, "time", nowMs);
+    // False for a notification the phone already announced (its snapshot after
+    // a reconnect, or a quiet update); older phone apps never send it.
+    info.alert = JsonBool(root, "alert", true);
     if (const auto* actions = JsonArray(root, "actions")) {
       for (const auto& item : actions->array) {
         NotificationAction action;
@@ -109,6 +112,8 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     event.kind = type == "photo.full" ? EventKind::PhotoSaved : EventKind::FileSaved;
     event.photo.id = JsonString(root, "id");
     event.photo.name = JsonString(root, "name");
+    // A photo the phone cannot send comes back with only its id and a reason.
+    if (type == "photo.full") event.text = JsonString(root, "error");
   } else if (type == "file.received") {
     event.kind = EventKind::FileDelivered;
     event.id = JsonString(root, "id");
@@ -214,6 +219,10 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
 // ------------------------------------------------------- PC → phone messages
 
 namespace message {
+
+// Sent when the phone has been quiet for a while; it answers "pong", which
+// keeps both read timeouts from firing while the phone sleeps.
+inline std::string Ping() { return Json("ping").Build(); }
 
 inline std::string Clipboard(std::string_view text, long long time) {
   return Json("clipboard.set").Str("text", text).Int("time", time).Build();

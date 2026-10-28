@@ -234,6 +234,61 @@ int main() {
     assert(hexSum && hexSum->display == L"17");
     const auto times = TryEvaluate(L"3x4");
     assert(times && times->display == L"12");
+
+    // Results keep up to 15 significant digits and drop binary noise.
+    auto shows = [](const wchar_t* input, const wchar_t* display, wchar_t decimal = L'.') {
+      const auto result = TryEvaluate(input, decimal);
+      return result && result->display == display;
+    };
+    assert(shows(L"1500000*1.1", L"1650000"));
+    assert(shows(L"10000000000+1", L"10000000001"));
+    assert(shows(L"0.1+0.2", L"0.3"));
+    assert(shows(L"0.1+0.2-0.3", L"0"));
+    assert(shows(L"1/1e-12", L"1000000000000"));
+    assert(shows(L"1e-12*1", L"1e-12"));
+    assert(shows(L"2e3+0", L"2000"));
+    assert(shows(L"2/3", L"0.666666666666667"));
+
+    // The locale decimal point decides what the other separator means: it
+    // groups thousands only in a well-formed grouped number.
+    assert(shows(L"1,000*3", L"3000"));
+    assert(shows(L"1,000,000.5+0", L"1000000.5"));
+    assert(shows(L"1,5*2", L"3"));
+    assert(shows(L"0,500*2", L"1"));
+    assert(!TryEvaluate(L"1.000,5*2", L'.'));
+    assert(!TryEvaluate(L"1,00,0*2", L'.'));
+    assert(shows(L"1.000*3", L"3000", L','));
+    assert(shows(L"1.000.000,5+0", L"1000000.5", L','));
+    assert(shows(L"1,5*2", L"3", L','));
+    assert(shows(L"1.5*2", L"3", L','));
+    assert(!TryEvaluate(L"1,000.5*2", L','));
+
+    // Times and dates are not divisions or subtractions.
+    assert(!TryEvaluate(L"10:30"));
+    assert(!TryEvaluate(L"10:30:15"));
+    assert(!TryEvaluate(L"2024-01-15"));
+    assert(shows(L"10:2", L"5"));
+
+    // Exact trigonometry at multiples of 90 degrees; tan(90) is undefined.
+    assert(!TryEvaluate(L"tan(90)"));
+    assert(!TryEvaluate(L"tan(270)"));
+    assert(shows(L"sin(180)", L"0"));
+    assert(shows(L"cos(90)", L"0"));
+    assert(shows(L"sin(-90)", L"-1"));
+
+    // More functions, with domain checks.
+    assert(shows(L"abs(-3)", L"3"));
+    assert(shows(L"round(2.5)", L"3"));
+    assert(shows(L"floor(2.7)", L"2"));
+    assert(shows(L"ceil(2.1)", L"3"));
+    assert(shows(L"ln(e)", L"1"));
+    assert(shows(L"log(1000)", L"3"));
+    assert(shows(L"log2(8)", L"3"));
+    assert(shows(L"exp(0)", L"1"));
+    assert(shows(L"2*pi", L"6.28318530717959"));
+    assert(!TryEvaluate(L"ln(0)"));
+    assert(!TryEvaluate(L"log(-1)"));
+    assert(!TryEvaluate(L"log2(0)"));
   }
 
   {
@@ -317,9 +372,20 @@ int main() {
     assert(attachedComma && std::fabs(attachedComma->value - 2500.0) < 0.001);
     const auto commaCurrency = TryConvert(L"1,5 usd to eur", rates);
     assert(commaCurrency && std::fabs(commaCurrency->value - 0.75) < 0.001);
-    // Grouped digits are ambiguous, so they are not a conversion at all.
-    assert(!TryConvert(L"1.000,5 km to m"));
-    assert(!TryConvert(L"1,000.5 km to m"));
+    // Thousands grouping follows the locale decimal point; a mix that does
+    // not fit it is rejected rather than guessed.
+    const auto englishGrouped = TryConvert(L"1,000.5 km to m", {}, L"", L'.');
+    assert(englishGrouped && std::fabs(englishGrouped->value - 1000500.0) < 0.001);
+    assert(!TryConvert(L"1.000,5 km to m", {}, L"", L'.'));
+    const auto germanGrouped = TryConvert(L"1.000,5 km to m", {}, L"", L',');
+    assert(germanGrouped && std::fabs(germanGrouped->value - 1000500.0) < 0.001);
+    assert(!TryConvert(L"1,000.5 km to m", {}, L"", L','));
+    const auto thousandKm = TryConvert(L"1,000 km to mi", {}, L"", L'.');
+    assert(thousandKm && std::fabs(thousandKm->value - 621.371) < 0.001);
+    const auto germanComma = TryConvert(L"1,5 km to m", {}, L"", L',');
+    assert(germanComma && std::fabs(germanComma->value - 1500.0) < 0.001);
+    const auto englishComma = TryConvert(L"1,5 km to m", {}, L"", L'.');
+    assert(englishComma && std::fabs(englishComma->value - 1500.0) < 0.001);
     // Non-finite spellings that wcstod accepts are not amounts.
     assert(!TryConvert(L"inf km to m"));
     assert(!TryConvert(L"nan km to m"));
@@ -342,6 +408,49 @@ int main() {
     assert(pesoTarget && std::fabs(pesoTarget->value - 240.0) < 0.001);
     // A lowercase "cup" never turns into a currency query.
     assert(!TryConvert(L"1 cup to eur", cupRates));
+
+    // Tiny results keep their significant digits instead of rounding to 0.
+    const auto tinyData = TryConvert(L"1 b to tb");
+    assert(tinyData && tinyData->display == L"1e-12 tb");
+
+    // "in" is a unit where a unit belongs, and a connector between units.
+    const auto inches = TryConvert(L"5 in to cm");
+    assert(inches && std::fabs(inches->value - 12.7) < 0.0001);
+    const auto inchesIn = TryConvert(L"5 inch in cm");
+    assert(inchesIn && std::fabs(inchesIn->value - 12.7) < 0.0001);
+
+    // Degree signs and temperature symbols.
+    const auto degrees = TryConvert(L"100°F to C");
+    assert(degrees && std::fabs(degrees->value - 37.7778) < 0.001);
+    assert(degrees->display.ends_with(L" °C"));
+    const auto boilingDisplay = TryConvert(L"100 c to f");
+    assert(boilingDisplay && boilingDisplay->display == L"212 °F");
+    const auto toKelvin = TryConvert(L"0 ºc to kelvin");
+    assert(toKelvin && toKelvin->display == L"273.15 K");
+
+    // Speeds with slashes.
+    const auto highway = TryConvert(L"100 km/h to mph");
+    assert(highway && std::fabs(highway->value - 62.1371) < 0.001);
+    const auto metersPerSecond = TryConvert(L"10 m/s to km/h");
+    assert(metersPerSecond && std::fabs(metersPerSecond->value - 36.0) < 0.0001);
+    const auto knots = TryConvert(L"10 kn to km/h");
+    assert(knots && std::fabs(knots->value - 18.52) < 0.0001);
+
+    // English words that are also ISO codes ("TOP", "TRY") are no currency
+    // query without a connector; common codes and capitals still are.
+    const std::map<std::wstring, double> wordRates = {
+        {L"USD", 1.0}, {L"EUR", 0.5}, {L"TOP", 2.0}, {L"TRY", 30.0}};
+    assert(!TryConvert(L"top 10", wordRates, L"EUR"));
+    assert(!TryConvert(L"10 top", wordRates, L"EUR"));
+    assert(!TryConvert(L"10 try", wordRates, L"EUR"));
+    const auto commonCode = TryConvert(L"10 usd", wordRates, L"EUR");
+    assert(commonCode && std::fabs(commonCode->value - 5.0) < 0.001);
+    const auto capitalCode = TryConvert(L"10 TOP", wordRates, L"EUR");
+    assert(capitalCode && std::fabs(capitalCode->value - 2.5) < 0.001);
+    const auto connectorCode = TryConvert(L"30 try to eur", wordRates);
+    assert(connectorCode && std::fabs(connectorCode->value - 0.5) < 0.001);
+    const auto capitalTry = TryConvert(L"10 TRY to EUR", wordRates);
+    assert(capitalTry && std::fabs(capitalTry->value - 10.0 / 60.0) < 0.001);
   }
 
   {
@@ -776,6 +885,16 @@ int main() {
     assert(shell);
     assert(shell->kind == feathercast::run_command::Kind::ShellCommand);
     assert(shell->input == L"echo hello");
+
+    // A command that quotes several arguments keeps all of its quotes.
+    const auto quotedArgs = feathercast::run_command::Classify(L">\"C:\\Tools\\app.exe\" \"my file.txt\"");
+    assert(quotedArgs);
+    assert(quotedArgs->kind == feathercast::run_command::Kind::ShellCommand);
+    assert(quotedArgs->input == L"\"C:\\Tools\\app.exe\" \"my file.txt\"");
+    assert(feathercast::run_command::StripMatchingQuotes(L"'a' 'b'") == L"'a' 'b'");
+    assert(feathercast::run_command::StripMatchingQuotes(L" \"C:\\My App\\x.exe\" ") == L"C:\\My App\\x.exe");
+    assert(feathercast::run_command::StripMatchingQuotes(L"'it\"s'") == L"it\"s");
+    assert(feathercast::run_command::StripMatchingQuotes(L"\"") == L"\"");
   }
 
   {
@@ -922,7 +1041,9 @@ int main() {
     // still keeps invariant casing and diacritic folding.
     using namespace feathercast::core;
     auto windowsNormalize = [](const std::wstring& value) {
-      return Trim(FoldDiacritics(LowerInvariant(value)));
+      auto out = LowerInvariant(FoldDiacritics(value));
+      TrimWhitespaceInPlace(out);
+      return out;
     };
     for (wchar_t ch = 0; ch < 128; ++ch) {
       for (const auto& value : {std::wstring(1, ch),
@@ -935,6 +1056,21 @@ int main() {
                               L"CAF\u00c9", L"\uD55C\uAE00 Notes"}) {
       assert(Normalize(value) == windowsNormalize(value));
     }
+
+    // Stroke and dotted letters fold to their base letter, and whitespace
+    // runs collapse, so typed queries match names with odd spacing.
+    assert(Normalize(L"\u0141\u00F3d\u017A") == L"lodz");
+    assert(Normalize(L"\u00D8resund") == L"oresund");
+    assert(Normalize(L"\u0130ndirilenler") == L"indirilenler");
+    assert(Normalize(L"stra\u00DFe \u0111\u0127\u0131") == L"stra\u00DFe dhi");
+    assert(Normalize(L"visual  studio") == L"visual studio");
+    assert(Normalize(L"  visual\t studio \r\n") == L"visual studio");
+    assert(Normalize(L"Gr\u00FC\u00DFe  Caf\u00E9") == L"gru\u00DFe cafe");
+    assert(ScoreText(L"visual studio", L"Visual  Studio") == 5000);
+    assert(ScoreText(L"lodz", L"\u0141\u00F3d\u017A Maps") > 0);
+    assert(ScoreText(L"oresund", L"\u00D8resund") == 5000);
+    // Persisted invocation keys keep internal whitespace as it was.
+    assert(StableInvocationKey(L"app", L"My  App") != StableInvocationKey(L"app", L"My App"));
 
     // Skipping weaker approximate fields must still consider stronger literal
     // matches in an alias or keyword, even after the name already matched.
@@ -1435,6 +1571,15 @@ int main() {
     assert(fs::ParseSettings(R"({"searchEngines": {}})")
                .searchEngines.empty());
     assert(!fs::ParseSettings("{}").searchEngines.empty());
+    // Keywords are looked up in lowercase, so they load lowercased; an exact
+    // lowercase keyword wins over a differently cased duplicate.
+    const auto casedEngines = fs::ParseSettings(
+        R"({"searchEngines": {"G": "https://upper/%s", "Yt": "https://yt/%s", "g": "https://lower/%s"}})");
+    assert(casedEngines.searchEngines.size() == 2);
+    assert(casedEngines.searchEngines.at(L"g") == L"https://lower/%s");
+    assert(casedEngines.searchEngines.at(L"yt") == L"https://yt/%s");
+    assert(fs::ParseSettings(R"({"searchEngines": {"DDG": "https://d/%s"}})")
+               .searchEngines.at(L"ddg") == L"https://d/%s");
     assert(copy.quicklinks.size() == 1);
     assert(copy.quicklinks[0].keyword == L"docs");
     assert(copy.quicklinks[0].name == L"My \"Docs\"");

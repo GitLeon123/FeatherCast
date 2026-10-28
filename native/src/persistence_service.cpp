@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <exception>
-#include <future>
 #include <utility>
 
 namespace feathercast::persistence {
@@ -56,8 +55,9 @@ StorageStartupState PersistenceService::LoadStorageForStartup(
 
 bool PersistenceService::LoadFileIndexAsync(std::size_t limit,
                                             std::uint64_t generation) {
-  return executor_.Submit([this, limit, generation](std::stop_token token) {
-    if (token.stop_requested()) return;
+  return executor_.Submit([this, limit, generation,
+                           deferred = DeferrableStopToken()](std::stop_token token) {
+    if (token.stop_requested() || deferred.stop_requested()) return;
     std::vector<storage::FileIndexEntry> entries;
     if (EnsureStorageOpen()) entries = storage_.LoadFileIndex(limit);
     Emit(FileIndexLoaded{generation, std::move(entries),
@@ -67,12 +67,20 @@ bool PersistenceService::LoadFileIndexAsync(std::size_t limit,
 }
 
 void PersistenceService::Start() {
+  {
+    std::lock_guard lock(deferrableMutex_);
+    if (deferrableStop_.stop_requested()) deferrableStop_ = std::stop_source();
+  }
   executor_.Start(1, [this](std::exception_ptr) {
     EmitWorkerFailure(L"persistence");
   });
 }
 
 void PersistenceService::Stop(bool drainPending) {
+  {
+    std::lock_guard lock(deferrableMutex_);
+    deferrableStop_.request_stop();
+  }
   executor_.Shutdown(drainPending);
   storage_.Close();
   std::lock_guard lock(settingsMutex_);
@@ -104,30 +112,6 @@ bool PersistenceService::SaveSettings(settings::Settings settings) {
   return false;
 }
 
-bool PersistenceService::SaveSettingsAndWait(settings::Settings settings,
-                                             std::wstring* error) {
-  using Result = std::pair<bool, std::wstring>;
-  auto completion = std::make_shared<std::promise<Result>>();
-  auto ready = completion->get_future();
-  if (!executor_.Submit(
-          [this, settings = std::move(settings), completion](std::stop_token token) {
-            if (token.stop_requested()) {
-              completion->set_value({false, L"The persistence worker is stopping."});
-              return;
-            }
-            std::wstring detail;
-            const bool succeeded =
-                settings_io::SaveSettingsFile(settingsPath_, settings, &detail);
-            completion->set_value({succeeded, std::move(detail)});
-          })) {
-    if (error) *error = L"The persistence worker is unavailable.";
-    return false;
-  }
-  auto [succeeded, detail] = ready.get();
-  if (!succeeded && error) *error = std::move(detail);
-  return succeeded;
-}
-
 bool PersistenceService::PruneClipboard(std::size_t limit,
                                         std::size_t retentionDays) {
   return executor_.Submit([this, limit, retentionDays](std::stop_token token) {
@@ -149,6 +133,16 @@ bool PersistenceService::PinClipboard(long long id, bool pinned,
     const bool succeeded = EnsureStorageOpen() &&
                            storage_.PinClipboard(id, pinned, limit,
                                                  retentionDays);
+    Emit(ClipboardLoaded{succeeded ? storage_.LoadClipboardHistory(limit) : std::vector<storage::ClipboardEntry>{},
+                         succeeded ? storage::StorageError{} : storage_.LastError()});
+  });
+}
+
+bool PersistenceService::DeleteClipboard(long long id, std::size_t limit) {
+  return executor_.Submit([this, id, limit](std::stop_token token) {
+    if (token.stop_requested()) return;
+    const bool succeeded =
+        EnsureStorageOpen() && storage_.DeleteClipboardEntry(id);
     Emit(ClipboardLoaded{succeeded ? storage_.LoadClipboardHistory(limit) : std::vector<storage::ClipboardEntry>{},
                          succeeded ? storage::StorageError{} : storage_.LastError()});
   });
@@ -182,9 +176,14 @@ bool PersistenceService::MergeFileIndex(
        configuredRoots = std::move(configuredRoots),
        availableRoots = std::move(availableRoots), limit,
        generation,
-       exclusionPatterns = std::move(exclusionPatterns)](
-          std::stop_token token) mutable {
-        if (token.stop_requested()) return;
+       exclusionPatterns = std::move(exclusionPatterns),
+       deferred = DeferrableStopToken()](std::stop_token token) mutable {
+        // Stop() requests the deferrable token before shutting the executor
+        // down, so it also covers a non-draining stop.
+        const auto abandoned = [&] {
+          return token.stop_requested() || deferred.stop_requested();
+        };
+        if (abandoned()) return;
         if (!EnsureStorageOpen()) {
           Emit(FileIndexMerged{generation, false, {}, storage_.LastError()});
           return;
@@ -192,14 +191,15 @@ bool PersistenceService::MergeFileIndex(
         auto merged = files::MergeFileIndexEntries(
             storage_.LoadFileIndex(limit), std::move(entries), configuredRoots,
             availableRoots, limit, exclusionPatterns);
+        if (abandoned()) return;
         // The scanner skips files that kept their size and write time and
         // relies on the stored text. Read the few whose text the database
         // does not hold, so they are not stored without content.
         for (const auto index : storage_.EntriesWithoutStoredContent(merged)) {
-          if (token.stop_requested()) return;
+          if (abandoned()) return;
           auto& entry = merged[index];
           auto extraction = file_content::Extract(
-              entry.path, file_content::kMaxIndexedBytes, token);
+              entry.path, file_content::kMaxIndexedBytes, deferred);
           entry.contentUnchanged = false;
           entry.contentState = static_cast<int>(extraction.state);
           entry.contentBytes =
@@ -222,6 +222,9 @@ bool PersistenceService::MergeFileIndex(
                 std::filesystem::path(configured).lexically_normal().wstring());
           }
         }
+        // A stop during extraction may have cut a file's text short; keep the
+        // stored index as it was rather than writing a partial merge.
+        if (abandoned()) return;
         const bool succeeded = storage_.UpdateFileIndex(merged, preserveRoots);
         Emit(FileIndexMerged{
             generation, succeeded, succeeded ? std::move(merged)
@@ -280,6 +283,11 @@ bool PersistenceService::Clear(app::StorageOperationKind kind) {
         kind, succeeded,
         succeeded ? storage::StorageError{} : storage_.LastError()});
   });
+}
+
+std::stop_token PersistenceService::DeferrableStopToken() {
+  std::lock_guard lock(deferrableMutex_);
+  return deferrableStop_.get_token();
 }
 
 bool PersistenceService::EnsureStorageOpen() {

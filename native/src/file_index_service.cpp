@@ -377,6 +377,7 @@ void FileIndexService::Stop() {
   rebuildPending_ = false;
   restartWatchersPending_ = false;
   ResetRetries();
+  watchFailures_.clear();
   ForgetContentRecords();
 }
 
@@ -388,6 +389,7 @@ void FileIndexService::Pause() {
     rebuildPending_ = false;
     restartWatchersPending_ = true;
     ResetRetries();
+    watchFailures_.clear();
     ForgetContentRecords();
   }
   cv_.notify_all();
@@ -426,6 +428,7 @@ bool FileIndexService::Reconfigure(IndexRequest request) {
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
     ResetRetries();
+    watchFailures_.clear();
     ForgetContentRecords();
   }
   cv_.notify_all();
@@ -438,8 +441,11 @@ bool FileIndexService::Rebuild() {
     if (!request_ || stopping_ || !worker_.joinable()) return false;
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
-    // A rebuild is an explicit request to read every file again.
+    // A rebuild is an explicit request to read every file again. It also
+    // restarts the watchers, which gives broken watches a fresh budget.
+    restartWatchersPending_ = true;
     ResetRetries();
+    watchFailures_.clear();
     ForgetContentRecords();
   }
   cv_.notify_all();
@@ -463,6 +469,30 @@ void FileIndexService::ScheduleWatchRefresh(bool restartWatchers) {
   cv_.notify_all();
 }
 
+void FileIndexService::ScheduleWatchRetry(const std::wstring& root) {
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_ || paused_ || !request_) return;
+    const std::size_t failures = ++watchFailures_[root];
+    if (failures > kMaxWatchRetries) return;
+    // Changes made while the watch was down are unknown, so the restart
+    // rescans as well. An earlier pending rebuild is not postponed.
+    const auto retryAt =
+        std::chrono::steady_clock::now() + WatchRetryDelay(failures);
+    rebuildAfter_ =
+        rebuildPending_ ? std::min(rebuildAfter_, retryAt) : retryAt;
+    rebuildPending_ = true;
+    probeOnly_ = false;
+    restartWatchersPending_ = true;
+  }
+  cv_.notify_all();
+}
+
+void FileIndexService::ClearWatchFailures(const std::wstring& root) {
+  std::lock_guard lock(mutex_);
+  watchFailures_.erase(root);
+}
+
 void FileIndexService::RestartWatchers(const IndexRequest& request) {
   std::lock_guard watchersLock(watchersMutex_);
   watchers_.clear();
@@ -480,15 +510,23 @@ void FileIndexService::RestartWatchers(const IndexRequest& request) {
         nullptr);
     if (watcher->directory == INVALID_HANDLE_VALUE) continue;
     Watcher* raw = watcher.get();
-    watcher->thread = std::jthread([this, raw, path, dataKey,
+    watcher->thread = std::jthread([this, raw, root, path, dataKey,
                                     patterns = request.exclusionPatterns](
                                        std::stop_token token) {
       const RelativePathExclusionMatcher exclusionMatcher(patterns);
       alignas(DWORD) std::array<std::byte, 64 * 1024> buffer{};
+      bool delivered = false;
+      std::size_t overflows = 0;
+      // A broken watch ends this thread and asks for a delayed restart.
+      // Reading the same handle again could fail at once, forever, and every
+      // report would also push the pending rescan further out.
+      const auto retry = [&] {
+        if (!token.stop_requested()) ScheduleWatchRetry(root);
+      };
       while (!token.stop_requested()) {
         OVERLAPPED overlapped{};
         overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!overlapped.hEvent) return;
+        if (!overlapped.hEvent) return retry();
         const BOOL queued = ReadDirectoryChangesW(
             raw->directory, buffer.data(), static_cast<DWORD>(buffer.size()),
             TRUE,
@@ -497,8 +535,7 @@ void FileIndexService::RestartWatchers(const IndexRequest& request) {
             nullptr, &overlapped, nullptr);
         if (!queued) {
           CloseHandle(overlapped.hEvent);
-          if (!token.stop_requested()) ScheduleWatchRefresh(true);
-          return;
+          return retry();
         }
         const HANDLE events[] = {overlapped.hEvent, raw->stopEvent};
         const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
@@ -510,9 +547,25 @@ void FileIndexService::RestartWatchers(const IndexRequest& request) {
             raw->directory, &overlapped, &transferred, TRUE);
         CloseHandle(overlapped.hEvent);
         if (token.stop_requested()) return;
-        if (!completed || transferred == 0) {
-          ScheduleWatchRefresh(true);
-          continue;
+        if (!completed) return retry();
+        if (transferred == 0) {
+          // The change buffer overflowed. The watch still works and the
+          // handle keeps collecting changes, but the dropped ones need a
+          // rescan. Pausing before the next read spaces out the rescans of
+          // a long burst (and of a file system that keeps completing empty).
+          ScheduleWatchRefresh();
+          const DWORD paused = WaitForSingleObject(
+              raw->stopEvent,
+              static_cast<DWORD>(WatchRetryDelay(++overflows).count()));
+          if (paused == WAIT_TIMEOUT) continue;
+          if (paused != WAIT_OBJECT_0) retry();
+          return;
+        }
+        overflows = 0;
+        if (!delivered) {
+          // The watch works, so its root gets a fresh retry budget.
+          delivered = true;
+          ClearWatchFailures(root);
         }
         if (NotificationsAffectIndex(buffer.data(), transferred, path,
                                      exclusionMatcher, dataKey)) {

@@ -204,6 +204,7 @@ fun main(args: Array<String>) {
                         val name = msg.path.substringAfterLast('/')
                         session.send(PhoneMessages.fileData(msg.path, name), "Simulated file: $name\n".toByteArray())
                     }
+                    PcMessage.Ping -> session.send(message("pong"))
                     else -> Unit
                 }
                 when (root.str("type")) {
