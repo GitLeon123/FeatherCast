@@ -1948,12 +1948,35 @@ void StartInputBrokerClient(HWND hwnd) {
       return WriteFile(pipe, &value, sizeof(value), &written, nullptr) &&
              written == sizeof(value);
     };
+    // The broker validates the registration and acknowledges it; a broker
+    // installed next to another FeatherCast.exe drops the pipe instead. Polls
+    // so a broker that never answers cannot block the client.
+    const auto accepted = [&pause](HANDLE pipe) {
+      for (int attempt = 0; attempt < 40; ++attempt) {
+        DWORD bytesAvail = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
+          return false;
+        }
+        if (bytesAvail >= sizeof(DWORD)) {
+          DWORD ack = 0;
+          DWORD read = 0;
+          return ReadFile(pipe, &ack, sizeof(ack), &read, nullptr) &&
+                 read == sizeof(ack) &&
+                 ack == feathercast::input_broker::kRegistrationAccepted;
+        }
+        if (!pause(50)) return false;
+      }
+      return false;
+    };
 
     // A broker that keeps exiting is relaunched with growing delays.
     constexpr ULONGLONG kFirstRestartDelay = 5000;
     constexpr ULONGLONG kMaxRestartDelay = 60000;
     ULONGLONG restartDelay = kFirstRestartDelay;
     ULONGLONG nextBrokerStart = 0;
+    // A broker that rejects this copy is asked again with growing delays;
+    // meanwhile the local hook keeps handling the Win key.
+    DWORD rejectedDelay = 0;
     while (pause(0)) {
       HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
                                 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1974,40 +1997,48 @@ void StartInputBrokerClient(HWND hwnd) {
       reg.hwnd = reinterpret_cast<std::uint64_t>(hwnd);
       reg.threadId = GetWindowThreadProcessId(hwnd, nullptr);
       reg.winShortcutEnabled = winShortcut ? 1 : 0;
-      if (send(pipe, reg)) {
-        restartDelay = kFirstRestartDelay;
-        nextBrokerStart = 0;
-        g_inputBrokerConnected.store(true);
-        AppendHookLog(L"[Hook] Connected to InputBroker\n");
-        PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
-
-        const HANDLE waits[] = {stop, wake};
-        while (true) {
-          const DWORD wait = WaitForMultipleObjects(
-              static_cast<DWORD>(std::size(waits)), waits, FALSE, 200);
-          if (wait == WAIT_OBJECT_0) {
-            send(pipe, BrokerCommand::Shutdown);
-            break;
-          }
-          if (wait == WAIT_OBJECT_0 + 1) {
-            const bool next = g_isExclusiveWinShortcut.load();
-            if (next == winShortcut) continue;
-            if (!send(pipe, next ? BrokerCommand::EnableWinShortcut
-                                 : BrokerCommand::DisableWinShortcut)) {
-              break;
-            }
-            winShortcut = next;
-            continue;
-          }
-          DWORD bytesAvail = 0;
-          if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
-            break;
-          }
+      if (!send(pipe, reg) || !accepted(pipe)) {
+        CloseHandle(pipe);
+        if (rejectedDelay == 0) {
+          AppendHookLog(L"[Hook] InputBroker did not accept this FeatherCast; using the local hook\n");
         }
-        g_inputBrokerConnected.store(false);
-        AppendHookLog(L"[Hook] Disconnected from InputBroker\n");
-        PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
+        rejectedDelay = std::min<DWORD>(rejectedDelay ? rejectedDelay * 2 : 5000, 60000);
+        if (!pause(rejectedDelay)) break;
+        continue;
       }
+      rejectedDelay = 0;
+      restartDelay = kFirstRestartDelay;
+      nextBrokerStart = 0;
+      g_inputBrokerConnected.store(true);
+      AppendHookLog(L"[Hook] Connected to InputBroker\n");
+      PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
+
+      const HANDLE waits[] = {stop, wake};
+      while (true) {
+        const DWORD wait = WaitForMultipleObjects(
+            static_cast<DWORD>(std::size(waits)), waits, FALSE, 200);
+        if (wait == WAIT_OBJECT_0) {
+          send(pipe, BrokerCommand::Shutdown);
+          break;
+        }
+        if (wait == WAIT_OBJECT_0 + 1) {
+          const bool next = g_isExclusiveWinShortcut.load();
+          if (next == winShortcut) continue;
+          if (!send(pipe, next ? BrokerCommand::EnableWinShortcut
+                               : BrokerCommand::DisableWinShortcut)) {
+            break;
+          }
+          winShortcut = next;
+          continue;
+        }
+        DWORD bytesAvail = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
+          break;
+        }
+      }
+      g_inputBrokerConnected.store(false);
+      AppendHookLog(L"[Hook] Disconnected from InputBroker\n");
+      PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
       CloseHandle(pipe);
       if (!pause(1000)) break;
     }

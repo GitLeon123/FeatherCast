@@ -489,11 +489,15 @@ void RunPipeServer(HWND msgHwnd) {
     DWORD read = 0;
     ULONG clientPid = 0;
     DWORD windowPid = 0;
+    DWORD ackWritten = 0;
+    const DWORD ack = feathercast::input_broker::kRegistrationAccepted;
     if (ReadFile(pipe, &reg, sizeof(reg), &read, nullptr) && read == sizeof(reg) &&
         GetNamedPipeClientProcessId(pipe, &clientPid) && clientPid == reg.pid &&
         GetWindowThreadProcessId(reinterpret_cast<HWND>(reg.hwnd), &windowPid) == reg.threadId &&
         windowPid == reg.pid &&
-        PathsEqualIgnoreCase(ProcessPath(reg.pid), expectedClientPath)) {
+        PathsEqualIgnoreCase(ProcessPath(reg.pid), expectedClientPath) &&
+        WriteFile(pipe, &ack, sizeof(ack), &ackWritten, nullptr) &&
+        ackWritten == sizeof(ack)) {
       {
         std::lock_guard lock(g_appMutex);
         g_appReg = reg;
@@ -545,6 +549,7 @@ void RunPipeServer(HWND msgHwnd) {
     }
 
     // Not the FeatherCast next to this broker: drop the client, keep the pipe.
+    AppendBrokerLog(L"[Broker] Rejected a client that is not the FeatherCast next to this broker\n");
     DisconnectNamedPipe(pipe);
   }
 
