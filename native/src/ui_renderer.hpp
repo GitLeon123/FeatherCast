@@ -4,6 +4,7 @@
 
 #include <d2d1_1.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -32,6 +33,23 @@ class HitRegions {
   [[nodiscard]] std::size_t size() const noexcept { return regions_.size(); }
 
   [[nodiscard]] const app::HitTarget* At(float x, float y) const noexcept;
+
+  // Limits the regions added since `first` to the vertical band a clip drew
+  // them in, dropping those left empty, so a row scrolled half out of view
+  // cannot take clicks over the header or footer.
+  void ClipFrom(std::size_t first, float top, float bottom) {
+    if (first >= regions_.size()) return;
+    for (auto it = regions_.begin() + static_cast<std::ptrdiff_t>(first);
+         it != regions_.end();) {
+      it->rect.top = std::max(it->rect.top, top);
+      it->rect.bottom = std::min(it->rect.bottom, bottom);
+      if (it->rect.bottom <= it->rect.top) {
+        it = regions_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 
  private:
   Container regions_;

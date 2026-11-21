@@ -1,10 +1,13 @@
 package app.feathercast.phone
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.view.inputmethod.InputMethodManager
@@ -13,7 +16,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.view.WindowCompat
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -26,7 +28,9 @@ import app.feathercast.phone.ui.FeatherTheme
 import app.feathercast.phone.ui.HomeActions
 import app.feathercast.phone.ui.HomeScreen
 import app.feathercast.phone.ui.PairConfirmDialog
+import app.feathercast.phone.ui.PermissionTopic
 import app.feathercast.phone.ui.Permissions
+import app.feathercast.phone.ui.SharingChoices
 import app.feathercast.phone.ui.Switches
 import app.feathercast.protocol.PairingInvite
 import app.feathercast.protocol.PhoneMessages
@@ -53,9 +57,9 @@ class MainActivity : ComponentActivity() {
         val consent = result.data
         if (result.resultCode == RESULT_OK && consent != null && ScreenBridge.pendingRequest()?.sessionId == id) {
             try { ScreenCaptureService.start(this, id, result.resultCode, consent) }
-            catch (_: RuntimeException) { ScreenBridge.stop(this, "Android could not start screen sharing. Start a new request on your PC.", id) }
+            catch (_: RuntimeException) { ScreenBridge.stop(this, getString(R.string.screen_start_failed), id) }
         } else {
-            ScreenBridge.stop(this, "Screen sharing was declined or the request expired.", id)
+            ScreenBridge.stop(this, getString(R.string.screen_declined), id)
         }
     }
 
@@ -68,26 +72,38 @@ class MainActivity : ComponentActivity() {
         if (contents != null) pairWith(contents)
     }
 
-    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        noteResult(mapOf(Manifest.permission.CAMERA to granted))
+        resumeTick++
+        if (granted) launchScanner()
+        // A permanent denial is explained, with a button to the settings, on the connect screen.
+        else pairError = if (isBlocked(Manifest.permission.CAMERA)) null else getString(R.string.camera_denied)
+    }
+
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (Build.VERSION.SDK_INT >= 33) noteResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to granted))
         resumeTick++
     }
 
     private var pairAfterNetworkPermission: String? = null
     private val networkPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        noteResult(mapOf(LocalNetworkAccess.PERMISSION to granted))
         resumeTick++
         val pending = pairAfterNetworkPermission
         pairAfterNetworkPermission = null
         if (granted) {
             if (pending != null) pairWith(pending) else LinkService.start(this)
-        } else pairError = "Allow local network access in Android settings to connect to your PC."
+        } else pairError = getString(R.string.network_denied)
     }
 
     private val photoPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        noteResult(it)
         resumeTick++
         link.sharePhotosNow()
     }
 
     private val featurePermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        noteResult(it)
         resumeTick++
         link.refreshStatus()
     }
@@ -97,14 +113,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // The system bar icons follow the light or dark theme.
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         approvingScreenId = savedInstanceState?.getString("approvingScreenId").orEmpty()
         savedInstanceState?.getString("pendingPair")?.let { confirmPairing(it) }
-        WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = false
-            isAppearanceLightNavigationBars = false
-        }
         if (store.load() != null) LinkService.start(this)
         handleIntent(intent)
         setContent {
@@ -116,7 +129,10 @@ class MainActivity : ComponentActivity() {
                     ConnectScreen(
                         busy = pairing,
                         error = pairError ?: state.detail.ifEmpty { null },
+                        cameraBlocked = isBlocked(Manifest.permission.CAMERA, tick),
                         onScan = ::startScan,
+                        onPasteLink = ::confirmPairing,
+                        onOpenSettings = ::openAppSettings,
                     )
                 } else {
                     HomeScreen(
@@ -125,13 +141,14 @@ class MainActivity : ComponentActivity() {
                         switches = currentSwitches(tick),
                         actions = homeActions,
                         screen = screenState,
+                        chooseSharing = tick >= 0 && !store.sharingChosen,
                     )
                 }
                 pendingPair?.let { (uri, invite) ->
                     PairConfirmDialog(
                         pcName = invite.pcName,
                         hosts = invite.hosts,
-                        replaces = state.pcName.ifEmpty { "your PC" }.takeIf { state.status != LinkStatus.Unpaired },
+                        replaces = state.pcName.ifEmpty { getString(R.string.your_pc) }.takeIf { state.status != LinkStatus.Unpaired },
                         onConfirm = {
                             pendingPair = null
                             pairWith(uri)
@@ -175,22 +192,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Links can come from any web page, so they never pair without the user's confirmation. */
+    /**
+     * Links can come from any web page, so they never pair without the user's confirmation.
+     * A pasted link takes the same path as one opened from the camera app or a browser.
+     */
     private fun confirmPairing(uri: String) {
+        pairError = null
         val invite = PairingInvite.parse(uri)
         if (invite == null) {
-            pairError = "This is not a valid FeatherCast pairing code."
+            pairError = getString(R.string.pair_invalid)
             return
         }
         pendingPair = uri to invite
     }
 
+    // ---- Permission bookkeeping -------------------------------------------------
+
+    private fun isGranted(permission: String) = checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * True when Android will no longer show a dialog for a permission that is still missing,
+     * so only the app's settings can grant it. [tick] only makes Compose re-read this.
+     */
+    private fun isBlocked(permission: String, @Suppress("UNUSED_PARAMETER") tick: Int = 0) =
+        store.isPermissionBlocked(permission) && !isGranted(permission)
+
+    private fun anyBlocked(permissions: Array<String>) = permissions.any { isBlocked(it) }
+
+    /** Remembers which denials were final: Android stops offering a rationale after them. */
+    private fun noteResult(result: Map<String, Boolean>) {
+        for ((permission, granted) in result) {
+            store.setPermissionBlocked(permission, !granted && !shouldShowRequestPermissionRationale(permission))
+        }
+    }
+
+    /** Asks for [permissions], or opens the app's settings when a required one can no longer be asked for. */
+    private fun requestOrSettings(permissions: Array<String>, required: Array<String> = permissions, request: (Array<String>) -> Unit) {
+        if (anyBlocked(required.filter { !isGranted(it) }.toTypedArray())) openAppSettings() else request(permissions)
+    }
+
+    private fun openAppSettings() {
+        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+    }
+
+    // ---- Pairing ----------------------------------------------------------------
+
     private fun startScan() {
         pairError = null
+        when {
+            isGranted(Manifest.permission.CAMERA) -> launchScanner()
+            isBlocked(Manifest.permission.CAMERA) -> openAppSettings()
+            else -> cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun launchScanner() {
         scanner.launch(
             ScanOptions()
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                .setPrompt("Point the camera at the pairing code on your PC")
+                .setPrompt(getString(R.string.scan_prompt))
                 .setBeepEnabled(false)
                 .setOrientationLocked(false)
                 .addExtra(Intents.Scan.SCAN_TYPE, Intents.Scan.MIXED_SCAN),
@@ -201,14 +261,17 @@ class MainActivity : ComponentActivity() {
         if (pairing) return
         if (!LocalNetworkAccess.allowed(this)) {
             pairAfterNetworkPermission = uri
-            networkPermission.launch(LocalNetworkAccess.PERMISSION)
+            if (isBlocked(LocalNetworkAccess.PERMISSION)) {
+                pairError = getString(R.string.network_denied)
+                openAppSettings()
+            } else networkPermission.launch(LocalNetworkAccess.PERMISSION)
             return
         }
         if (!uri.startsWith("feathercast://pair")) {
             pairError = if (uri.contains("/app.apk") || uri.contains(".apk")) {
-                "That is the download code. Scan the pairing code shown next to it on your PC."
+                getString(R.string.pair_download_code)
             } else {
-                "This is not a FeatherCast pairing code."
+                getString(R.string.pair_not_code)
             }
             return
         }
@@ -217,8 +280,9 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             link.pair(uri)
                 .onSuccess {
-                    SendClipboardActivity.toast(this@MainActivity, "Connected to $it")
-                    requestNotificationPermission()
+                    SendClipboardActivity.toast(this@MainActivity, getString(R.string.toast_connected, it))
+                    // The "Choose what to share" step appears first; permissions follow from it.
+                    toggles++
                 }
                 .onFailure { pairError = it.message }
             pairing = false
@@ -226,25 +290,44 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33 && !currentPermissions(0).postNotifications) {
+        if (Build.VERSION.SDK_INT >= 33 && !currentPermissions(0).postNotifications && !isBlocked(Manifest.permission.POST_NOTIFICATIONS)) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
-    private fun currentPermissions(@Suppress("UNUSED_PARAMETER") tick: Int) = Permissions(
-        notificationAccess = NotifyListener.hasAccess(this),
-        photos = PhotoSource.access(this),
-        postNotifications = Build.VERSION.SDK_INT < 33 ||
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED,
-        saveFiles = !IncomingFiles.needsPermission(this),
-        sms = SmsBridge.hasPermission(this),
-        calls = CallWatcher.hasPermission(this),
-        storage = StorageBridge.hasAccess(this),
-        remoteControl = RemoteControlService.instance != null,
-        pcKeyboard = PcKeyboardService.selected(this),
-        deviceAudio = Build.VERSION.SDK_INT >= 29,
-        localNetwork = LocalNetworkAccess.allowed(this),
-    )
+    private fun currentPermissions(@Suppress("UNUSED_PARAMETER") tick: Int): Permissions {
+        val photos = PhotoSource.access(this)
+        val postNotifications = Build.VERSION.SDK_INT < 33 || isGranted(Manifest.permission.POST_NOTIFICATIONS)
+        val saveFiles = !IncomingFiles.needsPermission(this)
+        val sms = SmsBridge.hasPermission(this)
+        val calls = CallWatcher.hasPermission(this)
+        val storage = StorageBridge.hasAccess(this)
+        val localNetwork = LocalNetworkAccess.allowed(this)
+        val blocked = buildSet {
+            if (photos == PhotoAccess.Denied && anyBlocked(PhotoSource.permissions())) add(PermissionTopic.Photos)
+            if (!postNotifications && isBlocked(Manifest.permission.POST_NOTIFICATIONS)) add(PermissionTopic.PostNotifications)
+            if (!saveFiles && isBlocked(Manifest.permission.WRITE_EXTERNAL_STORAGE)) add(PermissionTopic.SaveFiles)
+            if (!sms && anyBlocked(SMS_REQUIRED)) add(PermissionTopic.Sms)
+            if (!calls && isBlocked(Manifest.permission.READ_PHONE_STATE)) add(PermissionTopic.Calls)
+            if (!storage && Build.VERSION.SDK_INT < 30 && isBlocked(Manifest.permission.READ_EXTERNAL_STORAGE)) add(PermissionTopic.Storage)
+            if (!localNetwork && isBlocked(LocalNetworkAccess.PERMISSION)) add(PermissionTopic.LocalNetwork)
+        }
+        return Permissions(
+            notificationAccess = NotifyListener.hasAccess(this),
+            photos = photos,
+            postNotifications = postNotifications,
+            saveFiles = saveFiles,
+            sms = sms,
+            calls = calls,
+            storage = storage,
+            remoteControl = RemoteControlService.instance != null,
+            pcKeyboard = PcKeyboardService.selected(this),
+            deviceAudio = Build.VERSION.SDK_INT >= 29,
+            localNetwork = localNetwork,
+            blocked = blocked,
+            ignoringBattery = getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) ?: true,
+        )
+    }
 
     private fun currentSwitches(@Suppress("UNUSED_PARAMETER") tick: Int) = Switches(
         notifications = store.sendNotifications,
@@ -275,10 +358,10 @@ class MainActivity : ComponentActivity() {
     private fun sendFiles(uris: List<Uri>) {
         // Not tied to this activity, so leaving the app does not cancel the upload.
         link.sendUrisInBackground(uris) { sent, error ->
-            val pc = link.state.value.pcName.ifEmpty { "your PC" }
+            val pc = link.state.value.pcName.ifEmpty { getString(R.string.your_pc) }
             when {
-                sent == uris.size -> if (sent == 1) "Sent to $pc (Downloads\\FeatherCast)" else "$sent files sent to $pc"
-                else -> error ?: "Could not send to $pc"
+                sent == uris.size -> resources.getQuantityString(R.plurals.picked_sent, sent, sent, pc)
+                else -> error ?: getString(R.string.send_failed, pc)
             }
         }
     }
@@ -307,18 +390,10 @@ class MainActivity : ComponentActivity() {
                         link.sendAsync(PhoneMessages.mediaNone())
                     }
                 }
-                Feature.Sms -> {
-                    store.smsAccess = enabled
-                    if (enabled && !SmsBridge.hasPermission(this@MainActivity)) requestSms()
-                }
-                Feature.Calls -> {
-                    store.callAlerts = enabled
-                    if (enabled && !CallWatcher.hasPermission(this@MainActivity)) requestCalls()
-                }
-                Feature.Storage -> {
-                    store.storageAccess = enabled
-                    if (enabled && !StorageBridge.hasAccess(this@MainActivity)) openStorageAccess()
-                }
+                // The permission prompts for these start from the consent dialog on the home screen.
+                Feature.Sms -> store.smsAccess = enabled
+                Feature.Calls -> store.callAlerts = enabled
+                Feature.Storage -> store.storageAccess = enabled
                 Feature.Screen -> {
                     store.screenSharing = enabled
                     if (!enabled) ScreenBridge.stop(this@MainActivity)
@@ -332,8 +407,22 @@ class MainActivity : ComponentActivity() {
             link.refreshStatus()
         }
 
+        override fun finishSharingChoice(choices: SharingChoices?) {
+            if (choices != null) {
+                setFeature(Feature.Notifications, choices.notifications)
+                setFeature(Feature.Photos, choices.photos)
+                setFeature(Feature.Clipboard, choices.clipboard)
+                setFeature(Feature.ReceiveFiles, choices.receiveFiles)
+                setFeature(Feature.Ring, choices.ring)
+                setFeature(Feature.Media, choices.media)
+            }
+            store.sharingChosen = true
+            toggles++
+            requestNotificationPermission()
+        }
+
         override fun requestSaveFiles() {
-            featurePermissions.launch(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE))
+            requestOrSettings(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)) { featurePermissions.launch(it) }
         }
 
         override fun openRemoteControl() {
@@ -354,7 +443,7 @@ class MainActivity : ComponentActivity() {
             if (approvingScreenId.isNotEmpty()) return
             val request = ScreenBridge.pendingRequest() ?: return
             approvingScreenId = request.sessionId
-            if (request.audio && Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (request.audio && Build.VERSION.SDK_INT >= 29 && !isGranted(Manifest.permission.RECORD_AUDIO)) {
                 screenAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
             } else launchScreenConsent()
         }
@@ -362,22 +451,22 @@ class MainActivity : ComponentActivity() {
         override fun stopScreen() { ScreenBridge.stop(this@MainActivity) }
 
         override fun requestSms() {
-            featurePermissions.launch(SmsBridge.permissions)
+            requestOrSettings(SmsBridge.permissions, SMS_REQUIRED) { featurePermissions.launch(it) }
         }
 
         override fun requestCalls() {
-            featurePermissions.launch(CallWatcher.permissions)
+            requestOrSettings(CallWatcher.permissions, arrayOf(Manifest.permission.READ_PHONE_STATE)) { featurePermissions.launch(it) }
         }
 
         override fun openStorageAccess() {
             if (Build.VERSION.SDK_INT >= 30) {
                 try {
                     startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
-                } catch (_: android.content.ActivityNotFoundException) {
+                } catch (_: ActivityNotFoundException) {
                     startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                 }
             } else {
-                featurePermissions.launch(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE))
+                requestOrSettings(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)) { featurePermissions.launch(it) }
             }
         }
 
@@ -386,13 +475,30 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun requestPhotos() {
-            photoPermission.launch(PhotoSource.permissions())
+            val permissions = PhotoSource.permissions()
+            // "Choose photos" (partial access) asks again; only a missing permission can be blocked.
+            if (PhotoSource.access(this@MainActivity) == PhotoAccess.Denied && anyBlocked(permissions)) openAppSettings()
+            else photoPermission.launch(permissions)
         }
         override fun cancelTransfers() { link.cancelTransfers() }
-        override fun requestLocalNetwork() { networkPermission.launch(LocalNetworkAccess.PERMISSION) }
+        override fun requestLocalNetwork() {
+            if (isBlocked(LocalNetworkAccess.PERMISSION)) openAppSettings() else networkPermission.launch(LocalNetworkAccess.PERMISSION)
+        }
 
         override fun requestPostNotifications() {
-            if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT < 33) return
+            if (isBlocked(Manifest.permission.POST_NOTIFICATIONS)) openAppSettings()
+            else notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        override fun openAppSettings() { this@MainActivity.openAppSettings() }
+
+        override fun openBatterySettings() {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: ActivityNotFoundException) {
+                this@MainActivity.openAppSettings()
+            }
         }
 
         override fun sendClipboard() {
@@ -405,7 +511,7 @@ class MainActivity : ComponentActivity() {
 
         override fun copyPcClip(text: String) {
             link.copyToPhone(text)
-            if (Build.VERSION.SDK_INT < 33) SendClipboardActivity.toast(this@MainActivity, "Copied")
+            if (Build.VERSION.SDK_INT < 33) SendClipboardActivity.toast(this@MainActivity, getString(R.string.copied))
         }
 
         override fun reconnect() {
@@ -416,5 +522,14 @@ class MainActivity : ComponentActivity() {
         override fun unpair() {
             link.unpair()
         }
+    }
+
+    private companion object {
+        /** The SMS permissions the feature cannot work without; READ_CONTACTS only adds names. */
+        val SMS_REQUIRED = arrayOf(
+            Manifest.permission.READ_SMS,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS,
+        )
     }
 }

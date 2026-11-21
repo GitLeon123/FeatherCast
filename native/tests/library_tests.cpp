@@ -64,6 +64,13 @@ int main() {
          std::optional<std::wstring>(L"Another app already uses this alias."));
   assert(!ValidateAppAlias({L"app:other", L"Other", std::wstring(64, L'x')},
                            aliases));
+  // Aliases are saved keyed by app id, so a second alias for the same app
+  // would silently replace the first.
+  assert(ValidateAppAlias({L"app:code", L"Visual Studio Code", L"vsc"},
+                          aliases) ==
+         std::optional<std::wstring>(L"This app already has an alias."));
+  assert(!ValidateAppAlias({L"app:code", L"Visual Studio Code", L"vsc"},
+                           aliases, 0));
   // App aliases must not shadow a command alias, mirroring the command-side
   // check against app aliases.
   const std::map<std::wstring, std::wstring> takenCommandAliases = {
@@ -159,14 +166,14 @@ int main() {
   assert(missing.status == feathercast::snippets_io::LoadStatus::Missing);
   assert(missing.fingerprint.inspected && !missing.fingerprint.exists);
   const auto saved = feathercast::snippets_io::Save(
-      path, {{L"unicode", L"Grüße", L"First line\nSecond U0001F680"}},
+      path, {{L"unicode", L"Grüße", L"First line\nSecond \U0001F680"}},
       missing.fingerprint);
   assert(saved.succeeded);
   const auto loaded = feathercast::snippets_io::Load(path);
   assert(loaded.status == feathercast::snippets_io::LoadStatus::Valid);
   assert(loaded.snippets.size() == 1);
   assert(loaded.snippets[0].name == L"Grüße");
-  assert(loaded.snippets[0].text == L"First line\nSecond U0001F680");
+  assert(loaded.snippets[0].text == L"First line\nSecond \U0001F680");
 
   const auto originalWriteTime = loaded.fingerprint.writeTime;
   const auto originalSize = loaded.fingerprint.size;

@@ -247,6 +247,9 @@ class ScreenCaptureService : Service() {
             sendCapabilities(force = true)
         } catch (_: RuntimeException) {
             finish("Screen capture could not be configured on this phone. Start a new session and try again.")
+        } catch (_: java.io.IOException) {
+            // MediaCodec creation reports a missing or busy encoder this way.
+            finish("Screen capture could not be configured on this phone. Start a new session and try again.")
         }
     }
 
@@ -381,6 +384,8 @@ class ScreenCaptureService : Service() {
             }
         } catch (_: RuntimeException) {
             // Video and control remain usable when audio is unavailable.
+        } catch (_: java.io.IOException) {
+            // No AAC encoder: same as above, the session continues without audio.
         } finally {
             audioActive = false
             audioRecord = null

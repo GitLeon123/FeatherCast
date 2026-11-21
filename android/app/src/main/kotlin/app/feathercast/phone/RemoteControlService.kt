@@ -50,6 +50,8 @@ class RemoteControlService : AccessibilityService() {
                     if (busy || held) return@post
                     val width = ScreenBridge.displayWidth.toFloat()
                     val height = ScreenBridge.displayHeight.toFloat()
+                    // Teardown zeroes the size; coerceIn would throw on an empty range.
+                    if (width < 2f || height < 2f) return@post
                     val sx = (input.x.toFloat() / SCREEN_COORDINATE_SCALE * width).coerceIn(1f, width - 1f)
                     val sy = (input.y.toFloat() / SCREEN_COORDINATE_SCALE * height).coerceIn(height * .25f, height * .75f)
                     val end = (sy + input.value.coerceIn(-3, 3) * height * .12f).coerceIn(1f, height - 1f)
@@ -65,6 +67,7 @@ class RemoteControlService : AccessibilityService() {
         val input = latest
         if (input != null && !ScreenBridge.accepts(input.sessionId, input.generation)) { cancelGesture(); return }
         latest = null
+        if (ScreenBridge.displayWidth < 1 || ScreenBridge.displayHeight < 1) { cancelGesture(); return }
         val nx = input?.let { (it.x.toFloat() / SCREEN_COORDINATE_SCALE * ScreenBridge.displayWidth).coerceIn(0f, (ScreenBridge.displayWidth - 1).toFloat()) } ?: x
         val ny = input?.let { (it.y.toFloat() / SCREEN_COORDINATE_SCALE * ScreenBridge.displayHeight).coerceIn(0f, (ScreenBridge.displayHeight - 1).toFloat()) } ?: y
         val release = input?.action == "up"

@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace feathercast::library_ui {
@@ -45,6 +46,9 @@ struct ManagerCallbacks {
   std::function<library::OperationResult()> restoreDefaultWebSearches;
   std::function<ManagerData()> reload;
   std::function<void()> openSnippetsFile;
+  // Returns the outcome of the last queued snippet save once the worker has
+  // finished, or nullopt while it is still pending.
+  std::function<std::optional<library::OperationResult>()> pollSnippetSave;
 };
 
 void ShowLibraryManager(HWND owner, ManagerData data,

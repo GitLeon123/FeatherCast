@@ -13,6 +13,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -82,7 +83,10 @@ inline std::optional<Version> ParseVersion(std::wstring value) {
     int parsed = 0;
     for (size_t i = start; i < end; ++i) {
       if (!std::iswdigit(value[i])) return std::nullopt;
-      parsed = parsed * 10 + static_cast<int>(value[i] - L'0');
+      const int digit = static_cast<int>(value[i] - L'0');
+      // Tags come from the network; an oversized part must not overflow.
+      if (parsed > (std::numeric_limits<int>::max() - digit) / 10) return std::nullopt;
+      parsed = parsed * 10 + digit;
     }
     version.parts[part++] = parsed;
 
@@ -256,16 +260,18 @@ inline bool IsHexChar(char ch) {
          (ch >= 'A' && ch <= 'F');
 }
 
+// The first run of exactly 64 hex digits; a longer run (a SHA-512 digest,
+// say) is not a SHA-256 and is skipped whole.
 inline std::optional<std::string> ExtractSha256Hex(std::string_view text) {
-  for (size_t i = 0; i + 64 <= text.size(); ++i) {
-    bool allHex = true;
-    for (size_t j = 0; j < 64; ++j) {
-      if (!IsHexChar(text[i + j])) {
-        allHex = false;
-        break;
-      }
+  size_t i = 0;
+  while (i < text.size()) {
+    if (!IsHexChar(text[i])) {
+      ++i;
+      continue;
     }
-    if (allHex) return LowerAscii(std::string(text.substr(i, 64)));
+    const size_t start = i;
+    while (i < text.size() && IsHexChar(text[i])) ++i;
+    if (i - start == 64) return LowerAscii(std::string(text.substr(start, 64)));
   }
   return std::nullopt;
 }

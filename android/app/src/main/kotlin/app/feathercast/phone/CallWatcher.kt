@@ -14,6 +14,11 @@ import app.feathercast.protocol.PhoneMessages
 
 /** Tells the PC about incoming calls; the PC can reject or silence them. */
 object CallWatcher {
+    /**
+     * READ_PHONE_STATE is required. The call log and ANSWER_PHONE_CALLS (reject or silence from
+     * the PC) and READ_CONTACTS (the caller's name) are used for the matching call features;
+     * the user is told so before the permissions are requested.
+     */
     val permissions = buildList {
         add(Manifest.permission.READ_PHONE_STATE)
         add(Manifest.permission.READ_CALL_LOG)

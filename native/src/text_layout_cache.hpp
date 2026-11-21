@@ -23,6 +23,9 @@ struct TextLayoutOptions {
   TextLayoutStyle style = TextLayoutStyle::Inherit;
   bool centerHorizontally = false;
   bool centerVertically = false;
+  // Tabular (fixed-width) figures for counts, times, sizes and results, so
+  // digits do not shift horizontally while a value updates.
+  bool tabularFigures = false;
   bool operator==(const TextLayoutOptions&) const = default;
 };
 
@@ -87,6 +90,26 @@ class TextLayoutCache {
         FAILED(layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER))) {
       return nullptr;
     }
+    if (options.tabularFigures && !text.empty()) {
+      // Typography is optional polish: a font without the feature, or a
+      // failure here, still yields a usable proportional layout.
+      if (!tabularTypography_ || tabularFactory_ != factory) {
+        tabularTypography_.Reset();
+        tabularFactory_ = factory;
+        if (SUCCEEDED(factory->CreateTypography(&tabularTypography_))) {
+          const DWRITE_FONT_FEATURE feature{
+              DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1};
+          if (FAILED(tabularTypography_->AddFontFeature(feature))) {
+            tabularTypography_.Reset();
+          }
+        }
+      }
+      if (tabularTypography_) {
+        layout->SetTypography(
+            tabularTypography_.Get(),
+            {0, static_cast<UINT32>(text.size())});
+      }
+    }
     if (!cacheable) return layout;
 
     while (!entries_.empty() &&
@@ -146,6 +169,7 @@ class TextLayoutCache {
       mix(static_cast<std::size_t>(value.options.style));
       mix(value.options.centerHorizontally);
       mix(value.options.centerVertically);
+      mix(value.options.tabularFigures);
       return hash;
     }
   };
@@ -166,6 +190,8 @@ class TextLayoutCache {
   static constexpr std::size_t kMaxTextLength = 1024;
   std::size_t capacity_;
   std::size_t characterBudget_;
+  Microsoft::WRL::ComPtr<IDWriteTypography> tabularTypography_;
+  IDWriteFactory* tabularFactory_ = nullptr;
   std::size_t characters_ = 0;
   std::unordered_map<Key, Entry, Hash, Equal> entries_;
   std::list<const Key*> order_;

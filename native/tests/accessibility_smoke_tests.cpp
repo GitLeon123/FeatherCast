@@ -2,6 +2,7 @@
 #include "accessibility_projection.hpp"
 #include "test_framework.hpp"
 
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -624,6 +625,9 @@ void VerifyUiaRangeValuePattern() {
   assert(model.rangeRequests.size() == 1);
   assert(model.rangeRequests.front().first == 1);
   assert(model.rangeRequests.front().second == 65.0);
+  assert(range->SetValue(std::numeric_limits<double>::quiet_NaN()) ==
+         E_INVALIDARG);
+  assert(model.rangeRequests.size() == 1);
   IAccessibleEx* toggleChild = nullptr;
   assert(bridge->GetObjectForChild(2, &toggleChild) == S_OK);
   IRawElementProviderSimple* toggleProvider = nullptr;

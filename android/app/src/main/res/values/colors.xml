@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="launcher_background">#101012</color>
+    <!-- Behind the first frame, so the splash matches the app's light and dark canvas. -->
+    <color name="window_background">#F6F6F9</color>
 </resources>

@@ -396,7 +396,8 @@ class ChildProvider final : public IServiceProvider,
     if (!item->rangeValue) return UIA_E_NOTSUPPORTED;
     if ((item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_READONLY)) != 0)
       return E_ACCESSDENIED;
-    if (value < item->rangeMinimum || value > item->rangeMaximum) {
+    // Written so NaN, which fails every comparison, is rejected too.
+    if (!(value >= item->rangeMinimum && value <= item->rangeMaximum)) {
       return E_INVALIDARG;
     }
     return model->AccessibleSetRangeValue(connection_->hwnd, child_, value);

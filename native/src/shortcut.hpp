@@ -246,11 +246,16 @@ class ShortcutRecorder {
     return {};
   }
 
+  // Modifiers currently held while recording, for a live chord preview.
+  const PressedModifiers& HeldModifiers() const { return modifiers_; }
+
  private:
   void OnModifierDown(UINT generic) {
     const bool hadModifiers = AnyModifierPressed();
     const bool alreadyPressed = IsModifierPressed(generic);
     SetModifier(generic, true);
+    // Holding a modifier auto-repeats its key-down; that is not a chord.
+    if (alreadyPressed) return;
 
     if (!hadModifiers && !alreadyPressed) {
       singleModifierCandidate_ = generic;
@@ -405,6 +410,24 @@ inline HotKeySpec ToHotKeySpec(const ShortcutSpec& shortcut) {
   hotKey.vk = shortcut.vk;
   hotKey.supported = hotKey.modifiers != 0;
   return hotKey;
+}
+
+// Plain Win+<key> chords that Windows itself owns (Desktop, Explorer, Lock,
+// Run, Settings, Search, Task View, Clipboard history, Quick Link menu,
+// Quick Settings, Notifications and the taskbar slots Win+1..0). The hook could
+// swallow some of them, but they would silently break the system feature.
+inline bool IsReservedWindowsShortcut(const ShortcutSpec& shortcut) {
+  if (!shortcut.valid || shortcut.singleModifier || !shortcut.win ||
+      shortcut.ctrl || shortcut.alt || shortcut.shift) {
+    return false;
+  }
+  switch (shortcut.vk) {
+    case 'D': case 'E': case 'L': case 'R': case 'I': case 'S': case 'V':
+    case 'X': case 'A': case 'N': case VK_TAB:
+      return true;
+    default:
+      return shortcut.vk >= '0' && shortcut.vk <= '9';
+  }
 }
 
 inline bool IsExclusiveWinShortcut(const ShortcutSpec& shortcut) {

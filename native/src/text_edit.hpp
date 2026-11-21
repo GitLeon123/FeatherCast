@@ -89,6 +89,10 @@ inline std::pair<size_t, size_t> WordAt(const std::wstring& text, size_t positio
   return {start, end};
 }
 
+inline std::pair<size_t, size_t> WordBoundsAt(const std::wstring& text, size_t position) {
+  return WordAt(text, position);
+}
+
 // Both erase helpers remove a whole surrogate pair when position is inside
 // one, so they never leave an unpaired surrogate behind, and they leave
 // position on the code point boundary where the removed text started.

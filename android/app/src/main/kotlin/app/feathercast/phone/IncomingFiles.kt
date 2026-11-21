@@ -33,8 +33,8 @@ object IncomingFiles {
             context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
 
     fun createChannel(context: Context) {
-        val channel = NotificationChannel(CHANNEL_ID, "Files from PC", NotificationManager.IMPORTANCE_DEFAULT).apply {
-            description = "Shows files that your PC sent to this phone."
+        val channel = NotificationChannel(CHANNEL_ID, context.getString(R.string.channel_files), NotificationManager.IMPORTANCE_DEFAULT).apply {
+            description = context.getString(R.string.channel_files_description)
         }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }

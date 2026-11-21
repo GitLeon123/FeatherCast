@@ -32,6 +32,21 @@ class LinkStore(context: Context) {
             prefs.edit().putString("deviceId", it).apply()
         }
 
+    init {
+        // Sharing used to start switched on. Phones that were paired before the defaults
+        // changed keep exactly what they had; only unset keys on new pairings start off.
+        // The marker makes this run once: a new pairing whose sharing step is still
+        // pending also lacks "sharingChosen" and must not be switched on after a restart.
+        if (!prefs.getBoolean(SHARING_MIGRATED, false)) {
+            val edit = prefs.edit().putBoolean(SHARING_MIGRATED, true)
+            if (!prefs.contains("sharingChosen") && prefs.contains("linkKey")) {
+                edit.putBoolean("sharingChosen", true)
+                LEGACY_ON_BY_DEFAULT.forEach { if (!prefs.contains(it)) edit.putBoolean(it, true) }
+            }
+            edit.apply()
+        }
+    }
+
     // The unwrapped pairing, so the Keystore decrypts it once instead of on every call.
     private val lock = Any()
     private var cached: PairedPc? = null
@@ -56,9 +71,13 @@ class LinkStore(context: Context) {
 
     fun save(pc: PairedPc): Unit = synchronized(lock) {
         val edit = prefs.edit()
-        // A different PC must not inherit the extra access granted to the previous one.
-        if (prefs.getString("pcId", null) != pc.pcId) OPTIONAL_SWITCHES.forEach { edit.remove(it) }
-        edit.putString("pcId", pc.pcId)
+        // A different PC must not inherit the access granted to the previous one, and the
+        // user chooses again what to share with it.
+        if (prefs.getString("pcId", null) != pc.pcId) {
+            (OPTIONAL_SWITCHES + SHARING_SWITCHES + "sharingChosen").forEach { edit.remove(it) }
+        }
+        edit.putBoolean(SHARING_MIGRATED, true)
+            .putString("pcId", pc.pcId)
             .putString("pcName", pc.pcName)
             .putString("host", pc.host)
             .putInt("port", pc.port)
@@ -87,16 +106,22 @@ class LinkStore(context: Context) {
         cacheValid = true
     }
 
+    /** True once the user has seen the "Choose what to share" step for the current pairing. */
+    var sharingChosen: Boolean
+        get() = prefs.getBoolean("sharingChosen", false)
+        set(value) = prefs.edit().putBoolean("sharingChosen", value).apply()
+
+    // Notifications, photos and clipboard carry personal data, so they stay off until chosen.
     var sendNotifications: Boolean
-        get() = prefs.getBoolean("sendNotifications", true)
+        get() = prefs.getBoolean("sendNotifications", false)
         set(value) = prefs.edit().putBoolean("sendNotifications", value).apply()
 
     var sendPhotos: Boolean
-        get() = prefs.getBoolean("sendPhotos", true)
+        get() = prefs.getBoolean("sendPhotos", false)
         set(value) = prefs.edit().putBoolean("sendPhotos", value).apply()
 
     var clipboardSync: Boolean
-        get() = prefs.getBoolean("clipboardSync", true)
+        get() = prefs.getBoolean("clipboardSync", false)
         set(value) = prefs.edit().putBoolean("clipboardSync", value).apply()
 
     var receiveFiles: Boolean
@@ -131,6 +156,20 @@ class LinkStore(context: Context) {
     var remoteControl: Boolean
         get() = prefs.getBoolean("remoteControl", false)
         set(value) = prefs.edit().putBoolean("remoteControl", value).apply()
+
+    /**
+     * Runtime permissions that Android no longer shows a dialog for, so the app sends the
+     * user to its settings instead. Only meaningful while the permission is not granted.
+     */
+    fun isPermissionBlocked(permission: String): Boolean =
+        prefs.getStringSet("blockedPermissions", emptySet())?.contains(permission) == true
+
+    fun setPermissionBlocked(permission: String, blocked: Boolean) {
+        val next = (prefs.getStringSet("blockedPermissions", emptySet()) ?: emptySet()).toMutableSet()
+        if (if (blocked) next.add(permission) else next.remove(permission)) {
+            prefs.edit().putStringSet("blockedPermissions", next).apply()
+        }
+    }
 
     /** The ringer mode to restore after the PC silenced a call, or -1. Survives process death. */
     var silencedRingerMode: Int
@@ -169,6 +208,9 @@ class LinkStore(context: Context) {
 
     private companion object {
         const val KEY_ALIAS = "feathercast-link-key"
+        const val SHARING_MIGRATED = "sharingMigrated"
+        val LEGACY_ON_BY_DEFAULT = listOf("sendNotifications", "sendPhotos", "clipboardSync")
+        val SHARING_SWITCHES = listOf("sendNotifications", "sendPhotos", "clipboardSync", "receiveFiles", "allowRing", "mediaControl")
         val OPTIONAL_SWITCHES = listOf("smsAccess", "callAlerts", "storageAccess", "screenSharing", "remoteControl")
     }
 }

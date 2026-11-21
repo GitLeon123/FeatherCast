@@ -51,6 +51,7 @@ std::vector<app::DisplayItem> BuildHiddenAppActions(
 // running, so End Task is never offered for them.
 bool CanEndTask(const app::WindowEntry& window, DWORD currentProcessId);
 bool IsPersonalizableInvocation(const app::DisplayItem& item);
+bool RequiresConfirmation(const app::DisplayItem& item);
 bool RecordsRecentActivation(const app::DisplayItem& item);
 bool ValidateCatalog(std::wstring* error = nullptr);
 

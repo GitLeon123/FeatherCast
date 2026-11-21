@@ -19,6 +19,10 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Reads and sends text messages (SMS only, no MMS) for the PC. */
 object SmsBridge {
+    /**
+     * The first three are required. READ_CONTACTS is optional and only used to show contact
+     * names instead of numbers; the user is told so before the permissions are requested.
+     */
     val permissions = arrayOf(
         Manifest.permission.READ_SMS,
         Manifest.permission.SEND_SMS,

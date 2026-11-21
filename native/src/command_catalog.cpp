@@ -224,7 +224,7 @@ const std::vector<CommandDescriptor>& Catalog() {
        L"Refresh Apps & Games", L"Rescan apps and locally installed games",
        {L"rescan", L"reload apps", L"refresh games"}},
       {L"clear-icon-cache", app::CommandKind::ClearIconCache,
-       L"Clear Icon Cache", L"Delete cached shell icons",
+       L"Clear Icon Cache", L"Clear cached shell icons",
        {L"icons", L"cache"}},
       {L"clear-recents", app::CommandKind::ClearRecents, L"Clear Recents",
        L"Forget recently used apps", {L"history", L"recent apps"}},
@@ -651,8 +651,19 @@ bool IsPersonalizableInvocation(const app::DisplayItem& item) {
           item.app.source == L"quicklink" || item.app.source == L"script" || item.app.source == L"workspace");
 }
 
+bool RequiresConfirmation(const app::DisplayItem& item) {
+  if (!item.isCommand) return false;
+  const CommandDescriptor* descriptor = !item.commandStableId.empty()
+      ? Find(item.commandStableId)
+      : Find(item.command);
+  return descriptor && descriptor->confirmation.has_value();
+}
+
 bool RecordsRecentActivation(const app::DisplayItem& item) {
-  return IsPersonalizableInvocation(item) && !item.isAction;
+  // Power commands never enter Recent, so the launcher cannot open with
+  // "Restart PC" preselected.
+  return IsPersonalizableInvocation(item) && !item.isAction &&
+         !RequiresConfirmation(item);
 }
 
 bool ValidateCatalog(std::wstring* error) {

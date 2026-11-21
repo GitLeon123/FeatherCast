@@ -54,6 +54,57 @@ int main() {
   result = search_pipeline::ComputeResults(request);
   assert(result.flatItems.front().commandStableId == L"volume-up");
 
+  {
+    // A window whose title starts with the query is promoted next to the
+    // apps; a weaker window match stays in the trailing Open windows section.
+    const auto sectionIndex = [](const app::ResultsCollection& results,
+                                 const std::wstring& title) {
+      for (std::size_t index = 0; index < results.sections.size(); ++index) {
+        if (results.sections[index].title == title) return static_cast<int>(index);
+      }
+      return -1;
+    };
+    const auto rank = [&](const std::wstring& windowTitle) {
+      auto rankSnapshot = std::make_shared<app::SearchSnapshot>();
+      app::DisplayItem rankedApp;
+      rankedApp.app.id = L"app:mail";
+      rankedApp.app.name = L"Mail Inbox App";
+      rankedApp.app.source = L"start-menu";
+      rankedApp.app.launchType = app::LaunchType::Exe;
+      app::DisplayItem rankedFile;
+      rankedFile.app.id = L"file:inbox";
+      rankedFile.app.name = L"inbox notes.txt";
+      rankedFile.app.path = L"C:\\Users\\test\\inbox notes.txt";
+      rankedFile.app.source = L"file";
+      app::DisplayItem rankedWindow;
+      rankedWindow.isWindow = true;
+      rankedWindow.window.name = windowTitle;
+      rankedWindow.window.processName = L"mail.exe";
+      for (const auto* item : {&rankedApp, &rankedFile, &rankedWindow}) {
+        rankSnapshot->pool.push_back(*item);
+        core::SearchItem searchItem;
+        searchItem.id = item->isWindow ? L"win:1" : item->app.id;
+        searchItem.name = item->isWindow ? item->window.name : item->app.name;
+        searchItem.kind = item->isWindow ? L"window" : L"app";
+        searchItem.source = item->isWindow ? L"" : item->app.source;
+        searchItem.path = item->app.path;
+        if (item->isWindow) searchItem.processName = item->window.processName;
+        rankSnapshot->searchItems.push_back(core::PrepareSearchItem(searchItem));
+      }
+      app::QueryRequest rankRequest;
+      rankRequest.snapshot = rankSnapshot;
+      rankRequest.limit = 100;
+      rankRequest.query = L"inbox";
+      return search_pipeline::ComputeResults(rankRequest);
+    };
+    const auto strong = rank(L"Inbox - Contoso");
+    assert(sectionIndex(strong, L"Open windows") >= 0);
+    assert(sectionIndex(strong, L"Open windows") < sectionIndex(strong, L"Apps"));
+    assert(sectionIndex(strong, L"Open windows") < sectionIndex(strong, L"Files & Folders"));
+    const auto weak = rank(L"Contoso - my inbox");
+    assert(sectionIndex(weak, L"Open windows") > sectionIndex(weak, L"Files & Folders"));
+  }
+
   app::Settings settings;
   search_preferences::Remember(settings, L"vue", appItem);
   assert(settings.learnedQueryActions.empty());

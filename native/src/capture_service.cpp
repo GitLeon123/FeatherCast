@@ -76,7 +76,8 @@ std::wstring HResultMessage(HRESULT result) {
       nullptr, static_cast<DWORD>(result), 0,
       reinterpret_cast<wchar_t*>(&text), 0, nullptr);
   std::wstring message =
-      length && text ? std::wstring(text, length) : std::format(L"0x{:08X}", result);
+      length && text ? std::wstring(text, length)
+                     : std::format(L"0x{:08X}", static_cast<DWORD>(result));
   if (text) LocalFree(text);
   while (!message.empty() &&
          (message.back() == L'\r' || message.back() == L'\n')) {
@@ -1054,7 +1055,7 @@ class CaptureService::Impl {
       }
 
       const PixelRect outputBounds{crop.left, crop.top, crop.right, crop.bottom};
-      if (destination == screenshot::Destination::File) {
+      if (destination != screenshot::Destination::Clipboard) {
         const auto output = NextOutputPaths(CaptureOperation::Screenshot);
         temporary = output.partialPath;
         EncodePng(temporary, rendered->pixels,
@@ -1065,8 +1066,14 @@ class CaptureService::Impl {
           winrt::check_hresult(HRESULT_FROM_WIN32(GetLastError()));
         }
         temporary.clear();
+        // The file is already on disk, so a clipboard failure here is
+        // reported through clipboardSucceeded instead of failing the save.
+        const bool alsoCopied =
+            destination == screenshot::Destination::FileAndClipboard &&
+            PublishClipboard(rendered->pixels, static_cast<int>(rendered->width),
+                             static_cast<int>(rendered->height));
         Complete({CaptureEventKind::Completed, CaptureOperation::Screenshot,
-                  scope, outputBounds, output.finalPath, {}, {}, false});
+                  scope, outputBounds, output.finalPath, {}, {}, alsoCopied});
         return;
       }
 

@@ -37,8 +37,8 @@ object Ringer {
     private val timeout = Runnable { stop(PhoneApp.instance) }
 
     fun createChannel(context: Context) {
-        val channel = NotificationChannel(CHANNEL_ID, "Find my phone", NotificationManager.IMPORTANCE_HIGH).apply {
-            description = "Shows while the PC makes this phone ring."
+        val channel = NotificationChannel(CHANNEL_ID, context.getString(R.string.channel_ring), NotificationManager.IMPORTANCE_HIGH).apply {
+            description = context.getString(R.string.channel_ring_description)
             setSound(null, null)
         }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -58,8 +58,9 @@ object Ringer {
             val uri = RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_ALARM)
                 ?: RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val created = MediaPlayer()
             player = try {
-                MediaPlayer().apply {
+                created.apply {
                     setAudioAttributes(
                         AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_ALARM)
@@ -72,6 +73,7 @@ object Ringer {
                     start()
                 }
             } catch (_: Exception) {
+                created.release()
                 null
             }
             vibrate(context, true)

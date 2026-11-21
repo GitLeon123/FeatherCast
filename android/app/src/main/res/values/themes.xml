@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.FeatherCast" parent="android:Theme.Material.NoActionBar">
+    <!-- Light by default; values-night switches the parent to the dark platform theme. -->
+    <style name="Theme.FeatherCast" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowBackground">@color/launcher_background</item>
+        <item name="android:windowBackground">@color/window_background</item>
     </style>
     <style name="Theme.FeatherCast.Transparent" parent="android:Theme.Translucent.NoTitleBar">
         <item name="android:windowNoTitle">true</item>

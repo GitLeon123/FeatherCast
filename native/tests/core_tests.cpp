@@ -184,6 +184,8 @@ int main() {
 
     const auto tangent = TryEvaluate(L"tan(45)");
     assert(tangent && std::fabs(tangent->value - 1.0) < 0.000001);
+    assert(!TryEvaluate(L"tan(90)"));
+    assert(!TryEvaluate(L"tan(-270)"));
 
     const auto root = TryEvaluate(L"sqrt(16)");
     assert(root && root->display == L"4");
@@ -232,6 +234,8 @@ int main() {
     assert(hex && hex->display == L"255");
     const auto hexSum = TryEvaluate(L"0x10 + 1");
     assert(hexSum && hexSum->display == L"17");
+    // Beyond 2^53 the value would silently differ from what was typed.
+    assert(!TryEvaluate(L"0x20000000000001"));
     const auto times = TryEvaluate(L"3x4");
     assert(times && times->display == L"12");
 
@@ -459,6 +463,8 @@ int main() {
     assert(CompareVersionStrings(L"1.0.0", L"1.0.0") == 0);
     assert(IsNewerVersion(L"0.2.0", L"v0.3.0"));
     assert(!IsNewerVersion(L"0.3.0", L"v0.2.9"));
+    assert(feathercast::updater::ParseVersion(L"2147483647.0"));
+    assert(!feathercast::updater::ParseVersion(L"2147483648.0"));
 
     const auto release = ParseGitHubReleaseJson(
         "{\"tag_name\":\"v0.3.0\",\"name\":\"FeatherCast 0.3.0\",\"html_url\":\"https://github.com/GenericLeon0/FeatherCast/releases/tag/v0.3.0\","
@@ -480,6 +486,11 @@ int main() {
     const auto extracted = ExtractSha256Hex(
         "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  file.txt");
     assert(extracted && *extracted == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // A 128-digit (SHA-512) run is not split into a SHA-256.
+    assert(!ExtractSha256Hex(std::string(128, 'a') + "  file.txt"));
+    const auto prefixed = ExtractSha256Hex(
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(prefixed && prefixed->size() == 64);
     const auto signerPins = feathercast::updater::ParseSignerThumbprints(
         L"BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD;"
         L"invalid");
@@ -547,6 +558,14 @@ int main() {
     const auto outside = ParseManifestJson("{\"id\":\"escape\",\"name\":\"Escape\",\"version\":\"1\",\"dll\":\"..\\\\escape.dll\"}",
                                            pluginDir / L"escape.json");
     assert(!outside.manifest);
+
+    // Nested objects must not supply top-level fields; \u escapes decode.
+    const auto nested = ParseManifestJson(
+        "{\"author\":{\"name\":\"Bob\",\"id\":\"x\"},\"id\":\"nested\","
+        "\"name\":\"Caf\\u00e9\",\"version\":\"1\",\"dll\":\"nested.dll\"}",
+        pluginDir / L"nested.json");
+    assert(nested.manifest && nested.manifest->id == L"nested");
+    assert(nested.manifest->name == L"Café");
 
     const auto exePluginDir = tempRoot / L"exe" / L"plugins" / L"sample";
     WriteUtf8(exePluginDir / L"plugin.json",
@@ -895,6 +914,17 @@ int main() {
     assert(feathercast::run_command::StripMatchingQuotes(L" \"C:\\My App\\x.exe\" ") == L"C:\\My App\\x.exe");
     assert(feathercast::run_command::StripMatchingQuotes(L"'it\"s'") == L"it\"s");
     assert(feathercast::run_command::StripMatchingQuotes(L"\"") == L"\"");
+    const auto program = feathercast::run_command::Classify(L">notepad.exe");
+    assert(program);
+    assert(program->kind == feathercast::run_command::Kind::ShellCommand);
+    assert(program->input == L"notepad.exe");
+
+    // Launchable files that are not TLDs run as commands instead of becoming URLs.
+    for (const wchar_t* name : {L">setup.msi", L">regedit.lnk", L">script.js", L">tweak.reg"}) {
+      const auto launchable = feathercast::run_command::Classify(name);
+      assert(launchable);
+      assert(launchable->kind == feathercast::run_command::Kind::ShellCommand);
+    }
   }
 
   {
@@ -1527,9 +1557,13 @@ int main() {
     original.fileIndexRoots = {L"C:\\Work", L"D:\\Projects"};
     original.fileIndexExcludePatterns = {L"**\\.git\\**", L"*.tmp"};
     original.diagnosticsEnabled = true;
+    original.onboardingShown = true;
+    original.currencyRatesOnline = false;
     original.quicklinks.push_back({L"docs", L"My \"Docs\"", L"C:\\Users\\Leon\\Docs"});
 
     const fs::Settings copy = fs::ParseSettings(fs::SerializeSettings(original));
+    assert(copy.onboardingShown);
+    assert(!copy.currencyRatesOnline);
     assert(copy.shortcut == original.shortcut);
     assert(copy.recentApps == original.recentApps);
     assert(copy.pinnedApps == original.pinnedApps);
@@ -1975,6 +2009,22 @@ int main() {
       assert(!feathercast::input_broker::ShouldHandleWinKey(false, enabled));
     }
 
+    // Well-known Windows-owned Win chords are rejected up front; Win+Space and
+    // chords with extra modifiers remain assignable.
+    for (const auto* reserved :
+         {L"Win+D", L"Super+E", L"Win+L", L"Win+R", L"Win+I", L"Win+S",
+          L"Win+V", L"Win+X", L"Win+A", L"Win+N", L"Win+Tab", L"Win+1",
+          L"Win+0"}) {
+      assert(feathercast::shortcut::IsReservedWindowsShortcut(
+          ParseShortcut(reserved)));
+    }
+    for (const auto* allowed :
+         {L"Win+Space", L"Win+Shift+D", L"Ctrl+Win+L", L"Alt+D", L"Alt+Space",
+          L"Super", L"Print Screen", L"none", L"Win+K"}) {
+      assert(!feathercast::shortcut::IsReservedWindowsShortcut(
+          ParseShortcut(allowed)));
+    }
+
     assert(!ToHotKeySpec(ParseShortcut(L"Super")).supported);
     assert(!ToHotKeySpec(ParseShortcut(L"Super+Space")).supported);
     assert(!ToHotKeySpec(ParseShortcut(L"none")).supported);
@@ -2247,6 +2297,15 @@ void TestSurrogateSafeEditing() {
   assert(text_edit::ClipToCodePoints(pair, 2) == 1);
   assert(text_edit::ClipToCodePoints(pair, 3) == 3);
   assert(text_edit::ClipToCodePoints(pair, 99) == pair.size());
+
+  // Double-click selects the word under the pointer, or a whitespace run.
+  const std::wstring words = L"open  chrome now";
+  assert((text_edit::WordBoundsAt(words, 1) == std::pair<size_t, size_t>{0, 4}));
+  assert((text_edit::WordBoundsAt(words, 4) == std::pair<size_t, size_t>{4, 6}));
+  assert((text_edit::WordBoundsAt(words, 8) == std::pair<size_t, size_t>{6, 12}));
+  assert((text_edit::WordBoundsAt(words, words.size()) == std::pair<size_t, size_t>{13, 16}));
+  assert((text_edit::WordBoundsAt(L"", 0) == std::pair<size_t, size_t>{0, 0}));
+  assert((text_edit::WordBoundsAt(pair, 1) == std::pair<size_t, size_t>{0, pair.size()}));
 
   // Backspace and Delete from inside a pair remove the whole pair.
   std::wstring text = pair;

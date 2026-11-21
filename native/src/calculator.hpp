@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <cwchar>
@@ -224,6 +225,8 @@ class Parser {
   // search worker's stack.
   static constexpr int kMaxDepth = 64;
   static constexpr size_t kMaxHexDigits = 16;
+  // Larger integers no longer convert to a double exactly.
+  static constexpr std::uint64_t kMaxExactInteger = std::uint64_t{1} << 53;
 
   class Nesting {
    public:
@@ -434,7 +437,8 @@ class Parser {
   // something, and so is a digit run too long to hold exactly.
   bool ParseHex(Parsed& value) {
     pos_ += 2;
-    double parsed = 0.0;
+    // 16 hex digits always fit; the double conversion happens once at the end.
+    std::uint64_t parsed = 0;
     size_t digits = 0;
     while (pos_ < text_.size()) {
       const wchar_t ch = text_[pos_];
@@ -443,14 +447,14 @@ class Parser {
       else if (ch >= L'a' && ch <= L'f') digit = ch - L'a' + 10;
       else if (ch >= L'A' && ch <= L'F') digit = ch - L'A' + 10;
       if (digit < 0) break;
-      parsed = parsed * 16.0 + digit;
+      parsed = parsed * 16 + static_cast<std::uint64_t>(digit);
       ++digits;
       ++pos_;
     }
-    if (digits == 0 || digits > kMaxHexDigits) return false;
+    if (digits == 0 || digits > kMaxHexDigits || parsed > kMaxExactInteger) return false;
     sawValue_ = true;
     sawCalculationSyntax_ = true;
-    value = Parsed{parsed, false};
+    value = Parsed{static_cast<double>(parsed), false};
     return true;
   }
 
