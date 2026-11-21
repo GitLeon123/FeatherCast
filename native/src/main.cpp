@@ -87,6 +87,7 @@
 #include <dwmapi.h>
 #include <imm.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <knownfolders.h>
 #include <powrprof.h>
 #include <propidl.h>
@@ -1350,10 +1351,13 @@ uint64_t Fnv1a(const std::wstring& value) {
   return hash;
 }
 
-std::filesystem::path IconCacheDir() {
-  auto dir = LocalDataPath() / L"icon-cache-native";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
+const std::filesystem::path& IconCacheDir() {
+  static const std::filesystem::path dir = [] {
+    auto path = LocalDataPath() / L"icon-cache-native";
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    return path;
+  }();
   return dir;
 }
 
@@ -1951,35 +1955,68 @@ void StartInputBrokerClient(HWND hwnd) {
   }
   g_brokerClientThread = std::thread([hwnd, stop = g_brokerClientStop,
                                       wake = g_brokerClientWake]() {
+    struct ScopedHandle {
+      HANDLE handle = nullptr;
+      ~ScopedHandle() { if (handle) CloseHandle(handle); }
+    };
+    ScopedHandle writeEvent{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    ScopedHandle readEvent{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    if (!writeEvent.handle || !readEvent.handle) return;
+
     const auto pipeName = feathercast::input_broker::PipeName();
     // Waits for the timeout; false means the client is stopping.
     const auto pause = [stop](DWORD milliseconds) {
       return WaitForSingleObject(stop, milliseconds) == WAIT_TIMEOUT;
     };
-    const auto send = [](HANDLE pipe, const auto& value) {
+    const auto sendOverlapped = [stop, ev = writeEvent.handle](
+                                    HANDLE pipe, const auto& value,
+                                    DWORD timeoutMs = 2000,
+                                    bool ignoreStop = false) -> bool {
+      ResetEvent(ev);
+      OVERLAPPED ov{};
+      ov.hEvent = ev;
       DWORD written = 0;
-      return WriteFile(pipe, &value, sizeof(value), &written, nullptr) &&
-             written == sizeof(value);
-    };
-    // The broker validates the registration and acknowledges it; a broker
-    // installed next to another FeatherCast.exe drops the pipe instead. Polls
-    // so a broker that never answers cannot block the client.
-    const auto accepted = [&pause](HANDLE pipe) {
-      for (int attempt = 0; attempt < 40; ++attempt) {
-        DWORD bytesAvail = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
+      if (!WriteFile(pipe, &value, sizeof(value), &written, &ov)) {
+        if (GetLastError() != ERROR_IO_PENDING) return false;
+        DWORD wait = WAIT_FAILED;
+        if (ignoreStop) {
+          wait = WaitForSingleObject(ev, timeoutMs) == WAIT_OBJECT_0
+                     ? WAIT_OBJECT_0 + 1
+                     : WAIT_TIMEOUT;
+        } else {
+          const HANDLE waits[] = {stop, ev};
+          wait = WaitForMultipleObjects(2, waits, FALSE, timeoutMs);
+        }
+        if (wait != WAIT_OBJECT_0 + 1) {
+          CancelIoEx(pipe, &ov);
+          GetOverlappedResult(pipe, &ov, &written, TRUE);
           return false;
         }
-        if (bytesAvail >= sizeof(DWORD)) {
-          DWORD ack = 0;
-          DWORD read = 0;
-          return ReadFile(pipe, &ack, sizeof(ack), &read, nullptr) &&
-                 read == sizeof(ack) &&
-                 ack == feathercast::input_broker::kRegistrationAccepted;
-        }
-        if (!pause(50)) return false;
+        if (!GetOverlappedResult(pipe, &ov, &written, FALSE)) return false;
       }
-      return false;
+      return written == sizeof(value);
+    };
+    // The broker validates the registration and acknowledges it; a broker
+    // installed next to another FeatherCast.exe drops the pipe instead.
+    const auto accepted = [stop, ev = readEvent.handle](HANDLE pipe) -> bool {
+      ResetEvent(ev);
+      OVERLAPPED ov{};
+      ov.hEvent = ev;
+      DWORD ack = 0;
+      DWORD read = 0;
+      if (!ReadFile(pipe, &ack, sizeof(ack), &read, &ov)) {
+        if (GetLastError() != ERROR_IO_PENDING) return false;
+        const HANDLE waits[] = {stop, ev};
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 2000);
+        if (wait != WAIT_OBJECT_0 + 1) {
+          CancelIoEx(pipe, &ov);
+          GetOverlappedResult(pipe, &ov, &read, TRUE);
+          return false;
+        }
+        if (!GetOverlappedResult(pipe, &ov, &read, FALSE)) return false;
+      }
+      return read == sizeof(ack) &&
+             ack == feathercast::input_broker::kRegistrationAccepted;
     };
 
     // A broker that keeps exiting is relaunched with growing delays.
@@ -1987,20 +2024,24 @@ void StartInputBrokerClient(HWND hwnd) {
     constexpr ULONGLONG kMaxRestartDelay = 60000;
     ULONGLONG restartDelay = kFirstRestartDelay;
     ULONGLONG nextBrokerStart = 0;
+    DWORD missingPollDelay = 500;
     // A broker that rejects this copy is asked again with growing delays;
     // meanwhile the local hook keeps handling the Win key.
     DWORD rejectedDelay = 0;
     while (pause(0)) {
       HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                0, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_OVERLAPPED, nullptr);
       if (pipe == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND &&
             GetTickCount64() >= nextBrokerStart) {
-          StartInputBrokerProcess();
+          const bool launched = StartInputBrokerProcess();
           nextBrokerStart = GetTickCount64() + restartDelay;
           restartDelay = std::min(restartDelay * 2, kMaxRestartDelay);
+          missingPollDelay = launched ? 500 : 60000;
         }
-        if (!pause(500)) break;
+        if (!pause(missingPollDelay)) break;
+        missingPollDelay = std::min<DWORD>(missingPollDelay * 2, 60000);
         continue;
       }
 
@@ -2010,7 +2051,7 @@ void StartInputBrokerClient(HWND hwnd) {
       reg.hwnd = reinterpret_cast<std::uint64_t>(hwnd);
       reg.threadId = GetWindowThreadProcessId(hwnd, nullptr);
       reg.winShortcutEnabled = winShortcut ? 1 : 0;
-      if (!send(pipe, reg) || !accepted(pipe)) {
+      if (!sendOverlapped(pipe, reg) || !accepted(pipe)) {
         CloseHandle(pipe);
         if (rejectedDelay == 0) {
           AppendHookLog(L"[Hook] InputBroker did not accept this FeatherCast; using the local hook\n");
@@ -2022,31 +2063,66 @@ void StartInputBrokerClient(HWND hwnd) {
       rejectedDelay = 0;
       restartDelay = kFirstRestartDelay;
       nextBrokerStart = 0;
+      missingPollDelay = 500;
       g_inputBrokerConnected.store(true);
       AppendHookLog(L"[Hook] Connected to InputBroker\n");
       PostMessageW(hwnd, WM_BROKER_STATE_CHANGED, 0, 0);
 
-      const HANDLE waits[] = {stop, wake};
-      while (true) {
-        const DWORD wait = WaitForMultipleObjects(
-            static_cast<DWORD>(std::size(waits)), waits, FALSE, 200);
-        if (wait == WAIT_OBJECT_0) {
-          send(pipe, BrokerCommand::Shutdown);
-          break;
+      // Keep a single async read posted on the pipe so broker exit wakes us
+      // immediately with zero periodic polling while connected.
+      OVERLAPPED readOv{};
+      BYTE probe = 0;
+      DWORD probeRead = 0;
+      bool readPending = false;
+      const auto armRead = [&]() -> bool {
+        ResetEvent(readEvent.handle);
+        readOv = OVERLAPPED{};
+        readOv.hEvent = readEvent.handle;
+        if (ReadFile(pipe, &probe, 1, &probeRead, &readOv)) {
+          return probeRead != 0;
         }
-        if (wait == WAIT_OBJECT_0 + 1) {
-          const bool next = g_isExclusiveWinShortcut.load();
-          if (next == winShortcut) continue;
-          if (!send(pipe, next ? BrokerCommand::EnableWinShortcut
-                               : BrokerCommand::DisableWinShortcut)) {
+        if (GetLastError() == ERROR_IO_PENDING) {
+          readPending = true;
+          return true;
+        }
+        return false;
+      };
+      if (armRead()) {
+        const HANDLE waits[] = {stop, wake, readEvent.handle};
+        while (true) {
+          if (!readPending) {
+            if (!armRead()) break;
+            continue;
+          }
+          const DWORD wait = WaitForMultipleObjects(
+              static_cast<DWORD>(std::size(waits)), waits, FALSE, INFINITE);
+          if (wait == WAIT_OBJECT_0) {
+            sendOverlapped(pipe, BrokerCommand::Shutdown, 250, true);
             break;
           }
-          winShortcut = next;
-          continue;
-        }
-        DWORD bytesAvail = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvail, nullptr)) {
+          if (wait == WAIT_OBJECT_0 + 1) {
+            const bool next = g_isExclusiveWinShortcut.load();
+            if (next == winShortcut) continue;
+            if (!sendOverlapped(pipe, next ? BrokerCommand::EnableWinShortcut
+                                           : BrokerCommand::DisableWinShortcut)) {
+              break;
+            }
+            winShortcut = next;
+            continue;
+          }
+          if (wait == WAIT_OBJECT_0 + 2) {
+            readPending = false;
+            if (!GetOverlappedResult(pipe, &readOv, &probeRead, FALSE) ||
+                probeRead == 0) {
+              break;
+            }
+            continue;
+          }
           break;
+        }
+        if (readPending) {
+          CancelIoEx(pipe, &readOv);
+          GetOverlappedResult(pipe, &readOv, &probeRead, TRUE);
         }
       }
       g_inputBrokerConnected.store(false);
@@ -2738,8 +2814,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     config.configuredPrintScreen = HasConfiguredPrintScreenShortcut();
     if (config == publishedHookConfig_) return;
     publishedHookConfig_ = config;
-    std::lock_guard lock(hookConfigMutex_);
-    hookConfig_ = config;
+    {
+      std::lock_guard lock(hookConfigMutex_);
+      hookConfig_ = config;
+    }
+    hookConfigVersion_.fetch_add(1, std::memory_order_release);
   }
 
   // Hook thread. Returns true when the user tapped Win on its own.
@@ -2770,17 +2849,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   LRESULT LowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lParam) {
     const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
     const HWND target = g_mainWindow.load(std::memory_order_acquire);
-    HookConfig config;
-    {
-      std::lock_guard lock(hookConfigMutex_);
-      config = hookConfig_;
+    const std::uint64_t version =
+        hookConfigVersion_.load(std::memory_order_acquire);
+    if (version != hookAppliedVersion_) {
+      HookConfig nextConfig;
+      {
+        std::lock_guard lock(hookConfigMutex_);
+        nextConfig = hookConfig_;
+      }
+      if (!nextConfig.SameShortcuts(hookAppliedConfig_)) {
+        // A changed shortcut invalidates any half-finished chord.
+        hookShortcutRuntime_ = ShortcutRuntime{};
+        hookCaptureRuntimes_ = {};
+      }
+      hookAppliedConfig_ = nextConfig;
+      hookAppliedVersion_ = version;
     }
-    if (!config.SameShortcuts(hookAppliedConfig_)) {
-      // A changed shortcut invalidates any half-finished chord.
-      hookShortcutRuntime_ = ShortcutRuntime{};
-      hookCaptureRuntimes_ = {};
-    }
-    hookAppliedConfig_ = config;
+    const HookConfig& config = hookAppliedConfig_;
 
     const bool down = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
     const bool up = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
@@ -3347,6 +3432,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     auto checked = [&](HitType type) {
       return feathercast::settings_catalog::Checked(type, settings_);
     };
+    const auto focusedHit = CurrentSettingsFocusType();
     for (const HitType type : order) {
       const auto hit = std::find_if(settingsHits_.begin(), settingsHits_.end(),
                                     [&](const HitTarget& target) { return target.type == type; });
@@ -3363,7 +3449,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         setting.defaultAction = L"Edit settings filter";
         setting.role = ROLE_SYSTEM_TEXT;
         setting.state = STATE_SYSTEM_FOCUSABLE;
-        if (enabled && SettFocused(type)) {
+        if (enabled && focusedHit && *focusedHit == type) {
           setting.state |= STATE_SYSTEM_FOCUSED;
         }
         if (!enabled) setting.state = STATE_SYSTEM_UNAVAILABLE;
@@ -3414,7 +3500,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (category) setting.state |= STATE_SYSTEM_SELECTABLE;
       if (checked(type)) setting.state |= STATE_SYSTEM_CHECKED;
       if (category && *category == settingsCategory_) setting.state |= STATE_SYSTEM_SELECTED;
-      if (enabled && SettFocused(type)) {
+      if (enabled && focusedHit && *focusedHit == type) {
         setting.state |= STATE_SYSTEM_FOCUSED;
       }
       setting.screenRect = screenRect(hit->rect);
@@ -3473,6 +3559,177 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       items.push_back(std::move(status));
     }
     return items;
+  }
+
+  int AccessibleChildCount(HWND hwnd) const override {
+    if (hwnd == captureSelectorHwnd_ && !ScreenshotEditorActive()) return 1;
+    if (hwnd == recordingControlHwnd_) return 2;
+    if (hwnd == volumeHwnd_) return 2;
+    if (hwnd == hwnd_) {
+      return confirmation_ ? 2 : 4 + static_cast<int>(flatItems_.size());
+    }
+    if (hwnd == settingsHwnd_) {
+      int count = 0;
+      for (const HitType type : SettingsAccessibilityOrder()) {
+        if (std::any_of(settingsHits_.begin(), settingsHits_.end(),
+                        [type](const HitTarget& target) {
+                          return target.type == type;
+                        })) {
+          ++count;
+        }
+      }
+      if (settingsCategory_ == SettingsCategory::Shortcut) ++count;
+      if (settingsCategory_ == SettingsCategory::Extensions) {
+        count += static_cast<int>(extensions_.Health().size());
+      }
+      if (settingsStatus_) ++count;
+      return count;
+    }
+    return static_cast<int>(AccessibleItems(hwnd).size());
+  }
+
+  std::optional<feathercast::accessibility::Item> AccessibleItemAt(
+      HWND hwnd, int child) const override {
+    if (child <= 0) return std::nullopt;
+    if (hwnd == hwnd_ && !confirmation_) {
+      using feathercast::accessibility::Item;
+      const int total = 4 + static_cast<int>(flatItems_.size());
+      if (child > total) return std::nullopt;
+      POINT origin{0, 0};
+      ClientToScreen(hwnd, &origin);
+      RECT client{};
+      GetClientRect(hwnd, &client);
+      const float scale = GetWindowScale(hwnd);
+      const float width = static_cast<float>(client.right) / scale;
+      const auto screenRect = [&](RectF rect) {
+        const auto physical = feathercast::screenshot::DipToPixel(
+            {rect.left, rect.top, rect.right, rect.bottom}, {0, 0}, scale);
+        return RECT{origin.x + physical.left, origin.y + physical.top,
+                    origin.x + physical.right, origin.y + physical.bottom};
+      };
+      if (child == 1) {
+        const auto launcherLayout = feathercast::layout::Launcher(
+            width, settings_.compactMode && width >= 620.0f,
+            settings_.textSizePercent);
+        Item search;
+        search.key = L"search";
+        search.name = L"Search";
+        search.keyboardShortcut = shortcut_.display;
+        search.value = query_;
+        search.description = SearchPending()
+                                 ? L"Searching; " + std::to_wstring(flatItems_.size()) +
+                                       L" previous results unavailable"
+                                 : std::to_wstring(flatItems_.size()) + L" results";
+        search.role = ROLE_SYSTEM_TEXT;
+        search.defaultAction = L"Edit search";
+        search.state = STATE_SYSTEM_FOCUSABLE;
+        if (launcherAccessibleFocus_.kind == FocusKind::Search) {
+          search.state |= STATE_SYSTEM_FOCUSED;
+        }
+        search.screenRect = screenRect(launcherLayout.searchHit);
+        return search;
+      }
+      if (child == 2) {
+        Item status;
+        status.key = L"status";
+        status.name = L"Search status";
+        status.role = ROLE_SYSTEM_STATICTEXT;
+        status.state = STATE_SYSTEM_READONLY;
+        const auto projected = LauncherLiveStatus();
+        status.value = projected.value;
+        status.description = projected.description;
+        status.liveSetting = projected.alert ? LiveSetting::Assertive
+                                             : LiveSetting::Polite;
+        if (projected.alert) status.role = ROLE_SYSTEM_ALERT;
+        if (!projected.visible) {
+          status.state |= STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE;
+        }
+        status.screenRect = screenRect({
+            8,
+            feathercast::layout::LauncherResultsTop(settings_.textSizePercent),
+            width - 8, resultsTop_ + sectionHeaderHeight_});
+        return status;
+      }
+      if (child == 3) {
+        const auto launcherLayout = feathercast::layout::Launcher(
+            width, settings_.compactMode && width >= 620.0f,
+            settings_.textSizePercent);
+        Item settings;
+        settings.key = L"settings";
+        settings.name = L"Open settings";
+        settings.description =
+            L"Open FeatherCast settings. Keyboard shortcut Ctrl+,";
+        settings.keyboardShortcut = L"Ctrl+,";
+        settings.defaultAction = L"Open settings";
+        settings.role = ROLE_SYSTEM_PUSHBUTTON;
+        settings.state = STATE_SYSTEM_FOCUSABLE;
+        if (launcherAccessibleFocus_.kind == FocusKind::Settings) {
+          settings.state |= STATE_SYSTEM_FOCUSED;
+        }
+        settings.screenRect = screenRect(launcherLayout.settings);
+        return settings;
+      }
+      if (child == total) {
+        Item preview;
+        preview.key = L"preview";
+        preview.name = L"Preview";
+        preview.role = ROLE_SYSTEM_STATICTEXT;
+        preview.state = STATE_SYSTEM_READONLY;
+        if (previewOpen_) {
+          preview.value = previewResult_ ? L"Ready" : L"Loading";
+          preview.description = previewResult_ ? L"Preview content is available."
+                                               : L"Preview content is loading.";
+          preview.screenRect = screenRect(
+              {width / 2.0f, resultsTop_, width - 8,
+               static_cast<float>(client.bottom) / scale - 8});
+        } else {
+          preview.state |= STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE;
+        }
+        return preview;
+      }
+      const int targetIndex = child - 4;
+      float y = resultsTop_ -
+                static_cast<float>(overlayVisualScroll_.Value());
+      int baseIndex = 0;
+      for (const auto& section : sections_) {
+        y += sectionHeaderHeight_;
+        const float bodyTop = y;
+        const int sectionSize = static_cast<int>(section.items.size());
+        if (targetIndex < baseIndex + sectionSize) {
+          const std::size_t inSection =
+              static_cast<std::size_t>(targetIndex - baseIndex);
+          const auto& display = section.items[inSection];
+          Item result;
+          result.key = L"result:" + display.Key();
+          result.name = display.Name();
+          result.description = SourceLabel(display);
+          result.defaultAction = ActionHint(display);
+          result.role = ROLE_SYSTEM_LISTITEM;
+          result.state = STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE;
+          if (SearchPending()) {
+            result.state |= STATE_SYSTEM_UNAVAILABLE;
+            result.defaultAction.clear();
+          } else {
+            if (targetIndex == selected_) result.state |= STATE_SYSTEM_SELECTED;
+            if (launcherAccessibleFocus_.kind == FocusKind::Result &&
+                launcherAccessibleFocus_.key == result.key) {
+              result.state |= STATE_SYSTEM_FOCUSED;
+            }
+          }
+          result.screenRect =
+              screenRect(ResultItemRect(inSection, bodyTop, width));
+          if (result.screenRect.bottom < origin.y ||
+              result.screenRect.top > origin.y + client.bottom) {
+            result.state |= STATE_SYSTEM_OFFSCREEN;
+          }
+          return result;
+        }
+        baseIndex += sectionSize;
+        y = bodyTop + SectionBodyHeight(section.items.size());
+      }
+      return std::nullopt;
+    }
+    return feathercast::accessibility::Model::AccessibleItemAt(hwnd, child);
   }
 
   static std::wstring SettingsAccessibilityKey(HitType type) {
@@ -3912,8 +4169,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const LRESULT result = app->WndProc(hwnd, msg, wParam, lParam);
     // Recording and shortcut state can change in any handler; republishing
     // here keeps the keyboard hook's snapshot current, including inside modal
-    // loops that bypass Run().
-    app->PublishHookConfig();
+    // loops that bypass Run(). Skip read-only high-frequency UI messages.
+    switch (msg) {
+      case WM_PAINT:
+      case WM_ERASEBKGND:
+      case WM_NCHITTEST:
+      case WM_SETCURSOR:
+      case WM_MOUSEMOVE:
+      case WM_MOUSELEAVE:
+      case WM_GETOBJECT:
+      case WM_GETMINMAXINFO:
+      case WM_CTLCOLORSTATIC:
+      case WM_CTLCOLORBTN:
+      case WM_CTLCOLOREDIT:
+      case WM_NCMOUSEMOVE:
+      case WM_NCMOUSELEAVE:
+        break;
+      default:
+        app->PublishHookConfig();
+        break;
+    }
     return result;
   }
 
@@ -4054,6 +4329,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
       case WM_DWMCOMPOSITIONCHANGED:
+      case WM_DWMCOLORIZATIONCOLORCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
       case WM_DISPLAYCHANGE:
@@ -5152,6 +5428,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (hideWindow && captureSelectorHwnd_) {
       ShowWindow(captureSelectorHwnd_, SW_HIDE);
+      ReleaseGlassSurface(captureSelectorSurface_, captureSelectorHwnd_);
     }
     screenshotDraftBitmap_.Reset();
     screenshotDraft_.reset();
@@ -5209,6 +5486,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     captureUiState_.selectionEnd.reset();
     if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
     ShowWindow(captureSelectorHwnd_, SW_HIDE);
+    ReleaseGlassSurface(captureSelectorSurface_, captureSelectorHwnd_);
     UpdateBackgroundState();
   }
 
@@ -5306,6 +5584,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       NotifyWinEvent(EVENT_OBJECT_HIDE, recordingControlHwnd_, OBJID_CLIENT, 2);
     }
     ShowWindow(recordingControlHwnd_, SW_HIDE);
+    ReleaseGlassSurface(recordingControlSurface_, recordingControlHwnd_);
     UpdateBackgroundState();
   }
 
@@ -5393,6 +5672,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const auto selection = CaptureUiController::SelectionRect(captureUiState_);
     if (GetCapture() == captureSelectorHwnd_) ReleaseCapture();
     ShowWindow(captureSelectorHwnd_, SW_HIDE);
+    ReleaseGlassSurface(captureSelectorSurface_, captureSelectorHwnd_);
     DwmFlush();
     if (!selection) {
       CaptureUiController::Fail(captureUiState_);
@@ -7523,6 +7803,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
       case WM_DWMCOMPOSITIONCHANGED:
+      case WM_DWMCOLORIZATIONCOLORCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
         RefreshSystemPreferences();
@@ -7707,6 +7988,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
       case WM_DWMCOMPOSITIONCHANGED:
+      case WM_DWMCOLORIZATIONCOLORCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
       case WM_DISPLAYCHANGE:
@@ -8167,8 +8449,24 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     screenshotEffectPreviewBounds_ = {};
     screenshotEffectPreviewSelection_.reset();
     screenshotEffectPreviewRevision_ = 0;
-    brushCache_.clear();
+    photoTileClip_.Reset();
+    photoTileClipWidth_ = 0.0f;
+    photoTileClipHeight_ = 0.0f;
+    for (auto& brush : brushPool_) brush.Reset();
+    brushPoolNext_ = 0;
     ClearTextLayoutCache();
+  }
+
+  void ReleaseGlassSurface(GlassSurface& surface, HWND hwnd) {
+    CancelRenderRetry(hwnd);
+    const bool hadTarget = surface.target != nullptr;
+    if (surface.target) {
+      surface.target->SetRoot(nullptr);
+    }
+    surface.Reset();
+    if (hadTarget && dcompDevice_) {
+      dcompDevice_->Commit();
+    }
   }
 
   static bool IsDeviceLoss(HRESULT result) {
@@ -8537,8 +8835,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void PrewarmInteractiveSurfaces() {
     if (!EnsureRenderResources()) return;
     PrewarmGlassSurface(hwnd_, overlaySurface_);
-    PrewarmGlassSurface(settingsHwnd_, settingsSurface_);
-    PrewarmGlassSurface(volumeHwnd_, volumeSurface_);
     PromotePreviewBitmap();
     ApplySurfaceVisualStates();
   }
@@ -8623,6 +8919,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     screenshotAnnotationTextFormatSize_ = 0.0f;
     screenshotAnnotationTextFormatScale_ = 0.0f;
     screenshotAnnotationTextFormatFamily_.clear();
+    shortcutHintCache_.clear();
     ClearTextLayoutCache();
   }
 
@@ -8643,6 +8940,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     BOOL animations = TRUE;
     systemAnimationsEnabled_ =
         !SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0) || animations != FALSE;
+    const UINT blink = GetCaretBlinkTime();
+    cachedCaretBlinkMs_ = blink ? blink : 530;
+    UINT caretWidth = 1;
+    if (!SystemParametersInfoW(SPI_GETCARETWIDTH, 0, &caretWidth, 0)) caretWidth = 1;
+    cachedCaretWidth_ = std::min<UINT>(std::max<UINT>(caretWidth, 1), 16);
+    UINT keyboardSpeed = 31;
+    if (!SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &keyboardSpeed, 0)) keyboardSpeed = 31;
+    cachedKeyboardSpeed_ = keyboardSpeed;
+    accentCacheValid_ = false;
+    cachedPillTextValid_ = false;
     if (highContrast_) {
       theme_ = feathercast::theme::HighContrastTheme(
           std::move(theme_), ThemeColorFromSystem(GetSysColor(COLOR_WINDOW)),
@@ -8693,62 +9000,73 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                         float lineHeight) {
       return TextStyle{size * textScale, weight, lineHeight * textScale};
     };
+    const std::wstring resolvedFamily =
+        feathercast::ui::ResolveInstalledFontFamily(theme_.fontFamily,
+                                                    dwriteFactory_.Get());
     // Compact-native role ramp: size, weight, and leading work together so
     // hierarchy does not depend on size alone and every repeated role keeps
     // the same vertical rhythm across overlay, settings, and previews.
     // Leading stays on the 4 px grid; captions never go below 12 px.
-    CreateTextFormat(textStyle(18.0f, DWRITE_FONT_WEIGHT_NORMAL, 24.0f), inputFormat_);
-    CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_MEDIUM, 20.0f), rowFormat_);
+    CreateTextFormat(textStyle(18.0f, DWRITE_FONT_WEIGHT_NORMAL, 24.0f),
+                     inputFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_MEDIUM, 20.0f),
+                     rowFormat_, &resolvedFamily, true);
     CreateTextFormat(textStyle(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 22.0f),
-                     calculationResultFormat_);
+                     calculationResultFormat_, &resolvedFamily, true);
     if (calculationResultFormat_) {
       calculationResultFormat_->SetTextAlignment(
           DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
-    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f), subFormat_);
-    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 16.0f),
-                     sectionFormat_);
-    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f), footerFormat_);
     CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f),
-                     footerRightFormat_);
+                     subFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 16.0f),
+                     sectionFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f),
+                     footerFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_NORMAL, 16.0f),
+                     footerRightFormat_, &resolvedFamily, true);
     if (footerRightFormat_) {
       footerRightFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     // Keycap caption: 12 px medium, centred inside its cap.
     CreateTextFormat(textStyle(12.0f, DWRITE_FONT_WEIGHT_MEDIUM, 16.0f),
-                     keycapFormat_);
+                     keycapFormat_, &resolvedFamily, true);
     if (keycapFormat_) {
       keycapFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
       keycapFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
-    CreateTextFormat(textStyle(17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 23.0f), titleFormat_);
-    CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 20.0f), labelFormat_);
-    CreateTextFormat(textStyle(13.0f, DWRITE_FONT_WEIGHT_NORMAL, 18.0f), bodyFormat_);
+    CreateTextFormat(textStyle(17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 23.0f),
+                     titleFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 20.0f),
+                     labelFormat_, &resolvedFamily, true);
+    CreateTextFormat(textStyle(13.0f, DWRITE_FONT_WEIGHT_NORMAL, 18.0f),
+                     bodyFormat_, &resolvedFamily, true);
     // Paragraph text that wraps instead of trimming.
     CreateTextFormat(textStyle(13.0f, DWRITE_FONT_WEIGHT_NORMAL, 18.0f),
-                     wrapBodyFormat_);
+                     wrapBodyFormat_, &resolvedFamily, true);
     if (wrapBodyFormat_) {
       wrapBodyFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     }
     CreateTextFormat(textStyle(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0f),
-                     buttonFormat_);
+                     buttonFormat_, &resolvedFamily, true);
     if (buttonFormat_) {
       buttonFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
       buttonFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     CreateTextFormat(textStyle(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0f),
-                     centerFormat_);
+                     centerFormat_, &resolvedFamily, true);
     if (centerFormat_) {
       centerFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
       centerFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
-    CreateTextFormat(textStyle(22.0f, DWRITE_FONT_WEIGHT_NORMAL, 28.0f), emojiFormat_);
+    CreateTextFormat(textStyle(22.0f, DWRITE_FONT_WEIGHT_NORMAL, 28.0f),
+                     emojiFormat_, &resolvedFamily, true);
     if (emojiFormat_) {
       emojiFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
       emojiFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     CreateTextFormat(textStyle(28.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 32.0f),
-                     volumeValueFormat_);
+                     volumeValueFormat_, &resolvedFamily, true);
     if (volumeValueFormat_) {
       volumeValueFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -8762,7 +9080,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void CreateTextFormat(const TextStyle& style,
                         ComPtr<IDWriteTextFormat>& out,
-                        const std::wstring* familySpec = nullptr) {
+                        const std::wstring* familySpec = nullptr,
+                        bool alreadyResolved = false) {
     const std::wstring& families =
         familySpec && !familySpec->empty() ? *familySpec : theme_.fontFamily;
     const auto tryFamily = [&](const std::wstring& family) {
@@ -8775,8 +9094,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     // DirectWrite accepts family names that are not installed, so use the
     // first installed family of the list.
-    if (!tryFamily(feathercast::ui::ResolveInstalledFontFamily(
-            families, dwriteFactory_.Get()))) {
+    const std::wstring resolvedFamily =
+        alreadyResolved
+            ? families
+            : feathercast::ui::ResolveInstalledFontFamily(
+                  families, dwriteFactory_.Get());
+    if (!tryFamily(resolvedFamily)) {
       tryFamily(L"Segoe UI");
     }
     if (out) {
@@ -11510,7 +11833,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     resultRenderCache_.clear();
     markdownCache_.clear();
-    ClearTextLayoutCache();
     if (performanceGovernor_.Policy().allowRichPreview) {
       std::size_t warmedMarkdown = 0;
       for (const auto& item : flatItems_) {
@@ -11873,8 +12195,42 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // Background work remains unobtrusive without forcing page faults,
       // re-decoding icons, or restarting plugin hosts on every reopen.
       EnterBackgroundScheduling();
+      TrimIdleGraphicsResources();
 
     }
+  }
+
+  void TrimIdleGraphicsResources() {
+    resultRenderCache_.clear();
+    markdownCache_.clear();
+    if (!previewOpen_) {
+      previewBitmap_.Reset();
+    }
+    if (!ScreenshotEditorActive()) {
+      screenshotDraftBitmap_.Reset();
+      screenshotEffectPreviewBitmap_.Reset();
+    }
+    constexpr std::size_t kIdleIconCap = 48;
+    for (auto it = iconLru_.begin(); it != iconLru_.end(); ) {
+      if (StartsWith(*it, kPhoneThumbPrefix) ||
+          (!phoneArtKey_.empty() && *it == phoneArtKey_)) {
+        iconBitmaps_.erase(*it);
+        it = iconLru_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    while (iconBitmaps_.size() > kIdleIconCap && !iconLru_.empty()) {
+      iconBitmaps_.erase(iconLru_.back());
+      iconLru_.pop_back();
+    }
+    if (d3dDevice_) {
+      ComPtr<IDXGIDevice3> dxgiDevice3;
+      if (SUCCEEDED(d3dDevice_.As(&dxgiDevice3))) {
+        dxgiDevice3->Trim();
+      }
+    }
+    feathercast::performance::TrimIdleMemory(true);
   }
 
   void EnterInteractiveScheduling() {
@@ -12632,6 +12988,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     KillTimer(volumeHwnd_, TIMER_VOLUME_REFRESH);
     if (GetCapture() == volumeHwnd_) ReleaseCapture();
     ShowWindow(volumeHwnd_, SW_HIDE);
+    ReleaseGlassSurface(volumeSurface_, volumeHwnd_);
     volumeMonitor_ = nullptr;
     volumeStatus_.clear();
     volumeDeviceName_.clear();
@@ -12832,6 +13189,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         feathercast::ui::SettingsController::Close(settingsState_);
     shortcutRecorder_.Reset();
     ExecuteSettingsEffects(effects);
+    if (settingsHwnd_ && !IsWindowVisible(settingsHwnd_)) {
+      ReleaseGlassSurface(settingsSurface_, settingsHwnd_);
+    }
     UpdateBackgroundState();
   }
 
@@ -13488,14 +13848,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   UINT GetWindowDpi(HWND hwnd) const {
     UINT dpi = 96;
-    typedef UINT(WINAPI* GetDpiForWindowProc)(HWND);
-    if (hwnd && IsWindow(hwnd)) {
-      if (HMODULE hUser32 = GetModuleHandleW(L"user32.dll")) {
-        if (auto proc = reinterpret_cast<GetDpiForWindowProc>(
-                GetProcAddress(hUser32, "GetDpiForWindow"))) {
-          dpi = proc(hwnd);
-        }
-      }
+    using GetDpiForWindowProc = UINT(WINAPI*)(HWND);
+    static const GetDpiForWindowProc proc = [] {
+      const HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+      return hUser32 ? reinterpret_cast<GetDpiForWindowProc>(
+                           GetProcAddress(hUser32, "GetDpiForWindow"))
+                     : nullptr;
+    }();
+    if (proc && hwnd && IsWindow(hwnd)) {
+      dpi = proc(hwnd);
     }
     return dpi > 0 ? dpi : 96;
   }
@@ -13539,13 +13900,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         dpiX > 0) {
       return static_cast<float>(dpiX) / 96.0f;
     }
-    typedef UINT(WINAPI* GetDpiForSystemProc)();
-    if (HMODULE hUser32 = GetModuleHandleW(L"user32.dll")) {
-      if (auto proc = reinterpret_cast<GetDpiForSystemProc>(
-              GetProcAddress(hUser32, "GetDpiForSystem"))) {
-        const UINT dpi = proc();
-        if (dpi > 0) return static_cast<float>(dpi) / 96.0f;
-      }
+    using GetDpiForSystemProc = UINT(WINAPI*)();
+    static const GetDpiForSystemProc getDpiForSystem = [] {
+      const HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+      return hUser32 ? reinterpret_cast<GetDpiForSystemProc>(
+                           GetProcAddress(hUser32, "GetDpiForSystem"))
+                     : nullptr;
+    }();
+    if (getDpiForSystem) {
+      const UINT dpi = getDpiForSystem();
+      if (dpi > 0) return static_cast<float>(dpi) / 96.0f;
     }
     return 1.0f;
   }
@@ -14072,11 +14436,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // True when this selection change comes from keyboard auto-repeat, judged
   // by the spacing of key messages against the user's repeat rate.
   bool SelectionKeyRepeating() {
-    UINT speed = 31;
-    if (!SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &speed, 0)) speed = 31;
     selectionRepeatCadence_.SetThreshold(
         feathercast::motion::KeyRepeatCadence::ThresholdForRepeatInterval(
-            feathercast::motion::KeyboardRepeatIntervalSeconds(speed)));
+            feathercast::motion::KeyboardRepeatIntervalSeconds(
+                cachedKeyboardSpeed_)));
     return selectionRepeatCadence_.Step(
         static_cast<std::uint32_t>(GetMessageTime()));
   }
@@ -14664,33 +15027,53 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   COLORREF ActiveAccent() const {
     if (highContrast_) return GetSysColor(COLOR_HIGHLIGHT);
+    if (accentCacheValid_ &&
+        accentCacheSync_ == settings_.syncAccentColor &&
+        (settings_.syncAccentColor ||
+         accentCacheCustomHex_ == settings_.customAccentColor)) {
+      return cachedActiveAccent_;
+    }
+    COLORREF resolved = 0;
     if (!settings_.syncAccentColor) {
       const COLORREF custom = ColorRefFromHex(settings_.customAccentColor);
-      return ColorRefFromTheme(feathercast::theme::NormalizeAccent(
+      resolved = ColorRefFromTheme(feathercast::theme::NormalizeAccent(
           ThemeColorFromSystem(custom), theme_));
+    } else {
+      DWORD color = 0;
+      BOOL opaque = FALSE;
+      if (SUCCEEDED(DwmGetColorizationColor(&color, &opaque))) {
+        const COLORREF systemAccent =
+            RGB((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+        resolved = ColorRefFromTheme(feathercast::theme::NormalizeAccent(
+            ThemeColorFromSystem(systemAccent), theme_));
+      } else {
+        resolved = ColorRefFromTheme(feathercast::theme::NormalizeAccent(
+            theme_.accentFallback, theme_));
+      }
     }
-    DWORD color = 0;
-    BOOL opaque = FALSE;
-    if (SUCCEEDED(DwmGetColorizationColor(&color, &opaque))) {
-      const COLORREF systemAccent =
-          RGB((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
-      return ColorRefFromTheme(feathercast::theme::NormalizeAccent(
-          ThemeColorFromSystem(systemAccent), theme_));
-    }
-    return ColorRefFromTheme(feathercast::theme::NormalizeAccent(
-        theme_.accentFallback, theme_));
+    accentCacheValid_ = true;
+    accentCacheSync_ = settings_.syncAccentColor;
+    accentCacheCustomHex_ = settings_.syncAccentColor
+                                ? std::wstring{}
+                                : settings_.customAccentColor;
+    cachedActiveAccent_ = resolved;
+    const auto accent = ThemeColorFromSystem(resolved);
+    const feathercast::theme::Color white{1.0f, 1.0f, 1.0f, 1.0f};
+    const feathercast::theme::Color black{0.0f, 0.0f, 0.0f, 1.0f};
+    const auto foreground = feathercast::theme::ContrastRatio(white, accent) >=
+                                    feathercast::theme::ContrastRatio(black, accent)
+                                ? white
+                                : black;
+    cachedEmphasisRgb_ =
+        D2D1::ColorF(foreground.r, foreground.g, foreground.b, 1.0f);
+    return resolved;
   }
 
   D2D1_COLOR_F EmphasisTextColor(float alpha = 1.0f) const {
     if (!highContrast_) {
-      const auto accent = ThemeColorFromSystem(ActiveAccent());
-      const feathercast::theme::Color white{1.0f, 1.0f, 1.0f, 1.0f};
-      const feathercast::theme::Color black{0.0f, 0.0f, 0.0f, 1.0f};
-      const auto foreground = feathercast::theme::ContrastRatio(white, accent) >=
-                                      feathercast::theme::ContrastRatio(black, accent)
-                                  ? white
-                                  : black;
-      return D2D1::ColorF(foreground.r, foreground.g, foreground.b, alpha);
+      (void)ActiveAccent();
+      return D2D1::ColorF(cachedEmphasisRgb_.r, cachedEmphasisRgb_.g,
+                          cachedEmphasisRgb_.b, alpha);
     }
     return HighlightTextColor(alpha);
   }
@@ -14970,59 +15353,42 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return (clamp8(color.r) << 24) | (clamp8(color.g) << 16) | (clamp8(color.b) << 8) | clamp8(color.a);
   }
 
-  // Reuse solid-color brushes across draw calls. Every surface's device
-  // context comes from d2dDevice_, so a brush works on all of them; the cache
-  // is cleared when the device is discarded.
+  // Reuse a small rotating pool of solid-color brushes across draw calls.
+  // Every surface's device context comes from d2dDevice_, so a brush works on
+  // all of them; the pool is reset when the device is discarded.
   HRESULT EnsureBrushResources() {
     lastBrushFailure_ = S_OK;
     if (!activeRT_) return E_POINTER;
-    const std::array<D2D1_COLOR_F, 14> required = {
-        D2DColor(theme_.overlayBackground),
-        D2DColor(theme_.settingsBackground),
-        D2DColor(theme_.surface),
-        D2DColor(theme_.surfaceHover),
-        D2DColor(theme_.selectedBase),
-        D2DColor(theme_.iconTile),
-        D2DColor(theme_.border),
-        D2DColor(theme_.divider),
-        D2DColor(theme_.textPrimary),
-        D2DColor(theme_.textMuted),
-        D2DColor(theme_.textDim),
-        D2DColor(theme_.sectionText),
-        D2DColor(ActiveAccent()),
-        D2DColor(theme_.danger),
-    };
-    auto& byColor = brushCache_;
-    for (const auto color : required) {
-      const uint32_t key = ColorKey(color);
-      if (byColor.contains(key)) continue;
-      ComPtr<ID2D1SolidColorBrush> brush;
-      const HRESULT result =
-          activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
+    for (auto& brush : brushPool_) {
+      if (brush) continue;
+      const HRESULT result = activeRT_->CreateSolidColorBrush(
+          D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), brush.GetAddressOf());
       if (FAILED(result)) return result;
-      byColor.emplace(key, std::move(brush));
     }
     return S_OK;
   }
 
   ComPtr<ID2D1SolidColorBrush> Brush(D2D1_COLOR_F color) {
     if (!activeRT_) return nullptr;
-    auto& byColor = brushCache_;
-    const uint32_t key = ColorKey(color);
-    if (auto it = byColor.find(key); it != byColor.end()) return it->second;
-    ComPtr<ID2D1SolidColorBrush> brush;
-    const HRESULT result =
-        activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
-    if (FAILED(result)) {
-      lastBrushFailure_ = result;
-      return byColor.empty() ? nullptr : byColor.begin()->second;
+    auto& slot = brushPool_[brushPoolNext_];
+    brushPoolNext_ = (brushPoolNext_ + 1) % brushPool_.size();
+    if (!slot) {
+      const HRESULT result =
+          activeRT_->CreateSolidColorBrush(color, slot.GetAddressOf());
+      if (FAILED(result)) {
+        lastBrushFailure_ = result;
+        for (const auto& fallback : brushPool_) {
+          if (fallback) {
+            fallback->SetColor(color);
+            return fallback;
+          }
+        }
+        return nullptr;
+      }
+      return slot;
     }
-    // Animated colours add a new key on most frames, so the cache is bounded.
-    // Callers hold their own references.
-    constexpr size_t kMaxCachedBrushes = 256;
-    if (byColor.size() >= kMaxCachedBrushes) byColor.clear();
-    if (brush) byColor.emplace(key, brush);
-    return brush;
+    slot->SetColor(color);
+    return slot;
   }
 
   void FillRound(RectF rect, float radius, D2D1_COLOR_F color) {
@@ -15171,16 +15537,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   };
 
   // Measures " · "-separated hints and keeps the leading parts that fit.
-  ShortcutHintLayout LayoutShortcutHints(const std::wstring& hint,
-                                         float available) {
+  const ShortcutHintLayout& LayoutShortcutHints(const std::wstring& hint,
+                                                float available) {
+    static const ShortcutHintLayout kEmpty;
+    if (!keycapFormat_ || !footerFormat_) return kEmpty;
+    for (const auto& entry : shortcutHintCache_) {
+      if (entry.textSizePercent == settings_.textSizePercent &&
+          std::abs(entry.available - available) < 0.01f &&
+          entry.hint == hint) {
+        return entry.layout;
+      }
+    }
     ShortcutHintLayout layout;
-    if (!keycapFormat_ || !footerFormat_) return layout;
     const auto metrics = feathercast::visual::ScaledKeycapMetrics(
         feathercast::layout::TextMetrics(settings_.textSizePercent).scale);
     layout.parts = feathercast::visual::ParseShortcutHints(hint);
     std::vector<float> partWidths;
+    partWidths.reserve(layout.parts.size());
     for (const auto& part : layout.parts) {
       std::vector<float> keys;
+      keys.reserve(part.keys.size());
       for (const auto& key : part.keys) {
         keys.push_back(MeasureTextWidth(key, keycapFormat_.Get()));
       }
@@ -15195,7 +15571,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (std::size_t i = 0; i < layout.visibleParts; ++i) {
       layout.width += (i > 0 ? metrics.partGap : 0.0f) + partWidths[i];
     }
-    return layout;
+    constexpr std::size_t kShortcutHintCacheCap = 8;
+    if (shortcutHintCache_.size() >= kShortcutHintCacheCap) {
+      shortcutHintCache_.erase(shortcutHintCache_.begin());
+    }
+    shortcutHintCache_.push_back(
+        {hint, available, settings_.textSizePercent, std::move(layout)});
+    return shortcutHintCache_.back().layout;
   }
 
   // Draws shortcut hints as keycaps followed by their labels ("Enter open",
@@ -15206,7 +15588,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                           D2D1_COLOR_F textColor, float opacity,
                           bool alignRight) {
     if (hint.empty() || opacity <= 0.0f) return 0.0f;
-    const ShortcutHintLayout layout =
+    const ShortcutHintLayout& layout =
         LayoutShortcutHints(hint, rect.right - rect.left);
     if (layout.visibleParts == 0) return 0.0f;
     const float textScale =
@@ -15903,8 +16285,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool CaretPhase() const {
-    const UINT blink = GetCaretBlinkTime();
-    return ((GetTickCount() - caretBlinkEpoch_) / (blink ? blink : 530)) % 2 == 0;
+    return ((GetTickCount() - caretBlinkEpoch_) / cachedCaretBlinkMs_) % 2 == 0;
   }
 
   // Typing or moving the caret restarts the blink so the caret is solid while
@@ -15935,11 +16316,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return caretOffset_;
     }
     float offset = 0.0f;
-    ComPtr<IDWriteTextLayout> layout;
-    if (SUCCEEDED(dwriteFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
-                                                   format, layoutWidth, 48,
-                                                   layout.GetAddressOf()))) {
-      PrepareSingleLineMeasureLayout(layout.Get());
+    if (auto layout = textLayoutCache_.Get(
+            dwriteFactory_.Get(), text, format, layoutWidth, 48.0f,
+            {feathercast::ui::TextLayoutStyle::MeasureSingleLine})) {
       DWRITE_TEXT_METRICS metrics{};
       layout->GetMetrics(&metrics);
       // A caret after typed spaces sits after those spaces.
@@ -16045,10 +16424,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float fieldLeft = launcherLayout.query.left;
     const float fieldWidth = std::max(1.0f, launcherLayout.query.right - fieldLeft);
     float queryTextWidth = 0.0f;
+    float caretOffset = 0.0f;
     if (!displayedQuery.empty()) {
       ClampCaret();
       queryTextWidth = MeasureCaretOffset(displayedQuery, width);
-      const float caretOffset = MeasureCaretOffset(ImeCaretPrefix(), width);
+      caretOffset = MeasureCaretOffset(ImeCaretPrefix(), width);
       if (caretOffset - queryScrollX_ > fieldWidth - 2.0f) {
         queryScrollX_ = caretOffset - (fieldWidth - 2.0f);
       }
@@ -16101,7 +16481,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     float caretX = launcherLayout.query.left;
     if (!displayedQuery.empty()) {
-      caretX = queryX(ImeCaretPrefix());
+      caretX = fieldLeft + caretOffset - queryScrollX_;
     }
     activeRT_->PushAxisAlignedClip(
         D2D1::RectF(fieldLeft - 3.0f, launcherLayout.query.top,
@@ -16123,13 +16503,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // the system caret width setting) so the caret stays sharp at every
       // scale instead of blurring across two pixel columns.
       const float deviceScale = DeviceScale();
-      UINT systemCaretPixels = 1;
-      if (!SystemParametersInfoW(SPI_GETCARETWIDTH, 0, &systemCaretPixels, 0)) {
-        systemCaretPixels = 1;
-      }
       const float caretPixels = std::max(
           {1.0f, std::round(1.5f * deviceScale),
-           static_cast<float>(std::min<UINT>(systemCaretPixels, 16))});
+           static_cast<float>(cachedCaretWidth_)});
       const float caretLeft = feathercast::visual::SnapToPixelEdge(
           caretX - caretPixels * 0.5f / deviceScale, deviceScale);
       FillRect(SnapRect({caretLeft, launcherLayout.query.top + 5.0f,
@@ -16226,23 +16602,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       if (headerY + sectionHeaderHeight_ >= resultsTop &&
           headerY <= resultsBottom) {
-        const bool headerLayer = headerOpacity < 0.999f;
-        if (headerLayer) {
-          activeRT_->PushLayer(
-              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                    D2D1::IdentityMatrix(), headerOpacity),
-              nullptr);
-        }
         const float sectionTextHeight = 16.0f *
             feathercast::layout::TextMetrics(settings_.textSizePercent).scale;
         const float sectionTextTop =
             headerY + (sectionHeaderHeight_ - sectionTextHeight) * 0.5f;
-        DrawTextBlock(section.title,
-                      {kContentInset, sectionTextTop,
-                       resultsRight - kContentInset,
-                       sectionTextTop + sectionTextHeight},
-                      sectionFormat_.Get(), D2DColor(theme_.sectionText));
+        const RectF sectionRect{kContentInset, sectionTextTop,
+                                resultsRight - kContentInset,
+                                sectionTextTop + sectionTextHeight};
+        const bool headerLayer = headerOpacity < 0.999f;
+        if (headerLayer) {
+          activeRT_->PushLayer(
+              D2D1::LayerParameters(ToD2D(sectionRect), nullptr,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    D2D1::IdentityMatrix(), headerOpacity),
+              nullptr);
+        }
+        DrawTextBlock(section.title, sectionRect, sectionFormat_.Get(),
+                      D2DColor(theme_.sectionText));
         if (headerLayer) activeRT_->PopLayer();
       }
       y += sectionHeaderHeight_;
@@ -16260,20 +16636,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (rowRect.bottom >= resultsTop && rowRect.top <= resultsBottom) {
           const RowAnim anim = ComputeRowAnim();
           const float combinedOpacity = anim.opacity * rowOpacity;
-          if (combinedOpacity < 0.999f || anim.dy != 0.0f) {
+          const bool needsLayer = combinedOpacity < 0.999f;
+          const bool needsTransform = anim.dy != 0.0f;
+          if (needsLayer || needsTransform) {
             D2D1_MATRIX_3X2_F base;
-            activeRT_->GetTransform(&base);
-            activeRT_->SetTransform(
-                D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
-            activeRT_->PushLayer(
-                D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                      D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                      D2D1::IdentityMatrix(),
-                                      combinedOpacity),
-                nullptr);
+            if (needsTransform) {
+              activeRT_->GetTransform(&base);
+              activeRT_->SetTransform(
+                  D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
+            }
+            if (needsLayer) {
+              const D2D1_RECT_F layerBounds = D2D1::RectF(
+                  rowRect.left - 4.0f, rowRect.top - 4.0f,
+                  rowRect.right + 4.0f, rowRect.bottom + 4.0f);
+              activeRT_->PushLayer(
+                  D2D1::LayerParameters(layerBounds, nullptr,
+                                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                        D2D1::IdentityMatrix(),
+                                        combinedOpacity),
+                  nullptr);
+            }
             DrawResultRow(item, rowRect, rowIndex);
-            activeRT_->PopLayer();
-            activeRT_->SetTransform(base);
+            if (needsLayer) activeRT_->PopLayer();
+            if (needsTransform) activeRT_->SetTransform(base);
           } else {
             DrawResultRow(item, rowRect, rowIndex);
           }
@@ -16426,11 +16811,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         D2D1::Matrix3x2F::Scale(dialogScale, dialogScale, dialogCenter) *
         D2D1::Matrix3x2F::Translation(0.0f, dialogOffset) *
         dialogBase);
-    activeRT_->PushLayer(
-        D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                              D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                              D2D1::IdentityMatrix(), progress),
-        nullptr);
+    const bool dialogLayer = progress < 0.999f;
+    if (dialogLayer) {
+      const D2D1_RECT_F dialogBounds = D2D1::RectF(
+          dialog.left - 4.0f, dialog.top - 4.0f,
+          dialog.right + 4.0f, dialog.bottom + 4.0f);
+      activeRT_->PushLayer(
+          D2D1::LayerParameters(dialogBounds, nullptr,
+                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                D2D1::IdentityMatrix(), progress),
+          nullptr);
+    }
     const RectF dialogCard = SnapRect(dialog);
     FillRound(dialogCard, theme_.overlayRadius, D2DColor(theme_.overlayBackground));
     StrokeHairlineRound(dialogCard, theme_.overlayRadius, D2DColor(theme_.border));
@@ -16474,7 +16865,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       hits_.push_back({cancelRect, HitType::ConfirmCancel});
       hits_.push_back({actionRect, HitType::ConfirmAction});
     }
-    activeRT_->PopLayer();
+    if (dialogLayer) activeRT_->PopLayer();
     activeRT_->SetTransform(dialogBase);
   }
 
@@ -16569,19 +16960,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                           rect.bottom - 10.0f}),
                 1.5f, highContrast_ ? D2DColor(theme_.textPrimary) : D2DColor(accent));
     };
-    if (anim.opacity < 1.0f || anim.dy != 0.0f) {
+    const bool pillLayer = anim.opacity < 0.999f;
+    const bool pillTransform = anim.dy != 0.0f;
+    if (pillLayer || pillTransform) {
       D2D1_MATRIX_3X2_F base;
-      activeRT_->GetTransform(&base);
-      activeRT_->SetTransform(
-          D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
-      activeRT_->PushLayer(
-          D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                D2D1::IdentityMatrix(), anim.opacity),
-          nullptr);
+      if (pillTransform) {
+        activeRT_->GetTransform(&base);
+        activeRT_->SetTransform(
+            D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
+      }
+      if (pillLayer) {
+        const D2D1_RECT_F pillBounds = D2D1::RectF(
+            rect.left - 4.0f, rect.top - 4.0f,
+            rect.right + 4.0f, rect.bottom + 4.0f);
+        activeRT_->PushLayer(
+            D2D1::LayerParameters(pillBounds, nullptr,
+                                  D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                  D2D1::IdentityMatrix(), anim.opacity),
+            nullptr);
+      }
       drawPill();
-      activeRT_->PopLayer();
-      activeRT_->SetTransform(base);
+      if (pillLayer) activeRT_->PopLayer();
+      if (pillTransform) activeRT_->SetTransform(base);
     } else {
       drawPill();
     }
@@ -16594,11 +16994,27 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!selected) return color;
     if (highContrast_) return TextOnHighlight(true, color);
     if (selectedPill_.a <= 0.0f) return color;  // no pill drawn yet
+    const uint32_t pillKey = ColorKey(selectedPill_);
+    if (!cachedPillTextValid_ || cachedPillBgKey_ != pillKey) {
+      cachedPillTextValid_ = true;
+      cachedPillBgKey_ = pillKey;
+      cachedPillTextCount_ = 0;
+    }
+    const uint32_t colorKey = ColorKey(color);
+    for (std::size_t i = 0; i < cachedPillTextCount_; ++i) {
+      if (cachedPillTextEntries_[i].first == colorKey) {
+        return cachedPillTextEntries_[i].second;
+      }
+    }
     const feathercast::theme::Color pill{selectedPill_.r, selectedPill_.g,
                                          selectedPill_.b, 1.0f};
     const auto fixed = feathercast::theme::EnsureContrast(
         feathercast::theme::Color{color.r, color.g, color.b, color.a}, pill);
-    return D2D1::ColorF(fixed.r, fixed.g, fixed.b, color.a);
+    const D2D1_COLOR_F result = D2D1::ColorF(fixed.r, fixed.g, fixed.b, color.a);
+    if (cachedPillTextCount_ < cachedPillTextEntries_.size()) {
+      cachedPillTextEntries_[cachedPillTextCount_++] = {colorKey, result};
+    }
+    return result;
   }
 
   const DisplayItem* SelectedMarkdownDetailItem() const {
@@ -16756,20 +17172,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                (size.height - side) * 0.5f,
                                (size.width + side) * 0.5f,
                                (size.height + side) * 0.5f};
-      ComPtr<ID2D1Factory> factory;
-      activeRT_->GetFactory(factory.GetAddressOf());
-      ComPtr<ID2D1RoundedRectangleGeometry> clip;
-      if (factory) {
-        factory->CreateRoundedRectangleGeometry(
-            D2D1::RoundedRect(ToD2D(rect), kTileRadius, kTileRadius),
-            clip.GetAddressOf());
+      const float tileW = rect.right - rect.left;
+      const float tileH = rect.bottom - rect.top;
+      if (!photoTileClip_ ||
+          std::abs(photoTileClipWidth_ - tileW) > 0.01f ||
+          std::abs(photoTileClipHeight_ - tileH) > 0.01f) {
+        photoTileClip_.Reset();
+        ComPtr<ID2D1Factory> factory;
+        activeRT_->GetFactory(factory.GetAddressOf());
+        if (factory &&
+            SUCCEEDED(factory->CreateRoundedRectangleGeometry(
+                D2D1::RoundedRect(D2D1::RectF(0.0f, 0.0f, tileW, tileH),
+                                  kTileRadius, kTileRadius),
+                photoTileClip_.GetAddressOf()))) {
+          photoTileClipWidth_ = tileW;
+          photoTileClipHeight_ = tileH;
+        }
       }
-      if (clip) {
+      if (photoTileClip_) {
         activeRT_->PushLayer(
-            D2D1::LayerParameters(D2D1::InfiniteRect(), clip.Get()), nullptr);
+            D2D1::LayerParameters(
+                ToD2D(rect), photoTileClip_.Get(),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                D2D1::Matrix3x2F::Translation(rect.left, rect.top)),
+            nullptr);
       }
       DrawCrispBitmap(bitmap.Get(), rect, 1.0f, &source);
-      if (clip) activeRT_->PopLayer();
+      if (photoTileClip_) activeRT_->PopLayer();
     } else {
       constexpr float kGlyph = 28.0f;
       const float cx = (rect.left + rect.right) * 0.5f;
@@ -17249,8 +17678,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   LONG AccessibleSettingsStatusChild() const {
     if (!settingsStatus_ || !settingsHwnd_) return CHILDID_SELF;
-    const auto items = AccessibleItems(settingsHwnd_);
-    return items.empty() ? CHILDID_SELF : static_cast<LONG>(items.size());
+    const int count = AccessibleChildCount(settingsHwnd_);
+    return count <= 0 ? CHILDID_SELF : static_cast<LONG>(count);
   }
 
   void SetSettingsStatus(StatusSeverity severity, std::wstring text) {
@@ -17332,10 +17761,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         feathercast::settings::ClampTextSizePercent(settings_.textSizePercent)) /
                             100.0f;
     if (wrapBodyFormat_ && dwriteFactory_ && width > 1.0f && !text.empty()) {
-      ComPtr<IDWriteTextLayout> layout;
-      if (SUCCEEDED(dwriteFactory_->CreateTextLayout(
-              text.c_str(), static_cast<UINT32>(text.size()),
-              wrapBodyFormat_.Get(), width, 4096.0f, &layout))) {
+      if (auto layout = textLayoutCache_.Get(
+              dwriteFactory_.Get(), text, wrapBodyFormat_.Get(), width,
+              4096.0f)) {
         DWRITE_TEXT_METRICS metrics{};
         if (SUCCEEDED(layout->GetMetrics(&metrics))) {
           return std::ceil(metrics.height);
@@ -17451,9 +17879,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool SettFocused(HitType type) const {
-    const auto order = SettingsFocusOrder();
-    return settingsFocusIndex_ >= 0 && settingsFocusIndex_ < static_cast<int>(order.size()) &&
-           order[static_cast<size_t>(settingsFocusIndex_)] == type;
+    if (paintSettingsFocusActive_) {
+      return paintSettingsFocus_.has_value() && *paintSettingsFocus_ == type;
+    }
+    const auto focused = CurrentSettingsFocusType();
+    return focused.has_value() && *focused == type;
   }
 
   std::vector<HitType> SettingsFocusOrder() const {
@@ -17531,23 +17961,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void DrawSettingsNumericText(const std::wstring& text, RectF rect,
                                IDWriteTextFormat* format, D2D1_COLOR_F color) {
     if (!activeRT_ || !format || text.empty() || !dwriteFactory_) return;
-    if (!settingsTabularTypography_ &&
-        SUCCEEDED(dwriteFactory_->CreateTypography(
-            settingsTabularTypography_.GetAddressOf()))) {
-      settingsTabularTypography_->AddFontFeature(
-          {DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1});
-    }
-    ComPtr<IDWriteTextLayout> layout;
-    if (!settingsTabularTypography_ ||
-        FAILED(dwriteFactory_->CreateTextLayout(
-            text.c_str(), static_cast<UINT32>(text.size()), format,
-            std::max(1.0f, rect.right - rect.left),
-            std::max(1.0f, rect.bottom - rect.top), layout.GetAddressOf()))) {
+    feathercast::ui::TextLayoutOptions options;
+    options.tabularFigures = true;
+    auto layout = textLayoutCache_.Get(
+        dwriteFactory_.Get(), text, format,
+        std::max(1.0f, rect.right - rect.left),
+        std::max(1.0f, rect.bottom - rect.top), options);
+    if (!layout) {
       DrawTextBlock(text, rect, format, color);
       return;
     }
-    layout->SetTypography(settingsTabularTypography_.Get(),
-                          {0, static_cast<UINT32>(text.size())});
     auto brush = Brush(color);
     activeRT_->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(),
                               brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -17895,6 +18318,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void DrawSettings() {
+    paintSettingsFocus_ = CurrentSettingsFocusType();
+    paintSettingsFocusActive_ = true;
+    struct ResetPaintSettingsFocus {
+      bool& active;
+      ~ResetPaintSettingsFocus() { active = false; }
+    } resetSettingsFocus{paintSettingsFocusActive_};
     RECT rc{};
     GetClientRect(settingsHwnd_, &rc);
     const float scale = GetWindowScale(settingsHwnd_);
@@ -19015,14 +19444,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   std::optional<feathercast::runtime::DecodedIcon> ResolveIcon(
       const std::wstring& key) {
-    ComPtr<IWICImagingFactory> workerWicFactory;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&workerWicFactory)))) {
-      return std::nullopt;
+    IWICImagingFactory* wicFactory =
+        feathercast::runtime::CurrentIconWorkerWicFactory();
+    ComPtr<IWICImagingFactory> fallbackWicFactory;
+    if (!wicFactory) {
+      if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&fallbackWicFactory)))) {
+        return std::nullopt;
+      }
+      wicFactory = fallbackWicFactory.Get();
     }
     if (StartsWith(key, kPhoneImagePrefix)) {
-      return ResolvePhoneImage(workerWicFactory.Get(), key);
+      return ResolvePhoneImage(wicFactory, key);
     }
     const std::filesystem::path sourcePath(key);
     const std::wstring sourceExtension =
@@ -19031,7 +19465,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if ((sourceExtension == L".png" || sourceExtension == L".jpg" ||
          sourceExtension == L".jpeg" || sourceExtension == L".bmp") &&
         std::filesystem::is_regular_file(sourcePath, sourceEc)) {
-      if (auto decoded = DecodeIconFile(workerWicFactory.Get(), sourcePath, key)) {
+      if (auto decoded = DecodeIconFile(wicFactory, sourcePath, key)) {
         return decoded;
       }
     }
@@ -19040,10 +19474,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     auto createCachedIcon = [&]() {
       UniqueBitmap bitmap(CreateShellBitmap(key));
       if (!bitmap) return false;
+      std::filesystem::create_directories(png.parent_path(), ec);
       auto temporary = png;
       temporary += L".tmp-" + std::to_wstring(GetCurrentThreadId());
       std::filesystem::remove(temporary, ec);
-      if (!SaveHBitmapPng(workerWicFactory.Get(), bitmap.get(), temporary)) {
+      if (!SaveHBitmapPng(wicFactory, bitmap.get(), temporary)) {
         std::filesystem::remove(temporary, ec);
         return false;
       }
@@ -19059,7 +19494,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool cached = std::filesystem::exists(png, ec);
     if (ec) return std::nullopt;
     if (!cached && !createCachedIcon()) return std::nullopt;
-    if (auto decoded = DecodeIconFile(workerWicFactory.Get(), png, key)) {
+    if (auto decoded = DecodeIconFile(wicFactory, png, key)) {
       return decoded;
     }
 
@@ -19075,7 +19510,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       std::filesystem::remove(png, ec);
     }
     if (!createCachedIcon()) return std::nullopt;
-    auto decoded = DecodeIconFile(workerWicFactory.Get(), png, key);
+    auto decoded = DecodeIconFile(wicFactory, png, key);
     if (!decoded) std::filesystem::remove(png, ec);
     return decoded;
   }
@@ -21929,7 +22364,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         } else if (runCommand.kind == feathercast::run_command::Kind::ShellCommand) {
           // /s with one outer pair of quotes makes cmd strip exactly that
           // pair, so a command that starts and ends with a quoted path
-          // ("C:\Program Files\Apppp.exe" "file") keeps its own quotes.
+          // ("C:\Program Files\App\app.exe" "file") keeps its own quotes.
           const std::wstring args = L"/d /s /k \"" + runCommand.input + L"\"";
           launched = reinterpret_cast<INT_PTR>(
                          ShellExecuteW(nullptr, L"open", L"cmd.exe", args.c_str(),
@@ -24384,9 +24819,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   PressedModifiers hookModifiers_;
   bool hookPrintScreenPressed_ = false;
   HookConfig hookAppliedConfig_;
+  std::uint64_t hookAppliedVersion_ = 0;
   // Shared between the UI thread and the hook thread.
   std::mutex hookConfigMutex_;
   HookConfig hookConfig_;
+  std::atomic<std::uint64_t> hookConfigVersion_{0};
   std::atomic<bool> hookWinDown_{false};
   // UI thread copy of the last published snapshot.
   HookConfig publishedHookConfig_;
@@ -24501,7 +24938,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   size_t pendingDecodedIconBytes_ = 0;
 
   ComPtr<IDWriteFactory> dwriteFactory_;
-  feathercast::ui::TextLayoutCache textLayoutCache_;
+  mutable feathercast::ui::TextLayoutCache textLayoutCache_;
   static constexpr size_t kResultRenderCacheCap = 512;
   static constexpr size_t kMarkdownCacheCap = 64;
 
@@ -24538,11 +24975,36 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   };
   std::optional<PendingActivation> pendingActivation_;
   ID2D1RenderTarget* activeRT_ = nullptr;
-  // Per-render-target cache of solid-color brushes, keyed by packed RGBA.
-  std::unordered_map<uint32_t, ComPtr<ID2D1SolidColorBrush>> brushCache_;
+  // Small rotating pool of solid-color brushes shared across all device contexts.
+  std::array<ComPtr<ID2D1SolidColorBrush>, 4> brushPool_;
+  std::size_t brushPoolNext_ = 0;
   HRESULT lastBrushFailure_ = S_OK;
   ComPtr<ID2D1DeviceContext> activeDC_;  // QI of activeRT_ for color-emoji DrawText, when available
   ComPtr<ID2D1StrokeStyle> resultIconStroke_;
+  ComPtr<ID2D1RoundedRectangleGeometry> photoTileClip_;
+  float photoTileClipWidth_ = 0.0f;
+  float photoTileClipHeight_ = 0.0f;
+  UINT cachedCaretBlinkMs_ = 530;
+  UINT cachedCaretWidth_ = 1;
+  UINT cachedKeyboardSpeed_ = 31;
+  mutable bool accentCacheValid_ = false;
+  mutable bool accentCacheSync_ = true;
+  mutable std::wstring accentCacheCustomHex_;
+  mutable COLORREF cachedActiveAccent_ = RGB(99, 102, 241);
+  mutable D2D1_COLOR_F cachedEmphasisRgb_ = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+  mutable bool cachedPillTextValid_ = false;
+  mutable uint32_t cachedPillBgKey_ = 0;
+  mutable std::array<std::pair<uint32_t, D2D1_COLOR_F>, 8> cachedPillTextEntries_{};
+  mutable std::size_t cachedPillTextCount_ = 0;
+  struct CachedShortcutHint {
+    std::wstring hint;
+    float available = 0.0f;
+    int textSizePercent = 0;
+    ShortcutHintLayout layout;
+  };
+  std::vector<CachedShortcutHint> shortcutHintCache_;
+  std::optional<HitType> paintSettingsFocus_;
+  bool paintSettingsFocusActive_ = false;
   ComPtr<IDWriteTextFormat> inputFormat_;
   ComPtr<IDWriteTextFormat> rowFormat_;
   ComPtr<IDWriteTextFormat> calculationResultFormat_;

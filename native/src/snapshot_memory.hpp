@@ -1,6 +1,8 @@
 #pragma once
 #include "app_types.hpp"
 
+#include <type_traits>
+
 namespace feathercast::search {
 
 // Count capacities (including inline string storage conservatively) once per
@@ -9,6 +11,14 @@ inline std::size_t TextBytes(const std::wstring& value) { return (value.capacity
 inline std::size_t TextBytes(const std::vector<std::wstring>& values) {
   std::size_t bytes = values.capacity() * sizeof(std::wstring);
   for (const auto& value : values) bytes += TextBytes(value);
+  return bytes;
+}
+template <typename Token>
+inline std::size_t TokenBytes(const std::vector<Token>& values) {
+  std::size_t bytes = values.capacity() * sizeof(Token);
+  if constexpr (std::is_same_v<Token, std::wstring>) {
+    for (const auto& value : values) bytes += TextBytes(value);
+  }
   return bytes;
 }
 inline std::size_t SearchItemBytes(const core::SearchItem& item) {
@@ -40,7 +50,7 @@ inline std::size_t SnapshotBytes(const app::SearchSnapshot& snapshot) {
   for (const auto& item : snapshot.searchItems) {
     bytes += SearchItemBytes(item.item) + TextBytes(item.normalizedName) + TextBytes(item.lowerName) + TextBytes(item.normalizedAliases);
     bytes += item.fields.capacity() * sizeof(core::PreparedField);
-    for (const auto& field : item.fields) bytes += TextBytes(field.raw) + TextBytes(field.normalized) + TextBytes(field.tokens) + TextBytes(field.acronym);
+    for (const auto& field : item.fields) bytes += TextBytes(field.raw) + TextBytes(field.normalized) + TokenBytes(field.tokens) + TextBytes(field.acronym);
   }
   for (const auto* items : {&snapshot.clipboardSearchItems, &snapshot.gameSearchItems}) {
     bytes += items->capacity() * sizeof(core::SearchItem);

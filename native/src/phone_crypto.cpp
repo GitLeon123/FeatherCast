@@ -7,6 +7,7 @@
 #include <wincrypt.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <utility>
@@ -131,8 +132,7 @@ bool ConstantTimeEquals(const Bytes& a, const Bytes& b) {
 
 namespace {
 
-std::optional<Bytes> AesGcm(bool encrypt, const Bytes& key, const Bytes& nonce,
-                            const Bytes& input) {
+BCRYPT_ALG_HANDLE AesGcmAlgorithm() {
   static const Algorithm algorithm(BCRYPT_AES_ALGORITHM);
   static const bool gcmReady =
       algorithm &&
@@ -140,19 +140,17 @@ std::optional<Bytes> AesGcm(bool encrypt, const Bytes& key, const Bytes& nonce,
                            reinterpret_cast<PUCHAR>(
                                const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
                            sizeof(BCRYPT_CHAIN_MODE_GCM), 0));
+  return gcmReady ? algorithm.get() : nullptr;
+}
+
+std::optional<Bytes> AesGcmWithHandle(BCRYPT_KEY_HANDLE keyHandle, bool encrypt,
+                                      const Bytes& nonce, const Bytes& input) {
   constexpr std::size_t kTagBytes = 16;
-  if (!gcmReady || key.size() != 32 || nonce.size() != 12) return std::nullopt;
+  if (!keyHandle || nonce.size() != 12) return std::nullopt;
   if (!encrypt && input.size() < kTagBytes) return std::nullopt;
 
-  KeyHandle handle;
-  if (!Ok(BCryptGenerateSymmetricKey(algorithm.get(), handle.out(), nullptr, 0,
-                                     const_cast<PUCHAR>(key.data()),
-                                     static_cast<ULONG>(key.size()), 0))) {
-    return std::nullopt;
-  }
-
   const std::size_t dataSize = encrypt ? input.size() : input.size() - kTagBytes;
-  Bytes tag(kTagBytes);
+  std::array<std::uint8_t, kTagBytes> tag{};
   if (!encrypt) {
     std::copy(input.end() - kTagBytes, input.end(), tag.begin());
   }
@@ -174,10 +172,10 @@ std::optional<Bytes> AesGcm(bool encrypt, const Bytes& key, const Bytes& nonce,
   PUCHAR in = dataSize ? const_cast<PUCHAR>(input.data()) : &dummy;
   PUCHAR out = dataSize ? output.data() : &dummy;
   const NTSTATUS status =
-      encrypt ? BCryptEncrypt(handle.get(), in, static_cast<ULONG>(dataSize),
+      encrypt ? BCryptEncrypt(keyHandle, in, static_cast<ULONG>(dataSize),
                               &info, nullptr, 0, out,
                               static_cast<ULONG>(dataSize), &written, 0)
-              : BCryptDecrypt(handle.get(), in, static_cast<ULONG>(dataSize),
+              : BCryptDecrypt(keyHandle, in, static_cast<ULONG>(dataSize),
                               &info, nullptr, 0, out,
                               static_cast<ULONG>(dataSize), &written, 0);
   if (!Ok(status)) return std::nullopt;
@@ -187,14 +185,55 @@ std::optional<Bytes> AesGcm(bool encrypt, const Bytes& key, const Bytes& nonce,
 
 }  // namespace
 
+AesGcmKey::AesGcmKey(AesGcmKey&& other) noexcept
+    : key_(std::exchange(other.key_, nullptr)) {}
+
+AesGcmKey& AesGcmKey::operator=(AesGcmKey&& other) noexcept {
+  if (this != &other) {
+    if (key_) BCryptDestroyKey(key_);
+    key_ = std::exchange(other.key_, nullptr);
+  }
+  return *this;
+}
+
+AesGcmKey::~AesGcmKey() {
+  if (key_) BCryptDestroyKey(key_);
+}
+
+std::optional<AesGcmKey> AesGcmKey::Create(const Bytes& key) {
+  BCRYPT_ALG_HANDLE alg = AesGcmAlgorithm();
+  if (!alg || key.size() != 32) return std::nullopt;
+  BCRYPT_KEY_HANDLE handle = nullptr;
+  if (!Ok(BCryptGenerateSymmetricKey(alg, &handle, nullptr, 0,
+                                     const_cast<PUCHAR>(key.data()),
+                                     static_cast<ULONG>(key.size()), 0))) {
+    return std::nullopt;
+  }
+  AesGcmKey out;
+  out.key_ = handle;
+  return out;
+}
+
+std::optional<Bytes> AesGcmKey::Encrypt(const Bytes& nonce,
+                                        const Bytes& plaintext) const {
+  return AesGcmWithHandle(key_, true, nonce, plaintext);
+}
+
+std::optional<Bytes> AesGcmKey::Decrypt(const Bytes& nonce,
+                                        const Bytes& sealed) const {
+  return AesGcmWithHandle(key_, false, nonce, sealed);
+}
+
 std::optional<Bytes> AesGcmEncrypt(const Bytes& key, const Bytes& nonce,
                                    const Bytes& plaintext) {
-  return AesGcm(true, key, nonce, plaintext);
+  const auto keyObj = AesGcmKey::Create(key);
+  return keyObj ? keyObj->Encrypt(nonce, plaintext) : std::nullopt;
 }
 
 std::optional<Bytes> AesGcmDecrypt(const Bytes& key, const Bytes& nonce,
                                    const Bytes& sealed) {
-  return AesGcm(false, key, nonce, sealed);
+  const auto keyObj = AesGcmKey::Create(key);
+  return keyObj ? keyObj->Decrypt(nonce, sealed) : std::nullopt;
 }
 
 // ------------------------------------------------------------------- ECDH

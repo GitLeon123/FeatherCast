@@ -33,54 +33,80 @@ struct WinState {
 
 std::wstring GetProcessIntegrityLevel(HANDLE process);
 
+bool VerboseBrokerLogging() {
+  static const bool enabled =
+      IsDebuggerPresent() != FALSE ||
+      GetEnvironmentVariableW(L"FEATHERCAST_BROKER_LOG", nullptr, 0) > 0;
+  return enabled;
+}
+
 // Diagnostic log. The keyboard hook runs on the message-loop thread and must
 // return well inside the system hook timeout, so no caller does file I/O:
-// lines go into a bounded ring under a very short lock and a dedicated thread
-// writes them out. Overflow drops lines (and says so) instead of blocking.
+// lines go into a bounded ring under a very short lock and a lazy writer
+// thread writes them out and exits after 5s idle.
 class BrokerLog {
  public:
   void Start() {
     std::lock_guard lock(mutex_);
-    if (thread_.joinable()) return;
     stop_ = false;
-    thread_ = std::thread([this] { Run(); });
   }
 
   // Writes everything still queued, then ends the writer thread.
   void Stop() {
+    std::thread worker;
     {
       std::lock_guard lock(mutex_);
       stop_ = true;
+      worker = std::move(thread_);
+      workerActive_ = false;
     }
     wake_.notify_one();
-    if (thread_.joinable()) thread_.join();
+    if (worker.joinable()) worker.join();
   }
 
   void Post(const wchar_t* text) {
     if (!text || !text[0]) return;
+    std::thread finished;
+    bool notify = false;
     {
       std::lock_guard lock(mutex_);
+      if (stop_) return;
       Enqueue(text);
+      if (!workerActive_) {
+        if (thread_.joinable()) finished = std::move(thread_);
+        workerActive_ = true;
+        thread_ = std::thread([this] { Run(); });
+      } else {
+        notify = true;
+      }
     }
-    wake_.notify_one();
+    if (notify) wake_.notify_one();
+    if (finished.joinable()) finished.join();
   }
 
   // For the keyboard hook: never waits, drops the line if the queue is busy.
   void TryPost(const wchar_t* text) {
-    if (!text || !text[0]) return;
+    if (!text || !text[0] || !VerboseBrokerLogging()) return;
+    bool notify = false;
     {
       std::unique_lock lock(mutex_, std::try_to_lock);
-      if (!lock.owns_lock()) {
+      if (!lock.owns_lock() || stop_) {
         dropped_.fetch_add(1, std::memory_order_relaxed);
         return;
       }
       Enqueue(text);
+      if (!workerActive_ && !thread_.joinable()) {
+        workerActive_ = true;
+        thread_ = std::thread([this] { Run(); });
+      } else if (workerActive_) {
+        notify = true;
+      }
     }
-    wake_.notify_one();
+    if (notify) wake_.notify_one();
   }
 
  private:
-  static constexpr std::size_t kCapacity = 256;
+  static constexpr std::size_t kCapacity = 32;
   static constexpr std::size_t kLineChars = 192;
   struct Line {
     wchar_t text[kLineChars];
@@ -100,11 +126,15 @@ class BrokerLog {
   void Run() {
     std::vector<Line> batch;
     batch.reserve(kCapacity);
+    constexpr auto kIdleTimeout = std::chrono::seconds(5);
     for (;;) {
       bool stopping = false;
+      bool timedOut = false;
       {
         std::unique_lock lock(mutex_);
-        wake_.wait(lock, [this] { return stop_ || count_ > 0; });
+        const bool woke = wake_.wait_for(lock, kIdleTimeout, [this] {
+          return stop_ || count_ > 0;
+        });
         batch.clear();
         while (count_ > 0) {
           batch.push_back(ring_[head_]);
@@ -112,7 +142,12 @@ class BrokerLog {
           --count_;
         }
         stopping = stop_;
+        if (!woke && batch.empty() && !stopping) {
+          workerActive_ = false;
+          timedOut = true;
+        }
       }
+      if (timedOut) return;
       try {
         const unsigned dropped = dropped_.exchange(0, std::memory_order_relaxed);
         if (dropped != 0) {
@@ -132,7 +167,7 @@ class BrokerLog {
     // An elevated broker must not open log files in a user-writable directory.
     static const auto integrity = GetProcessIntegrityLevel(GetCurrentProcess());
     FILE* file = nullptr;
-    if (integrity != L"HIGH" && integrity != L"SYSTEM") {
+    if (VerboseBrokerLogging() && integrity != L"HIGH" && integrity != L"SYSTEM") {
       wchar_t local[MAX_PATH]{};
       const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
       if (length != 0 && length < MAX_PATH) {
@@ -153,6 +188,7 @@ class BrokerLog {
   std::array<Line, kCapacity> ring_{};
   std::size_t head_ = 0;
   std::size_t count_ = 0;
+  bool workerActive_ = false;
   bool stop_ = false;
   std::atomic<unsigned> dropped_{0};
 };
@@ -301,16 +337,18 @@ void TriggerAndActivateApp() {
     AttachThreadInput(brokerThread, fgThread, FALSE);
   }
 
-  HWND fgAfter = GetForegroundWindow();
-  DWORD pidAfter = 0;
-  if (fgAfter && IsWindow(fgAfter)) GetWindowThreadProcessId(fgAfter, &pidAfter);
-  std::wstring procAfter = ProcessName(pidAfter);
+  if (VerboseBrokerLogging()) {
+    HWND fgAfter = GetForegroundWindow();
+    DWORD pidAfter = 0;
+    if (fgAfter && IsWindow(fgAfter)) GetWindowThreadProcessId(fgAfter, &pidAfter);
+    std::wstring procAfter = ProcessName(pidAfter);
 
-  wchar_t actBuf[512]{};
-  swprintf_s(actBuf,
-             L"[Broker] TriggerAndActivateApp: SetForegroundWindow=%ls, foreground-after=%ls\n",
-             sfwResult ? L"TRUE" : L"FALSE", procAfter.c_str());
-  AppendBrokerLog(actBuf);
+    wchar_t actBuf[512]{};
+    swprintf_s(actBuf,
+               L"[Broker] TriggerAndActivateApp: SetForegroundWindow=%ls, foreground-after=%ls\n",
+               sfwResult ? L"TRUE" : L"FALSE", procAfter.c_str());
+    AppendBrokerLog(actBuf);
+  }
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -507,10 +545,14 @@ void RunPipeServer(HWND msgHwnd) {
         g_activePipe.store(pipe);
       }
 
-      wchar_t regBuf[256]{};
-      swprintf_s(regBuf, L"[Broker] App registered: pid=%lu hwnd=0x%llX tid=%lu\n",
-                 reg.pid, reg.hwnd, reg.threadId);
-      AppendBrokerLog(regBuf);
+      if (VerboseBrokerLogging()) {
+        wchar_t regBuf[256]{};
+        swprintf_s(regBuf, L"[Broker] App registered: pid=%lu hwnd=0x%llX tid=%lu\n",
+                   reg.pid, reg.hwnd, reg.threadId);
+        AppendBrokerLog(regBuf);
+      }
+      SetProcessWorkingSetSizeEx(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1), 0);
 
       // Commands are message framed; blocking here applies shortcut changes promptly.
       while (!g_stopPipeServer.load()) {

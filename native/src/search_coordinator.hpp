@@ -47,6 +47,8 @@ class SearchCoordinator {
   std::condition_variable cv_;
   std::optional<app::QueryRequest> pending_;
   std::atomic<unsigned long long> latestGeneration_ = 0;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
 };
 
@@ -79,6 +81,8 @@ class SnapshotCoordinator {
   std::condition_variable cv_;
   std::optional<app::SnapshotBuildRequest> pending_;
   std::atomic<std::uint64_t> latestRevision_ = 0;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
 };
 

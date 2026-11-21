@@ -42,7 +42,7 @@ inline std::string JoinRaw(const std::vector<std::string>& items) {
 // types. For "photo.full", "file.send", and "file.data" the caller saves
 // `binary` and fills in Event::path.
 inline std::optional<Event> ParseSessionMessage(const json::Value& root,
-                                                const Bytes& binary,
+                                                Bytes binary,
                                                 long long nowMs) {
   using detail::JsonArray;
   const std::string type = JsonString(root, "type");
@@ -78,7 +78,7 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
         if (action.index >= 0 && !action.title.empty()) info.actions.push_back(std::move(action));
       }
     }
-    info.iconPng = binary;
+    info.iconPng = std::move(binary);
   } else if (type == "notification.removed") {
     event.kind = EventKind::NotificationRemoved;
     event.text = JsonString(root, "key");
@@ -107,7 +107,7 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
   } else if (type == "photo.thumb") {
     event.kind = EventKind::PhotoThumb;
     event.photo.id = JsonString(root, "id");
-    event.photo.thumbJpeg = binary;
+    event.photo.thumbJpeg = std::move(binary);
   } else if (type == "photo.full" || type == "file.send") {
     event.kind = type == "photo.full" ? EventKind::PhotoSaved : EventKind::FileSaved;
     event.photo.id = JsonString(root, "id");
@@ -137,7 +137,7 @@ inline std::optional<Event> ParseSessionMessage(const json::Value& root,
     media.positionAt = JsonInt(root, "posAt", nowMs);
     media.volume = JsonInt32(root, "vol", -1);
     media.volumeMax = JsonInt32(root, "volMax");
-    media.artJpeg = binary;
+    media.artJpeg = std::move(binary);
   } else if (type == "media.none") {
     event.kind = EventKind::MediaState;
   } else if (type == "sms.threads") {

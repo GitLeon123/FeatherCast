@@ -13,9 +13,23 @@ Set-StrictMode -Version 3.0
 $outPath = Join-Path $PSScriptRoot "..\native\src\emoji.hpp"
 $preservedEntries = @()
 if ($ReuseData) {
-  $preservedEntries = @(Get-Content -LiteralPath $outPath -Encoding utf8 |
+  $rawLines = @(Get-Content -LiteralPath $outPath -Encoding utf8 |
     Where-Object { $_ -match '^    \{L"' })
-  if ($preservedEntries.Count -eq 0) { throw 'No existing emoji data to reuse.' }
+  if ($rawLines.Count -eq 0) { throw 'No existing emoji data to reuse.' }
+  foreach ($entryLine in $rawLines) {
+    if ($entryLine -match '^    \{(L"(?:[^"\\]|\\.)*"), (L"(?:[^"\\]|\\.)*"), \{([^}]*)\}\},$') {
+      $valLit = $Matches[1]
+      $lblLit = $Matches[2]
+      $kwRaw = $Matches[3]
+      $kws = [regex]::Matches($kwRaw, 'L"((?:[^"\\]|\\.)*)"') | ForEach-Object { $_.Groups[1].Value }
+      $kwJoined = ($kws -join ' ')
+      $preservedEntries += "    {$valLit, $lblLit, L`"$kwJoined`"},"
+    } elseif ($entryLine -match '^    \{(L"(?:[^"\\]|\\.)*"), (L"(?:[^"\\]|\\.)*"), (L"(?:[^"\\]|\\.)*")\},$') {
+      $preservedEntries += $entryLine
+    } else {
+      throw "Unrecognized emoji entry line: $entryLine"
+    }
+  }
   $lines = @()
 } else {
   Write-Host "Downloading $Source ..."
@@ -23,7 +37,7 @@ if ($ReuseData) {
   $lines = $text -split "`r?`n"
 }
 
-# Build a literal for one entry: {L"<value escapes>", L"<label>", {L"kw", ...}}.
+# Build a literal for one entry: {L"<value escapes>", L"<label>", L"kw1 kw2 ..."}.
 function Escape-Literal([string]$s) {
   return $s.Replace('\', '\\').Replace('"', '\"')
 }
@@ -64,10 +78,10 @@ foreach ($line in $lines) {
   # Keywords: tokens from the name + subgroup, lowercased, deduped, length >= 2.
   $kwSource = ($name + " " + ($subgroup -replace '-', ' '))
   $tokens = ($kwSource.ToLower() -split '[^a-z0-9]+') | Where-Object { $_.Length -ge 2 } | Select-Object -Unique
-  $kwLiteral = ($tokens | ForEach-Object { 'L"' + (Escape-Literal $_) + '"' }) -join ', '
+  $kwJoined = Escape-Literal ($tokens -join ' ')
 
   $label = Escape-Literal $name
-  $entries.Add("    {L`"$value`", L`"$label`", {$kwLiteral}},")
+  $entries.Add("    {L`"$value`", L`"$label`", L`"$kwJoined`"},")
 }
 
 Write-Host ("Parsed {0} emoji entries." -f $entries.Count)
@@ -81,70 +95,80 @@ $header = @"
 #include "symbols.hpp"
 
 #include <algorithm>
-#include <string>
-#include <vector>
+#include <iterator>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace feathercast::emoji {
 
-inline std::vector<feathercast::symbols::Symbol>* g_EmojiList = nullptr;
-inline std::vector<feathercast::core::PreparedSearchItem>* g_EmojiSearchItems = nullptr;
+namespace detail {
+
+inline constexpr feathercast::symbols::detail::RawSymbol kRawEmoji[] = {
+$($entries -join "`n")
+};
+
+}  // namespace detail
+
+inline std::unique_ptr<std::vector<feathercast::core::PreparedSearchItem>> g_EmojiSearchItems;
 inline std::mutex g_EmojiMutex;
 
-inline const std::vector<feathercast::symbols::Symbol>& AllEmojiUnlocked();
-
 inline const std::vector<feathercast::symbols::Symbol>& AllEmoji() {
-  std::lock_guard<std::mutex> lock(g_EmojiMutex);
-  return AllEmojiUnlocked();
+  static const std::vector<feathercast::symbols::Symbol> kEmoji = [] {
+    std::vector<feathercast::symbols::Symbol> list;
+    list.reserve(std::size(detail::kRawEmoji));
+    for (const auto& raw : detail::kRawEmoji) {
+      list.push_back({
+          raw.value,
+          raw.label,
+          feathercast::symbols::detail::SplitKeywords(raw.keywords),
+      });
+    }
+    return list;
+  }();
+  return kEmoji;
 }
 
 inline void FreeEmojiMemory() {
   std::lock_guard<std::mutex> lock(g_EmojiMutex);
-  if (g_EmojiList) {
-    delete g_EmojiList;
-    g_EmojiList = nullptr;
-  }
-  if (g_EmojiSearchItems) {
-    delete g_EmojiSearchItems;
-    g_EmojiSearchItems = nullptr;
-  }
-}
-
-inline const std::vector<feathercast::symbols::Symbol>& AllEmojiUnlocked() {
-  if (!g_EmojiList) {
-    g_EmojiList = new std::vector<feathercast::symbols::Symbol>{
-$($entries -join "`n")
-  };
-  }
-  return *g_EmojiList;
+  g_EmojiSearchItems.reset();
 }
 
 inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query, size_t limit = 300) {
   if (limit == 0) return {};
   query = feathercast::core::Trim(std::move(query));
 
-  std::lock_guard<std::mutex> lock(g_EmojiMutex);
-  const auto& all = AllEmojiUnlocked();
+  constexpr size_t kTotalEmoji = std::size(detail::kRawEmoji);
   std::vector<feathercast::symbols::Symbol> out;
   if (query.empty()) {
-    for (const auto& emoji : all) {
-      out.push_back(emoji);
-      if (out.size() >= limit) break;
+    const size_t count = (std::min)(limit, kTotalEmoji);
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      const auto& raw = detail::kRawEmoji[i];
+      out.push_back({
+          raw.value,
+          raw.label,
+          feathercast::symbols::detail::SplitKeywords(raw.keywords),
+      });
     }
     return out;
   }
 
+  std::lock_guard<std::mutex> lock(g_EmojiMutex);
   if (!g_EmojiSearchItems) {
-    g_EmojiSearchItems = new std::vector<feathercast::core::PreparedSearchItem>();
-    g_EmojiSearchItems->reserve(all.size());
-    for (size_t i = 0; i < all.size(); ++i) {
+    g_EmojiSearchItems = std::make_unique<std::vector<feathercast::core::PreparedSearchItem>>();
+    g_EmojiSearchItems->reserve(kTotalEmoji);
+    for (size_t i = 0; i < kTotalEmoji; ++i) {
+      const auto& raw = detail::kRawEmoji[i];
       feathercast::core::SearchItem item;
       item.id = std::to_wstring(i);
       item.kind = L"emoji";
       item.source = L"emoji";
-      item.name = all[i].label;
-      item.keywords = all[i].keywords;
-      g_EmojiSearchItems->push_back(feathercast::core::PrepareSearchItem(item));
+      item.name = raw.label;
+      item.keywords = feathercast::symbols::detail::SplitKeywords(raw.keywords);
+      g_EmojiSearchItems->push_back(feathercast::core::PrepareSearchItem(std::move(item)));
     }
   }
 
@@ -153,7 +177,12 @@ inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query,
   const auto order = feathercast::core::SearchPrepared(query, *g_EmojiSearchItems, {}, options);
   out.reserve(order.size());
   for (const auto index : order) {
-    out.push_back(all[index]);
+    const auto& raw = detail::kRawEmoji[index];
+    out.push_back({
+        raw.value,
+        raw.label,
+        feathercast::symbols::detail::SplitKeywords(raw.keywords),
+    });
     if (out.size() >= limit) break;
   }
   return out;

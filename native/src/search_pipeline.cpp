@@ -16,10 +16,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cwctype>
 #include <iterator>
 #include <map>
-#include <set>
+#include <mutex>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace feathercast::search_pipeline {
@@ -29,7 +32,7 @@ using namespace app;
 
 // Words folded exactly like the search core folds them (invariant case,
 // diacritics), so a gate never rejects what the search itself matched.
-std::vector<std::wstring> LowerWords(const std::wstring& text) {
+std::vector<std::wstring> LowerWords(std::wstring_view text) {
   return core::Tokens(text);
 }
 
@@ -39,6 +42,9 @@ namespace {
 
 std::wstring JoinWords(const std::vector<std::wstring>& words) {
   std::wstring joined;
+  std::size_t total = 0;
+  for (const auto& word : words) total += word.size() + 1;
+  if (total > 0) joined.reserve(total - 1);
   for (const auto& word : words) {
     if (!joined.empty()) joined.push_back(L' ');
     joined += word;
@@ -64,24 +70,88 @@ struct FeatureQuery {
 
 bool MatchesFeatureQuery(const FeatureQuery& query,
                          const std::vector<std::wstring>& phrases) {
-  const auto& queryWords = query.words;
-  const auto& joinedQuery = query.joined;
-  // One or two letters match too much to be worth a feature result.
-  if (joinedQuery.size() < 3) return false;
+  if (query.joined.size() < 3) return false;
+  const bool multiWord = query.words.size() > 1;
   std::vector<std::wstring> phraseWords;
   for (const auto& phrase : phrases) {
     auto words = LowerWords(phrase);
     const auto joinedPhrase = JoinWords(words);
-    // The whole name, keyword, or alias is (almost) spelled out.
     if (!words.empty() &&
-        (joinedPhrase.starts_with(joinedQuery) ||
-         NearlyEqual(joinedQuery, joinedPhrase))) return true;
-    phraseWords.insert(phraseWords.end(), words.begin(), words.end());
+        (joinedPhrase.starts_with(query.joined) ||
+         NearlyEqual(query.joined, joinedPhrase))) {
+      return true;
+    }
+    if (multiWord) {
+      phraseWords.insert(phraseWords.end(),
+                         std::make_move_iterator(words.begin()),
+                         std::make_move_iterator(words.end()));
+    }
   }
-  // Several words that each (almost) spell out a word of the feature, such as
-  // "increase volume" or "adjust output".
-  return queryWords.size() > 1 &&
-         std::all_of(queryWords.begin(), queryWords.end(), [&](const auto& queryWord) {
+  return multiWord &&
+         std::all_of(query.words.begin(), query.words.end(), [&](const auto& queryWord) {
+           return std::any_of(phraseWords.begin(), phraseWords.end(),
+                              [&](const auto& word) { return NearlyEqual(queryWord, word); });
+         });
+}
+
+bool MatchesFeatureQueryPair(const FeatureQuery& query,
+                             std::wstring_view first,
+                             std::wstring_view second) {
+  if (query.joined.size() < 3) return false;
+  const bool multiWord = query.words.size() > 1;
+  std::vector<std::wstring> phraseWords;
+  for (const std::wstring_view phrase : {first, second}) {
+    auto words = LowerWords(phrase);
+    const auto joinedPhrase = JoinWords(words);
+    if (!words.empty() &&
+        (joinedPhrase.starts_with(query.joined) ||
+         NearlyEqual(query.joined, joinedPhrase))) {
+      return true;
+    }
+    if (multiWord) {
+      phraseWords.insert(phraseWords.end(),
+                         std::make_move_iterator(words.begin()),
+                         std::make_move_iterator(words.end()));
+    }
+  }
+  return multiWord &&
+         std::all_of(query.words.begin(), query.words.end(), [&](const auto& queryWord) {
+           return std::any_of(phraseWords.begin(), phraseWords.end(),
+                              [&](const auto& word) { return NearlyEqual(queryWord, word); });
+         });
+}
+
+bool MatchesFeatureQueryItem(const FeatureQuery& query,
+                             const std::vector<std::wstring>& keywords,
+                             std::wstring_view name,
+                             const std::vector<std::wstring>& aliases) {
+  if (query.joined.size() < 3) return false;
+  const bool multiWord = query.words.size() > 1;
+  std::vector<std::wstring> phraseWords;
+  auto check = [&](std::wstring_view phrase) {
+    auto words = LowerWords(phrase);
+    const auto joinedPhrase = JoinWords(words);
+    if (!words.empty() &&
+        (joinedPhrase.starts_with(query.joined) ||
+         NearlyEqual(query.joined, joinedPhrase))) {
+      return true;
+    }
+    if (multiWord) {
+      phraseWords.insert(phraseWords.end(),
+                         std::make_move_iterator(words.begin()),
+                         std::make_move_iterator(words.end()));
+    }
+    return false;
+  };
+  for (const auto& kw : keywords) {
+    if (check(kw)) return true;
+  }
+  if (check(name)) return true;
+  for (const auto& alias : aliases) {
+    if (check(alias)) return true;
+  }
+  return multiWord &&
+         std::all_of(query.words.begin(), query.words.end(), [&](const auto& queryWord) {
            return std::any_of(phraseWords.begin(), phraseWords.end(),
                               [&](const auto& word) { return NearlyEqual(queryWord, word); });
          });
@@ -89,9 +159,93 @@ bool MatchesFeatureQuery(const FeatureQuery& query,
 
 bool MatchesPhoneSuggestion(const FeatureQuery& query,
                             const app::DisplayItem& item) {
-  std::vector<std::wstring> phrases = item.commandKeywords;
-  phrases.push_back(item.commandName);
-  return MatchesFeatureQuery(query, phrases);
+  static const std::vector<std::wstring> kNoAliases;
+  return MatchesFeatureQueryItem(query, item.commandKeywords, item.commandName,
+                                 kNoAliases);
+}
+
+struct PreparedViewCache {
+  std::mutex mutex;
+  app::BrowseView view = app::BrowseView::None;
+  std::weak_ptr<const app::SearchSnapshot> snapshot;
+  std::size_t count = 0;
+  std::uint64_t fingerprint = 0;
+  std::vector<core::PreparedSearchItem> prepared;
+};
+
+PreparedViewCache& ViewCache() {
+  static PreparedViewCache cache;
+  return cache;
+}
+
+std::uint64_t FingerprintSearchItems(const std::vector<core::SearchItem>& items) {
+  std::uint64_t hash = 14695981039346656037ull;
+  auto mix = [&](std::uint64_t v) {
+    hash ^= v;
+    hash *= 1099511628211ull;
+  };
+  auto mixStr = [&](std::wstring_view s) {
+    mix(s.size());
+    for (const wchar_t ch : s) mix(static_cast<std::uint64_t>(ch));
+  };
+  mix(items.size());
+  if (!items.empty()) {
+    mixStr(items.front().id);
+    mixStr(items.front().name);
+    mixStr(items.back().id);
+    mixStr(items.back().name);
+    if (items.size() > 2) {
+      const auto& mid = items[items.size() / 2];
+      mixStr(mid.id);
+      mixStr(mid.name);
+    }
+  }
+  return hash;
+}
+
+std::vector<std::size_t> SearchCachedBrowseItems(
+    const app::QueryRequest& request,
+    const std::vector<core::SearchItem>& items) {
+  if (!request.snapshot) {
+    return core::Search(request.query, items);
+  }
+  const auto fp = FingerprintSearchItems(items);
+  auto& cache = ViewCache();
+  std::lock_guard lock(cache.mutex);
+  const auto locked = cache.snapshot.lock();
+  if (cache.view != request.browseView || locked.get() != request.snapshot.get() ||
+      cache.count != items.size() || cache.fingerprint != fp) {
+    cache.prepared.clear();
+    cache.prepared.reserve(items.size());
+    for (const auto& item : items) {
+      cache.prepared.push_back(core::PrepareSearchItem(item));
+    }
+    cache.view = request.browseView;
+    cache.snapshot = request.snapshot;
+    cache.count = items.size();
+    cache.fingerprint = fp;
+  }
+  core::SearchOptions options;
+  options.maxWorkers = request.maxWorkers;
+  options.now = request.now;
+  options.generation = request.generation;
+  options.latestGeneration = request.latestGeneration;
+  return core::SearchPrepared(request.query, cache.prepared, {}, options);
+}
+
+void ClearBrowseViewCacheIfNeeded(app::BrowseView view) {
+  if (view == app::BrowseView::Clipboard || view == app::BrowseView::Games) {
+    return;
+  }
+  auto& cache = ViewCache();
+  std::lock_guard lock(cache.mutex);
+  if (!cache.prepared.empty()) {
+    std::vector<core::PreparedSearchItem>().swap(cache.prepared);
+    cache.snapshot.reset();
+    cache.view = app::BrowseView::None;
+    cache.count = 0;
+    cache.fingerprint = 0;
+  }
 }
 
 }  // namespace
@@ -325,11 +479,13 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
   };
   if (cancelled()) return result;
 
+  ClearBrowseViewCacheIfNeeded(request.browseView);
   const SearchSnapshot emptySnapshot;
   const SearchSnapshot* snapshot =
       request.snapshot ? request.snapshot.get() : &emptySnapshot;
   std::vector<Section> sections;
-  std::set<std::wstring> used;
+  std::vector<std::size_t> sectionHidden;
+  std::unordered_set<std::wstring> used;
   auto appendUnique = [&](const DisplayItem& item,
                           std::vector<DisplayItem>& output) {
     const auto key = item.Key();
@@ -359,19 +515,28 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
     return output;
   };
-  auto addSection = [&](std::wstring title, std::vector<DisplayItem> items) {
-    if (items.empty()) return;
+  auto addSection = [&](std::wstring title, std::vector<DisplayItem> items,
+                        std::size_t hidden = 0) {
+    if (items.empty() && hidden == 0) return;
     // One section per title: a later "Best match" joins the first instead of
     // rendering a second header, and expansion state stays unambiguous.
-    for (auto& section : sections) {
-      if (section.title == title) {
-        section.items.insert(section.items.end(),
-                             std::make_move_iterator(items.begin()),
-                             std::make_move_iterator(items.end()));
+    for (std::size_t i = 0; i < sections.size(); ++i) {
+      if (sections[i].title == title) {
+        sections[i].items.insert(sections[i].items.end(),
+                                 std::make_move_iterator(items.begin()),
+                                 std::make_move_iterator(items.end()));
+        sectionHidden[i] += hidden;
         return;
       }
     }
     sections.push_back({std::move(title), std::move(items)});
+    sectionHidden.push_back(hidden);
+  };
+  auto existingSectionVisible = [&](std::wstring_view title) -> std::size_t {
+    for (const auto& section : sections) {
+      if (section.title == title) return section.items.size();
+    }
+    return 0;
   };
 
   if (request.compactClear) {
@@ -427,9 +592,10 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     if (request.empty) {
       addSection(L"Clipboard History", take(snapshot->clipboardItems));
     } else {
-      const auto order = core::Search(request.query,
-                                      snapshot->clipboardSearchItems);
+      const auto order =
+          SearchCachedBrowseItems(request, snapshot->clipboardSearchItems);
       std::vector<DisplayItem> hits;
+      hits.reserve(order.size());
       for (const auto index : order) hits.push_back(snapshot->clipboardItems[index]);
       std::stable_partition(hits.begin(), hits.end(), [](const auto& item) { return item.clipboard.pinned; });
       addSection(L"Clipboard History", take(hits));
@@ -444,8 +610,10 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     if (request.empty) {
       addSection(L"Games", take(snapshot->gameItems));
     } else {
-      const auto order = core::Search(request.query, snapshot->gameSearchItems);
+      const auto order =
+          SearchCachedBrowseItems(request, snapshot->gameSearchItems);
       std::vector<DisplayItem> hits;
+      hits.reserve(order.size());
       for (const auto index : order) hits.push_back(snapshot->gameItems[index]);
       addSection(L"Games", take(hits));
     }
@@ -632,19 +800,20 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       std::vector<DisplayItem> settingMatches;
       // The catalog search is shared with the Settings window; only a
       // near-complete match of the label shows up in general search.
-      for (const auto* descriptorMatch : settings_catalog::Search(request.query)) {
-        const auto& descriptor = *descriptorMatch;
-        if (!MatchesFeatureQuery(featureQuery,
-                                 {std::wstring(descriptor.label),
-                                  std::wstring(descriptor.accessibleName)})) {
-          continue;
+      if (featureQuery.joined.size() >= 3) {
+        for (const auto* descriptorMatch : settings_catalog::Search(request.query)) {
+          const auto& descriptor = *descriptorMatch;
+          if (!MatchesFeatureQueryPair(featureQuery, descriptor.label,
+                                       descriptor.accessibleName)) {
+            continue;
+          }
+          DisplayItem item;
+          item.settingId = descriptor.stableId;
+          item.commandName = descriptor.label;
+          item.commandDetail = L"FeatherCast Settings - " + std::wstring(descriptor.description);
+          settingMatches.push_back(std::move(item));
+          if (settingMatches.size() == 6) break;
         }
-        DisplayItem item;
-        item.settingId = descriptor.stableId;
-        item.commandName = descriptor.label;
-        item.commandDetail = L"FeatherCast Settings - " + std::wstring(descriptor.description);
-        settingMatches.push_back(std::move(item));
-        if (settingMatches.size() == 6) break;
       }
 
       core::SearchOptions options;
@@ -673,52 +842,58 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       const auto best = [&](const std::vector<std::size_t>& positions) {
         return *std::min_element(positions.begin(), positions.end(), better);
       };
-      const auto takeRanked = [&](std::vector<std::size_t>& positions,
-                                  std::size_t limit = SIZE_MAX) {
+      const auto addRankedSection = [&](const wchar_t* title,
+                                        std::vector<std::size_t>& positions,
+                                        std::size_t limit = SIZE_MAX) {
+        if (positions.empty() || limit == 0) return;
+        const bool expanded = request.expandedSections.contains(title);
+        const std::size_t existingVisible = existingSectionVisible(title);
+        const std::size_t visibleCap =
+            expanded ? limit
+                     : (existingVisible < kCollapsedSectionLimit
+                            ? kCollapsedSectionLimit - existingVisible
+                            : 0);
         std::vector<DisplayItem> output;
-        output.reserve(std::min(positions.size(), limit));
+        output.reserve(std::min(positions.size(), visibleCap));
         std::size_t begin = 0;
-        while (begin < positions.size() && output.size() < limit) {
+        std::size_t totalTaken = 0;
+        while (begin < positions.size() && output.size() < visibleCap &&
+               totalTaken < limit) {
           if (cancelled()) break;
-          const auto count = std::min(positions.size() - begin,
-                                      limit - output.size());
+          const auto count =
+              std::min(positions.size() - begin,
+                       std::min(visibleCap - output.size(), limit - totalTaken));
           auto first = positions.begin() + begin;
           std::partial_sort(first, first + count, positions.end(), better);
           for (std::size_t offset = 0; offset < count; ++offset) {
-            appendUnique(matchedItem(positions[begin + offset]), output);
+            const auto& item = matchedItem(positions[begin + offset]);
+            const auto key = item.Key();
+            if (key.empty() || !used.insert(key).second) continue;
+            output.push_back(item);
+            ++totalTaken;
           }
           begin += count;
-          // If aliases or earlier sections consumed these keys, select the
-          // next ranked prefix too. A fixed top-N list would underfill the
-          // section when duplicate keys appear near its head.
         }
-        return output;
+        std::size_t hidden = 0;
+        while (!expanded && begin < positions.size() && totalTaken < limit) {
+          if (cancelled()) break;
+          const auto count =
+              std::min(positions.size() - begin, limit - totalTaken);
+          auto first = positions.begin() + begin;
+          if (begin + count < positions.size()) {
+            std::nth_element(first, first + count, positions.end(), better);
+          }
+          for (std::size_t offset = 0; offset < count; ++offset) {
+            const auto key = matchedItem(positions[begin + offset]).Key();
+            if (key.empty() || !used.insert(key).second) continue;
+            ++hidden;
+            ++totalTaken;
+          }
+          begin += count;
+        }
+        addSection(title, std::move(output), hidden);
       };
-      std::vector<std::size_t> hits;
-      hits.reserve(matches.size());
-      for (std::size_t position = 0; position < matches.size(); ++position) {
-        if ((position & 255u) == 0 && cancelled()) return result;
-        const auto index = matches[position].index;
-        const auto& item = snapshot->pool[index];
-        // Clipboard history stays private to its own view and scope.
-        if (item.isClipboard) continue;
-        // Commands and Windows settings only show up for a near-complete match.
-        // The windows-settings source includes classic/advanced settings too.
-        if (item.isCommand || item.app.source == L"windows-settings") {
-          const auto& prepared = snapshot->searchItems[index];
-          const auto& searchItem = prepared.item;
-          std::vector<std::wstring> phrases = searchItem.keywords;
-          phrases.push_back(searchItem.name);
-          phrases.insert(phrases.end(), searchItem.aliases.begin(),
-                         searchItem.aliases.end());
-          const bool exactAlias =
-              std::find(prepared.normalizedAliases.begin(),
-                        prepared.normalizedAliases.end(), explicitQuery) !=
-              prepared.normalizedAliases.end();
-          if (!exactAlias && !MatchesFeatureQuery(featureQuery, phrases)) continue;
-        }
-        hits.push_back(position);
-      }
+
       std::vector<std::size_t> games;
       std::vector<std::size_t> apps;
       std::vector<std::size_t> windows;
@@ -729,30 +904,90 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       std::vector<std::size_t> systemFolders;
       std::vector<std::size_t> windowsSettings;
       std::vector<std::size_t> other;
-      for (const auto index : hits) {
-        const auto& item = matchedItem(index);
+      std::vector<std::size_t> explicitMatches;
+      bool hasBestHit = false;
+      std::size_t bestHitPos = 0;
+      bool hasExactName = false;
+      std::size_t bestExactNamePos = 0;
+      bool hasPreferred = false;
+      std::size_t bestPreferredPos = 0;
+      const bool checkAliases = !aliasInvocations.empty();
+      const bool checkPreferred = !request.preferredInvocationKey.empty();
+      const bool featureEligible = featureQuery.joined.size() >= 3;
+      const auto& normalizedQuery = explicitQuery;
+
+      for (std::size_t position = 0; position < matches.size(); ++position) {
+        if ((position & 255u) == 0 && cancelled()) return result;
+        const auto index = matches[position].index;
+        const auto& item = snapshot->pool[index];
+        // Clipboard history stays private to its own view and scope.
+        if (item.isClipboard) continue;
+        const auto& prepared = snapshot->searchItems[index];
+        bool isExactAlias = false;
+        if (checkAliases && !prepared.normalizedAliases.empty()) {
+          isExactAlias =
+              std::find(prepared.normalizedAliases.begin(),
+                        prepared.normalizedAliases.end(), normalizedQuery) !=
+              prepared.normalizedAliases.end();
+          if (isExactAlias) explicitMatches.push_back(position);
+        }
+        // Commands and Windows settings only show up for a near-complete match.
+        // The windows-settings source includes classic/advanced settings too.
+        if (item.isCommand || item.app.source == L"windows-settings") {
+          if (!isExactAlias) {
+            if (!checkAliases && !prepared.normalizedAliases.empty()) {
+              isExactAlias =
+                  std::find(prepared.normalizedAliases.begin(),
+                            prepared.normalizedAliases.end(), normalizedQuery) !=
+                  prepared.normalizedAliases.end();
+            }
+            if (!isExactAlias) {
+              if (!featureEligible) continue;
+              const auto& searchItem = prepared.item;
+              if (!MatchesFeatureQueryItem(featureQuery, searchItem.keywords,
+                                           searchItem.name, searchItem.aliases)) {
+                continue;
+              }
+            }
+          }
+        }
+        if (!hasBestHit || better(position, bestHitPos)) {
+          hasBestHit = true;
+          bestHitPos = position;
+        }
+        if (prepared.normalizedName == normalizedQuery &&
+            (!hasExactName || better(position, bestExactNamePos))) {
+          hasExactName = true;
+          bestExactNamePos = position;
+        }
+        if (checkPreferred &&
+            item.InvocationKey() == request.preferredInvocationKey &&
+            (!hasPreferred || better(position, bestPreferredPos))) {
+          hasPreferred = true;
+          bestPreferredPos = position;
+        }
         if (item.isSnippet) {
-          snippets.push_back(index);
+          snippets.push_back(position);
         } else if (item.isCommand) {
-          commands.push_back(index);
+          commands.push_back(position);
         } else if (item.isWindow) {
-          windows.push_back(index);
+          windows.push_back(position);
         } else if (IsLaunchableApp(item)) {
           if (item.app.isGame) {
-            games.push_back(index);
+            games.push_back(position);
           } else {
-            apps.push_back(index);
+            apps.push_back(position);
           }
         } else if (item.app.source == L"file") {
-          files.push_back(index);
+          files.push_back(position);
         } else if (item.app.source == L"system-folder") {
-          systemFolders.push_back(index);
+          systemFolders.push_back(position);
         } else if (item.app.source == L"windows-settings") {
-          windowsSettings.push_back(index);
+          windowsSettings.push_back(position);
         } else if (IsPlainApp(item)) {
-          system.push_back(index);
+          system.push_back(position);
         } else {
-          other.push_back(index);
+          other.push_back(position);
         }
       }
 
@@ -760,8 +995,10 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       // like one ("notif", "photos", "phone"). An app whose name starts with
       // the query (e.g. the Photos app) keeps the first place.
       std::vector<DisplayItem> phoneSuggestions;
-      for (const auto& item : request.phoneSuggestions) {
-        if (MatchesPhoneSuggestion(featureQuery, item)) phoneSuggestions.push_back(item);
+      if (featureEligible) {
+        for (const auto& item : request.phoneSuggestions) {
+          if (MatchesPhoneSuggestion(featureQuery, item)) phoneSuggestions.push_back(item);
+        }
       }
       const auto& queryWords = featureQuery.words;
       const bool strongAppMatch =
@@ -784,32 +1021,11 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
             });
       }
       const bool hasLaunchableApps = !apps.empty() || !games.empty();
-      std::vector<std::size_t> explicitMatches;
-      const auto& normalizedQuery = explicitQuery;
-      for (std::size_t index = 0; index < matches.size(); ++index) {
-        const auto& prepared = matchedPrepared(index);
-        if (std::find(prepared.normalizedAliases.begin(),
-                      prepared.normalizedAliases.end(), normalizedQuery) !=
-            prepared.normalizedAliases.end() &&
-            !matchedItem(index).isClipboard) {
-          explicitMatches.push_back(index);
-        }
+      if (explicitMatches.empty() && hasExactName) {
+        explicitMatches.push_back(bestExactNamePos);
       }
-      if (explicitMatches.empty()) {
-        for (const auto index : hits) {
-          if (matchedPrepared(index).normalizedName == normalizedQuery) {
-            explicitMatches.push_back(index);
-          }
-        }
-        if (!explicitMatches.empty()) explicitMatches = {best(explicitMatches)};
-      }
-      if (explicitMatches.empty() && !request.preferredInvocationKey.empty()) {
-        for (const auto index : hits) {
-          if (matchedItem(index).InvocationKey() == request.preferredInvocationKey) {
-            explicitMatches.push_back(index);
-          }
-        }
-        if (!explicitMatches.empty()) explicitMatches = {best(explicitMatches)};
+      if (explicitMatches.empty() && hasPreferred) {
+        explicitMatches.push_back(bestPreferredPos);
       }
       if (explicitMatches.empty() && !commands.empty()) {
         const auto command = best(commands);
@@ -819,33 +1035,33 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
           explicitMatches.push_back(command);
         }
       }
-      addSection(L"Best match", takeRanked(explicitMatches));
+      addRankedSection(L"Best match", explicitMatches);
       if (!strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
       const bool windowsPromoted = strongWindowMatch;
       if (strongWindowMatch && hasLaunchableApps && !strongAppMatch) {
-        addSection(L"Open windows", takeRanked(windows, 40));
+        addRankedSection(L"Open windows", windows, 40);
       }
       if (hasLaunchableApps) {
-        addSection(L"Apps", takeRanked(apps, 80));
-        addSection(L"Games", takeRanked(games, 80));
-      } else if (!hits.empty() && explicitMatches.empty() &&
+        addRankedSection(L"Apps", apps, 80);
+        addRankedSection(L"Games", games, 80);
+      } else if (hasBestHit && explicitMatches.empty() &&
                  aliasInvocations.empty()) {
-        addSection(L"Best match", takeMatches({matches[best(hits)].index}, 1));
+        addSection(L"Best match", takeMatches({matches[bestHitPos].index}, 1));
       }
       if (strongWindowMatch && (strongAppMatch || !hasLaunchableApps)) {
-        addSection(L"Open windows", takeRanked(windows, 40));
+        addRankedSection(L"Open windows", windows, 40);
       }
       if (strongAppMatch) addSection(L"Phone", take(phoneSuggestions));
-      addSection(L"Windows Settings", takeRanked(windowsSettings, 40));
+      addRankedSection(L"Windows Settings", windowsSettings, 40);
       addSection(L"FeatherCast Settings", take(settingMatches));
       addSection(L"Extensions", take(request.extensionItems, 20));
-      addSection(L"Commands", takeRanked(commands, 20));
-      addSection(L"Snippets", takeRanked(snippets, 20));
-      addSection(L"Files & Folders", takeRanked(files, 40));
-      addSection(L"System Folders", takeRanked(systemFolders, 30));
-      if (!windowsPromoted) addSection(L"Open windows", takeRanked(windows, 40));
-      addSection(L"System & Store apps", takeRanked(system, 80));
-      addSection(L"Other matches", takeRanked(other, 40));
+      addRankedSection(L"Commands", commands, 20);
+      addRankedSection(L"Snippets", snippets, 20);
+      addRankedSection(L"Files & Folders", files, 40);
+      addRankedSection(L"System Folders", systemFolders, 30);
+      if (!windowsPromoted) addRankedSection(L"Open windows", windows, 40);
+      addRankedSection(L"System & Store apps", system, 80);
+      addRankedSection(L"Other matches", other, 40);
       if (const auto fallback = WebSearchFallback(
               request, trimmed,
               !aliasInvocations.empty() || !explicitMatches.empty() || strongAppMatch,
@@ -855,17 +1071,27 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
     }
   }
 
-  for (auto& section : sections) {
-    if (!request.expandedSections.contains(section.title) &&
-        section.items.size() > kCollapsedSectionLimit) {
-      const std::size_t hidden = section.items.size() - kCollapsedSectionLimit;
-      section.items.resize(kCollapsedSectionLimit);
-      DisplayItem expander;
-      expander.isSectionExpander = true;
-      expander.sectionTitle = section.title;
-      expander.hiddenResultCount = hidden;
-      section.items.push_back(std::move(expander));
+  std::size_t totalFlat = 0;
+  for (std::size_t i = 0; i < sections.size(); ++i) {
+    auto& section = sections[i];
+    std::size_t hidden = sectionHidden[i];
+    if (!request.expandedSections.contains(section.title)) {
+      if (section.items.size() > kCollapsedSectionLimit) {
+        hidden += section.items.size() - kCollapsedSectionLimit;
+        section.items.resize(kCollapsedSectionLimit);
+      }
+      if (hidden > 0) {
+        DisplayItem expander;
+        expander.isSectionExpander = true;
+        expander.sectionTitle = section.title;
+        expander.hiddenResultCount = hidden;
+        section.items.push_back(std::move(expander));
+      }
     }
+    totalFlat += section.items.size();
+  }
+  result.flatItems.reserve(totalFlat);
+  for (const auto& section : sections) {
     result.flatItems.insert(result.flatItems.end(), section.items.begin(),
                             section.items.end());
   }

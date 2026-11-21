@@ -107,7 +107,9 @@ struct PhoneScreenWindow::Impl {
   ComPtr<ID2D1HwndRenderTarget> target;
   ComPtr<ID2D1SolidColorBrush> brush;
   ComPtr<ID2D1Bitmap> bitmap;
+  ComPtr<ID2D1BitmapBrush> imageBrush;
   ComPtr<ID2D1DCRenderTarget> buttonTarget;  // antialiased rounded owner-drawn buttons
+  ComPtr<ID2D1SolidColorBrush> buttonBrush;
   std::shared_ptr<const phone::ScreenFrame> shownFrame;
   // Only the newest decoded frame and every status are marshalled to the UI.
   std::shared_ptr<ScreenMailbox> mailbox = std::make_shared<ScreenMailbox>();
@@ -168,7 +170,7 @@ struct PhoneScreenWindow::Impl {
     const auto id = callbacks.start(true);
     if (id.empty()) { detail = L"Reconnect your phone and try again."; Update(); return; }
     sessionId = id; generation = 0; controlReady = keyboardReady = audioReady = false;
-    audioDetail.clear(); shownFrame.reset(); bitmap.Reset();
+    audioDetail.clear(); shownFrame.reset(); imageBrush.Reset(); bitmap.Reset();
     { std::lock_guard lock(mailbox->mutex); mailbox->session = id; mailbox->frame.reset(); mailbox->statuses.clear(); }
     playback->Begin(id);
     playback->SetAudio(sound, static_cast<float>(SendMessageW(controls[Volume], TBM_GETPOS, 0, 0)) / 100);
@@ -182,9 +184,29 @@ struct PhoneScreenWindow::Impl {
     sessionId.clear(); generation = 0; controlReady = keyboardReady = audioReady = false;
     { std::lock_guard lock(mailbox->mutex); mailbox->session.clear(); mailbox->frame.reset(); mailbox->statuses.clear(); }
     if (playback) playback->End();
-    shownFrame.reset(); bitmap.Reset(); Update();
+    shownFrame.reset(); imageBrush.Reset(); bitmap.Reset(); Update();
   }
-  void Close() { EndSession(); if (fullscreen) ToggleFullscreen(); if (hwnd) ShowWindow(hwnd, SW_HIDE); }
+  void Close() {
+    EndSession();
+    if (fullscreen) ToggleFullscreen();
+    if (hwnd) ShowWindow(hwnd, SW_HIDE);
+    imageBrush.Reset();
+    bitmap.Reset();
+    brush.Reset();
+    target.Reset();
+    buttonBrush.Reset();
+    buttonTarget.Reset();
+    body.Reset();
+    heading.Reset();
+    dwrite.Reset();
+    d2d.Reset();
+    std::shared_ptr<phone::ScreenPlayback> ended;
+    {
+      std::lock_guard lock(mailbox->mutex);
+      ended = std::move(playback);
+    }
+    ended.reset();
+  }
   void Update() {
     if (!controls[Start]) return;
     EnableWindow(controls[Start], connected && available && sessionId.empty());
@@ -221,12 +243,13 @@ struct PhoneScreenWindow::Impl {
       std::lock_guard lock(mailbox->mutex);
       states.swap(mailbox->statuses); frame = std::move(mailbox->frame); mailbox->notified = false;
     }
+    const bool hadFrame = static_cast<bool>(shownFrame);
     for (const auto& state : states) {
       if (state.sessionId != sessionId) continue;  // also after EndSession below
       if (state.state == "audio-error") audioDetail = Widen(state.detail);
       else if (state.state == "streaming") {
         if (state.generation < generation) continue;
-        if (state.generation != generation) { CancelInput(); shownFrame.reset(); bitmap.Reset(); imageRect = {}; }
+        if (state.generation != generation) { CancelInput(); shownFrame.reset(); imageBrush.Reset(); bitmap.Reset(); imageRect = {}; }
         generation = state.generation; controlReady = state.control; keyboardReady = state.keyboard;
         audioReady = state.audio; phase = L"Screen shared"; detail = Widen(state.detail);
       } else if (state.state == "stopped" || state.state == "error") {
@@ -238,7 +261,11 @@ struct PhoneScreenWindow::Impl {
       if (frame->generation != generation) { CancelInput(); imageRect = {}; }
       generation = frame->generation; shownFrame = std::move(frame);
     }
-    Update();
+    if (!states.empty() || static_cast<bool>(shownFrame) != hadFrame) {
+      Update();
+    } else if (hwnd) {
+      InvalidateRect(hwnd, nullptr, FALSE);
+    }
   }
   void Layout() {
     if (!controls[Start]) return;
@@ -318,15 +345,18 @@ struct PhoneScreenWindow::Impl {
   // controls. Returns false when Direct2D is unavailable; the caller then
   // draws the plain GDI frame.
   bool DrawButtonFrame(HDC dc, const RECT& rc, COLORREF fill, COLORREF edge, bool focused, COLORREF ring) {
-    if (!d2d) return false;
+    if (!d2d && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf()))) return false;
     if (!buttonTarget) {
       const auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
           D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96, 96);
       if (FAILED(d2d->CreateDCRenderTarget(&props, &buttonTarget))) return false;
     }
     if (FAILED(buttonTarget->BindDC(dc, &rc))) return false;
-    ComPtr<ID2D1SolidColorBrush> paint;
-    if (FAILED(buttonTarget->CreateSolidColorBrush(FromGdi(fill), &paint))) return false;
+    if (!buttonBrush) {
+      if (FAILED(buttonTarget->CreateSolidColorBrush(FromGdi(fill), &buttonBrush))) return false;
+    } else {
+      buttonBrush->SetColor(FromGdi(fill));
+    }
     // Device pixels: the radius follows the DPI, strokes sit on half-pixel centres.
     const float dpiScale = GetDpiForWindow(hwnd) / 96.0f;
     const float width = static_cast<float>(rc.right - rc.left), height = static_cast<float>(rc.bottom - rc.top);
@@ -335,17 +365,17 @@ struct PhoneScreenWindow::Impl {
     buttonTarget->BeginDraw();
     buttonTarget->Clear(Color(theme.surface));  // what sits behind the rounded corners
     const D2D1_RECT_F face{hairline / 2, hairline / 2, width - hairline / 2, height - hairline / 2};
-    buttonTarget->FillRoundedRectangle(D2D1::RoundedRect(face, radius, radius), paint.Get());
-    paint->SetColor(FromGdi(edge));
-    buttonTarget->DrawRoundedRectangle(D2D1::RoundedRect(face, radius, radius), paint.Get(), hairline);
+    buttonTarget->FillRoundedRectangle(D2D1::RoundedRect(face, radius, radius), buttonBrush.Get());
+    buttonBrush->SetColor(FromGdi(edge));
+    buttonTarget->DrawRoundedRectangle(D2D1::RoundedRect(face, radius, radius), buttonBrush.Get(), hairline);
     if (focused) {
       // Concentric with the body: inner radius = outer radius - inset.
       const float ringWidth = std::max(2.0f, std::round(2 * dpiScale)), inset = hairline + ringWidth / 2;
-      paint->SetColor(FromGdi(ring));
+      buttonBrush->SetColor(FromGdi(ring));
       buttonTarget->DrawRoundedRectangle(D2D1::RoundedRect({inset, inset, width - inset, height - inset},
-          std::max(0.0f, radius - inset), std::max(0.0f, radius - inset)), paint.Get(), ringWidth);
+          std::max(0.0f, radius - inset), std::max(0.0f, radius - inset)), buttonBrush.Get(), ringWidth);
     }
-    if (FAILED(buttonTarget->EndDraw())) { buttonTarget.Reset(); return false; }
+    if (FAILED(buttonTarget->EndDraw())) { buttonBrush.Reset(); buttonTarget.Reset(); return false; }
     return true;
   }
   void Text(const std::wstring& text, D2D1_RECT_F rc, IDWriteTextFormat* format, theme::Color color) {
@@ -363,6 +393,7 @@ struct PhoneScreenWindow::Impl {
       if (shownFrame) {
         const auto& f = *shownFrame; imageRect = phone::FitScreenRect(viewport, f.width, f.height);
         if (!bitmap || bitmap->GetPixelSize().width != static_cast<UINT32>(f.width) || bitmap->GetPixelSize().height != static_cast<UINT32>(f.height)) {
+          imageBrush.Reset();
           bitmap.Reset(); target->CreateBitmap(D2D1::SizeU(f.width, f.height), f.bgra.data(), f.width * 4,
               D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)), &bitmap);
         } else bitmap->CopyFromMemory(nullptr, f.bgra.data(), f.width * 4);
@@ -370,8 +401,10 @@ struct PhoneScreenWindow::Impl {
           // Painted through a bitmap brush so the screen gets rounded corners that
           // stay inside the rounded viewport instead of poking out of it.
           const D2D1_RECT_F image{imageRect.left, imageRect.top, imageRect.right, imageRect.bottom};
-          ComPtr<ID2D1BitmapBrush> imageBrush;
-          if (SUCCEEDED(target->CreateBitmapBrush(bitmap.Get(), &imageBrush))) {
+          if (!imageBrush) {
+            target->CreateBitmapBrush(bitmap.Get(), &imageBrush);
+          }
+          if (imageBrush) {
             imageBrush->SetTransform(D2D1::Matrix3x2F::Scale((image.right - image.left) / static_cast<float>(f.width),
                                                              (image.bottom - image.top) / static_cast<float>(f.height)) *
                                      D2D1::Matrix3x2F::Translation(image.left, image.top));
@@ -382,7 +415,7 @@ struct PhoneScreenWindow::Impl {
           }
         }
       }
-      if (FAILED(target->EndDraw())) { bitmap.Reset(); brush.Reset(); target.Reset(); }
+      if (FAILED(target->EndDraw())) { imageBrush.Reset(); bitmap.Reset(); brush.Reset(); target.Reset(); }
     }
     EndPaint(hwnd, &ps);
   }

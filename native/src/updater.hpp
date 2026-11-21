@@ -565,15 +565,21 @@ inline bool VerifyAuthenticodePublisher(const std::filesystem::path& path,
   return publisher && LowerWide(*publisher) == LowerWide(expectedPublisher);
 }
 
+inline bool VerifyHandleAuthenticodeSigner(
+    HANDLE file, const std::filesystem::path& displayPath,
+    const std::wstring& expectedPublisher, const std::wstring& allowedThumbprints);
+
 inline bool VerifyAuthenticodeSigner(
     const std::filesystem::path& path, const std::wstring& expectedPublisher,
     const std::wstring& allowedThumbprints) {
-  const auto pins = ParseSignerThumbprints(allowedThumbprints);
-  if (pins.empty()) return false;
-  if (!VerifyAuthenticodePublisher(path, expectedPublisher)) return false;
-  const auto thumbprint = AuthenticodeSignerSha256(path);
-  return thumbprint &&
-         std::find(pins.begin(), pins.end(), LowerWide(*thumbprint)) != pins.end();
+  const HANDLE file = CreateFileW(
+      path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  const bool ok = VerifyHandleAuthenticodeSigner(file, path, expectedPublisher,
+                                                 allowedThumbprints);
+  CloseHandle(file);
+  return ok;
 }
 
 // Identity of the certificate that signed a file, as seen by WinVerifyTrust.

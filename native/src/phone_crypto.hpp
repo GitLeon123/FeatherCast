@@ -20,6 +20,28 @@ Bytes Hkdf(const Bytes& ikm, const Bytes& salt, std::string_view info,
 // False for empty input, so a failed HMAC never matches an empty proof.
 bool ConstantTimeEquals(const Bytes& a, const Bytes& b);
 
+// Reusable AES-256-GCM symmetric key (avoids recreating the CNG key schedule
+// on every encrypted/decrypted frame during screen mirroring and transfers).
+class AesGcmKey {
+ public:
+  static std::optional<AesGcmKey> Create(const Bytes& key);
+
+  AesGcmKey() = default;
+  AesGcmKey(AesGcmKey&&) noexcept;
+  AesGcmKey& operator=(AesGcmKey&&) noexcept;
+  ~AesGcmKey();
+  AesGcmKey(const AesGcmKey&) = delete;
+  AesGcmKey& operator=(const AesGcmKey&) = delete;
+
+  explicit operator bool() const noexcept { return key_ != nullptr; }
+
+  std::optional<Bytes> Encrypt(const Bytes& nonce, const Bytes& plaintext) const;
+  std::optional<Bytes> Decrypt(const Bytes& nonce, const Bytes& sealed) const;
+
+ private:
+  void* key_ = nullptr;  // BCRYPT_KEY_HANDLE
+};
+
 // Returns ciphertext || 16-byte tag, or nullopt on failure.
 std::optional<Bytes> AesGcmEncrypt(const Bytes& key, const Bytes& nonce,
                                    const Bytes& plaintext);

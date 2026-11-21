@@ -56,6 +56,8 @@ class DiscoveryService {
   std::condition_variable cv_;
   std::optional<app::DiscoveryRequest> pending_;
   std::atomic<std::uint64_t> latestGeneration_ = 0;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
 };
 

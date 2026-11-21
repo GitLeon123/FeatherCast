@@ -225,12 +225,18 @@ inline std::optional<Parsed> Parse(std::wstring_view input) {
     return parsed;
   }
 
+  const wchar_t first = input.front();
+  if (first != L'r' && first != L'R' && first != L'h' && first != L'H') {
+    return std::nullopt;
+  }
+  const std::size_t openRaw = input.find(L'(');
+  if (openRaw == std::wstring_view::npos || openRaw < 3) return std::nullopt;
+
   std::wstring lowered(input);
   for (auto& ch : lowered) {
     if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
   }
-  const std::size_t open = lowered.find(L'(');
-  if (open == std::wstring::npos) return std::nullopt;
+  const std::size_t open = openRaw;
   std::wstring function = lowered.substr(0, open);
   while (!function.empty() && detail::IsSpace(function.back())) function.pop_back();
   const bool rgb = function == L"rgb" || function == L"rgba";

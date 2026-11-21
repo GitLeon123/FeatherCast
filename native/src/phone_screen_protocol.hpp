@@ -75,7 +75,7 @@ inline bool ValidScreenInput(const ScreenInput& input) {
          input.action == "recents" || input.action == "cancel" || input.action == "keyframe";
 }
 
-inline std::optional<ScreenPacket> ParseScreenPacket(const Payload& payload) {
+inline std::optional<ScreenPacket> ParseScreenPacket(Payload payload) {
   if (payload.json.size() > 8192 || payload.binary.size() > kMaxScreenPacketBytes) return {};
   const auto root = json::Parse(payload.json);
   if (!root || root->type != json::Value::Type::Object) return {};
@@ -119,7 +119,7 @@ inline std::optional<ScreenPacket> ParseScreenPacket(const Payload& payload) {
       (packet.generation <= 0 || payload.binary.empty())) return {};
   if (packet.kind == ScreenPacketKind::AudioConfig && payload.binary.size() > 64) return {};
   if (packet.kind == ScreenPacketKind::Audio && payload.binary.size() > 65536) return {};
-  packet.data = payload.binary;
+  packet.data = std::move(payload.binary);
   return packet;
 }
 

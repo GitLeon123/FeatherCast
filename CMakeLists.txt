@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.12.0 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.13.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY
       "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Release optimization: function/data-level linking, string pooling, inline
+  # COMDAT stripping, and whole-program optimization (LTCG) so /OPT:REF /OPT:ICF
+  # can dead-strip unused SQLite/STL subsystems and minimize exe & working-set footprint.
+  add_compile_options(
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Gy>"
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Gw>"
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/GF>"
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/Zc:inline>"
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/GL>"
+  )
+  set(CMAKE_STATIC_LINKER_FLAGS_RELEASE "${CMAKE_STATIC_LINKER_FLAGS_RELEASE} /LTCG")
+  add_link_options("$<$<CONFIG:Release>:/LTCG>")
 endif()
 
 option(FEATHERCAST_WARNINGS_AS_ERRORS "Treat FeatherCast project warnings as errors" OFF)
@@ -47,6 +59,18 @@ target_compile_definitions(FeatherCastSQLite PRIVATE
   SQLITE_ENABLE_FTS5
   SQLITE_OMIT_LOAD_EXTENSION
   SQLITE_THREADSAFE=1
+  SQLITE_DEFAULT_CACHE_SIZE=-512
+  SQLITE_DEFAULT_MEMSTATUS=0
+  SQLITE_TEMP_STORE=2
+  SQLITE_DQS=0
+  SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+  SQLITE_LIKE_DOESNT_MATCH_BLOBS
+  SQLITE_MAX_EXPR_DEPTH=0
+  SQLITE_OMIT_DECLTYPE
+  SQLITE_OMIT_DEPRECATED
+  SQLITE_OMIT_SHARED_CACHE
+  SQLITE_OMIT_TCL_VARIABLE
+  SQLITE_OMIT_TRACE
 )
 
 add_library(FeatherCastRuntime STATIC
@@ -171,7 +195,12 @@ target_link_libraries(InputBroker PRIVATE advapi32 user32 ole32 oleaut32 tasksch
 target_sources(FeatherCast PRIVATE native/src/input_broker_task.cpp)
 target_link_libraries(FeatherCast PRIVATE taskschd)
 if(MSVC)
-  target_link_options(InputBroker PRIVATE "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+  target_link_libraries(InputBroker PRIVATE delayimp)
+  target_link_options(InputBroker PRIVATE
+    "/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+    "/DELAYLOAD:ole32.dll"
+    "/DELAYLOAD:oleaut32.dll"
+  )
 endif()
 
 target_link_libraries(FeatherCast PRIVATE
@@ -200,6 +229,20 @@ target_link_libraries(FeatherCast PRIVATE
   wintrust
   crypt32
 )
+if(MSVC)
+  # Defer loading feature-gated system DLLs until the feature is actually used,
+  # keeping hidden-idle working set and startup DLL load cost low.
+  target_link_libraries(FeatherCast PRIVATE delayimp)
+  target_link_options(FeatherCast PRIVATE
+    "/DELAYLOAD:mfplat.dll"
+    "/DELAYLOAD:mfreadwrite.dll"
+    "/DELAYLOAD:winhttp.dll"
+    "/DELAYLOAD:wintrust.dll"
+    "/DELAYLOAD:ws2_32.dll"
+    "/DELAYLOAD:iphlpapi.dll"
+    "/DELAYLOAD:powrprof.dll"
+  )
+endif()
 
 # Shipped executables keep full PDBs in Release (CI archives them for crash
 # analysis). /DEBUG switches the linker to /OPT:NOREF,NOICF, so restore both.
@@ -332,7 +375,7 @@ add_executable(FeatherCastGameDiscoveryTests
 
 target_include_directories(FeatherCastCoreTests PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(FeatherCastCoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(FeatherCastCoreTests PRIVATE FeatherCastSQLite advapi32 normaliz wintrust crypt32)
+target_link_libraries(FeatherCastCoreTests PRIVATE FeatherCastSQLite advapi32 bcrypt normaliz wintrust crypt32)
 
 target_include_directories(FeatherCastTestExtension PRIVATE native/src)
 target_include_directories(FeatherCastV1TestExtension PRIVATE native/src)
@@ -392,7 +435,7 @@ target_link_libraries(FeatherCastGameDiscoveryTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastPerformanceSelfTest PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchBenchmarks PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastFileSearchBenchmarks PRIVATE FeatherCastRuntime)
-target_link_libraries(FeatherCastStorageTrustTests PRIVATE FeatherCastSQLite advapi32 crypt32)
+target_link_libraries(FeatherCastStorageTrustTests PRIVATE FeatherCastSQLite advapi32 bcrypt crypt32)
 
 if(MSVC)
   target_compile_options(FeatherCastCoreTests PRIVATE /bigobj)

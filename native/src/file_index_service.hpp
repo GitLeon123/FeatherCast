@@ -92,7 +92,7 @@ class FileIndexService {
   bool IsCurrent(std::uint64_t generation) const;
 
  private:
-  struct Watcher;
+  struct WatcherGroup;
   // What the last delivered scan learned about one file's content. The next
   // scan reuses it while the file keeps its size and write time, instead of
   // reading and decoding the file again.
@@ -104,6 +104,7 @@ class FileIndexService {
   };
   using ContentRecords = std::unordered_map<std::wstring, ContentRecord>;
 
+  void EnsureWorker();
   void WorkerLoop(std::stop_token token);
   IndexStatus Scan(const IndexRequest& request, std::stop_token token,
                    const ContentRecords& previous,
@@ -126,10 +127,13 @@ class FileIndexService {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::optional<IndexRequest> request_;
-  std::vector<std::unique_ptr<Watcher>> watchers_;
+  std::unique_ptr<WatcherGroup> watcherGroup_;
   std::mutex watchersMutex_;
   std::atomic<std::uint64_t> currentGeneration_ = 0;
   std::atomic<bool> interactive_ = false;
+  std::atomic<bool> stoppingAtomic_ = false;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
   std::atomic<bool> paused_ = false;
   bool rebuildPending_ = false;

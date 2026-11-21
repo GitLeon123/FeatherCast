@@ -3,6 +3,7 @@
 #include "file_content.hpp"
 #include "file_index_service.hpp"
 #include "filesystem_semantics.hpp"
+#include "performance_governor.hpp"
 
 #include <algorithm>
 #include <exception>
@@ -50,6 +51,7 @@ StorageStartupState PersistenceService::LoadStorageForStartup(
     return state;
   }
   state.clipboard = storage_.LoadClipboardHistory(clipboardLimit);
+  storage_.ReleaseMemory();
   return state;
 }
 
@@ -71,9 +73,15 @@ void PersistenceService::Start() {
     std::lock_guard lock(deferrableMutex_);
     if (deferrableStop_.stop_requested()) deferrableStop_ = std::stop_source();
   }
-  executor_.Start(1, [this](std::exception_ptr) {
-    EmitWorkerFailure(L"persistence");
-  });
+  executor_.Start(
+      1,
+      [this](std::exception_ptr) { EmitWorkerFailure(L"persistence"); },
+      [this]() {
+        if (storage_.IsOpen()) {
+          storage_.ReleaseMemory();
+          performance::TrimIdleMemory(false);
+        }
+      });
 }
 
 void PersistenceService::Stop(bool drainPending) {
@@ -226,6 +234,7 @@ bool PersistenceService::MergeFileIndex(
         // stored index as it was rather than writing a partial merge.
         if (abandoned()) return;
         const bool succeeded = storage_.UpdateFileIndex(merged, preserveRoots);
+        if (succeeded) storage_.ReleaseMemory();
         Emit(FileIndexMerged{
             generation, succeeded, succeeded ? std::move(merged)
                                              : std::vector<storage::FileIndexEntry>{},

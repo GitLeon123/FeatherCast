@@ -12,11 +12,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "json.hpp"
@@ -45,7 +47,10 @@ inline Bytes ToBytes(std::string_view text) {
 }
 
 inline Bytes Concat(std::initializer_list<const Bytes*> parts) {
+  std::size_t total = 0;
+  for (const Bytes* part : parts) total += part->size();
   Bytes out;
+  out.reserve(total);
   for (const Bytes* part : parts) out.insert(out.end(), part->begin(), part->end());
   return out;
 }
@@ -131,6 +136,7 @@ inline std::optional<Bytes> HexDecode(std::string_view text) {
     return -1;
   };
   Bytes out;
+  out.reserve(text.size() / 2);
   for (std::size_t i = 0; i < text.size(); i += 2) {
     const int hi = nibble(text[i]);
     const int lo = nibble(text[i + 1]);
@@ -143,6 +149,7 @@ inline std::optional<Bytes> HexDecode(std::string_view text) {
 inline std::string UrlEncode(std::string_view text) {
   static constexpr char kDigits[] = "0123456789ABCDEF";
   std::string out;
+  out.reserve(text.size());
   for (const char ch : text) {
     const auto byte = static_cast<unsigned char>(ch);
     if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
@@ -255,20 +262,28 @@ inline Bytes PackPayload(std::string_view json, const Bytes& binary = {}) {
   return out;
 }
 
-inline std::optional<Payload> UnpackPayload(const Bytes& data) {
+inline std::optional<Payload> UnpackPayload(Bytes data) {
   if (data.size() < 4) return std::nullopt;
   const std::uint32_t length = ReadU32(data.data());
   if (length > data.size() - 4) return std::nullopt;
   Payload payload;
   payload.json.assign(reinterpret_cast<const char*>(data.data() + 4), length);
-  payload.binary.assign(data.begin() + 4 + length, data.end());
+  const std::size_t headerSize = 4u + static_cast<std::size_t>(length);
+  const std::size_t binarySize = data.size() - headerSize;
+  if (binarySize > 0) {
+    std::memmove(data.data(), data.data() + headerSize, binarySize);
+    data.resize(binarySize);
+    payload.binary = std::move(data);
+  }
   return payload;
 }
 
 // ------------------------------------------------------------- JSON writing
 
 inline std::string JsonQuote(std::string_view value) {
-  std::string out = "\"";
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
   for (const char ch : value) {
     switch (ch) {
       case '"': out += "\\\""; break;

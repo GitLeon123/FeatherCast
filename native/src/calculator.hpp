@@ -16,6 +16,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace feathercast::calculator {
@@ -498,10 +499,48 @@ class Parser {
   bool sawCalculationSyntax_ = false;
 };
 
+inline bool MayBeCalculation(std::wstring_view raw) {
+  std::size_t start = 0;
+  while (start < raw.size() && std::iswspace(raw[start]) != 0) ++start;
+  if (start >= raw.size()) return false;
+  if (raw[start] == L'=') {
+    ++start;
+    while (start < raw.size() && std::iswspace(raw[start]) != 0) ++start;
+    if (start >= raw.size()) return false;
+  }
+  const wchar_t first = raw[start];
+  const wchar_t fl = (first >= L'A' && first <= L'Z')
+                         ? static_cast<wchar_t>(first - L'A' + L'a')
+                         : first;
+  const bool validStart =
+      (fl >= L'0' && fl <= L'9') || fl == L'.' || fl == L',' || fl == L'+' ||
+      fl == L'-' || fl == L'(' || fl == L'a' || fl == L'c' || fl == L'e' ||
+      fl == L'f' || fl == L'l' || fl == L'p' || fl == L'r' || fl == L's' ||
+      fl == L't';
+  if (!validStart) return false;
+  bool hasSyntax = false;
+  bool hasValue = false;
+  for (std::size_t i = start; i < raw.size(); ++i) {
+    const wchar_t ch = raw[i];
+    if (ch >= L'0' && ch <= L'9') {
+      hasValue = true;
+    } else if (ch == L'+' || ch == L'-' || ch == L'*' || ch == L'/' ||
+               ch == L':' || ch == L'^' || ch == L'%' || ch == L'(' ||
+               ch == L'x' || ch == L'X') {
+      hasSyntax = true;
+    } else if (ch == L'p' || ch == L'P' || ch == L'e' || ch == L'E') {
+      hasValue = true;
+    }
+    if (hasSyntax && hasValue) return true;
+  }
+  return false;
+}
+
 // `decimalSeparator` is the locale's decimal point ('.' or ','); tests pass
 // it explicitly.
 inline std::optional<Result> TryEvaluate(
     std::wstring input, wchar_t decimalSeparator = UserDecimalSeparator()) {
+  if (!MayBeCalculation(input)) return std::nullopt;
   input = Trim(std::move(input));
   if (input.empty()) return std::nullopt;
   if (input.front() == L'=') input = Trim(input.substr(1));

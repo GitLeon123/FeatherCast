@@ -12,6 +12,9 @@
 #include <wmcodecdsp.h>
 #include <wrl/client.h>
 
+#include <emmintrin.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +23,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace feathercast::phone {
 namespace {
@@ -66,7 +70,20 @@ class Decoder {
  public:
   ComPtr<IMFTransform> transform;
   ComPtr<IMFMediaType> output;
+  ComPtr<IMFSample> outputSample;
+  ComPtr<IMFMediaBuffer> outputBuffer;
+  DWORD outputBufferCapacity = 0;
+  DWORD outputBufferAlignment = 0;
   bool audio = false;
+
+  void Reset() {
+    transform.Reset();
+    output.Reset();
+    outputSample.Reset();
+    outputBuffer.Reset();
+    outputBufferCapacity = 0;
+    outputBufferAlignment = 0;
+  }
 
   void Start() {
     Check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0));
@@ -75,6 +92,10 @@ class Decoder {
 
   void SelectOutput() {
     output.Reset();
+    outputSample.Reset();
+    outputBuffer.Reset();
+    outputBufferCapacity = 0;
+    outputBufferAlignment = 0;
     for (DWORD i = 0; ; ++i) {
       ComPtr<IMFMediaType> candidate;
       if (FAILED(transform->GetOutputAvailableType(0, i, &candidate))) break;
@@ -97,10 +118,20 @@ class Decoder {
       Check(transform->GetOutputStreamInfo(0, &info));
       ComPtr<IMFSample> sample;
       if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-        ComPtr<IMFMediaBuffer> buffer;
-        Check(MFCreateSample(&sample));
-        Check(MFCreateAlignedMemoryBuffer(std::max<DWORD>(info.cbSize, 4096), info.cbAlignment, &buffer));
-        Check(sample->AddBuffer(buffer.Get()));
+        const DWORD needed = std::max<DWORD>(info.cbSize, 4096);
+        if (!outputSample || !outputBuffer || outputBufferCapacity < needed ||
+            outputBufferAlignment != info.cbAlignment) {
+          outputSample.Reset();
+          outputBuffer.Reset();
+          Check(MFCreateSample(&outputSample));
+          Check(MFCreateAlignedMemoryBuffer(needed, info.cbAlignment, &outputBuffer));
+          Check(outputSample->AddBuffer(outputBuffer.Get()));
+          outputBufferCapacity = needed;
+          outputBufferAlignment = info.cbAlignment;
+        } else {
+          Check(outputBuffer->SetCurrentLength(0));
+        }
+        sample = outputSample;
       }
       MFT_OUTPUT_DATA_BUFFER outputData{};
       outputData.pSample = sample.Get();
@@ -192,19 +223,58 @@ std::shared_ptr<ScreenFrame> VideoFrame(IMFSample* sample, IMFMediaType* type,
   UINT32 matrix = MFVideoTransferMatrix_BT709;
   type->GetUINT32(MF_MT_YUV_MATRIX, &matrix);
   const bool bt709 = matrix == MFVideoTransferMatrix_BT709;
+  const int kBd = bt709 ? 541 : 516;
+  const int kGd = bt709 ? -55 : -100;
+  const int kGe = bt709 ? -136 : -208;
+  const int kRe = bt709 ? 459 : 409;
   const BYTE* uv = data + static_cast<std::size_t>(stride) * height;
   const auto channel = [](int value) { return static_cast<BYTE>(std::clamp(value >> 8, 0, 255)); };
+  const __m128i v16 = _mm_set1_epi16(16);
+  const __m128i v128_32 = _mm_set1_epi32(128);
+  const __m128i v298 = _mm_setr_epi16(298, 0, 298, 0, 298, 0, 298, 0);
+  const __m128i vBd = _mm_setr_epi16(static_cast<short>(kBd), 0, static_cast<short>(kBd), 0,
+                                     static_cast<short>(kBd), 0, static_cast<short>(kBd), 0);
+  const __m128i vGde = _mm_setr_epi16(static_cast<short>(kGd), static_cast<short>(kGe),
+                                      static_cast<short>(kGd), static_cast<short>(kGe),
+                                      static_cast<short>(kGd), static_cast<short>(kGe),
+                                      static_cast<short>(kGd), static_cast<short>(kGe));
+  const __m128i vRe = _mm_setr_epi16(0, static_cast<short>(kRe), 0, static_cast<short>(kRe),
+                                     0, static_cast<short>(kRe), 0, static_cast<short>(kRe));
+  const __m128i vAlpha = _mm_set1_epi8(static_cast<char>(0xFF));
+  const __m128i vZero = _mm_setzero_si128();
+  const __m128i v128_16 = _mm_set1_epi16(128);
   for (int y = 0; y < visibleHeight; ++y) {
     const BYTE* luma = data + static_cast<std::size_t>(y) * stride;
     const BYTE* chroma = uv + static_cast<std::size_t>(y / 2) * stride;
     BYTE* dest = frame->bgra.data() + static_cast<std::size_t>(y) * visibleWidth * 4;
-    for (int x = 0; x < visibleWidth; ++x) {
+    int x = 0;
+    for (; x + 4 <= visibleWidth; x += 4) {
+      // Load 4 luma bytes [y0 y1 y2 y3] -> 16-bit max(0, y - 16) -> 32-bit c = (y-16)*298.
+      const int y4 = *reinterpret_cast<const int*>(luma + x);
+      const __m128i y16 = _mm_subs_epu16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(y4), vZero), v16);
+      const __m128i c32 = _mm_madd_epi16(_mm_unpacklo_epi16(y16, vZero), v298);
+      // Load 2 chroma pairs [u0 v0 u1 v1] -> 16-bit signed [d0 e0 d1 e1] -> duplicate pairs
+      // to [d0 e0 d0 e0 d1 e1 d1 e1].
+      const int uv4 = *reinterpret_cast<const int*>(chroma + x);
+      const __m128i uv16 = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(uv4), vZero), v128_16);
+      const __m128i de = _mm_unpacklo_epi32(uv16, uv16);
+      const __m128i b32 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(c32, _mm_madd_epi16(de, vBd)), v128_32), 8);
+      const __m128i g32 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(c32, _mm_madd_epi16(de, vGde)), v128_32), 8);
+      const __m128i r32 = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(c32, _mm_madd_epi16(de, vRe)), v128_32), 8);
+      const __m128i b8 = _mm_packus_epi16(_mm_packs_epi32(b32, b32), vZero);
+      const __m128i g8 = _mm_packus_epi16(_mm_packs_epi32(g32, g32), vZero);
+      const __m128i r8 = _mm_packus_epi16(_mm_packs_epi32(r32, r32), vZero);
+      const __m128i bg = _mm_unpacklo_epi8(b8, g8);
+      const __m128i ra = _mm_unpacklo_epi8(r8, vAlpha);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dest + x * 4), _mm_unpacklo_epi16(bg, ra));
+    }
+    for (; x < visibleWidth; ++x) {
       const int c = std::max(0, static_cast<int>(luma[x]) - 16) * 298;
       const int d = static_cast<int>(chroma[x & ~1]) - 128;
       const int e = static_cast<int>(chroma[(x & ~1) + 1]) - 128;
-      dest[x * 4] = channel(c + (bt709 ? 541 : 516) * d + 128);
-      dest[x * 4 + 1] = channel(c - (bt709 ? 55 : 100) * d - (bt709 ? 136 : 208) * e + 128);
-      dest[x * 4 + 2] = channel(c + (bt709 ? 459 : 409) * e + 128);
+      dest[x * 4] = channel(c + kBd * d + 128);
+      dest[x * 4 + 1] = channel(c + kGd * d + kGe * e + 128);
+      dest[x * 4 + 2] = channel(c + kRe * e + 128);
       dest[x * 4 + 3] = 255;
     }
   }
@@ -217,11 +287,13 @@ class AudioOutput {
   ComPtr<IAudioClient> client;
   ComPtr<IAudioRenderClient> render;
   UINT32 capacity = 0;
-  std::deque<float> samples;
+  std::vector<float> samples;
+  std::size_t readPos = 0;
   ~AudioOutput() { if (client) client->Stop(); }
+  bool HasSamples() const noexcept { return samples.size() - readPos >= 2; }
   void Reset() {
     if (client) client->Stop();
-    render.Reset(); client.Reset(); samples.clear(); capacity = 0;
+    render.Reset(); client.Reset(); samples.clear(); samples.shrink_to_fit(); readPos = 0; capacity = 0;
   }
   void Configure() {
     Reset();
@@ -255,20 +327,33 @@ class AudioOutput {
     samples.insert(samples.end(), values, values + length / sizeof(float));
     buffer->Unlock();
     constexpr std::size_t maxSamples = 48000 * 2 * 150 / 1000;
-    while (samples.size() > maxSamples) samples.pop_front();
+    const std::size_t queued = samples.size() - readPos;
+    if (queued > maxSamples) readPos += queued - maxSamples;
+    if (readPos >= 8192) {
+      samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(readPos));
+      readPos = 0;
+    }
   }
   void Pump(float gain) {
-    if (!client || samples.size() < 2) return;
+    if (!client || !HasSamples()) return;
     UINT32 padding = 0;
     Check(client->GetCurrentPadding(&padding));
-    const auto frames = std::min<UINT32>(capacity - std::min(capacity, padding), static_cast<UINT32>(samples.size() / 2));
+    const std::size_t availableFrames = (samples.size() - readPos) / 2;
+    const auto frames = std::min<UINT32>(capacity - std::min(capacity, padding), static_cast<UINT32>(availableFrames));
     if (!frames) return;
     BYTE* buffer = nullptr;
     Check(render->GetBuffer(frames, &buffer));
     auto* output = reinterpret_cast<float*>(buffer);
-    for (UINT32 i = 0; i < frames * 2; ++i) {
-      output[i] = samples.front() * gain;
-      samples.pop_front();
+    const float* src = samples.data() + readPos;
+    const UINT32 count = frames * 2;
+    for (UINT32 i = 0; i < count; ++i) output[i] = src[i] * gain;
+    readPos += count;
+    if (readPos == samples.size()) {
+      samples.clear();
+      readPos = 0;
+    } else if (readPos >= 8192) {
+      samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(readPos));
+      readPos = 0;
     }
     Check(render->ReleaseBuffer(frames, 0));
   }
@@ -284,13 +369,30 @@ struct ScreenPlayback::Impl {
   std::deque<ScreenPacket> statuses;
   std::string sessionId;
   bool reset = false;
+  bool workerExited = false;
   std::atomic<float> gain{1.0f};
   std::jthread worker;
 
-  explicit Impl(ScreenPlaybackCallbacks cb) : callbacks(std::move(cb)) {
-    worker = std::jthread([this](std::stop_token stop) { Run(stop); });
+  explicit Impl(ScreenPlaybackCallbacks cb) : callbacks(std::move(cb)) {}
+  ~Impl() { StopWorker(); }
+
+  void StopWorker() {
+    std::jthread old;
+    {
+      std::lock_guard lock(mutex);
+      sessionId.clear();
+      packets.Clear();
+      statuses.clear();
+      reset = true;
+      workerExited = false;
+      old = std::move(worker);
+    }
+    if (old.joinable()) {
+      old.request_stop();
+      wake.notify_all();
+      old.join();
+    }
   }
-  ~Impl() { worker.request_stop(); wake.notify_all(); if (worker.joinable()) worker.join(); }
 
   void Report(const std::string& id, std::string detail, bool fatal) {
     ScreenPacket packet;
@@ -315,22 +417,38 @@ struct ScreenPlayback::Impl {
       {
         std::unique_lock lock(mutex);
         const auto ready = [&] { return reset || !statuses.empty() || packets.Size() > 0; };
-        if (output.client) wake.wait_for(lock, stop, std::chrono::milliseconds(3), ready);
-        else wake.wait(lock, stop, ready);
+        if (output.client && output.HasSamples()) {
+          wake.wait_for(lock, stop, std::chrono::milliseconds(8), ready);
+        } else {
+          wake.wait(lock, stop, ready);
+        }
         if (stop.stop_requested()) break;
         if (reset) {
-          video.transform.Reset(); audio.transform.Reset(); output.Reset();
+          video.Reset(); audio.Reset(); output.Reset();
           generation = 0; audioGeneration = 0; videoFailed = false; audioFailed = false;
           firstVideo = true; videoConfig.clear(); decoderSession = sessionId; reset = false;
+          if (decoderSession.empty() && statuses.empty() && packets.Size() == 0) {
+            workerExited = true;
+            break;
+          }
         }
         states.swap(statuses);
         packet = packets.Pop();
       }
+      bool ended = false;
       for (const auto& state : states) {
         if (callbacks.status) callbacks.status(state);
         if (state.state == "stopped" || state.state == "error") {
-          output.Reset(); video.transform.Reset(); audio.transform.Reset();
+          output.Reset(); video.Reset(); audio.Reset();
           videoFailed = true; audioFailed = true;
+          ended = true;
+        }
+      }
+      if (ended) {
+        std::lock_guard lock(mutex);
+        if (!reset && statuses.empty() && packets.Size() == 0 && sessionId == decoderSession) {
+          workerExited = true;
+          break;
         }
       }
       if (packet && packet->sessionId == decoderSession) {
@@ -370,10 +488,10 @@ struct ScreenPlayback::Impl {
           const bool isAudio = packet->kind == ScreenPacketKind::Audio || packet->kind == ScreenPacketKind::AudioConfig;
           if (isAudio) {
             if (!audioFailed) Report(decoderSession, "Device audio is unavailable on this PC. Screen sharing and control remain active.", false);
-            audioFailed = true; output.Reset(); audio.transform.Reset();
+            audioFailed = true; output.Reset(); audio.Reset();
           } else {
             if (!videoFailed) Report(decoderSession, "Windows could not decode the phone screen. Install the Media Feature Pack if required, then start a new session.", true);
-            videoFailed = true; video.transform.Reset(); output.Reset();
+            videoFailed = true; video.Reset(); output.Reset();
           }
         }
       }
@@ -383,7 +501,7 @@ struct ScreenPlayback::Impl {
         audioFailed = true; output.Reset();
       }
     }
-    output.Reset(); video.transform.Reset(); audio.transform.Reset();
+    output.Reset(); video.Reset(); audio.Reset();
     if (SUCCEEDED(mf)) MFShutdown();
     if (SUCCEEDED(com)) CoUninitialize();
   }
@@ -393,13 +511,37 @@ ScreenPlayback::ScreenPlayback(ScreenPlaybackCallbacks callbacks) : impl_(std::m
 ScreenPlayback::~ScreenPlayback() = default;
 
 void ScreenPlayback::Begin(std::string sessionId) {
-  std::lock_guard lock(impl_->mutex);
-  impl_->sessionId = std::move(sessionId); impl_->packets.Clear(); impl_->statuses.clear();
-  impl_->keyframes.Reset(); impl_->reset = true;
+  if (sessionId.empty()) {
+    impl_->StopWorker();
+    return;
+  }
+  std::jthread finishedWorker;
+  bool needSpawn = false;
+  {
+    std::lock_guard lock(impl_->mutex);
+    impl_->sessionId = std::move(sessionId);
+    impl_->packets.Clear();
+    impl_->statuses.clear();
+    impl_->keyframes.Reset();
+    impl_->reset = true;
+    if (!impl_->worker.joinable() || impl_->workerExited) {
+      finishedWorker = std::move(impl_->worker);
+      impl_->workerExited = false;
+      needSpawn = true;
+    }
+  }
+  // Join any previously exited worker outside mutex before spawning a new one.
+  if (finishedWorker.joinable()) finishedWorker.join();
+  if (needSpawn) {
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->sessionId.empty() && !impl_->worker.joinable()) {
+      impl_->worker = std::jthread([impl = impl_.get()](std::stop_token stop) { impl->Run(stop); });
+    }
+  }
   impl_->wake.notify_all();
 }
 
-void ScreenPlayback::End() { Begin({}); }
+void ScreenPlayback::End() { impl_->StopWorker(); }
 
 void ScreenPlayback::OnPacket(ScreenPacket packet) {
   ScreenInput recovery;

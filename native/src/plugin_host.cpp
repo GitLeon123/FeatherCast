@@ -58,23 +58,40 @@ std::string AdaptRequestForPluginApi(std::string request, uint32_t pluginApiVers
 // with a larger buffer, which would run activations and other side effects
 // twice.
 std::string HandleRequest(HandleJsonFn fn, uint32_t pluginApiVersion, const std::string& request,
-                          std::vector<char>& buffer) {
+                          char* buffer, size_t bufferSize) {
   const std::string adaptedRequest = AdaptRequestForPluginApi(request, pluginApiVersion);
   buffer[0] = '\0';
   const uint32_t required =
-      CallPlugin(fn, adaptedRequest.c_str(), buffer.data(), static_cast<uint32_t>(buffer.size()));
-  if (!feathercast::extensions::ResponseSizeAllowed(required) || required > buffer.size()) {
+      CallPlugin(fn, adaptedRequest.c_str(), buffer, static_cast<uint32_t>(bufferSize));
+  if (!feathercast::extensions::ResponseSizeAllowed(required) || required > bufferSize) {
     return ErrorJson("plugin-call-failed");
   }
 
   // buffer[0] was cleared above, so a plugin that reports success without
   // writing anything yields an empty string instead of a stale response.
-  const size_t length = strnlen_s(buffer.data(), buffer.size());
-  if (length == 0 || length >= buffer.size()) return ErrorJson("plugin-call-failed");
-  auto line = feathercast::extensions::FrameResponseLine(std::string(buffer.data(), length));
+  const size_t length = strnlen_s(buffer, bufferSize);
+  if (length == 0 || length >= bufferSize) return ErrorJson("plugin-call-failed");
+  auto line = feathercast::extensions::FrameResponseLine(std::string(buffer, length));
   if (!line) return ErrorJson("invalid-response");
   return std::move(*line);
 }
+
+class DemandZeroBuffer {
+ public:
+  explicit DemandZeroBuffer(size_t size) : size_(size) {
+    data_ = static_cast<char*>(VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  }
+  ~DemandZeroBuffer() {
+    if (data_) VirtualFree(data_, 0, MEM_RELEASE);
+  }
+  DemandZeroBuffer(const DemandZeroBuffer&) = delete;
+  DemandZeroBuffer& operator=(const DemandZeroBuffer&) = delete;
+  char* data() const noexcept { return data_; }
+  size_t size() const noexcept { return data_ ? size_ : 0; }
+ private:
+  char* data_ = nullptr;
+  size_t size_ = 0;
+};
 
 // Points one standard stream (the Win32 handle and the CRT descriptor) at NUL.
 bool RedirectToNul(int descriptor, DWORD standardHandle, DWORD access, int flags) {
@@ -191,7 +208,13 @@ int wmain(int argc, wchar_t** argv) {
     return static_cast<int>(kHostExitUnsupportedApi);
   }
 
-  std::vector<char> responseBuffer(kMaxResponseBytes, '\0');
+  DemandZeroBuffer responseBuffer(kMaxResponseBytes);
+  if (!responseBuffer.data()) {
+    FreeLibrary(dll);
+    CloseHandle(protocolInput);
+    CloseHandle(protocolOutput);
+    return static_cast<int>(kHostExitLoadFailed);
+  }
   LineReader requests(protocolInput);
   std::string request;
   bool connected = WriteLine(protocolOutput, BuildHostReadyJson(pluginApiVersion));
@@ -199,7 +222,8 @@ int wmain(int argc, wchar_t** argv) {
     connected = WriteLine(protocolOutput,
                           request.empty() ? ErrorJson("empty-request")
                                           : HandleRequest(handleJson, pluginApiVersion, request,
-                                                          responseBuffer));
+                                                          responseBuffer.data(),
+                                                          responseBuffer.size()));
   }
 
   FreeLibrary(dll);

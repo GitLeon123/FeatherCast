@@ -355,11 +355,16 @@ struct PhoneWindow::Impl : public accessibility::Model {
   std::map<Action, motion::Spring> toggleMotion;
 
   // Graphics
+  struct CachedQr {
+    std::string payload;
+    qrcodegen::QrCode qr;
+  };
   ComPtr<ID2D1Factory> d2d;
   ComPtr<IDWriteFactory> dwrite;
   ComPtr<IWICImagingFactory> wic;
   ComPtr<ID2D1HwndRenderTarget> target;
   ComPtr<ID2D1SolidColorBrush> brush;
+  ComPtr<ID2D1BitmapBrush> photoBrush;
   ComPtr<IDWriteTextFormat> titleFormat;
   ComPtr<IDWriteTextFormat> headingFormat;
   ComPtr<IDWriteTextFormat> bodyFormat;
@@ -373,6 +378,8 @@ struct PhoneWindow::Impl : public accessibility::Model {
   ComPtr<IDWriteTextFormat> statFormat;
   ComPtr<IDWriteTypography> tabularFigures;  // tnum for counts, times, sizes and percents
   ui::TextLayoutCache textLayouts{128, 16 * 1024};
+  std::vector<CachedQr> qrCache;
+  bool tickTimerArmed = false;
 
   Impl() {
     windowOpacity.Snap(1.0);
@@ -498,6 +505,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
   }
 
   void DiscardDeviceResources() {
+    photoBrush.Reset();
     target.Reset();
     brush.Reset();
     for (auto& item : notifications) item.icon.Reset();
@@ -516,6 +524,8 @@ struct PhoneWindow::Impl : public accessibility::Model {
     DiscardDeviceResources();
     textLayouts.Clear();
     ResetFormats();
+    qrCache.clear();
+    qrCache.shrink_to_fit();
     wic.Reset();
     dwrite.Reset();
     d2d.Reset();
@@ -777,8 +787,21 @@ struct PhoneWindow::Impl : public accessibility::Model {
 
   void DrawQr(const std::string& payload, const D2D1_RECT_F& box) {
     try {
-      const auto qr = qrcodegen::QrCode::encodeText(payload.c_str(),
-                                                    qrcodegen::QrCode::Ecc::MEDIUM);
+      const qrcodegen::QrCode* qrPtr = nullptr;
+      for (const auto& entry : qrCache) {
+        if (entry.payload == payload) {
+          qrPtr = &entry.qr;
+          break;
+        }
+      }
+      if (!qrPtr) {
+        auto encoded = qrcodegen::QrCode::encodeText(payload.c_str(),
+                                                     qrcodegen::QrCode::Ecc::MEDIUM);
+        if (qrCache.size() >= 4) qrCache.erase(qrCache.begin());
+        qrCache.push_back(CachedQr{payload, std::move(encoded)});
+        qrPtr = &qrCache.back().qr;
+      }
+      const auto& qr = *qrPtr;
       const int size = qr.getSize();
       const int quiet = 3;
       const float side = std::min(box.right - box.left, box.bottom - box.top);
@@ -1538,13 +1561,28 @@ struct PhoneWindow::Impl : public accessibility::Model {
         const float side = std::min(size.width, size.height);
         const D2D1_RECT_F source{(size.width - side) / 2.0f, (size.height - side) / 2.0f,
                                  (size.width + side) / 2.0f, (size.height + side) / 2.0f};
-        ComPtr<ID2D1RoundedRectangleGeometry> clip;
-        d2d->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect, 8.0f, 8.0f),
-                                            clip.GetAddressOf());
-        target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), clip.Get()), nullptr);
-        target->DrawBitmap(photo.thumb.Get(), rect, 1.0f,
-                           D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, source);
-        target->PopLayer();
+        if (side > 0.0f) {
+          if (!photoBrush) {
+            target->CreateBitmapBrush(
+                photo.thumb.Get(),
+                D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),
+                photoBrush.GetAddressOf());
+          } else {
+            photoBrush->SetBitmap(photo.thumb.Get());
+          }
+        }
+        if (side > 0.0f && photoBrush) {
+          const float scale = (rect.right - rect.left) / side;
+          photoBrush->SetTransform(
+              D2D1::Matrix3x2F::Translation(-source.left, -source.top) *
+              D2D1::Matrix3x2F::Scale(scale, scale) *
+              D2D1::Matrix3x2F::Translation(rect.left, rect.top));
+          target->FillRoundedRectangle(D2D1::RoundedRect(rect, 8.0f, 8.0f), photoBrush.Get());
+        } else {
+          target->DrawBitmap(photo.thumb.Get(), rect, 1.0f,
+                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, source);
+        }
       } else {
         Text(kGlyphPhoto, rect, iconLargeFormat.Get(), TextMuted());
       }
@@ -1949,6 +1987,29 @@ struct PhoneWindow::Impl : public accessibility::Model {
     return false;
   }
 
+  void SyncTickTimer() {
+    if (!hwnd) {
+      tickTimerArmed = false;
+      return;
+    }
+    const bool downloadingPhoto = std::any_of(
+        photos.begin(), photos.end(),
+        [](const PhotoItem& photo) { return photo.downloading; });
+    const bool visible = IsWindowVisible(hwnd) != FALSE;
+    const bool needed =
+        downloadingPhoto || !toast.empty() ||
+        (visible &&
+         (ShowingPairing() || !transfers.empty() ||
+          (!connected && !lastSeenId.empty())));
+    if (needed && !tickTimerArmed) {
+      SetTimer(hwnd, kTickTimer, 1000, nullptr);
+      tickTimerArmed = true;
+    } else if (!needed && tickTimerArmed) {
+      KillTimer(hwnd, kTickTimer);
+      tickTimerArmed = false;
+    }
+  }
+
   void RequestFrame() {
     if (!hwnd || !IsWindowVisible(hwnd) || !HasActiveMotion()) return;
     SetTimer(hwnd, kFrameTimer, 16, nullptr);
@@ -1990,6 +2051,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
         toastOpacity.Value() <= 0.001) {
       toast.clear();
       toastRun = nullptr;
+      SyncTickTimer();
     }
     if (closing && !windowOpacity.Active() && (fadeMotion || !windowOffset.Active())) {
       KillTimer(hwnd, kFrameTimer);
@@ -2042,6 +2104,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
     windowOpacity.Retarget(1.0, 0.23, fadeMotion);
     windowOffset.Retarget(0.0, spatialMotion);
     ApplyWindowPresentation();
+    SyncTickTimer();
     RequestFrame();
     Invalidate();
   }
@@ -2092,6 +2155,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
     toastOpacity.Retarget(1.0, 0.17, fadeMotion);
     if (!replacing) toastOffset.Snap(spatialMotion ? 8.0 : 0.0);
     toastOffset.Retarget(0.0, 0.20, spatialMotion);
+    SyncTickTimer();
     RequestFrame();
     Invalidate();
   }
@@ -2279,10 +2343,12 @@ struct PhoneWindow::Impl : public accessibility::Model {
         }
         break;
     }
+    SyncTickTimer();
     Invalidate();
   }
 
   void ClearPhoneData() {
+    photoBrush.Reset();
     textLayouts.Clear();
     notifications.clear();
     photos.clear();
@@ -2326,6 +2392,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       photo.downloadingSince = NowMs();
       callbacks.requestPhoto(id);
     }
+    SyncTickTimer();
   }
 
   void ShowPhotoFailure(const std::wstring& message, const std::string& id) {
@@ -2814,6 +2881,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
               Invalidate();
             }
           }
+          SyncTickTimer();
         }
         return 0;
       case WM_CLOSE:
@@ -2822,6 +2890,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       case WM_DESTROY:
         accessibility::Disconnect(hwnd);
         KillTimer(hwnd, kTickTimer);
+        tickTimerArmed = false;
         KillTimer(hwnd, kFrameTimer);
         closing = false;
         lastFrame = {};
@@ -2907,14 +2976,13 @@ struct PhoneWindow::Impl : public accessibility::Model {
     ApplyWindowPresentation();
     ApplyChrome();
     DragAcceptFiles(hwnd, TRUE);
-    SetTimer(hwnd, kTickTimer, 1000, nullptr);
+    SyncTickTimer();
     return true;
   }
 
   // ---------------------------------------------------------------- model
 
   void OnEvent(const phone::Event& event) {
-    textLayouts.Clear();
     using phone::EventKind;
     switch (event.kind) {
       case EventKind::Connected:
@@ -3118,6 +3186,7 @@ struct PhoneWindow::Impl : public accessibility::Model {
       case EventKind::ClipboardHistoryRequested:
         break;
     }
+    SyncTickTimer();
     Invalidate();
   }
 };
@@ -3152,6 +3221,7 @@ void PhoneWindow::SetState(State state) {
     impl_->ClearPhoneData();
   }
   if (!wasEnabled) impl_->ResetPairing();  // the service may listen on another port now
+  impl_->SyncTickTimer();
   impl_->Invalidate();
 }
 

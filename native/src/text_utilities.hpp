@@ -205,31 +205,69 @@ inline std::wstring HexString(std::string_view bytes, bool spaced = false) {
   return out;
 }
 
+namespace detail {
+
+struct CachedHashAlg {
+  BCRYPT_ALG_HANDLE handle = nullptr;
+  DWORD length = 0;
+
+  explicit CachedHashAlg(const wchar_t* id) {
+    if (BCryptOpenAlgorithmProvider(&handle, id, nullptr, 0) < 0) {
+      handle = nullptr;
+      return;
+    }
+    ULONG written = 0;
+    if (BCryptGetProperty(handle, BCRYPT_HASH_LENGTH,
+                          reinterpret_cast<PUCHAR>(&length),
+                          sizeof(length), &written, 0) < 0 ||
+        length == 0 || length > 64) {
+      BCryptCloseAlgorithmProvider(handle, 0);
+      handle = nullptr;
+      length = 0;
+    }
+  }
+
+  ~CachedHashAlg() {
+    if (handle) BCryptCloseAlgorithmProvider(handle, 0);
+  }
+  CachedHashAlg(const CachedHashAlg&) = delete;
+  CachedHashAlg& operator=(const CachedHashAlg&) = delete;
+};
+
+inline const CachedHashAlg& HashAlg(HashAlgorithm algorithm) {
+  switch (algorithm) {
+    case HashAlgorithm::Md5: {
+      static const CachedHashAlg alg(BCRYPT_MD5_ALGORITHM);
+      return alg;
+    }
+    case HashAlgorithm::Sha1: {
+      static const CachedHashAlg alg(BCRYPT_SHA1_ALGORITHM);
+      return alg;
+    }
+    case HashAlgorithm::Sha256:
+    default: {
+      static const CachedHashAlg alg(BCRYPT_SHA256_ALGORITHM);
+      return alg;
+    }
+  }
+}
+
+}  // namespace detail
+
 // Lowercase hex digest, or nullopt when the CNG provider is unavailable.
 inline std::optional<std::wstring> HashHex(HashAlgorithm algorithm,
                                            std::string_view bytes) {
-  const wchar_t* id = algorithm == HashAlgorithm::Md5    ? BCRYPT_MD5_ALGORITHM
-                      : algorithm == HashAlgorithm::Sha1 ? BCRYPT_SHA1_ALGORITHM
-                                                         : BCRYPT_SHA256_ALGORITHM;
-  BCRYPT_ALG_HANDLE handle = nullptr;
-  if (BCryptOpenAlgorithmProvider(&handle, id, nullptr, 0) < 0) return std::nullopt;
-  DWORD length = 0;
-  ULONG written = 0;
-  NTSTATUS status = BCryptGetProperty(handle, BCRYPT_HASH_LENGTH,
-                                      reinterpret_cast<PUCHAR>(&length),
-                                      sizeof(length), &written, 0);
-  std::string digest;
-  if (status >= 0 && length > 0 && length <= 64) {
-    digest.resize(length);
-    static unsigned char empty = 0;
-    auto* input = bytes.empty()
-        ? &empty
-        : reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data()));
-    status = BCryptHash(handle, nullptr, 0, input, static_cast<ULONG>(bytes.size()),
-                        reinterpret_cast<PUCHAR>(digest.data()), length);
-  }
-  BCryptCloseAlgorithmProvider(handle, 0);
-  if (status < 0 || digest.empty()) return std::nullopt;
+  const auto& alg = detail::HashAlg(algorithm);
+  if (!alg.handle || alg.length == 0) return std::nullopt;
+  std::string digest(alg.length, '\0');
+  static unsigned char empty = 0;
+  auto* input = bytes.empty()
+      ? &empty
+      : reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data()));
+  const NTSTATUS status =
+      BCryptHash(alg.handle, nullptr, 0, input, static_cast<ULONG>(bytes.size()),
+                 reinterpret_cast<PUCHAR>(digest.data()), alg.length);
+  if (status < 0) return std::nullopt;
   return HexString(digest);
 }
 
@@ -392,21 +430,25 @@ inline std::vector<Result> Evaluate(std::wstring_view query) {
   while (space < query.size() && !detail::IsSpace(query[space])) ++space;
   const std::size_t keywordLength = space - start;
   if (keywordLength < 3 || keywordLength > 9 || space >= query.size()) return results;
-  std::wstring keyword(query.substr(start, keywordLength));
-  for (auto& ch : keyword) {
-    if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+  wchar_t keywordBuf[10];
+  for (std::size_t i = 0; i < keywordLength; ++i) {
+    const wchar_t ch = query[start + i];
+    keywordBuf[i] = (ch >= L'A' && ch <= L'Z')
+                        ? static_cast<wchar_t>(ch - L'A' + L'a')
+                        : ch;
   }
+  const std::wstring_view keywordView(keywordBuf, keywordLength);
   enum class Kind { None, Base64, Base64Decode, UrlEncode, UrlDecode, Md5, Sha1, Sha256, Hash, Json };
   Kind kind = Kind::None;
-  if (keyword == L"base64" || keyword == L"b64") kind = Kind::Base64;
-  else if (keyword == L"base64d" || keyword == L"b64d") kind = Kind::Base64Decode;
-  else if (keyword == L"urlencode") kind = Kind::UrlEncode;
-  else if (keyword == L"urldecode") kind = Kind::UrlDecode;
-  else if (keyword == L"md5") kind = Kind::Md5;
-  else if (keyword == L"sha1") kind = Kind::Sha1;
-  else if (keyword == L"sha256") kind = Kind::Sha256;
-  else if (keyword == L"hash") kind = Kind::Hash;
-  else if (keyword == L"json") kind = Kind::Json;
+  if (keywordView == L"base64" || keywordView == L"b64") kind = Kind::Base64;
+  else if (keywordView == L"base64d" || keywordView == L"b64d") kind = Kind::Base64Decode;
+  else if (keywordView == L"urlencode") kind = Kind::UrlEncode;
+  else if (keywordView == L"urldecode") kind = Kind::UrlDecode;
+  else if (keywordView == L"md5") kind = Kind::Md5;
+  else if (keywordView == L"sha1") kind = Kind::Sha1;
+  else if (keywordView == L"sha256") kind = Kind::Sha256;
+  else if (keywordView == L"hash") kind = Kind::Hash;
+  else if (keywordView == L"json") kind = Kind::Json;
   if (kind == Kind::None) return results;
 
   std::size_t textBegin = space;
@@ -420,7 +462,7 @@ inline std::vector<Result> Evaluate(std::wstring_view query) {
     return results;
   }
 
-  const std::vector<std::wstring> keywords = {keyword, L"text", L"developer"};
+  const std::vector<std::wstring> keywords = {std::wstring(keywordView), L"text", L"developer"};
   if (text.size() > kMaxInputLength) {
     results.push_back(detail::Notice(
         L"text-too-long", L"Text is too long for text utilities",

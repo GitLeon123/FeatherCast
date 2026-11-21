@@ -255,8 +255,9 @@ class PhoneService {
   bool SendToSession(const std::shared_ptr<Session>& session, std::string json,
                      Bytes binary = {}, bool wait = false);
   bool SaveState();
-  enum class StateLoad { Loaded, Missing, Failed };
+  enum class StateLoad { Loaded, LoadedNeedsSave, Missing, Failed };
   StateLoad LoadState();
+  void PruneFinishedWorkers();
   void Emit(Event event);
   // Matches a received photo or storage file to its request.
   void SettleRequest(Event& event);
@@ -276,7 +277,9 @@ class PhoneService {
   std::jthread acceptThread_;
   std::jthread beaconThread_;
   std::jthread screenSendThread_;
+  std::condition_variable_any beaconWake_;
   std::condition_variable_any screenWake_;
+  std::uint64_t beaconRevision_ = 0;
 
   mutable std::mutex mutex_;
   std::mutex stateSaveMutex_;

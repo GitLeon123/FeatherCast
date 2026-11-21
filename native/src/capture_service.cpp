@@ -472,7 +472,36 @@ void DrainLatestFrame(MonitorCapture& source, ID3D11Device* device,
 void ComposeFrame(const std::vector<MonitorCapture>& sources, PixelRect bounds,
                   std::uint32_t outputWidth, std::uint32_t outputHeight,
                   std::vector<std::uint8_t>& output) {
-  output.assign(static_cast<std::size_t>(outputWidth) * outputHeight * 4, 0);
+  const std::size_t totalBytes =
+      static_cast<std::size_t>(outputWidth) * outputHeight * 4;
+  const int selectedWidth = bounds.Width();
+  const int selectedHeight = bounds.Height();
+  bool fullCoverage = false;
+  if (sources.size() == 1 && sources[0].received && selectedWidth > 0 &&
+      selectedHeight > 0 &&
+      outputWidth <= static_cast<std::uint32_t>(selectedWidth) + 1 &&
+      outputHeight <= static_cast<std::uint32_t>(selectedHeight) + 1) {
+    const auto& source = sources[0];
+    const PixelRect& slice = source.slice.intersection;
+    const int sourceX = slice.left - source.slice.monitorBounds.left;
+    const int sourceY = slice.top - source.slice.monitorBounds.top;
+    const int destinationX = slice.left - bounds.left;
+    const int destinationY = slice.top - bounds.top;
+    const int copyWidth = std::min(
+        {slice.Width(), static_cast<int>(source.width) - sourceX,
+         static_cast<int>(outputWidth) - destinationX});
+    const int copyHeight = std::min(
+        {slice.Height(), static_cast<int>(source.height) - sourceY,
+         static_cast<int>(outputHeight) - destinationY});
+    fullCoverage = sourceX >= 0 && sourceY >= 0 && destinationX == 0 &&
+                   destinationY == 0 && copyWidth >= selectedWidth &&
+                   copyHeight >= selectedHeight;
+  }
+  if (fullCoverage) {
+    output.resize(totalBytes);
+  } else {
+    output.assign(totalBytes, 0);
+  }
   for (const auto& source : sources) {
     if (!source.received) continue;
     const PixelRect& slice = source.slice.intersection;
@@ -504,8 +533,6 @@ void ComposeFrame(const std::vector<MonitorCapture>& sources, PixelRect bounds,
     }
   }
 
-  const int selectedWidth = bounds.Width();
-  const int selectedHeight = bounds.Height();
   if (outputWidth > static_cast<std::uint32_t>(selectedWidth)) {
     for (int row = 0; row < selectedHeight; ++row) {
       auto* destination =

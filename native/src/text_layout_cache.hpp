@@ -75,12 +75,23 @@ class TextLayoutCache {
               ? DWRITE_TRIMMING_GRANULARITY_CHARACTER
               : DWRITE_TRIMMING_GRANULARITY_NONE,
           0, 0};
-      Microsoft::WRL::ComPtr<IDWriteInlineObject> ellipsis;
-      if (options.style == TextLayoutStyle::SingleLineEllipsis &&
-          FAILED(factory->CreateEllipsisTrimmingSign(format, &ellipsis))) {
-        return nullptr;
+      IDWriteInlineObject* ellipsis = nullptr;
+      if (options.style == TextLayoutStyle::SingleLineEllipsis) {
+        if (ellipsisFactory_ != factory) {
+          ellipsisSigns_.clear();
+          ellipsisFactory_ = factory;
+        }
+        auto& cached = ellipsisSigns_[format];
+        if (!cached.sign) {
+          if (FAILED(factory->CreateEllipsisTrimmingSign(format, &cached.sign))) {
+            ellipsisSigns_.erase(format);
+            return nullptr;
+          }
+          cached.format = format;
+        }
+        ellipsis = cached.sign.Get();
       }
-      if (FAILED(layout->SetTrimming(&trimming, ellipsis.Get()))) return nullptr;
+      if (FAILED(layout->SetTrimming(&trimming, ellipsis))) return nullptr;
     }
     if (options.centerHorizontally &&
         FAILED(layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER))) {
@@ -134,6 +145,8 @@ class TextLayoutCache {
   void Clear() {
     order_.clear();
     entries_.clear();
+    ellipsisSigns_.clear();
+    ellipsisFactory_ = nullptr;
     characters_ = 0;
   }
 
@@ -187,11 +200,18 @@ class TextLayoutCache {
     std::list<const Key*>::iterator order;
   };
 
+  struct EllipsisEntry {
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+    Microsoft::WRL::ComPtr<IDWriteInlineObject> sign;
+  };
+
   static constexpr std::size_t kMaxTextLength = 1024;
   std::size_t capacity_;
   std::size_t characterBudget_;
   Microsoft::WRL::ComPtr<IDWriteTypography> tabularTypography_;
   IDWriteFactory* tabularFactory_ = nullptr;
+  IDWriteFactory* ellipsisFactory_ = nullptr;
+  std::unordered_map<IDWriteTextFormat*, EllipsisEntry> ellipsisSigns_;
   std::size_t characters_ = 0;
   std::unordered_map<Key, Entry, Hash, Equal> entries_;
   std::list<const Key*> order_;

@@ -8,6 +8,18 @@
 #include <sstream>
 
 namespace feathercast::snippets_io {
+namespace {
+
+std::uint64_t Fnv1aBytes(const char* data, std::size_t size) noexcept {
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (std::size_t i = 0; i < size; ++i) {
+    hash ^= static_cast<unsigned char>(data[i]);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+}  // namespace
 
 FileFingerprint Inspect(const std::filesystem::path& path) {
   FileFingerprint fingerprint;
@@ -38,29 +50,57 @@ FileFingerprint Inspect(const std::filesystem::path& path) {
 
 LoadResult Load(const std::filesystem::path& path) {
   LoadResult result;
-  result.fingerprint = Inspect(path);
-  if (!result.fingerprint.inspected) {
+  std::error_code ec;
+  result.fingerprint.exists = std::filesystem::exists(path, ec);
+  if (ec) {
     result.status = LoadStatus::Invalid;
     result.message = L"Could not inspect snippets.json. Editing is disabled.";
     return result;
   }
+  result.fingerprint.inspected = true;
   if (!result.fingerprint.exists) return result;
+  result.fingerprint.size = std::filesystem::file_size(path, ec);
+  if (ec) {
+    result.fingerprint = {};
+    result.status = LoadStatus::Invalid;
+    result.message = L"Could not inspect snippets.json. Editing is disabled.";
+    return result;
+  }
+  result.fingerprint.writeTime = std::filesystem::last_write_time(path, ec);
+  if (ec) {
+    result.fingerprint = {};
+    result.status = LoadStatus::Invalid;
+    result.message = L"Could not inspect snippets.json. Editing is disabled.";
+    return result;
+  }
 
   std::ifstream file(path, std::ios::binary);
   if (!file) {
+    result.fingerprint = {};
     result.status = LoadStatus::Invalid;
     result.message = L"Could not read snippets.json. Editing is disabled.";
     return result;
   }
-  std::ostringstream buffer;
-  buffer << file.rdbuf();
-  if (!file.good() && !file.eof()) {
+  std::string content;
+  if (result.fingerprint.size > 0 && result.fingerprint.size <= 32u * 1024u * 1024u) {
+    content.reserve(static_cast<std::size_t>(result.fingerprint.size));
+  }
+  std::array<char, 8192> chunk{};
+  while (file) {
+    file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    const auto got = file.gcount();
+    if (got > 0) content.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (!file.eof()) {
+    result.fingerprint = {};
     result.status = LoadStatus::Invalid;
     result.message = L"Could not finish reading snippets.json. Editing is disabled.";
     return result;
   }
+  result.fingerprint.size = content.size();
+  result.fingerprint.contentHash = Fnv1aBytes(content.data(), content.size());
 
-  auto parsed = snippets::ParseSnippetsDocument(buffer.str());
+  auto parsed = snippets::ParseSnippetsDocument(content);
   switch (parsed.status) {
     case snippets::ParseStatus::Valid:
       result.snippets = std::move(parsed.snippets);
@@ -113,7 +153,8 @@ SaveResult Save(const std::filesystem::path& path,
     return {false, expected, L"Could not create the snippets directory."};
   }
   using filesystem_semantics::ReplaceStatus;
-  switch (filesystem_semantics::ReplaceFileDurably(path, Serialize(snippets))) {
+  const std::string serialized = Serialize(snippets);
+  switch (filesystem_semantics::ReplaceFileDurably(path, serialized)) {
     case ReplaceStatus::Replaced:
       break;
     case ReplaceStatus::CreateFailed:
@@ -123,7 +164,14 @@ SaveResult Save(const std::filesystem::path& path,
     case ReplaceStatus::ReplaceFailed:
       return {false, expected, L"Could not replace snippets.json."};
   }
-  return {true, Inspect(path), L"Library saved."};
+  FileFingerprint saved;
+  saved.inspected = true;
+  saved.exists = true;
+  saved.size = serialized.size();
+  saved.contentHash = Fnv1aBytes(serialized.data(), serialized.size());
+  saved.writeTime = std::filesystem::last_write_time(path, ec);
+  if (ec) saved = Inspect(path);
+  return {true, saved, L"Library saved."};
 }
 
 }  // namespace feathercast::snippets_io

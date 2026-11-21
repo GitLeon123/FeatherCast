@@ -4,9 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cwctype>
 #include <fstream>
-#include <set>
+#include <string_view>
 
 namespace feathercast::file_content {
 namespace {
@@ -16,35 +17,6 @@ std::wstring LowerExtension(const std::filesystem::path& path) {
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
   return extension;
-}
-
-bool ValidUtf8(const std::vector<unsigned char>& bytes, std::size_t offset) {
-  for (std::size_t i = offset; i < bytes.size();) {
-    const unsigned char first = bytes[i];
-    if (first <= 0x7f) {
-      ++i;
-    } else if (first >= 0xc2 && first <= 0xdf) {
-      if (i + 1 >= bytes.size() || (bytes[i + 1] & 0xc0) != 0x80) return false;
-      i += 2;
-    } else if (first >= 0xe0 && first <= 0xef) {
-      if (i + 2 >= bytes.size() || (bytes[i + 1] & 0xc0) != 0x80 ||
-          (bytes[i + 2] & 0xc0) != 0x80) return false;
-      if ((first == 0xe0 && bytes[i + 1] < 0xa0) ||
-          (first == 0xed && bytes[i + 1] >= 0xa0)) return false;
-      i += 3;
-    } else if (first >= 0xf0 && first <= 0xf4) {
-      if (i + 3 >= bytes.size() || (bytes[i + 1] & 0xc0) != 0x80 ||
-          (bytes[i + 2] & 0xc0) != 0x80 || (bytes[i + 3] & 0xc0) != 0x80) {
-        return false;
-      }
-      if ((first == 0xf0 && bytes[i + 1] < 0x90) ||
-          (first == 0xf4 && bytes[i + 1] >= 0x90)) return false;
-      i += 4;
-    } else {
-      return false;
-    }
-  }
-  return true;
 }
 
 std::optional<std::wstring> DecodeCodePage(const unsigned char* data,
@@ -65,9 +37,9 @@ std::optional<std::wstring> DecodeCodePage(const unsigned char* data,
 }
 
 bool LooksBinary(const std::vector<unsigned char>& bytes) {
-  if (std::find(bytes.begin(), bytes.end(), 0) != bytes.end()) return true;
   std::size_t controls = 0;
   for (const auto byte : bytes) {
+    if (byte == 0) return true;
     if (byte < 0x20 && byte != '\r' && byte != '\n' && byte != '\t' &&
         byte != '\f' && byte != '\b') {
       ++controls;
@@ -77,9 +49,9 @@ bool LooksBinary(const std::vector<unsigned char>& bytes) {
 }
 
 bool LooksBinaryText(const std::wstring& text) {
-  if (text.find(L'\0') != std::wstring::npos) return true;
   std::size_t controls = 0;
   for (const wchar_t ch : text) {
+    if (ch == L'\0') return true;
     if (ch < 0x20 && ch != L'\r' && ch != L'\n' && ch != L'\t' &&
         ch != L'\f' && ch != L'\b') {
       ++controls;
@@ -91,21 +63,26 @@ bool LooksBinaryText(const std::wstring& text) {
 }  // namespace
 
 bool Supports(const std::filesystem::path& path) {
-  static const std::set<std::wstring> extensions = {
-      L".txt", L".md", L".log", L".csv", L".tsv", L".json", L".xml",
-      L".yaml", L".yml", L".ini", L".cfg", L".toml", L".c", L".cc",
-      L".cpp", L".cxx", L".h", L".hh", L".hpp", L".hxx", L".cs",
-      L".java", L".kt", L".py", L".js", L".jsx", L".ts", L".tsx",
-      L".html", L".htm", L".css", L".scss", L".sql", L".ps1",
-      L".bat", L".cmd", L".sh"};
-  return extensions.contains(LowerExtension(path));
+  static constexpr std::wstring_view kExtensions[] = {
+      L".bat",  L".c",    L".cc",   L".cfg",  L".cmd",  L".cpp",  L".cs",
+      L".css",  L".csv",  L".cxx",  L".h",    L".hh",   L".hpp",  L".htm",
+      L".html", L".hxx",  L".ini",  L".java", L".js",   L".json", L".jsx",
+      L".kt",   L".log",  L".md",   L".ps1",  L".py",   L".scss", L".sh",
+      L".sql",  L".toml", L".ts",   L".tsv",  L".tsx",  L".txt",  L".xml",
+      L".yaml", L".yml",
+  };
+  const std::wstring ext = LowerExtension(path);
+  return std::binary_search(std::begin(kExtensions), std::end(kExtensions),
+                            std::wstring_view(ext));
 }
 
 bool IsImage(const std::filesystem::path& path) {
-  static const std::set<std::wstring> extensions = {
-      L".bmp", L".gif", L".ico", L".jpeg", L".jpg", L".png", L".tif",
-      L".tiff"};
-  return extensions.contains(LowerExtension(path));
+  static constexpr std::wstring_view kExtensions[] = {
+      L".bmp", L".gif", L".ico", L".jpeg", L".jpg", L".png", L".tif", L".tiff",
+  };
+  const std::wstring ext = LowerExtension(path);
+  return std::binary_search(std::begin(kExtensions), std::end(kExtensions),
+                            std::wstring_view(ext));
 }
 
 Extraction Extract(const std::filesystem::path& path, std::size_t maxBytes,
@@ -116,12 +93,13 @@ Extraction Extract(const std::filesystem::path& path, std::size_t maxBytes,
     return result;
   }
 
-  const DWORD attributes = GetFileAttributesW(path.c_str());
-  if (attributes == INVALID_FILE_ATTRIBUTES ||
-      (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+  WIN32_FILE_ATTRIBUTE_DATA attrData{};
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attrData) ||
+      (attrData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
     result.state = State::Unavailable;
     return result;
   }
+  const DWORD attributes = attrData.dwFileAttributes;
   bool cloudOnly = (attributes & FILE_ATTRIBUTE_OFFLINE) != 0;
 #ifdef FILE_ATTRIBUTE_RECALL_ON_OPEN
   cloudOnly = cloudOnly || (attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0;
@@ -135,12 +113,9 @@ Extraction Extract(const std::filesystem::path& path, std::size_t maxBytes,
     return result;
   }
 
-  std::error_code ec;
-  const auto size = std::filesystem::file_size(path, ec);
-  if (ec) {
-    result.state = State::Unavailable;
-    return result;
-  }
+  const std::uint64_t size =
+      (static_cast<std::uint64_t>(attrData.nFileSizeHigh) << 32) |
+      attrData.nFileSizeLow;
   result.sourceBytes = static_cast<std::size_t>(size);
   if (size > maxBytes) {
     result.state = State::TooLarge;
@@ -192,12 +167,13 @@ Extraction Extract(const std::filesystem::path& path, std::size_t maxBytes,
       result.state = State::Binary;
       return result;
     }
-    auto decoded = ValidUtf8(bytes, bomOffset)
-                       ? DecodeCodePage(bytes.data() + bomOffset,
-                                        bytes.size() - bomOffset, CP_UTF8,
-                                        MB_ERR_INVALID_CHARS)
-                       : DecodeCodePage(bytes.data() + bomOffset,
-                                        bytes.size() - bomOffset, CP_ACP, 0);
+    auto decoded = DecodeCodePage(bytes.data() + bomOffset,
+                                  bytes.size() - bomOffset, CP_UTF8,
+                                  MB_ERR_INVALID_CHARS);
+    if (!decoded) {
+      decoded = DecodeCodePage(bytes.data() + bomOffset,
+                               bytes.size() - bomOffset, CP_ACP, 0);
+    }
     if (!decoded) {
       result.state = State::Binary;
       return result;

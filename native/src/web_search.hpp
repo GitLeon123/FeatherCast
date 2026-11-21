@@ -67,47 +67,79 @@ inline std::wstring TemplateHost(std::wstring_view engineTemplate) {
 inline std::wstring EngineName(const std::wstring& keyword,
                                std::wstring_view engineTemplate) {
   const std::wstring host = TemplateHost(engineTemplate);
-  std::vector<std::wstring> labels;
+  std::wstring_view labelStack[16];
+  std::vector<std::wstring_view> labelHeap;
+  std::size_t labelCount = 0;
   std::size_t begin = 0;
-  while (begin <= host.size()) {
-    const std::size_t dot = host.find(L'.', begin);
-    const std::size_t end = dot == std::wstring::npos ? host.size() : dot;
-    if (end > begin) labels.push_back(host.substr(begin, end - begin));
-    if (dot == std::wstring::npos) break;
+  const std::wstring_view hostView(host);
+  while (begin <= hostView.size()) {
+    const std::size_t dot = hostView.find(L'.', begin);
+    const std::size_t end = dot == std::wstring_view::npos ? hostView.size() : dot;
+    if (end > begin) {
+      const std::wstring_view part = hostView.substr(begin, end - begin);
+      if (labelHeap.empty() && labelCount < std::size(labelStack)) {
+        labelStack[labelCount++] = part;
+      } else {
+        if (labelHeap.empty()) {
+          labelHeap.assign(labelStack, labelStack + labelCount);
+        }
+        labelHeap.push_back(part);
+        ++labelCount;
+      }
+    }
+    if (dot == std::wstring_view::npos) break;
     begin = dot + 1;
   }
-  if (labels.empty()) return keyword;
+  if (labelCount == 0) return keyword;
+  const auto labelAt = [&](std::size_t index) -> std::wstring_view {
+    return labelHeap.empty() ? labelStack[index] : labelHeap[index];
+  };
 
-  std::wstring label = labels.front();
-  if (labels.size() >= 2) {
+  std::wstring_view labelView = labelAt(0);
+  if (labelCount >= 2) {
     // "example.co.uk" and "example.com.au" register below a short
     // second-level label; everything else registers below the TLD.
-    std::size_t registrable = labels.size() - 2;
+    std::size_t registrable = labelCount - 2;
     static constexpr std::wstring_view kSecondLevel[] = {
         L"ac", L"co", L"com", L"edu", L"gov", L"net", L"org"};
-    if (labels.size() >= 3 && labels.back().size() == 2 &&
-        std::find(std::begin(kSecondLevel), std::end(kSecondLevel),
-                  labels[registrable]) != std::end(kSecondLevel)) {
+    if (labelCount >= 3 && labelAt(labelCount - 1).size() == 2 &&
+        std::binary_search(std::begin(kSecondLevel), std::end(kSecondLevel),
+                           labelAt(registrable))) {
       --registrable;
     }
-    label = labels[registrable];
+    labelView = labelAt(registrable);
   }
 
-  static const std::map<std::wstring, std::wstring, std::less<>> kKnown = {
-      {L"amazon", L"Amazon"},       {L"baidu", L"Baidu"},
-      {L"bing", L"Bing"},           {L"brave", L"Brave Search"},
-      {L"duckduckgo", L"DuckDuckGo"}, {L"ecosia", L"Ecosia"},
-      {L"github", L"GitHub"},       {L"google", L"Google"},
-      {L"kagi", L"Kagi"},           {L"npmjs", L"npm"},
-      {L"qwant", L"Qwant"},         {L"reddit", L"Reddit"},
-      {L"stackoverflow", L"Stack Overflow"}, {L"startpage", L"Startpage"},
-      {L"wikipedia", L"Wikipedia"}, {L"yahoo", L"Yahoo"},
-      {L"yandex", L"Yandex"},       {L"youtube", L"YouTube"},
+  static constexpr std::pair<std::wstring_view, std::wstring_view> kKnown[] = {
+      {L"amazon", L"Amazon"},
+      {L"baidu", L"Baidu"},
+      {L"bing", L"Bing"},
+      {L"brave", L"Brave Search"},
+      {L"duckduckgo", L"DuckDuckGo"},
+      {L"ecosia", L"Ecosia"},
+      {L"github", L"GitHub"},
+      {L"google", L"Google"},
+      {L"kagi", L"Kagi"},
+      {L"npmjs", L"npm"},
+      {L"qwant", L"Qwant"},
+      {L"reddit", L"Reddit"},
+      {L"stackoverflow", L"Stack Overflow"},
+      {L"startpage", L"Startpage"},
+      {L"wikipedia", L"Wikipedia"},
+      {L"yahoo", L"Yahoo"},
+      {L"yandex", L"Yandex"},
+      {L"youtube", L"YouTube"},
   };
-  if (const auto known = kKnown.find(label); known != kKnown.end()) {
-    return known->second;
+  const auto known = std::lower_bound(
+      std::begin(kKnown), std::end(kKnown), labelView,
+      [](const auto& entry, std::wstring_view target) {
+        return entry.first < target;
+      });
+  if (known != std::end(kKnown) && known->first == labelView) {
+    return std::wstring(known->second);
   }
-  if (label.empty()) return keyword;
+  if (labelView.empty()) return keyword;
+  std::wstring label(labelView);
   label.front() = static_cast<wchar_t>(std::towupper(label.front()));
   return label;
 }

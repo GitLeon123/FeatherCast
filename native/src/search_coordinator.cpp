@@ -2,9 +2,13 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <utility>
 
 namespace feathercast::search {
+namespace {
+constexpr auto kIdleWorkerTimeout = std::chrono::seconds(20);
+}
 
 SearchCoordinator::SearchCoordinator(ResultSink resultSink, ErrorSink errorSink)
     : resultSink_(std::move(resultSink)), errorSink_(std::move(errorSink)) {}
@@ -15,23 +19,26 @@ SearchCoordinator::~SearchCoordinator() {
 
 void SearchCoordinator::Start(Processor processor) {
   std::lock_guard lock(mutex_);
-  if (worker_.joinable()) return;
+  if (started_) return;
   processor_ = std::move(processor);
   stopping_ = false;
-  worker_ = std::jthread(
-      [this](std::stop_token token) { WorkerLoop(token); });
+  started_ = static_cast<bool>(processor_);
 }
 
 void SearchCoordinator::Stop() {
+  std::jthread toJoin;
   {
     std::lock_guard lock(mutex_);
-    if (!worker_.joinable()) return;
+    if (!started_ && !worker_.joinable()) return;
     stopping_ = true;
+    started_ = false;
     pending_.reset();
-    worker_.request_stop();
+    toJoin = std::move(worker_);
+    workerActive_ = false;
+    if (toJoin.joinable()) toJoin.request_stop();
   }
   cv_.notify_all();
-  worker_.join();
+  if (toJoin.joinable()) toJoin.join();
   std::lock_guard lock(mutex_);
   processor_ = {};
   stopping_ = false;
@@ -39,11 +46,19 @@ void SearchCoordinator::Stop() {
 
 bool SearchCoordinator::Query(app::QueryRequest request) {
   latestGeneration_.store(request.generation, std::memory_order_release);
+  std::jthread retired;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable() || !processor_) return false;
+    if (!started_ || stopping_ || !processor_) return false;
     pending_ = std::move(request);
+    if (!workerActive_) {
+      retired = std::move(worker_);
+      workerActive_ = true;
+      worker_ = std::jthread(
+          [this](std::stop_token token) { WorkerLoop(token); });
+    }
   }
+  if (retired.joinable()) retired.join();
   cv_.notify_one();
   return true;
 }
@@ -58,22 +73,24 @@ void SearchCoordinator::WorkerLoop(std::stop_token stopToken) {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     app::QueryRequest request;
-    Processor processor;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
+      const bool woke = cv_.wait_for(lock, kIdleWorkerTimeout, [&] {
         return pending_.has_value() || stopping_ ||
                stopToken.stop_requested();
       });
-      if (stopping_ || stopToken.stop_requested()) return;
+      if (stopping_ || stopToken.stop_requested() ||
+          (!woke && !pending_.has_value())) {
+        workerActive_ = false;
+        return;
+      }
       request = std::move(*pending_);
       pending_.reset();
-      processor = processor_;
     }
     request.latestGeneration = &latestGeneration_;
     app::ResultsCollection result;
     try {
-      result = processor(request);
+      result = processor_(request);
     } catch (...) {
       if (errorSink_) {
         try { errorSink_(std::current_exception()); } catch (...) {}
@@ -106,23 +123,26 @@ SnapshotCoordinator::~SnapshotCoordinator() {
 
 void SnapshotCoordinator::Start(Builder builder) {
   std::lock_guard lock(mutex_);
-  if (worker_.joinable()) return;
+  if (started_) return;
   builder_ = std::move(builder);
   stopping_ = false;
-  worker_ = std::jthread(
-      [this](std::stop_token token) { WorkerLoop(token); });
+  started_ = static_cast<bool>(builder_);
 }
 
 void SnapshotCoordinator::Stop() {
+  std::jthread toJoin;
   {
     std::lock_guard lock(mutex_);
-    if (!worker_.joinable()) return;
+    if (!started_ && !worker_.joinable()) return;
     stopping_ = true;
+    started_ = false;
     pending_.reset();
-    worker_.request_stop();
+    toJoin = std::move(worker_);
+    workerActive_ = false;
+    if (toJoin.joinable()) toJoin.request_stop();
   }
   cv_.notify_all();
-  worker_.join();
+  if (toJoin.joinable()) toJoin.join();
   std::lock_guard lock(mutex_);
   builder_ = {};
   stopping_ = false;
@@ -136,11 +156,19 @@ void SnapshotCoordinator::Invalidate() {
 
 bool SnapshotCoordinator::UpdateCorpus(app::SnapshotBuildRequest request) {
   latestRevision_.store(request.revision, std::memory_order_release);
+  std::jthread retired;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable() || !builder_) return false;
+    if (!started_ || stopping_ || !builder_) return false;
     pending_ = std::move(request);
+    if (!workerActive_) {
+      retired = std::move(worker_);
+      workerActive_ = true;
+      worker_ = std::jthread(
+          [this](std::stop_token token) { WorkerLoop(token); });
+    }
   }
+  if (retired.joinable()) retired.join();
   cv_.notify_one();
   return true;
 }
@@ -149,21 +177,23 @@ void SnapshotCoordinator::WorkerLoop(std::stop_token stopToken) {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
     app::SnapshotBuildRequest request;
-    Builder builder;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
+      const bool woke = cv_.wait_for(lock, kIdleWorkerTimeout, [&] {
         return pending_.has_value() || stopping_ ||
                stopToken.stop_requested();
       });
-      if (stopping_ || stopToken.stop_requested()) return;
+      if (stopping_ || stopToken.stop_requested() ||
+          (!woke && !pending_.has_value())) {
+        workerActive_ = false;
+        return;
+      }
       request = std::move(*pending_);
       pending_.reset();
-      builder = builder_;
     }
     std::shared_ptr<const app::SearchSnapshot> snapshot;
     try {
-      snapshot = builder(request.settings);
+      snapshot = builder_(request.settings);
     } catch (...) {
       if (errorSink_) {
         try { errorSink_(std::current_exception()); } catch (...) {}

@@ -7,6 +7,9 @@
 #include <utility>
 
 namespace feathercast::discovery_runtime {
+namespace {
+constexpr auto kIdleWorkerTimeout = std::chrono::seconds(20);
+}
 
 DiscoveryService::DiscoveryService(ResultSink resultSink, ErrorSink errorSink,
                                    RetryPolicy retry)
@@ -20,36 +23,47 @@ DiscoveryService::~DiscoveryService() {
 
 void DiscoveryService::Start(Worker worker) {
   std::lock_guard lock(mutex_);
-  if (worker_.joinable()) return;
+  if (started_) return;
   workerFunction_ = std::move(worker);
   stopping_ = false;
-  worker_ = std::jthread(
-      [this](std::stop_token token) { WorkerLoop(token); });
+  started_ = static_cast<bool>(workerFunction_);
 }
 
 void DiscoveryService::Stop() {
+  std::jthread toJoin;
   {
     std::lock_guard lock(mutex_);
-    if (!worker_.joinable()) return;
+    if (!started_ && !worker_.joinable()) return;
     stopping_ = true;
+    started_ = false;
     pending_.reset();
     latestGeneration_.fetch_add(1, std::memory_order_acq_rel);
-    worker_.request_stop();
+    toJoin = std::move(worker_);
+    workerActive_ = false;
+    if (toJoin.joinable()) toJoin.request_stop();
   }
   cv_.notify_all();
-  worker_.join();
+  if (toJoin.joinable()) toJoin.join();
   std::lock_guard lock(mutex_);
   workerFunction_ = {};
   stopping_ = false;
 }
 
 bool DiscoveryService::Refresh(app::DiscoveryRequest request) {
+  std::jthread retired;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable() || !workerFunction_) return false;
+    if (!started_ || stopping_ || !workerFunction_) return false;
     latestGeneration_.store(request.generation, std::memory_order_release);
     pending_ = std::move(request);
+    if (!workerActive_) {
+      retired = std::move(worker_);
+      workerActive_ = true;
+      worker_ = std::jthread(
+          [this](std::stop_token token) { WorkerLoop(token); });
+    }
   }
+  if (retired.joinable()) retired.join();
   cv_.notify_one();
   return true;
 }
@@ -75,17 +89,19 @@ void DiscoveryService::WorkerLoop(std::stop_token stopToken) {
   int failedAttempts = 0;
   for (;;) {
     app::DiscoveryRequest request;
-    Worker worker;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
+      const bool woke = cv_.wait_for(lock, kIdleWorkerTimeout, [&] {
         return pending_.has_value() || stopping_ ||
                stopToken.stop_requested();
       });
-      if (stopping_ || stopToken.stop_requested()) return;
+      if (stopping_ || stopToken.stop_requested() ||
+          (!woke && !pending_.has_value())) {
+        workerActive_ = false;
+        return;
+      }
       request = std::move(*pending_);
       pending_.reset();
-      worker = workerFunction_;
     }
     if (retryGeneration != request.generation) {
       retryGeneration = request.generation;
@@ -93,7 +109,7 @@ void DiscoveryService::WorkerLoop(std::stop_token stopToken) {
     }
     std::optional<app::DiscoveryResult> result;
     try {
-      result = worker(request, stopToken);
+      result = workerFunction_(request, stopToken);
     } catch (...) {
       ++failedAttempts;
       if (!IsCurrent(request.generation)) continue;
@@ -116,7 +132,10 @@ void DiscoveryService::WorkerLoop(std::stop_token stopToken) {
         return pending_.has_value() || stopping_ ||
                stopToken.stop_requested() || !IsCurrent(request.generation);
       });
-      if (stopping_ || stopToken.stop_requested()) return;
+      if (stopping_ || stopToken.stop_requested()) {
+        workerActive_ = false;
+        return;
+      }
       if (!pending_ && IsCurrent(request.generation)) {
         request.allowCache = false;
         pending_ = std::move(request);

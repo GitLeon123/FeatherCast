@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+struct IWICImagingFactory;
+
 namespace feathercast::preview {
 
 enum class Kind { Metadata, Text, Image, Error };
@@ -52,7 +54,8 @@ class PreviewService {
 
  private:
   void WorkerLoop(std::stop_token token);
-  Result Build(const Request& request, std::stop_token token) const;
+  Result Build(const Request& request, std::stop_token token,
+               ::IWICImagingFactory** cachedFactory) const;
 
   ResultSink sink_;
   ErrorSink errors_;
@@ -61,6 +64,8 @@ class PreviewService {
   std::condition_variable cv_;
   std::optional<Request> pending_;
   std::atomic<std::uint64_t> generation_ = 0;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
 };
 

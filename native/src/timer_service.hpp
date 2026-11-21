@@ -1,12 +1,10 @@
 #pragma once
 
 #include <windows.h>
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
-#include <thread>
 
 namespace feathercast::timers {
 
@@ -21,12 +19,14 @@ class TimerService {
   bool Schedule(std::optional<long long> deadline, std::uint64_t generation);
   void Stop();
  private:
+  static void CALLBACK OnTimer(PTP_CALLBACK_INSTANCE, PVOID context, PTP_TIMER);
   Sink sink_;
-  HANDLE timer_ = nullptr;
-  HANDLE changed_ = nullptr;
-  std::jthread worker_;
+  PTP_TIMER timer_ = nullptr;
   std::mutex mutex_;
   std::uint64_t generation_ = 0;
+  unsigned long long dueFileTime_ = 0;
+  bool armed_ = false;
+  bool stopping_ = false;
 };
 
 }  // namespace feathercast::timers

@@ -42,6 +42,15 @@ class Model {
   virtual ~Model() = default;
   virtual std::wstring AccessibleWindowName(HWND hwnd) const = 0;
   virtual std::vector<Item> AccessibleItems(HWND hwnd) const = 0;
+  virtual int AccessibleChildCount(HWND hwnd) const {
+    return static_cast<int>(AccessibleItems(hwnd).size());
+  }
+  virtual std::optional<Item> AccessibleItemAt(HWND hwnd, int child) const {
+    if (child <= 0) return std::nullopt;
+    auto items = AccessibleItems(hwnd);
+    if (child > static_cast<int>(items.size())) return std::nullopt;
+    return std::move(items[static_cast<size_t>(child - 1)]);
+  }
   virtual int AccessibleFocusedChild(HWND hwnd) const = 0;  // one-based; 0 = root
   virtual int AccessibleSelectedChild(HWND hwnd) const {
     return AccessibleFocusedChild(hwnd);
@@ -508,12 +517,8 @@ class ChildProvider final : public IServiceProvider,
   }
 
   std::optional<Item> CurrentItem(Model* model) const {
-    if (!model) return std::nullopt;
-    const auto items = model->AccessibleItems(connection_->hwnd);
-    if (child_ <= 0 || child_ > static_cast<int>(items.size())) {
-      return std::nullopt;
-    }
-    return items[static_cast<size_t>(child_ - 1)];
+    if (!model || child_ <= 0) return std::nullopt;
+    return model->AccessibleItemAt(connection_->hwnd, child_);
   }
 
   HRESULT RangeProperty(double* value, double Item::*member) const {
@@ -598,8 +603,8 @@ class Window final : public IAccessible,
     *result = nullptr;
     Model* const model = ConnectedModel();
     if (!model) return UIA_E_ELEMENTNOTAVAILABLE;
-    const auto items = model->AccessibleItems(hwnd_);
-    if (child <= 0 || child > static_cast<long>(items.size())) {
+    const int count = model->AccessibleChildCount(hwnd_);
+    if (child <= 0 || child > count) {
       return E_INVALIDARG;
     }
     auto* provider = new detail::ChildProvider(
@@ -712,7 +717,7 @@ class Window final : public IAccessible,
     *count = 0;
     Model* const model = ConnectedModel();
     if (!model) return RPC_E_DISCONNECTED;
-    *count = static_cast<LONG>(model->AccessibleItems(hwnd_).size());
+    *count = static_cast<LONG>(model->AccessibleChildCount(hwnd_));
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch** child) override {
@@ -814,11 +819,11 @@ class Window final : public IAccessible,
     if (!model) return RPC_E_DISCONNECTED;
     const LONG child = model->AccessibleFocusedChild(hwnd_);
     focus->vt = VT_I4;
-    const auto items = model->AccessibleItems(hwnd_);
-    if (child > 0 && child <= static_cast<LONG>(items.size()) &&
-        (items[static_cast<size_t>(child - 1)].state &
-         (STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_UNAVAILABLE |
-          STATE_SYSTEM_INVISIBLE)) == STATE_SYSTEM_FOCUSABLE) {
+    const auto item = child > 0 ? model->AccessibleItemAt(hwnd_, child)
+                                : std::nullopt;
+    if (item &&
+        (item->state & (STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_UNAVAILABLE |
+                        STATE_SYSTEM_INVISIBLE)) == STATE_SYSTEM_FOCUSABLE) {
       focus->lVal = child;
     } else {
       focus->lVal = CHILDID_SELF;
@@ -832,10 +837,10 @@ class Window final : public IAccessible,
     if (!model) return RPC_E_DISCONNECTED;
     const LONG child = model->AccessibleSelectedChild(hwnd_);
     selection->vt = VT_I4;
-    const auto items = model->AccessibleItems(hwnd_);
-    if (child > 0 && child <= static_cast<LONG>(items.size()) &&
-        (items[static_cast<size_t>(child - 1)].state &
-         (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) == 0) {
+    const auto item = child > 0 ? model->AccessibleItemAt(hwnd_, child)
+                                : std::nullopt;
+    if (item &&
+        (item->state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) == 0) {
       selection->lVal = child;
     } else {
       selection->lVal = CHILDID_SELF;
@@ -899,7 +904,7 @@ class Window final : public IAccessible,
     VariantInit(destination);
     Model* const model = ConnectedModel();
     if (!model) return RPC_E_DISCONNECTED;
-    const LONG count = static_cast<LONG>(model->AccessibleItems(hwnd_).size());
+    const LONG count = static_cast<LONG>(model->AccessibleChildCount(hwnd_));
     LONG id = IsSelf(start) ? 0 : start.lVal;
     if (!IsSelf(start) && (start.vt != VT_I4 || id <= 0 || id > count)) {
       return E_INVALIDARG;
@@ -998,9 +1003,7 @@ class Window final : public IAccessible,
   std::optional<Item> ItemFor(Model* model, const VARIANT& child) const {
     const auto id = ChildId(child);
     if (!id) return std::nullopt;
-    const auto items = model->AccessibleItems(hwnd_);
-    if (*id > static_cast<int>(items.size())) return std::nullopt;
-    return items[static_cast<size_t>(*id - 1)];
+    return model->AccessibleItemAt(hwnd_, *id);
   }
 
   std::atomic<ULONG> references_ = 1;

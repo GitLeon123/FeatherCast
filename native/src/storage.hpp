@@ -6,16 +6,19 @@
 #include "timers.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <wincrypt.h>
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <filesystem>
 #include <limits>
 #include <optional>
 #include <string_view>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace feathercast::storage {
@@ -131,13 +134,23 @@ class Storage {
       return false;
     }
 
+    sqlite3_db_config(db_, SQLITE_DBCONFIG_LOOKASIDE, nullptr, 512, 64);
     sqlite3_busy_timeout(db_, 3000);
+    // Bound SQLite's per-connection page cache and WAL file retention so idle
+    // memory stays compact while active queries remain fast.
+    Exec("PRAGMA cache_size=-512;");
+    Exec("PRAGMA journal_size_limit=2097152;");
+    Exec("PRAGMA temp_store=MEMORY;");
+    Exec("PRAGMA mmap_size=0;");
     if (!IntegrityCheck()) {
       Close();
       return false;
     }
-    if (!Exec("PRAGMA journal_mode=WAL;") ||
-        !Exec("PRAGMA synchronous=NORMAL;")) {
+    if (!IsWalJournalMode() && !Exec("PRAGMA journal_mode=WAL;")) {
+      Close();
+      return false;
+    }
+    if (!Exec("PRAGMA synchronous=NORMAL;")) {
       Close();
       return false;
     }
@@ -148,6 +161,29 @@ class Storage {
       }
       Close();
       return false;
+    }
+    // Fast read-only startup path: skip BEGIN IMMEDIATE + DDL write transaction
+    // when the v4 schema and performance indexes are already present.
+    if (schemaVersion == 4 &&
+        HasTable("file_index") &&
+        HasTable("clipboard_history") &&
+        HasTable("file_content_fts") &&
+        HasTable("timers") &&
+        HasTable("stopwatch")) {
+      const bool hasPerfIndexes =
+          HasIndex("idx_clipboard_history_hash") &&
+          HasIndex("idx_file_index_name");
+      if (!hasPerfIndexes) {
+        if (!Exec("BEGIN IMMEDIATE;") ||
+            !EnsurePerformanceIndexes() ||
+            !Exec("COMMIT;")) {
+          Exec("ROLLBACK;");
+          Close();
+          return false;
+        }
+      }
+      ReleaseMemory();
+      return true;
     }
     if (schemaVersion < 4 &&
         (HasTable("clipboard_history") || HasTable("file_index")) &&
@@ -180,21 +216,34 @@ class Storage {
         !Exec("CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5("
               "content, content='', contentless_delete=1, "
               "tokenize='unicode61 remove_diacritics 2');") ||
+        !EnsurePerformanceIndexes() ||
         !Exec("PRAGMA user_version=4;") ||
         !Exec("COMMIT;")) {
       Exec("ROLLBACK;");
       Close();
       return false;
     }
+    ReleaseMemory();
     return true;
   }
 
  public:
   void Close() {
+    FinalizeCachedStatements();
     if (db_) {
       sqlite3_close(db_);
       db_ = nullptr;
     }
+  }
+
+  // Release cached SQLite page buffers and passively checkpoint WAL so hidden
+  // idle sessions keep minimal heap memory.
+  void ReleaseMemory() const {
+    if (!db_) return;
+    sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr,
+                              nullptr);
+    sqlite3_db_release_memory(db_);
+    sqlite3_release_memory(INT_MAX);
   }
 
   bool IsOpen() const { return db_ != nullptr; }
@@ -211,6 +260,7 @@ class Storage {
       return out;
     }
     sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(limit));
+    out.reserve(std::min<size_t>(limit, 1024));
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
       FileIndexEntry entry;
@@ -269,16 +319,15 @@ class Storage {
                       "icon_key=excluded.icon_key, last_write_time=excluded.last_write_time, "
                       "size=excluded.size, indexed_at=excluded.indexed_at, root=excluded.root, "
                       "content_state=excluded.content_state, content_bytes=excluded.content_bytes, "
-                      "scan_generation=excluded.scan_generation;")) {
+                      "scan_generation=excluded.scan_generation "
+                      "RETURNING id;")) {
       Exec("ROLLBACK;");
       return false;
     }
-    Statement identity;
     Statement stored;
     Statement removeContent;
     Statement insertContent;
-    if (!identity.Prepare(db_, "SELECT id FROM file_index WHERE path=?;") ||
-        !stored.Prepare(db_,
+    if (!stored.Prepare(db_,
                         "SELECT last_write_time, size, content_state "
                         "FROM file_index WHERE path=?;") ||
         !removeContent.Prepare(
@@ -288,9 +337,10 @@ class Storage {
       Exec("ROLLBACK;");
       return false;
     }
-    std::vector<std::wstring> preserveKeys;
+    std::unordered_set<std::wstring> preserveKeys;
+    preserveKeys.reserve(preserveContentRoots.size());
     for (const auto& root : preserveContentRoots) {
-      preserveKeys.push_back(filesystem_semantics::PathKey(root));
+      preserveKeys.insert(filesystem_semantics::PathKey(root));
     }
 
     for (const auto& entry : entries) {
@@ -301,38 +351,29 @@ class Storage {
           entry.contentUnchanged && StoredContentMatches(stored.get(), entry);
       const bool contentKnown = !entry.contentUnchanged || keepContent;
       sqlite3_reset(stmt.get());
-      sqlite3_clear_bindings(stmt.get());
-      BindText(stmt.get(), 1, entry.path);
-      BindText(stmt.get(), 2, entry.name);
+      BindTextStatic(stmt.get(), 1, entry.path);
+      BindTextStatic(stmt.get(), 2, entry.name);
       sqlite3_bind_int(stmt.get(), 3, entry.isDirectory ? 1 : 0);
-      BindText(stmt.get(), 4, entry.iconKey);
+      BindTextStatic(stmt.get(), 4, entry.iconKey);
       sqlite3_bind_int64(stmt.get(), 5, entry.lastWriteTime);
       sqlite3_bind_int64(stmt.get(), 6, entry.size);
       sqlite3_bind_int64(stmt.get(), 7, entry.indexedAt);
-      BindText(stmt.get(), 8, entry.root);
+      BindTextStatic(stmt.get(), 8, entry.root);
       sqlite3_bind_int(stmt.get(), 9, contentKnown ? entry.contentState : 0);
       sqlite3_bind_int64(stmt.get(), 10, contentKnown ? entry.contentBytes : 0);
       sqlite3_bind_int64(stmt.get(), 11, entry.scanGeneration);
-      if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+      if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+        sqlite3_reset(stmt.get());
         Exec("ROLLBACK;");
         return false;
       }
-      sqlite3_reset(identity.get());
-      sqlite3_clear_bindings(identity.get());
-      BindText(identity.get(), 1, entry.path);
-      if (sqlite3_step(identity.get()) != SQLITE_ROW) {
-        Exec("ROLLBACK;");
-        return false;
-      }
-      const auto rowId = sqlite3_column_int64(identity.get(), 0);
+      const auto rowId = sqlite3_column_int64(stmt.get(), 0);
+      sqlite3_reset(stmt.get());
       const bool preserveContent =
           !preserveKeys.empty() &&
-          std::find(preserveKeys.begin(), preserveKeys.end(),
-                    filesystem_semantics::PathKey(entry.root)) !=
-              preserveKeys.end();
+          preserveKeys.contains(filesystem_semantics::PathKey(entry.root));
       if (preserveContent || keepContent) continue;
       sqlite3_reset(removeContent.get());
-      sqlite3_clear_bindings(removeContent.get());
       sqlite3_bind_int64(removeContent.get(), 1, rowId);
       if (sqlite3_step(removeContent.get()) != SQLITE_DONE) {
         Exec("ROLLBACK;");
@@ -340,9 +381,8 @@ class Storage {
       }
       if (!entry.contentText.empty()) {
         sqlite3_reset(insertContent.get());
-        sqlite3_clear_bindings(insertContent.get());
         sqlite3_bind_int64(insertContent.get(), 1, rowId);
-        BindText(insertContent.get(), 2, entry.contentText);
+        BindTextStatic(insertContent.get(), 2, entry.contentText);
         if (sqlite3_step(insertContent.get()) != SQLITE_DONE) {
           Exec("ROLLBACK;");
           return false;
@@ -351,6 +391,19 @@ class Storage {
     }
 
     if (!entries.empty()) {
+      Statement cleanupFts;
+      if (!cleanupFts.Prepare(
+              db_,
+              "DELETE FROM file_content_fts WHERE rowid IN "
+              "(SELECT id FROM file_index WHERE indexed_at <> ?);")) {
+        Exec("ROLLBACK;");
+        return false;
+      }
+      sqlite3_bind_int64(cleanupFts.get(), 1, entries.front().indexedAt);
+      if (sqlite3_step(cleanupFts.get()) != SQLITE_DONE) {
+        Exec("ROLLBACK;");
+        return false;
+      }
       Statement cleanup;
       if (!cleanup.Prepare(db_, "DELETE FROM file_index WHERE indexed_at <> ?;")) {
         Exec("ROLLBACK;");
@@ -358,10 +411,6 @@ class Storage {
       }
       sqlite3_bind_int64(cleanup.get(), 1, entries.front().indexedAt);
       if (sqlite3_step(cleanup.get()) != SQLITE_DONE) {
-        Exec("ROLLBACK;");
-        return false;
-      }
-      if (!Exec("DELETE FROM file_content_fts WHERE rowid NOT IN (SELECT id FROM file_index);")) {
         Exec("ROLLBACK;");
         return false;
       }
@@ -391,6 +440,7 @@ class Storage {
       Exec("ROLLBACK;");
       return false;
     }
+    ReleaseMemory();
     return true;
   }
 
@@ -449,47 +499,60 @@ class Storage {
     long long id = 0;
     bool pinned = false;
     {
-      Statement read;
-      if (!read.Prepare(db_, "SELECT id,pinned FROM clipboard_history WHERE content_hash=? LIMIT 1;")) {
+      sqlite3_stmt* read = EnsurePersistentStmt(
+          stmtClipFindHash_,
+          "SELECT id,pinned FROM clipboard_history WHERE content_hash=? LIMIT 1;");
+      if (!read) {
         CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
-      BindText(read.get(), 1, *contentHash);
-      const int result = sqlite3_step(read.get());
+      sqlite3_reset(read);
+      BindTextStatic(read, 1, *contentHash);
+      const int result = sqlite3_step(read);
       if (result == SQLITE_ROW) {
-        id = sqlite3_column_int64(read.get(), 0);
-        pinned = sqlite3_column_int(read.get(), 1) != 0;
+        id = sqlite3_column_int64(read, 0);
+        pinned = sqlite3_column_int(read, 1) != 0;
       } else if (result != SQLITE_DONE) {
+        sqlite3_reset(read);
+        sqlite3_clear_bindings(read);
         CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
+      sqlite3_reset(read);
+      sqlite3_clear_bindings(read);
     }
 
     {
-      Statement insert;
-      if (!insert.Prepare(db_,
-                          "INSERT INTO clipboard_history "
-                          "(text, preview, captured_at, content_hash, encrypted, id, pinned) "
-                          "VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
-                          "text=excluded.text,preview=excluded.preview,captured_at=excluded.captured_at;")) {
+      sqlite3_stmt* insert = EnsurePersistentStmt(
+          stmtClipUpsert_,
+          "INSERT INTO clipboard_history "
+          "(text, preview, captured_at, content_hash, encrypted, id, pinned) "
+          "VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+          "text=excluded.text,preview=excluded.preview,captured_at=excluded.captured_at;");
+      if (!insert) {
         CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
-      BindText(insert.get(), 1, *protectedText);
-      BindText(insert.get(), 2, *protectedPreview);
-      sqlite3_bind_int64(insert.get(), 3, capturedAt);
-      BindText(insert.get(), 4, *contentHash);
-      if (id) sqlite3_bind_int64(insert.get(), 5, id);
-      else sqlite3_bind_null(insert.get(), 5);
-      sqlite3_bind_int(insert.get(), 6, pinned ? 1 : 0);
-      if (sqlite3_step(insert.get()) != SQLITE_DONE) {
+      sqlite3_reset(insert);
+      BindTextStatic(insert, 1, *protectedText);
+      BindTextStatic(insert, 2, *protectedPreview);
+      sqlite3_bind_int64(insert, 3, capturedAt);
+      BindTextStatic(insert, 4, *contentHash);
+      if (id) sqlite3_bind_int64(insert, 5, id);
+      else sqlite3_bind_null(insert, 5);
+      sqlite3_bind_int(insert, 6, pinned ? 1 : 0);
+      if (sqlite3_step(insert) != SQLITE_DONE) {
+        sqlite3_reset(insert);
+        sqlite3_clear_bindings(insert);
         CaptureError();
         Exec("ROLLBACK;");
         return std::nullopt;
       }
+      sqlite3_reset(insert);
+      sqlite3_clear_bindings(insert);
     }
 
     if (!id) id = sqlite3_last_insert_rowid(db_);
@@ -598,7 +661,9 @@ class Storage {
   }
 
   bool ClearClipboardHistory() {
-    return Exec("DELETE FROM clipboard_history;");
+    const bool ok = Exec("DELETE FROM clipboard_history;");
+    if (ok) ReleaseMemory();
+    return ok;
   }
 
   bool PruneClipboardHistory(size_t limit, size_t retentionDays = 0) {
@@ -614,20 +679,25 @@ class Storage {
         boundedDays * kSecondsPerDay);
     const long long cutoff = retentionSeconds > now ? 0 : now - retentionSeconds;
 
-    Statement prune;
-    if (!prune.Prepare(db_,
-                       "DELETE FROM clipboard_history WHERE pinned=0 AND ("
-                       "(?<>0 AND captured_at<?) OR id NOT IN ("
-                       "SELECT id FROM clipboard_history WHERE pinned=0 "
-                       "ORDER BY captured_at DESC, id DESC LIMIT ?"
-                       "));")) {
+    sqlite3_stmt* prune = EnsurePersistentStmt(
+        stmtClipPrune_,
+        "DELETE FROM clipboard_history WHERE pinned=0 AND ("
+        "(?<>0 AND captured_at<?) OR id NOT IN ("
+        "SELECT id FROM clipboard_history WHERE pinned=0 "
+        "ORDER BY captured_at DESC, id DESC LIMIT ?"
+        "));");
+    if (!prune) {
       CaptureError();
       return false;
     }
-    sqlite3_bind_int(prune.get(), 1, retentionDays == 0 ? 0 : 1);
-    sqlite3_bind_int64(prune.get(), 2, cutoff);
-    sqlite3_bind_int64(prune.get(), 3, static_cast<sqlite3_int64>(limit));
-    if (sqlite3_step(prune.get()) != SQLITE_DONE) {
+    sqlite3_reset(prune);
+    sqlite3_bind_int(prune, 1, retentionDays == 0 ? 0 : 1);
+    sqlite3_bind_int64(prune, 2, cutoff);
+    sqlite3_bind_int64(prune, 3, static_cast<sqlite3_int64>(limit));
+    const int step = sqlite3_step(prune);
+    sqlite3_reset(prune);
+    sqlite3_clear_bindings(prune);
+    if (step != SQLITE_DONE) {
       CaptureError();
       return false;
     }
@@ -665,6 +735,54 @@ class Storage {
       return -1;
     }
     return sqlite3_column_int(stmt.get(), 0);
+  }
+
+  bool IsWalJournalMode() const {
+    Statement stmt;
+    if (!stmt.Prepare(db_, "PRAGMA journal_mode;")) return false;
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    const auto* mode =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    return mode && (std::string_view(mode) == "wal" || std::string_view(mode) == "WAL");
+  }
+
+  bool HasIndex(const char* name) {
+    Statement stmt;
+    if (!stmt.Prepare(
+            db_,
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1;")) {
+      CaptureError();
+      return false;
+    }
+    sqlite3_bind_text(stmt.get(), 1, name, -1, SQLITE_STATIC);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+  }
+
+  bool EnsurePerformanceIndexes() const {
+    return Exec("CREATE INDEX IF NOT EXISTS idx_clipboard_history_hash "
+                "ON clipboard_history(content_hash);") &&
+           Exec("CREATE INDEX IF NOT EXISTS idx_file_index_name "
+                "ON file_index(name COLLATE NOCASE);");
+  }
+
+  sqlite3_stmt* EnsurePersistentStmt(sqlite3_stmt*& slot, const char* sql) const {
+    if (slot) return slot;
+    if (!db_) return nullptr;
+    if (sqlite3_prepare_v3(db_, sql, -1, SQLITE_PREPARE_PERSISTENT, &slot,
+                           nullptr) != SQLITE_OK) {
+      slot = nullptr;
+      return nullptr;
+    }
+    return slot;
+  }
+
+  void FinalizeCachedStatements() {
+    for (sqlite3_stmt** slot : {&stmtClipFindHash_, &stmtClipUpsert_, &stmtClipPrune_}) {
+      if (*slot) {
+        sqlite3_finalize(*slot);
+        *slot = nullptr;
+      }
+    }
   }
 
   bool HasTable(const char* name) {
@@ -872,44 +990,32 @@ class Storage {
   }
 
   static std::optional<std::wstring> ContentHash(const std::wstring& value) {
-    // CryptHashCertificate is specifically for DER-encoded certificates. It
-    // rejects ordinary clipboard text, which made every first clipboard write
-    // fail before the row could be inserted. Use the CryptoAPI hash provider
-    // for the actual UTF-16 payload instead.
-    if (value.size() > static_cast<size_t>(std::numeric_limits<DWORD>::max()) /
+    if (value.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max()) /
                           sizeof(wchar_t)) {
       return std::nullopt;
     }
+    struct Sha256Alg {
+      BCRYPT_ALG_HANDLE handle = nullptr;
+      Sha256Alg() {
+        if (BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM,
+                                        nullptr, 0) < 0) {
+          handle = nullptr;
+        }
+      }
+      ~Sha256Alg() {
+        if (handle) BCryptCloseAlgorithmProvider(handle, 0);
+      }
+    };
+    static const Sha256Alg sha256;
+    if (!sha256.handle) return std::nullopt;
 
-    HCRYPTPROV provider = 0;
-    if (!CryptAcquireContextW(&provider, nullptr, MS_ENH_RSA_AES_PROV_W,
-                              PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
-        !CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES,
-                              CRYPT_VERIFYCONTEXT)) {
-      return std::nullopt;
-    }
-
-    HCRYPTHASH hashHandle = 0;
-    const bool created = CryptCreateHash(provider, CALG_SHA_256, 0, 0,
-                                         &hashHandle) != FALSE;
-    if (!created) {
-      CryptReleaseContext(provider, 0);
-      return std::nullopt;
-    }
-
-    const DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
-    const bool hashed = CryptHashData(
-        hashHandle, reinterpret_cast<const BYTE*>(value.data()), bytes, 0) !=
-                        FALSE;
     BYTE hash[32]{};
-    DWORD size = static_cast<DWORD>(sizeof(hash));
-    const bool read = hashed &&
-                      CryptGetHashParam(hashHandle, HP_HASHVAL, hash, &size,
-                                        0) != FALSE &&
-                      size == sizeof(hash);
-    CryptDestroyHash(hashHandle);
-    CryptReleaseContext(provider, 0);
-    if (!read) {
+    const ULONG bytes = static_cast<ULONG>(value.size() * sizeof(wchar_t));
+    BYTE dummy = 0;
+    PUCHAR input = bytes > 0 ? reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(value.data()))
+                             : &dummy;
+    if (BCryptHash(sha256.handle, nullptr, 0, input, bytes, hash,
+                   static_cast<ULONG>(sizeof(hash))) < 0) {
       return std::nullopt;
     }
     static constexpr wchar_t kHex[] = L"0123456789abcdef";
@@ -944,6 +1050,10 @@ class Storage {
     sqlite3_bind_text16(stmt, index, value.c_str(), static_cast<int>(value.size() * sizeof(wchar_t)), SQLITE_TRANSIENT);
   }
 
+  static void BindTextStatic(sqlite3_stmt* stmt, int index, const std::wstring& value) {
+    sqlite3_bind_text16(stmt, index, value.c_str(), static_cast<int>(value.size() * sizeof(wchar_t)), SQLITE_STATIC);
+  }
+
   static std::wstring ColumnText(sqlite3_stmt* stmt, int index) {
     const auto* raw = static_cast<const wchar_t*>(sqlite3_column_text16(stmt, index));
     const int bytes = sqlite3_column_bytes16(stmt, index);
@@ -955,8 +1065,7 @@ class Storage {
   static bool StoredContentMatches(sqlite3_stmt* stored,
                                    const FileIndexEntry& entry) {
     sqlite3_reset(stored);
-    sqlite3_clear_bindings(stored);
-    BindText(stored, 1, entry.path);
+    BindTextStatic(stored, 1, entry.path);
     const bool matches =
         sqlite3_step(stored) == SQLITE_ROW &&
         sqlite3_column_int64(stored, 0) == entry.lastWriteTime &&
@@ -967,6 +1076,9 @@ class Storage {
   }
 
   sqlite3* db_ = nullptr;
+  mutable sqlite3_stmt* stmtClipFindHash_ = nullptr;
+  mutable sqlite3_stmt* stmtClipUpsert_ = nullptr;
+  mutable sqlite3_stmt* stmtClipPrune_ = nullptr;
   mutable StorageError lastError_;
   bool recoveredFromCorruption_ = false;
   std::filesystem::path quarantinedPath_;

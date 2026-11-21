@@ -42,13 +42,12 @@ class ExtensionManager {
   ExtensionManager& operator=(const ExtensionManager&) = delete;
 
   void Initialize(std::filesystem::path dataDir, std::filesystem::path exeDir, HWND notifyHwnd, UINT notifyMessage) {
-    stop_.store(false);
+    stop_.store(false, std::memory_order_release);
     dataDir_ = std::move(dataDir);
     exeDir_ = std::move(exeDir);
     notifyHwnd_ = notifyHwnd;
     notifyMessage_ = notifyMessage;
     Reload();
-    StartQueryWorker();
   }
 
   void SetInteractive(bool interactive) {
@@ -67,16 +66,18 @@ class ExtensionManager {
   }
 
   void Shutdown() {
+    std::jthread worker;
     {
       std::lock_guard lock(queryMutex_);
-      stop_.store(true);
+      stop_.store(true, std::memory_order_release);
+      hasPlugins_.store(false, std::memory_order_release);
       pendingQuery_.reset();
+      if (queryThread_.joinable()) queryThread_.request_stop();
+      worker = std::move(queryThread_);
+      queryWorkerActive_ = false;
     }
     queryCv_.notify_all();
-    if (queryThread_.joinable()) {
-      queryThread_.request_stop();
-      queryThread_.join();
-    }
+    if (worker.joinable()) worker.join();
 
     std::lock_guard pluginsLock(pluginsMutex_);
     for (const auto& plugin : plugins_) {
@@ -113,7 +114,10 @@ class ExtensionManager {
       std::lock_guard pluginsLock(pluginsMutex_);
       plugins_ = std::move(loaded);
     }
-    Log(L"Loaded " + std::to_wstring(loadedCount) + L" extension(s)");
+    hasPlugins_.store(loadedCount > 0, std::memory_order_release);
+    if (loadedCount > 0 || !discovery.errors.empty()) {
+      Log(L"Loaded " + std::to_wstring(loadedCount) + L" extension(s)");
+    }
 
     {
       std::lock_guard cacheLock(cacheMutex_);
@@ -122,14 +126,18 @@ class ExtensionManager {
   }
 
   void RequestQuery(std::wstring query, unsigned long long generation) {
+    if (!hasPlugins_.load(std::memory_order_acquire)) return;
     if (TrimWide(query).empty()) return;
     {
       std::lock_guard cacheLock(cacheMutex_);
       if (cache_.contains(query)) return;
     }
 
+    std::jthread finishedWorker;
+    bool notify = false;
     {
       std::lock_guard queryLock(queryMutex_);
+      if (stop_.load(std::memory_order_acquire)) return;
       if (runningQuery_ == query) {
         runningGeneration_ = generation;
         latestRequestedGeneration_ = generation;
@@ -143,11 +151,19 @@ class ExtensionManager {
       pendingQuery_ = PendingQuery{std::move(query), generation};
       latestRequestedGeneration_ = generation;
       lastQueryRequestTick_.store(GetTickCount64(), std::memory_order_release);
+      if (!queryWorkerActive_) {
+        if (queryThread_.joinable()) finishedWorker = std::move(queryThread_);
+        StartQueryWorkerLocked();
+      } else {
+        notify = true;
+      }
     }
-    queryCv_.notify_one();
+    if (notify) queryCv_.notify_one();
+    if (finishedWorker.joinable()) finishedWorker.join();
   }
 
   std::vector<QueryResultItem> CachedResultsFor(const std::wstring& query) const {
+    if (!hasPlugins_.load(std::memory_order_acquire)) return {};
     std::lock_guard cacheLock(cacheMutex_);
     if (const auto found = cache_.find(query); found != cache_.end()) return found->second;
     return {};
@@ -240,18 +256,26 @@ class ExtensionManager {
     return process && WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
   }
 
-  void StartQueryWorker() {
-    if (queryThread_.joinable()) return;
+  void StartQueryWorkerLocked() {
+    queryWorkerActive_ = true;
     queryThread_ = std::jthread([this](std::stop_token stopToken) {
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      constexpr auto kIdleTimeout = std::chrono::seconds(30);
       for (;;) {
         PendingQuery pending;
         {
           std::unique_lock lock(queryMutex_);
-          queryCv_.wait(lock, [&] {
+          const bool woke = queryCv_.wait_for(lock, kIdleTimeout, [&] {
             return pendingQuery_.has_value() || stop_.load() || stopToken.stop_requested();
           });
-          if (stop_.load() || stopToken.stop_requested()) return;
+          if (stop_.load() || stopToken.stop_requested()) {
+            queryWorkerActive_ = false;
+            return;
+          }
+          if (!woke && !pendingQuery_.has_value()) {
+            queryWorkerActive_ = false;
+            return;
+          }
           pending = std::move(*pendingQuery_);
           pendingQuery_.reset();
           runningQuery_ = pending.query;
@@ -300,54 +324,62 @@ class ExtensionManager {
       std::lock_guard pluginsLock(pluginsMutex_);
       plugins = plugins_;
     }
+    if (plugins.empty()) return results;
 
     std::mutex resultsMutex;
     std::atomic<size_t> nextPlugin = 0;
-    std::vector<std::jthread> workers;
     const size_t workerCount = std::min(
         queryConcurrencyLimit_.load(std::memory_order_acquire),
         plugins.size());
-    workers.reserve(workerCount);
-    for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
-      workers.emplace_back([&](std::stop_token workerStop) {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        try {
-          for (;;) {
-            const size_t pluginIndex =
-                nextPlugin.fetch_add(1, std::memory_order_relaxed);
-            if (pluginIndex >= plugins.size()) return;
-            const auto& plugin = plugins[pluginIndex];
-            if (workerStop.stop_requested() || stopToken.stop_requested() ||
-                stop_.load() || !plugin->available.load()) {
-              continue;
-            }
-
-            const auto response = Exchange(
-                *plugin,
-                BuildQueryRequestJson(plugin->manifest, dataDir_, query,
-                                      kDefaultQueryLimit),
-                std::chrono::milliseconds(250));
-            if (!response) continue;
-
-            auto parsed = ParseQueryResponse(*response, kDefaultQueryLimit);
-            if (!parsed) {
-              Log(plugin->manifest.id + L": invalid query response");
-              continue;
-            }
-            std::lock_guard resultsLock(resultsMutex);
-            for (auto& item : parsed->items) {
-              item.pluginId = plugin->manifest.id;
-              item.pluginName = plugin->manifest.name;
-              results.push_back(std::move(item));
-            }
+    auto runWorker = [&](std::stop_token workerStop) {
+      try {
+        for (;;) {
+          const size_t pluginIndex =
+              nextPlugin.fetch_add(1, std::memory_order_relaxed);
+          if (pluginIndex >= plugins.size()) return;
+          const auto& plugin = plugins[pluginIndex];
+          if (workerStop.stop_requested() || stopToken.stop_requested() ||
+              stop_.load() || !plugin->available.load()) {
+            continue;
           }
-        } catch (...) {
-          Log(L"plugin query worker failed; remaining plugins were skipped");
+
+          const auto response = Exchange(
+              *plugin,
+              BuildQueryRequestJson(plugin->manifest, dataDir_, query,
+                                    kDefaultQueryLimit),
+              std::chrono::milliseconds(250));
+          if (!response) continue;
+
+          auto parsed = ParseQueryResponse(*response, kDefaultQueryLimit);
+          if (!parsed) {
+            Log(plugin->manifest.id + L": invalid query response");
+            continue;
+          }
+          std::lock_guard resultsLock(resultsMutex);
+          for (auto& item : parsed->items) {
+            item.pluginId = plugin->manifest.id;
+            item.pluginName = plugin->manifest.name;
+            results.push_back(std::move(item));
+          }
         }
-      });
-    }
-    for (auto& worker : workers) {
-      if (worker.joinable()) worker.join();
+      } catch (...) {
+        Log(L"plugin query worker failed; remaining plugins were skipped");
+      }
+    };
+    if (workerCount <= 1) {
+      runWorker(stopToken);
+    } else {
+      std::vector<std::jthread> workers;
+      workers.reserve(workerCount);
+      for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
+        workers.emplace_back([&](std::stop_token workerStop) {
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+          runWorker(workerStop);
+        });
+      }
+      for (auto& worker : workers) {
+        if (worker.joinable()) worker.join();
+      }
     }
 
     std::sort(results.begin(), results.end(), [](const QueryResultItem& a, const QueryResultItem& b) {
@@ -499,6 +531,7 @@ class ExtensionManager {
   static ReadResult ReadLine(Plugin& plugin, std::chrono::steady_clock::time_point deadline,
                              std::string& line) {
     std::string buffer;
+    int pollMs = 1;
     for (;;) {
       DWORD available = 0;
       if (!PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &available, nullptr)) {
@@ -527,7 +560,8 @@ class ExtensionManager {
         return ReadResult::Exited;
       }
       if (std::chrono::steady_clock::now() >= deadline) return ReadResult::TimedOut;
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(pollMs));
+      if (pollMs < 5) ++pollMs;
     }
   }
 
@@ -686,6 +720,8 @@ class ExtensionManager {
   std::wstring runningQuery_;
   unsigned long long runningGeneration_ = 0;
   unsigned long long latestRequestedGeneration_ = 0;
+  bool queryWorkerActive_ = false;
+  std::atomic<bool> hasPlugins_ = false;
   std::atomic<bool> stop_ = false;
   std::atomic<bool> interactive_ = false;
   std::atomic<std::size_t> queryConcurrencyLimit_ = 2;

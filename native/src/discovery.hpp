@@ -3,10 +3,12 @@
 // Pure app-discovery helpers (name cleanup, skip filters, keyword derivation),
 // extracted from main.cpp so they can be unit-tested.
 
+#include <algorithm>
 #include <cwctype>
 #include <filesystem>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core.hpp"
@@ -74,15 +76,30 @@ inline std::wstring CleanName(const std::wstring& value) {
 
 inline bool IsHostExecutable(const std::wstring& path) {
   if (path.empty()) return false;
-  std::filesystem::path p(path);
-  const std::wstring fn = Lower(p.filename().wstring());
-  static const std::set<std::wstring> hosts = {
-    L"cmd.exe", L"powershell.exe", L"pwsh.exe", L"msiexec.exe",
-    L"cscript.exe", L"wscript.exe", L"python.exe", L"pythonw.exe",
-    L"javaw.exe", L"java.exe", L"rundll32.exe", L"explorer.exe",
-    L"bash.exe", L"wsl.exe", L"onenote.exe"
+  const std::size_t slash = path.find_last_of(L"\\/");
+  const std::wstring_view name =
+      slash == std::wstring::npos ? std::wstring_view(path)
+                                  : std::wstring_view(path).substr(slash + 1);
+  if (name.size() < 7 || name.size() > 14) return false;
+  wchar_t lower[16];
+  for (std::size_t i = 0; i < name.size(); ++i) {
+    const wchar_t ch = name[i];
+    if (ch >= L'A' && ch <= L'Z') {
+      lower[i] = static_cast<wchar_t>(ch - L'A' + L'a');
+    } else if (ch < 128) {
+      lower[i] = ch;
+    } else {
+      return false;
+    }
+  }
+  const std::wstring_view fn(lower, name.size());
+  static constexpr std::wstring_view kHosts[] = {
+      L"bash.exe", L"cmd.exe", L"cscript.exe", L"explorer.exe",
+      L"java.exe", L"javaw.exe", L"msiexec.exe", L"onenote.exe",
+      L"powershell.exe", L"pwsh.exe", L"python.exe", L"pythonw.exe",
+      L"rundll32.exe", L"wscript.exe", L"wsl.exe",
   };
-  return hosts.contains(fn);
+  return std::binary_search(std::begin(kHosts), std::end(kHosts), fn);
 }
 
 inline bool SupportsAdminLaunchTarget(const std::wstring& target) {
@@ -136,11 +153,14 @@ inline std::wstring DisambiguateShortcutName(const std::wstring& stemName, const
   if (parent.empty()) return stemName;
 
   const std::wstring lowerParent = Lower(parent);
-  static const std::set<std::wstring> ignoreParents = {
-    L"programs", L"start menu", L"desktop", L"commonprograms",
-    L"public", L"accessories", L"system tools", L"windows tools"
+  static constexpr std::wstring_view kIgnoreParents[] = {
+      L"accessories", L"commonprograms", L"desktop", L"programs",
+      L"public", L"start menu", L"system tools", L"windows tools",
   };
-  if (ignoreParents.contains(lowerParent)) return stemName;
+  if (std::binary_search(std::begin(kIgnoreParents), std::end(kIgnoreParents),
+                         std::wstring_view(lowerParent))) {
+    return stemName;
+  }
 
   const std::wstring lowerStem = Lower(stemName);
   if (lowerParent.rfind(lowerStem + L" ", 0) == 0) {
@@ -235,28 +255,43 @@ inline std::vector<std::wstring> KeywordsFor(const std::wstring& name, const std
 }
 
 inline bool IsSystemEssentialName(const std::wstring& name) {
-  static const std::set<std::wstring> names = {
-    L"terminal", L"windows terminal", L"command prompt", L"windows powershell",
-    L"powershell 7 (x64)", L"settings", L"calculator",
+  static constexpr std::wstring_view kNames[] = {
+      L"calculator", L"command prompt", L"powershell 7 (x64)",
+      L"settings", L"terminal", L"windows powershell", L"windows terminal",
   };
-  return names.contains(NameKey(name));
+  const std::wstring key = NameKey(name);
+  return std::binary_search(std::begin(kNames), std::end(kNames),
+                            std::wstring_view(key));
 }
 
 inline std::wstring CanonicalPathKey(const std::wstring& rawPath) {
   if (rawPath.empty()) return {};
-  std::wstring expandedPath = rawPath;
+  std::wstring expandedPath;
+  const std::wstring* pathRef = &rawPath;
   if (rawPath.find(L'%') != std::wstring::npos) {
-    wchar_t buf[32768]{};
-    if (ExpandEnvironmentStringsW(rawPath.c_str(), buf, static_cast<DWORD>(std::size(buf))) > 0) {
-      expandedPath = buf;
+    wchar_t stackBuf[512];
+    const DWORD needed = ExpandEnvironmentStringsW(
+        rawPath.c_str(), stackBuf, static_cast<DWORD>(std::size(stackBuf)));
+    if (needed > 0 && needed <= std::size(stackBuf)) {
+      expandedPath.assign(stackBuf, needed - 1);
+      pathRef = &expandedPath;
+    } else if (needed > std::size(stackBuf)) {
+      expandedPath.resize(needed);
+      const DWORD written = ExpandEnvironmentStringsW(
+          rawPath.c_str(), expandedPath.data(), needed);
+      if (written > 0 && written <= needed) {
+        expandedPath.resize(written - 1);
+        pathRef = &expandedPath;
+      }
     }
   }
-  const bool isFsPath = (expandedPath.size() >= 2 && expandedPath[1] == L':') ||
-                        (expandedPath.size() >= 2 && (expandedPath[0] == L'\\' || expandedPath[0] == L'/'));
+  const std::wstring& resolved = *pathRef;
+  const bool isFsPath = (resolved.size() >= 2 && resolved[1] == L':') ||
+                        (resolved.size() >= 2 && (resolved[0] == L'\\' || resolved[0] == L'/'));
   if (!isFsPath) {
-    return Lower(expandedPath);
+    return Lower(resolved);
   }
-  std::filesystem::path path(expandedPath);
+  std::filesystem::path path(resolved);
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(path, ec);
   std::wstring value = Lower((ec ? path.lexically_normal() : canonical).wstring());
@@ -295,42 +330,95 @@ inline bool StartsOwnExecutable(const app::AppEntry& entry) {
          !IsHostExecutable(entry.targetPath) && entry.args.empty();
 }
 
+inline bool EqualsInsensitiveSimple(std::wstring_view left, std::wstring_view right) {
+  if (left.size() != right.size()) return false;
+  for (std::size_t i = 0; i < left.size(); ++i) {
+    const wchar_t a = left[i];
+    const wchar_t b = right[i];
+    if (a == b) continue;
+    if (std::towlower(a) != std::towlower(b)) return false;
+  }
+  return true;
+}
+
+inline bool IsPathLikeKey(std::wstring_view value) {
+  return value.find(L'%') != std::wstring_view::npos ||
+         (value.size() >= 2 && (value[1] == L':' || value[0] == L'\\' || value[0] == L'/'));
+}
+
+inline bool SameCanonicalKey(const std::wstring& left, const std::wstring& right) {
+  if (left == right) return true;
+  if (!IsPathLikeKey(left) && !IsPathLikeKey(right)) {
+    return EqualsInsensitiveSimple(left, right);
+  }
+  return CanonicalPathKey(left) == CanonicalPathKey(right);
+}
+
 inline bool ShouldMergeApps(const app::AppEntry& existing, const app::AppEntry& incoming) {
   if (existing.id.empty() || incoming.id.empty()) return false;
 
   // 1. Direct ID match
-  if (CanonicalPathKey(existing.id) == CanonicalPathKey(incoming.id)) return true;
+  if (SameCanonicalKey(existing.id, incoming.id)) return true;
 
   // 2. AUMID match
   if (!existing.appUserModelId.empty() && !incoming.appUserModelId.empty()) {
-    if (Lower(existing.appUserModelId) == Lower(incoming.appUserModelId)) return true;
+    if (EqualsInsensitiveSimple(existing.appUserModelId, incoming.appUserModelId)) return true;
   }
 
   // 3. Launch target match. Launchers start many games through one
   // executable (steam.exe, Battle.net.exe), so the arguments must match too.
   if (!existing.launchTarget.empty() && !incoming.launchTarget.empty() &&
       existing.args == incoming.args) {
-    if (CanonicalPathKey(existing.launchTarget) == CanonicalPathKey(incoming.launchTarget)) return true;
+    if (SameCanonicalKey(existing.launchTarget, incoming.launchTarget)) return true;
   }
 
   // 4. Game install path match
   if (incoming.isGame && !incoming.path.empty() && existing.isGame && !existing.path.empty()) {
-    if (CanonicalPathKey(existing.path) == CanonicalPathKey(incoming.path)) return true;
+    if (SameCanonicalKey(existing.path, incoming.path)) return true;
   }
+
+  // Cache target-path checks across steps 5 and 6 to avoid repeated
+  // weakly_canonical() filesystem calls on the same pair.
+  bool computedTargetMatch = false;
+  bool sameTarget = false;
+  bool computedExistingHost = false;
+  bool existingHost = false;
+  const auto getExistingHost = [&] {
+    if (!computedExistingHost) {
+      existingHost = IsHostExecutable(existing.targetPath);
+      computedExistingHost = true;
+    }
+    return existingHost;
+  };
+  const auto getSameTarget = [&] {
+    if (!computedTargetMatch) {
+      sameTarget = SameCanonicalKey(existing.targetPath, incoming.targetPath);
+      computedTargetMatch = true;
+    }
+    return sameTarget;
+  };
+
+  bool computedNames = false;
+  bool sameName = false;
+  const auto getSameName = [&] {
+    if (!computedNames) {
+      sameName = !existing.name.empty() && !incoming.name.empty() &&
+                 NameKey(existing.name) == NameKey(incoming.name);
+      computedNames = true;
+    }
+    return sameName;
+  };
 
   // 5. Target executable match (for non-host executables)
   if (!existing.targetPath.empty() && !incoming.targetPath.empty()) {
-    if (CanonicalPathKey(existing.targetPath) == CanonicalPathKey(incoming.targetPath)) {
-      if (!IsHostExecutable(existing.targetPath)) {
-        if (NameKey(existing.name) == NameKey(incoming.name)) return true;
-        if (existing.args.empty() && incoming.args.empty()) return true;
-      }
+    if (getSameTarget() && !getExistingHost()) {
+      if (getSameName()) return true;
+      if (existing.args.empty() && incoming.args.empty()) return true;
     }
   }
 
   // 6. Name match
-  if (!existing.name.empty() && !incoming.name.empty() &&
-      NameKey(existing.name) == NameKey(incoming.name)) {
+  if (getSameName()) {
     // A provider knows the install folder while a shortcut knows the
     // executable, which may be a launcher inside that folder.
     if (StartsInsideInstall(existing, incoming) ||
@@ -345,8 +433,8 @@ inline bool ShouldMergeApps(const app::AppEntry& existing, const app::AppEntry& 
     }
     // If both specify different concrete target executables, they are distinct apps (unless host)
     if (!existing.targetPath.empty() && !incoming.targetPath.empty() &&
-        !IsHostExecutable(existing.targetPath) && !IsHostExecutable(incoming.targetPath)) {
-      return CanonicalPathKey(existing.targetPath) == CanonicalPathKey(incoming.targetPath);
+        !getExistingHost() && !IsHostExecutable(incoming.targetPath)) {
+      return getSameTarget();
     }
     // An ordinary app that starts its own executable from outside a game's
     // install folder only shares the game's name. Shortcuts that pass

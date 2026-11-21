@@ -16,6 +16,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -57,114 +58,249 @@ inline std::wstring FormatNumber(double value) {
 // A measurement unit identified by its category and factor to the category's
 // base unit. Temperature uses a dedicated code instead of a linear factor.
 struct Unit {
-  std::wstring category;
+  std::wstring_view category;
   double factor = 1.0;
-  std::wstring tempCode;  // non-empty only for temperature units
+  std::wstring_view tempCode;  // non-empty only for temperature units
 };
 
-inline const std::map<std::wstring, Unit>& UnitTable() {
-  static const std::map<std::wstring, Unit> table = [] {
-    std::map<std::wstring, Unit> t;
-    auto add = [&](std::initializer_list<const wchar_t*> names, const wchar_t* cat, double factor) {
-      for (const auto* n : names) t[n] = Unit{cat, factor, L""};
-    };
-    // Length (base: meter)
-    add({L"m", L"meter", L"meters", L"metre", L"metres"}, L"length", 1.0);
-    add({L"km", L"kilometer", L"kilometers", L"kilometre"}, L"length", 1000.0);
-    add({L"cm", L"centimeter", L"centimeters"}, L"length", 0.01);
-    add({L"mm", L"millimeter", L"millimeters"}, L"length", 0.001);
-    add({L"mi", L"mile", L"miles"}, L"length", 1609.344);
-    add({L"yd", L"yard", L"yards"}, L"length", 0.9144);
-    add({L"ft", L"foot", L"feet"}, L"length", 0.3048);
-    // "in" is also a connector; TryConvert only reads it as a unit where a
-    // unit belongs ("5 in to cm").
-    add({L"in", L"inch", L"inches"}, L"length", 0.0254);
-    add({L"nmi", L"nauticalmile"}, L"length", 1852.0);
-    // Mass (base: gram)
-    add({L"g", L"gram", L"grams"}, L"mass", 1.0);
-    add({L"kg", L"kilogram", L"kilograms"}, L"mass", 1000.0);
-    add({L"mg", L"milligram", L"milligrams"}, L"mass", 0.001);
-    add({L"lb", L"lbs", L"pound", L"pounds"}, L"mass", 453.59237);
-    add({L"oz", L"ounce", L"ounces"}, L"mass", 28.349523125);
-    add({L"t", L"tonne", L"tonnes", L"ton"}, L"mass", 1000000.0);
-    add({L"st", L"stone", L"stones"}, L"mass", 6350.29318);
-    // Temperature (special handling via tempCode)
-    // The degree sign (U+00B0) and its common look-alike, the masculine
-    // ordinal (U+00BA), may prefix C and F ("100\u00B0F to C").
-    for (const auto* name : {L"c", L"celsius", L"\u00B0c", L"\u00BAc"}) t[name] = Unit{L"temp", 0.0, L"c"};
-    for (const auto* name : {L"f", L"fahrenheit", L"\u00B0f", L"\u00BAf"}) t[name] = Unit{L"temp", 0.0, L"f"};
-    t[L"k"] = t[L"kelvin"] = Unit{L"temp", 0.0, L"k"};
-    // Data (base: byte, decimal SI plus binary IEC)
-    add({L"b", L"byte", L"bytes"}, L"data", 1.0);
-    add({L"kb", L"kilobyte", L"kilobytes"}, L"data", 1000.0);
-    add({L"mb", L"megabyte", L"megabytes"}, L"data", 1000000.0);
-    add({L"gb", L"gigabyte", L"gigabytes"}, L"data", 1000000000.0);
-    add({L"tb", L"terabyte", L"terabytes"}, L"data", 1000000000000.0);
-    add({L"kib"}, L"data", 1024.0);
-    add({L"mib"}, L"data", 1048576.0);
-    add({L"gib"}, L"data", 1073741824.0);
-    // Data rate (base: bit per second)
-    add({L"bps"}, L"data-rate", 1.0);
-    add({L"kbps"}, L"data-rate", 1000.0);
-    add({L"mbps"}, L"data-rate", 1000000.0);
-    add({L"gbps"}, L"data-rate", 1000000000.0);
-    // Time (base: second)
-    add({L"s", L"sec", L"secs", L"second", L"seconds"}, L"time", 1.0);
-    add({L"ms", L"millisecond", L"milliseconds"}, L"time", 0.001);
-    add({L"min", L"mins", L"minute", L"minutes"}, L"time", 60.0);
-    add({L"h", L"hr", L"hrs", L"hour", L"hours"}, L"time", 3600.0);
-    add({L"day", L"days"}, L"time", 86400.0);
-    add({L"week", L"weeks"}, L"time", 604800.0);
-    // Speed (base: meter/second)
-    add({L"m/s", L"mps"}, L"speed", 1.0);
-    add({L"km/h", L"kmh", L"kph", L"kmph"}, L"speed", 1000.0 / 3600.0);
-    add({L"mph", L"mi/h"}, L"speed", 0.44704);
-    add({L"kn", L"knot", L"knots"}, L"speed", 1852.0 / 3600.0);
-    // Volume (base: liter)
-    add({L"l", L"liter", L"liters", L"litre", L"litres"}, L"volume", 1.0);
-    add({L"ml", L"milliliter", L"milliliters"}, L"volume", 0.001);
-    add({L"gal", L"gallon", L"gallons"}, L"volume", 3.785411784);
-    add({L"qt", L"quart", L"quarts"}, L"volume", 0.946352946);
-    add({L"pt", L"pint", L"pints"}, L"volume", 0.473176473);
-    add({L"cup", L"cups"}, L"volume", 0.2365882365);
-    add({L"floz"}, L"volume", 0.0295735296);
-    // Area (base: square meter)
-    add({L"sqm", L"m2"}, L"area", 1.0);
-    add({L"sqkm", L"km2"}, L"area", 1000000.0);
-    add({L"sqft", L"ft2"}, L"area", 0.09290304);
-    add({L"sqmi", L"mi2"}, L"area", 2589988.110336);
-    add({L"acre", L"acres"}, L"area", 4046.8564224);
-    add({L"hectare", L"hectares", L"ha"}, L"area", 10000.0);
-    // Angle (base: degree)
-    add({L"deg", L"degree", L"degrees"}, L"angle", 1.0);
-    add({L"rad", L"radian", L"radians"}, L"angle", 57.2957795130823);
-    // Power (base: watt)
-    add({L"w", L"watt", L"watts"}, L"power", 1.0);
-    add({L"kw", L"kilowatt", L"kilowatts"}, L"power", 1000.0);
-    add({L"hp", L"horsepower"}, L"power", 745.699872);
-    // Energy (base: joule)
-    add({L"j", L"joule", L"joules"}, L"energy", 1.0);
-    add({L"kj", L"kilojoule", L"kilojoules"}, L"energy", 1000.0);
-    add({L"wh", L"watt-hour", L"watt-hours", L"watthour", L"watthours"}, L"energy", 3600.0);
-    add({L"kwh", L"kilowatt-hour", L"kilowatt-hours", L"kilowatthour", L"kilowatthours"}, L"energy", 3600000.0);
-    return t;
-  }();
-  return table;
+namespace detail {
+
+struct UnitEntry {
+  std::wstring_view name;
+  Unit unit;
+};
+
+inline constexpr UnitEntry kUnits[] = {
+    {L"acre", {L"area", 4046.8564224, L""}},
+    {L"acres", {L"area", 4046.8564224, L""}},
+    {L"b", {L"data", 1.0, L""}},
+    {L"bps", {L"data-rate", 1.0, L""}},
+    {L"byte", {L"data", 1.0, L""}},
+    {L"bytes", {L"data", 1.0, L""}},
+    {L"c", {L"temp", 0.0, L"c"}},
+    {L"celsius", {L"temp", 0.0, L"c"}},
+    {L"centimeter", {L"length", 0.01, L""}},
+    {L"centimeters", {L"length", 0.01, L""}},
+    {L"cm", {L"length", 0.01, L""}},
+    {L"cup", {L"volume", 0.2365882365, L""}},
+    {L"cups", {L"volume", 0.2365882365, L""}},
+    {L"day", {L"time", 86400.0, L""}},
+    {L"days", {L"time", 86400.0, L""}},
+    {L"deg", {L"angle", 1.0, L""}},
+    {L"degree", {L"angle", 1.0, L""}},
+    {L"degrees", {L"angle", 1.0, L""}},
+    {L"f", {L"temp", 0.0, L"f"}},
+    {L"fahrenheit", {L"temp", 0.0, L"f"}},
+    {L"feet", {L"length", 0.3048, L""}},
+    {L"floz", {L"volume", 0.0295735296, L""}},
+    {L"foot", {L"length", 0.3048, L""}},
+    {L"ft", {L"length", 0.3048, L""}},
+    {L"ft2", {L"area", 0.09290304, L""}},
+    {L"g", {L"mass", 1.0, L""}},
+    {L"gal", {L"volume", 3.785411784, L""}},
+    {L"gallon", {L"volume", 3.785411784, L""}},
+    {L"gallons", {L"volume", 3.785411784, L""}},
+    {L"gb", {L"data", 1000000000.0, L""}},
+    {L"gbps", {L"data-rate", 1000000000.0, L""}},
+    {L"gib", {L"data", 1073741824.0, L""}},
+    {L"gigabyte", {L"data", 1000000000.0, L""}},
+    {L"gigabytes", {L"data", 1000000000.0, L""}},
+    {L"gram", {L"mass", 1.0, L""}},
+    {L"grams", {L"mass", 1.0, L""}},
+    {L"h", {L"time", 3600.0, L""}},
+    {L"ha", {L"area", 10000.0, L""}},
+    {L"hectare", {L"area", 10000.0, L""}},
+    {L"hectares", {L"area", 10000.0, L""}},
+    {L"horsepower", {L"power", 745.699872, L""}},
+    {L"hour", {L"time", 3600.0, L""}},
+    {L"hours", {L"time", 3600.0, L""}},
+    {L"hp", {L"power", 745.699872, L""}},
+    {L"hr", {L"time", 3600.0, L""}},
+    {L"hrs", {L"time", 3600.0, L""}},
+    {L"in", {L"length", 0.0254, L""}},
+    {L"inch", {L"length", 0.0254, L""}},
+    {L"inches", {L"length", 0.0254, L""}},
+    {L"j", {L"energy", 1.0, L""}},
+    {L"joule", {L"energy", 1.0, L""}},
+    {L"joules", {L"energy", 1.0, L""}},
+    {L"k", {L"temp", 0.0, L"k"}},
+    {L"kb", {L"data", 1000.0, L""}},
+    {L"kbps", {L"data-rate", 1000.0, L""}},
+    {L"kelvin", {L"temp", 0.0, L"k"}},
+    {L"kg", {L"mass", 1000.0, L""}},
+    {L"kib", {L"data", 1024.0, L""}},
+    {L"kilobyte", {L"data", 1000.0, L""}},
+    {L"kilobytes", {L"data", 1000.0, L""}},
+    {L"kilogram", {L"mass", 1000.0, L""}},
+    {L"kilograms", {L"mass", 1000.0, L""}},
+    {L"kilojoule", {L"energy", 1000.0, L""}},
+    {L"kilojoules", {L"energy", 1000.0, L""}},
+    {L"kilometer", {L"length", 1000.0, L""}},
+    {L"kilometers", {L"length", 1000.0, L""}},
+    {L"kilometre", {L"length", 1000.0, L""}},
+    {L"kilowatt", {L"power", 1000.0, L""}},
+    {L"kilowatt-hour", {L"energy", 3600000.0, L""}},
+    {L"kilowatt-hours", {L"energy", 3600000.0, L""}},
+    {L"kilowatthour", {L"energy", 3600000.0, L""}},
+    {L"kilowatthours", {L"energy", 3600000.0, L""}},
+    {L"kilowatts", {L"power", 1000.0, L""}},
+    {L"kj", {L"energy", 1000.0, L""}},
+    {L"km", {L"length", 1000.0, L""}},
+    {L"km/h", {L"speed", 1000.0 / 3600.0, L""}},
+    {L"km2", {L"area", 1000000.0, L""}},
+    {L"kmh", {L"speed", 1000.0 / 3600.0, L""}},
+    {L"kmph", {L"speed", 1000.0 / 3600.0, L""}},
+    {L"kn", {L"speed", 1852.0 / 3600.0, L""}},
+    {L"knot", {L"speed", 1852.0 / 3600.0, L""}},
+    {L"knots", {L"speed", 1852.0 / 3600.0, L""}},
+    {L"kph", {L"speed", 1000.0 / 3600.0, L""}},
+    {L"kw", {L"power", 1000.0, L""}},
+    {L"kwh", {L"energy", 3600000.0, L""}},
+    {L"l", {L"volume", 1.0, L""}},
+    {L"lb", {L"mass", 453.59237, L""}},
+    {L"lbs", {L"mass", 453.59237, L""}},
+    {L"liter", {L"volume", 1.0, L""}},
+    {L"liters", {L"volume", 1.0, L""}},
+    {L"litre", {L"volume", 1.0, L""}},
+    {L"litres", {L"volume", 1.0, L""}},
+    {L"m", {L"length", 1.0, L""}},
+    {L"m/s", {L"speed", 1.0, L""}},
+    {L"m2", {L"area", 1.0, L""}},
+    {L"mb", {L"data", 1000000.0, L""}},
+    {L"mbps", {L"data-rate", 1000000.0, L""}},
+    {L"megabyte", {L"data", 1000000.0, L""}},
+    {L"megabytes", {L"data", 1000000.0, L""}},
+    {L"meter", {L"length", 1.0, L""}},
+    {L"meters", {L"length", 1.0, L""}},
+    {L"metre", {L"length", 1.0, L""}},
+    {L"metres", {L"length", 1.0, L""}},
+    {L"mg", {L"mass", 0.001, L""}},
+    {L"mi", {L"length", 1609.344, L""}},
+    {L"mi/h", {L"speed", 0.44704, L""}},
+    {L"mi2", {L"area", 2589988.110336, L""}},
+    {L"mib", {L"data", 1048576.0, L""}},
+    {L"mile", {L"length", 1609.344, L""}},
+    {L"miles", {L"length", 1609.344, L""}},
+    {L"milligram", {L"mass", 0.001, L""}},
+    {L"milligrams", {L"mass", 0.001, L""}},
+    {L"milliliter", {L"volume", 0.001, L""}},
+    {L"milliliters", {L"volume", 0.001, L""}},
+    {L"millimeter", {L"length", 0.001, L""}},
+    {L"millimeters", {L"length", 0.001, L""}},
+    {L"millisecond", {L"time", 0.001, L""}},
+    {L"milliseconds", {L"time", 0.001, L""}},
+    {L"min", {L"time", 60.0, L""}},
+    {L"mins", {L"time", 60.0, L""}},
+    {L"minute", {L"time", 60.0, L""}},
+    {L"minutes", {L"time", 60.0, L""}},
+    {L"ml", {L"volume", 0.001, L""}},
+    {L"mm", {L"length", 0.001, L""}},
+    {L"mph", {L"speed", 0.44704, L""}},
+    {L"mps", {L"speed", 1.0, L""}},
+    {L"ms", {L"time", 0.001, L""}},
+    {L"nauticalmile", {L"length", 1852.0, L""}},
+    {L"nmi", {L"length", 1852.0, L""}},
+    {L"ounce", {L"mass", 28.349523125, L""}},
+    {L"ounces", {L"mass", 28.349523125, L""}},
+    {L"oz", {L"mass", 28.349523125, L""}},
+    {L"pint", {L"volume", 0.473176473, L""}},
+    {L"pints", {L"volume", 0.473176473, L""}},
+    {L"pound", {L"mass", 453.59237, L""}},
+    {L"pounds", {L"mass", 453.59237, L""}},
+    {L"pt", {L"volume", 0.473176473, L""}},
+    {L"qt", {L"volume", 0.946352946, L""}},
+    {L"quart", {L"volume", 0.946352946, L""}},
+    {L"quarts", {L"volume", 0.946352946, L""}},
+    {L"rad", {L"angle", 57.2957795130823, L""}},
+    {L"radian", {L"angle", 57.2957795130823, L""}},
+    {L"radians", {L"angle", 57.2957795130823, L""}},
+    {L"s", {L"time", 1.0, L""}},
+    {L"sec", {L"time", 1.0, L""}},
+    {L"second", {L"time", 1.0, L""}},
+    {L"seconds", {L"time", 1.0, L""}},
+    {L"secs", {L"time", 1.0, L""}},
+    {L"sqft", {L"area", 0.09290304, L""}},
+    {L"sqkm", {L"area", 1000000.0, L""}},
+    {L"sqm", {L"area", 1.0, L""}},
+    {L"sqmi", {L"area", 2589988.110336, L""}},
+    {L"st", {L"mass", 6350.29318, L""}},
+    {L"stone", {L"mass", 6350.29318, L""}},
+    {L"stones", {L"mass", 6350.29318, L""}},
+    {L"t", {L"mass", 1000000.0, L""}},
+    {L"tb", {L"data", 1000000000000.0, L""}},
+    {L"terabyte", {L"data", 1000000000000.0, L""}},
+    {L"terabytes", {L"data", 1000000000000.0, L""}},
+    {L"ton", {L"mass", 1000000.0, L""}},
+    {L"tonne", {L"mass", 1000000.0, L""}},
+    {L"tonnes", {L"mass", 1000000.0, L""}},
+    {L"w", {L"power", 1.0, L""}},
+    {L"watt", {L"power", 1.0, L""}},
+    {L"watt-hour", {L"energy", 3600.0, L""}},
+    {L"watt-hours", {L"energy", 3600.0, L""}},
+    {L"watthour", {L"energy", 3600.0, L""}},
+    {L"watthours", {L"energy", 3600.0, L""}},
+    {L"watts", {L"power", 1.0, L""}},
+    {L"week", {L"time", 604800.0, L""}},
+    {L"weeks", {L"time", 604800.0, L""}},
+    {L"wh", {L"energy", 3600.0, L""}},
+    {L"yard", {L"length", 0.9144, L""}},
+    {L"yards", {L"length", 0.9144, L""}},
+    {L"yd", {L"length", 0.9144, L""}},
+    {L"\u00B0c", {L"temp", 0.0, L"c"}},
+    {L"\u00B0f", {L"temp", 0.0, L"f"}},
+    {L"\u00BAc", {L"temp", 0.0, L"c"}},
+    {L"\u00BAf", {L"temp", 0.0, L"f"}},
+};
+
+consteval bool UnitsStrictlySorted() {
+  for (std::size_t i = 1; i < std::size(kUnits); ++i) {
+    if (!(kUnits[i - 1].name < kUnits[i].name)) return false;
+  }
+  return true;
+}
+static_assert(UnitsStrictlySorted(), "kUnits must be strictly sorted");
+
+inline const Unit* FindUnit(std::wstring_view lower) {
+  const auto it = std::lower_bound(
+      std::begin(kUnits), std::end(kUnits), lower,
+      [](const UnitEntry& entry, std::wstring_view key) {
+        return entry.name < key;
+      });
+  if (it == std::end(kUnits) || it->name != lower) return nullptr;
+  return &it->unit;
 }
 
+inline std::wstring_view CurrencySymbolCode(wchar_t ch) {
+  switch (ch) {
+    case L'$': return L"USD";
+    case L'\u20AC': return L"EUR";
+    case L'\u00A3': return L"GBP";
+    case L'\u00A5': return L"JPY";
+    case L'\u20B9': return L"INR";
+    case L'\u20A9': return L"KRW";
+    case L'\u20BD': return L"RUB";
+    case L'\u20BA': return L"TRY";
+    case L'\u20AA': return L"ILS";
+    case L'\u0E3F': return L"THB";
+    default: return {};
+  }
+}
+
+}  // namespace detail
+
 // Display name of a temperature unit: "\u00B0C", "\u00B0F" or "K".
-inline std::wstring TemperatureSymbol(const std::wstring& code) {
+inline std::wstring TemperatureSymbol(std::wstring_view code) {
   if (code == L"k") return L"K";
   return code == L"f" ? L"\u00B0F" : L"\u00B0C";
 }
 
-inline double ToCelsius(double value, const std::wstring& code) {
+inline double ToCelsius(double value, std::wstring_view code) {
   if (code == L"f") return (value - 32.0) * 5.0 / 9.0;
   if (code == L"k") return value - 273.15;
   return value;
 }
 
-inline double FromCelsius(double celsius, const std::wstring& code) {
+inline double FromCelsius(double celsius, std::wstring_view code) {
   if (code == L"f") return celsius * 9.0 / 5.0 + 32.0;
   if (code == L"k") return celsius + 273.15;
   return celsius;
@@ -235,36 +371,24 @@ inline bool IsCommonCurrencyCode(const std::wstring& lower) {
                      [&](const wchar_t* code) { return lower == code; });
 }
 
-// Common single-character currency symbols mapped to their ISO-4217 code. Both
-// keys and codes are written with \u escapes so the source stays
-// encoding-independent. Symbols like "$" are inherently ambiguous; we pick the
-// most common interpretation.
-inline const std::map<wchar_t, std::wstring>& CurrencySymbols() {
-  static const std::map<wchar_t, std::wstring> table = {
-      {L'$', L"USD"},        // dollar
-      {L'\u20AC', L"EUR"},   // euro
-      {L'\u00A3', L"GBP"},   // pound
-      {L'\u00A5', L"JPY"},   // yen
-      {L'\u20B9', L"INR"},   // rupee
-      {L'\u20A9', L"KRW"},   // won
-      {L'\u20BD', L"RUB"},   // ruble
-      {L'\u20BA', L"TRY"},   // lira
-      {L'\u20AA', L"ILS"},   // shekel
-      {L'\u0E3F', L"THB"},   // baht
-  };
-  return table;
-}
-
 // Replaces currency symbols with their spaced ISO code so "$5" becomes " USD 5",
 // letting the regular tokenizer/parser take over.
 inline std::wstring ExpandCurrencySymbols(const std::wstring& text) {
-  const auto& symbols = CurrencySymbols();
-  std::wstring out;
-  out.reserve(text.size());
+  bool hasSymbol = false;
   for (const wchar_t ch : text) {
-    if (const auto it = symbols.find(ch); it != symbols.end()) {
+    if (!detail::CurrencySymbolCode(ch).empty()) {
+      hasSymbol = true;
+      break;
+    }
+  }
+  if (!hasSymbol) return text;
+  std::wstring out;
+  out.reserve(text.size() + 8);
+  for (const wchar_t ch : text) {
+    const auto code = detail::CurrencySymbolCode(ch);
+    if (!code.empty()) {
       out.push_back(L' ');
-      out += it->second;
+      out.append(code);
       out.push_back(L' ');
     } else {
       out.push_back(ch);
@@ -282,6 +406,15 @@ inline std::wstring ExpandCurrencySymbols(const std::wstring& text) {
 inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::wstring, double>& rates = {},
                                         const std::wstring& defaultCurrency = L"",
                                         wchar_t decimalSeparator = calculator::UserDecimalSeparator()) {
+  bool hasDigit = false;
+  for (const wchar_t ch : input) {
+    if (ch >= L'0' && ch <= L'9') {
+      hasDigit = true;
+      break;
+    }
+  }
+  if (!hasDigit) return std::nullopt;
+
   const std::wstring original = Trim(std::move(input));
   if (original.empty()) return std::nullopt;
 
@@ -350,8 +483,6 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   }
   if (fromToken.empty() || toToken.empty()) return std::nullopt;
 
-  const auto& table = UnitTable();
-
   // Currency conversion takes priority when both tokens are known codes.
   if (!rates.empty()) {
     // A code that is also spelled like a unit ("cup" vs. the Cuban peso CUP)
@@ -361,7 +492,8 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
       const std::wstring code = Upper(token);
       if (token != code) {
         const std::wstring lower = Lower(token);
-        if (table.contains(lower) || (!explicitConnector && !IsCommonCurrencyCode(lower))) {
+        if (detail::FindUnit(lower) != nullptr ||
+            (!explicitConnector && !IsCommonCurrencyCode(lower))) {
           return rates.end();
         }
       }
@@ -380,24 +512,26 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
     if ((fromRate != rates.end()) != (toRate != rates.end())) return std::nullopt;
   }
 
-  const auto fromUnit = table.find(Lower(fromToken));
-  const auto toUnit = table.find(Lower(toToken));
-  if (fromUnit == table.end() || toUnit == table.end()) return std::nullopt;
-  if (fromUnit->second.category != toUnit->second.category) return std::nullopt;
+  const std::wstring fromLower = Lower(fromToken);
+  const std::wstring toLower = Lower(toToken);
+  const Unit* fromUnit = detail::FindUnit(fromLower);
+  const Unit* toUnit = detail::FindUnit(toLower);
+  if (!fromUnit || !toUnit) return std::nullopt;
+  if (fromUnit->category != toUnit->category) return std::nullopt;
 
   double converted = 0.0;
-  if (fromUnit->second.category == L"temp") {
-    const double celsius = ToCelsius(amount, fromUnit->second.tempCode);
-    converted = FromCelsius(celsius, toUnit->second.tempCode);
+  if (fromUnit->category == L"temp") {
+    const double celsius = ToCelsius(amount, fromUnit->tempCode);
+    converted = FromCelsius(celsius, toUnit->tempCode);
   } else {
-    if (toUnit->second.factor == 0.0) return std::nullopt;
-    converted = amount * fromUnit->second.factor / toUnit->second.factor;
+    if (toUnit->factor == 0.0) return std::nullopt;
+    converted = amount * fromUnit->factor / toUnit->factor;
   }
 
   if (!std::isfinite(converted)) return std::nullopt;
-  const std::wstring unitName = fromUnit->second.category == L"temp"
-                                    ? TemperatureSymbol(toUnit->second.tempCode)
-                                    : Lower(toToken);
+  const std::wstring unitName = fromUnit->category == L"temp"
+                                    ? TemperatureSymbol(toUnit->tempCode)
+                                    : toLower;
   const std::wstring display = FormatNumber(converted) + L" " + unitName;
   return Result{original, display, converted};
 }

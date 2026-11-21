@@ -7,11 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <chrono>
 #include <cwctype>
 #include <deque>
 #include <filesystem>
-#include <queue>
 #include <set>
 #include <string_view>
 
@@ -28,15 +28,24 @@ std::wstring RootOf(const std::filesystem::path& path) {
   return path.root_path().wstring();
 }
 
-bool IsGeneratedDirectory(const std::filesystem::path& path) {
-  std::wstring name = path.filename().wstring();
-  std::transform(name.begin(), name.end(), name.begin(),
-                 [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-  return name == L".git" || name == L".hg" || name == L".svn" ||
-         name == L"node_modules" || name == L"build" ||
-         name == L"build-native" || name == L"bin" || name == L"obj" ||
-         name == L"target" || name == L"out" || name == L"dist" ||
-         name == L".cache";
+bool IsGeneratedDirectory(std::wstring_view rawName) {
+  if (rawName.size() < 3 || rawName.size() > 12) return false;
+  wchar_t lower[16];
+  for (std::size_t i = 0; i < rawName.size(); ++i) {
+    const wchar_t ch = rawName[i];
+    if (ch >= L'A' && ch <= L'Z') {
+      lower[i] = static_cast<wchar_t>(ch - L'A' + L'a');
+    } else if (ch < 128) {
+      lower[i] = ch;
+    } else {
+      return false;
+    }
+  }
+  const std::wstring_view name(lower, rawName.size());
+  static constexpr std::wstring_view kGenerated[] = {
+      L".cache", L".git", L".hg", L".svn", L"bin", L"build",
+      L"build-native", L"dist", L"node_modules", L"obj", L"out", L"target"};
+  return std::binary_search(std::begin(kGenerated), std::end(kGenerated), name);
 }
 
 // Full rescans while a configured root is unavailable. Later retries only
@@ -44,25 +53,68 @@ bool IsGeneratedDirectory(const std::filesystem::path& path) {
 constexpr std::size_t kMaxRescanRetries = 4;
 constexpr DWORD kSkippedAttributes =
     FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT;
+constexpr auto kWorkerIdleTimeout = std::chrono::seconds(20);
 
 // Key of %LOCALAPPDATA%\FeatherCast, or empty when it cannot be resolved.
 // FeatherCast writes its database, the file index itself and the icon cache
 // there, so a root containing it would rescan after every one of those writes.
 std::wstring OperationalDataKey() {
-  std::array<wchar_t, 32768> buffer{};
-  const DWORD length = GetEnvironmentVariableW(
-      L"LOCALAPPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
-  if (length == 0 || length >= buffer.size()) return {};
+  wchar_t stackBuffer[512];
+  DWORD length = GetEnvironmentVariableW(
+      L"LOCALAPPDATA", stackBuffer, static_cast<DWORD>(std::size(stackBuffer)));
+  if (length == 0) return {};
+  std::wstring localAppData;
+  if (length < std::size(stackBuffer)) {
+    localAppData.assign(stackBuffer, length);
+  } else {
+    localAppData.resize(length);
+    const DWORD written = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", localAppData.data(), length);
+    if (written == 0 || written >= length) return {};
+    localAppData.resize(written);
+  }
   return filesystem_semantics::PathKey(
-      (std::filesystem::path(std::wstring(buffer.data(), length)) /
-       L"FeatherCast")
-          .wstring());
+      (std::filesystem::path(std::move(localAppData)) / L"FeatherCast").wstring());
 }
 
-bool IsOperationalDataDirectory(const std::filesystem::path& path,
+bool IsOperationalDataDirectory(const std::wstring& path,
                                 const std::wstring& dataKey) {
-  return !dataKey.empty() &&
-         filesystem_semantics::PathKey(path.wstring()) == dataKey;
+  return !dataKey.empty() && filesystem_semantics::PathKey(path) == dataKey;
+}
+
+bool PathKeyContainsOrEquals(const std::wstring& parentKey,
+                             const std::wstring& childKey) {
+  if (parentKey.empty() || childKey.size() < parentKey.size()) return false;
+  if (childKey == parentKey) return true;
+  if (!childKey.starts_with(parentKey)) return false;
+  return parentKey.back() == L'\\' || childKey[parentKey.size()] == L'\\';
+}
+
+std::wstring MakeFindPattern(const std::wstring& directory) {
+  std::wstring pattern;
+  const bool needsExtended =
+      directory.size() >= 246 && !directory.starts_with(L"\\\\?\\");
+  if (needsExtended) {
+    if (directory.starts_with(L"\\\\")) {
+      pattern = L"\\\\?\\UNC\\";
+      pattern.append(directory, 2, std::wstring::npos);
+    } else {
+      pattern = L"\\\\?\\";
+      pattern += directory;
+    }
+  } else {
+    pattern = directory;
+  }
+  if (!pattern.empty() && pattern.back() != L'\\') pattern.push_back(L'\\');
+  pattern.push_back(L'*');
+  return pattern;
+}
+
+long long FileTimeToTicks(const FILETIME& ft) {
+  ULARGE_INTEGER value{};
+  value.LowPart = ft.dwLowDateTime;
+  value.HighPart = ft.dwHighDateTime;
+  return static_cast<long long>(value.QuadPart);
 }
 
 bool NewerEntry(const storage::FileIndexEntry& left,
@@ -188,6 +240,8 @@ class RelativePathExclusionMatcher {
     }
   }
 
+  bool Empty() const noexcept { return patterns_.empty(); }
+
   bool Matches(std::wstring_view relativePath) const {
     if (patterns_.empty()) return false;
     const auto pathSegments = NormalizedSegments(relativePath);
@@ -205,7 +259,7 @@ class RelativePathExclusionMatcher {
 bool EntryMatchesExclusion(
     const storage::FileIndexEntry& entry,
     const RelativePathExclusionMatcher& exclusionMatcher) {
-  if (entry.path.empty() || entry.root.empty()) {
+  if (exclusionMatcher.Empty() || entry.path.empty() || entry.root.empty()) {
     return false;
   }
   const auto relative = std::filesystem::path(entry.path).lexically_relative(
@@ -235,17 +289,19 @@ bool ChangeAffectsIndex(const std::filesystem::path& root,
     if (segment.empty()) continue;
     const bool leaf = end >= relative.size();
     current /= std::wstring(segment);
-    if (!prefix.empty()) prefix.push_back(L'/');
-    prefix.append(segment);
-    if (exclusionMatcher.Matches(prefix)) return false;
+    if (!exclusionMatcher.Empty()) {
+      if (!prefix.empty()) prefix.push_back(L'/');
+      prefix.append(segment);
+      if (exclusionMatcher.Matches(prefix)) return false;
+    }
     const DWORD attributes = GetFileAttributesW(current.c_str());
     const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
     if (exists && (attributes & kSkippedAttributes) != 0) return false;
     // Every ancestor of a reported path is a directory, even after a delete.
     const bool directory =
         !leaf || (exists && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
-    if (directory && (IsGeneratedDirectory(current) ||
-                      IsOperationalDataDirectory(current, dataKey))) {
+    if (directory && (IsGeneratedDirectory(segment) ||
+                      IsOperationalDataDirectory(current.wstring(), dataKey))) {
       return false;
     }
   }
@@ -331,21 +387,42 @@ std::vector<storage::FileIndexEntry> MergeFileIndexEntries(
   return scanned;
 }
 
-struct FileIndexService::Watcher {
-  std::wstring root;
-  HANDLE directory = INVALID_HANDLE_VALUE;
-  HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+struct FileIndexService::WatcherGroup {
+  struct WatchSlot {
+    std::wstring root;
+    std::filesystem::path path;
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    OVERLAPPED overlapped{};
+    alignas(DWORD) std::array<std::byte, 64 * 1024> buffer{};
+    bool ioPending = false;
+    bool broken = false;
+    bool delivered = false;
+    std::size_t overflows = 0;
+    bool waitingOverflow = false;
+    std::chrono::steady_clock::time_point resumeAt{};
+  };
+
+  static constexpr ULONG_PTR kStopKey = 0;
+  HANDLE iocp = nullptr;
+  std::vector<std::unique_ptr<WatchSlot>> slots;
   std::jthread thread;
 
-  ~Watcher() {
+  ~WatcherGroup() {
     if (thread.joinable()) {
       thread.request_stop();
-      SetEvent(stopEvent);
-      if (directory != INVALID_HANDLE_VALUE) CancelIoEx(directory, nullptr);
+      if (iocp) PostQueuedCompletionStatus(iocp, 0, kStopKey, nullptr);
       thread.join();
     }
-    if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
-    if (stopEvent) CloseHandle(stopEvent);
+    for (auto& slot : slots) {
+      if (slot && slot->directory != INVALID_HANDLE_VALUE) {
+        CloseHandle(slot->directory);
+        slot->directory = INVALID_HANDLE_VALUE;
+      }
+    }
+    if (iocp) {
+      CloseHandle(iocp);
+      iocp = nullptr;
+    }
   }
 };
 
@@ -356,24 +433,56 @@ FileIndexService::~FileIndexService() { Stop(); }
 
 void FileIndexService::Start() {
   std::lock_guard lock(mutex_);
-  if (worker_.joinable()) return;
   stopping_ = false;
-  worker_ = std::jthread([this](std::stop_token token) { WorkerLoop(token); });
+  stoppingAtomic_.store(false, std::memory_order_release);
+  started_ = true;
+}
+
+void FileIndexService::EnsureWorker() {
+  for (;;) {
+    std::jthread toJoin;
+    {
+      std::lock_guard lock(mutex_);
+      if (!started_ || stopping_ || workerActive_) return;
+      if (worker_.joinable()) {
+        toJoin = std::move(worker_);
+      } else {
+        workerActive_ = true;
+        worker_ = std::jthread([this](std::stop_token token) { WorkerLoop(token); });
+        return;
+      }
+    }
+    toJoin.join();
+  }
 }
 
 void FileIndexService::Stop() {
   {
     std::lock_guard lock(mutex_);
-    if (!worker_.joinable()) return;
-    stopping_ = true;
-    request_.reset();
-    worker_.request_stop();
+    if (!started_ && !worker_.joinable()) {
+      stopping_ = false;
+      stoppingAtomic_.store(false, std::memory_order_release);
+    } else {
+      stopping_ = true;
+      stoppingAtomic_.store(true, std::memory_order_release);
+      started_ = false;
+      request_.reset();
+      if (worker_.joinable()) worker_.request_stop();
+    }
   }
   cv_.notify_all();
   StopWatchers();
-  worker_.join();
+  std::jthread toJoin;
+  {
+    std::lock_guard lock(mutex_);
+    toJoin = std::move(worker_);
+  }
+  if (toJoin.joinable()) toJoin.join();
+  StopWatchers();
   std::lock_guard lock(mutex_);
   stopping_ = false;
+  stoppingAtomic_.store(false, std::memory_order_release);
+  workerActive_ = false;
   rebuildPending_ = false;
   restartWatchersPending_ = false;
   ResetRetries();
@@ -387,11 +496,12 @@ void FileIndexService::Pause() {
     paused_ = true;
     request_.reset();
     rebuildPending_ = false;
-    restartWatchersPending_ = true;
+    restartWatchersPending_ = false;
     ResetRetries();
     watchFailures_.clear();
     ForgetContentRecords();
   }
+  StopWatchers();
   cv_.notify_all();
 }
 
@@ -415,13 +525,7 @@ bool FileIndexService::Reconfigure(IndexRequest request) {
   currentGeneration_.store(request.generation, std::memory_order_release);
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable()) return false;
-  }
-  // Watch first so changes made while the initial crawl is running are
-  // retained by the watcher and reconciled by the coalesced follow-up scan.
-  {
-    std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable()) return false;
+    if (stopping_ || !started_) return false;
     request_ = std::move(request);
     paused_ = false;
     restartWatchersPending_ = true;
@@ -431,6 +535,7 @@ bool FileIndexService::Reconfigure(IndexRequest request) {
     watchFailures_.clear();
     ForgetContentRecords();
   }
+  EnsureWorker();
   cv_.notify_all();
   return true;
 }
@@ -438,7 +543,7 @@ bool FileIndexService::Reconfigure(IndexRequest request) {
 bool FileIndexService::Rebuild() {
   {
     std::lock_guard lock(mutex_);
-    if (!request_ || stopping_ || !worker_.joinable()) return false;
+    if (!request_ || stopping_ || !started_) return false;
     rebuildPending_ = true;
     rebuildAfter_ = std::chrono::steady_clock::now();
     // A rebuild is an explicit request to read every file again. It also
@@ -448,6 +553,7 @@ bool FileIndexService::Rebuild() {
     watchFailures_.clear();
     ForgetContentRecords();
   }
+  EnsureWorker();
   cv_.notify_all();
   return true;
 }
@@ -457,22 +563,28 @@ bool FileIndexService::IsCurrent(std::uint64_t generation) const {
 }
 
 void FileIndexService::ScheduleWatchRefresh(bool restartWatchers) {
+  bool shouldWake = false;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || paused_ || !request_) return;
+    if (stopping_ || !started_ || paused_ || !request_) return;
     rebuildPending_ = true;
     probeOnly_ = false;
     restartWatchersPending_ = restartWatchersPending_ || restartWatchers;
     rebuildAfter_ = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(250);
+    shouldWake = true;
   }
-  cv_.notify_all();
+  if (shouldWake) {
+    EnsureWorker();
+    cv_.notify_all();
+  }
 }
 
 void FileIndexService::ScheduleWatchRetry(const std::wstring& root) {
+  bool shouldWake = false;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || paused_ || !request_) return;
+    if (stopping_ || !started_ || paused_ || !request_) return;
     const std::size_t failures = ++watchFailures_[root];
     if (failures > kMaxWatchRetries) return;
     // Changes made while the watch was down are unknown, so the restart
@@ -484,8 +596,12 @@ void FileIndexService::ScheduleWatchRetry(const std::wstring& root) {
     rebuildPending_ = true;
     probeOnly_ = false;
     restartWatchersPending_ = true;
+    shouldWake = true;
   }
-  cv_.notify_all();
+  if (shouldWake) {
+    EnsureWorker();
+    cv_.notify_all();
+  }
 }
 
 void FileIndexService::ClearWatchFailures(const std::wstring& root) {
@@ -495,91 +611,166 @@ void FileIndexService::ClearWatchFailures(const std::wstring& root) {
 
 void FileIndexService::RestartWatchers(const IndexRequest& request) {
   std::lock_guard watchersLock(watchersMutex_);
-  watchers_.clear();
-  const auto dataKey = OperationalDataKey();
+  watcherGroup_.reset();
+  if (stoppingAtomic_.load(std::memory_order_acquire) ||
+      paused_.load(std::memory_order_acquire)) {
+    return;
+  }
+  auto group = std::make_unique<WatcherGroup>();
+  group->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+  if (!group->iocp) return;
+
   for (const auto& root : request.roots) {
     const std::filesystem::path path(root);
     if (!FixedLocalRoot(path)) continue;
-    auto watcher = std::make_unique<Watcher>();
-    watcher->root = root;
-    if (!watcher->stopEvent) continue;
-    watcher->directory = CreateFileW(
+    HANDLE directory = CreateFileW(
         root.c_str(), FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
         nullptr);
-    if (watcher->directory == INVALID_HANDLE_VALUE) continue;
-    Watcher* raw = watcher.get();
-    watcher->thread = std::jthread([this, raw, root, path, dataKey,
-                                    patterns = request.exclusionPatterns](
-                                       std::stop_token token) {
-      const RelativePathExclusionMatcher exclusionMatcher(patterns);
-      alignas(DWORD) std::array<std::byte, 64 * 1024> buffer{};
-      bool delivered = false;
-      std::size_t overflows = 0;
-      // A broken watch ends this thread and asks for a delayed restart.
-      // Reading the same handle again could fail at once, forever, and every
-      // report would also push the pending rescan further out.
-      const auto retry = [&] {
-        if (!token.stop_requested()) ScheduleWatchRetry(root);
-      };
-      while (!token.stop_requested()) {
-        OVERLAPPED overlapped{};
-        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!overlapped.hEvent) return retry();
-        const BOOL queued = ReadDirectoryChangesW(
-            raw->directory, buffer.data(), static_cast<DWORD>(buffer.size()),
-            TRUE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-            nullptr, &overlapped, nullptr);
-        if (!queued) {
-          CloseHandle(overlapped.hEvent);
-          return retry();
-        }
-        const HANDLE events[] = {overlapped.hEvent, raw->stopEvent};
-        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
-        if (wait != WAIT_OBJECT_0 || token.stop_requested()) {
-          CancelIoEx(raw->directory, &overlapped);
-        }
-        DWORD transferred = 0;
-        const BOOL completed = GetOverlappedResult(
-            raw->directory, &overlapped, &transferred, TRUE);
-        CloseHandle(overlapped.hEvent);
-        if (token.stop_requested()) return;
-        if (!completed) return retry();
-        if (transferred == 0) {
-          // The change buffer overflowed. The watch still works and the
-          // handle keeps collecting changes, but the dropped ones need a
-          // rescan. Pausing before the next read spaces out the rescans of
-          // a long burst (and of a file system that keeps completing empty).
-          ScheduleWatchRefresh();
-          const DWORD paused = WaitForSingleObject(
-              raw->stopEvent,
-              static_cast<DWORD>(WatchRetryDelay(++overflows).count()));
-          if (paused == WAIT_TIMEOUT) continue;
-          if (paused != WAIT_OBJECT_0) retry();
-          return;
-        }
-        overflows = 0;
-        if (!delivered) {
-          // The watch works, so its root gets a fresh retry budget.
-          delivered = true;
-          ClearWatchFailures(root);
-        }
-        if (NotificationsAffectIndex(buffer.data(), transferred, path,
-                                     exclusionMatcher, dataKey)) {
-          ScheduleWatchRefresh();
+    if (directory == INVALID_HANDLE_VALUE) continue;
+    auto slot = std::make_unique<WatcherGroup::WatchSlot>();
+    slot->root = root;
+    slot->path = path;
+    slot->directory = directory;
+    if (!CreateIoCompletionPort(slot->directory, group->iocp,
+                                reinterpret_cast<ULONG_PTR>(slot.get()), 0)) {
+      CloseHandle(slot->directory);
+      slot->directory = INVALID_HANDLE_VALUE;
+      continue;
+    }
+    group->slots.push_back(std::move(slot));
+  }
+  if (group->slots.empty()) return;
+
+  const auto dataKey = OperationalDataKey();
+  WatcherGroup* rawGroup = group.get();
+  group->thread = std::jthread([this, rawGroup, dataKey,
+                                patterns = request.exclusionPatterns](
+                                   std::stop_token token) {
+    const RelativePathExclusionMatcher exclusionMatcher(patterns);
+    auto issueRead = [&](WatcherGroup::WatchSlot& slot) {
+      slot.overlapped = {};
+      const BOOL queued = ReadDirectoryChangesW(
+          slot.directory, slot.buffer.data(),
+          static_cast<DWORD>(slot.buffer.size()), TRUE,
+          FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+              FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+          nullptr, &slot.overlapped, nullptr);
+      if (queued) {
+        slot.ioPending = true;
+        return true;
+      }
+      slot.broken = true;
+      if (!token.stop_requested()) ScheduleWatchRetry(slot.root);
+      return false;
+    };
+
+    for (auto& slot : rawGroup->slots) {
+      issueRead(*slot);
+    }
+
+    while (!token.stop_requested()) {
+      const auto now = std::chrono::steady_clock::now();
+      DWORD timeout = INFINITE;
+      bool anyActive = false;
+      for (auto& slot : rawGroup->slots) {
+        if (slot->broken) continue;
+        if (slot->waitingOverflow) {
+          if (now >= slot->resumeAt) {
+            slot->waitingOverflow = false;
+            if (issueRead(*slot)) anyActive = true;
+          } else {
+            anyActive = true;
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                slot->resumeAt - now)
+                                .count();
+            const DWORD clamped = ms <= 0 ? 1u
+                : (ms > 60'000 ? 60'000u : static_cast<DWORD>(ms));
+            timeout = timeout == INFINITE ? clamped : std::min(timeout, clamped);
+          }
+        } else if (slot->ioPending) {
+          anyActive = true;
         }
       }
-    });
-    watchers_.push_back(std::move(watcher));
-  }
+      if (!anyActive) break;
+
+      DWORD transferred = 0;
+      ULONG_PTR key = 0;
+      LPOVERLAPPED overlapped = nullptr;
+      const BOOL completed = GetQueuedCompletionStatus(
+          rawGroup->iocp, &transferred, &key, &overlapped, timeout);
+      if (!completed && !overlapped) {
+        if (GetLastError() == WAIT_TIMEOUT) continue;
+        break;
+      }
+      if (key == WatcherGroup::kStopKey) break;
+      auto* slot = reinterpret_cast<WatcherGroup::WatchSlot*>(key);
+      slot->ioPending = false;
+      if (token.stop_requested()) break;
+      if (!completed) {
+        slot->broken = true;
+        ScheduleWatchRetry(slot->root);
+        continue;
+      }
+      if (transferred == 0) {
+        // The change buffer overflowed. The watch still works and the
+        // handle keeps collecting changes, but the dropped ones need a
+        // rescan. Pausing before the next read spaces out the rescans of
+        // a long burst (and of a file system that keeps completing empty).
+        ScheduleWatchRefresh();
+        slot->waitingOverflow = true;
+        slot->resumeAt = std::chrono::steady_clock::now() +
+                         WatchRetryDelay(++slot->overflows);
+        continue;
+      }
+      slot->overflows = 0;
+      if (!slot->delivered) {
+        // The watch works, so its root gets a fresh retry budget.
+        slot->delivered = true;
+        ClearWatchFailures(slot->root);
+      }
+      if (NotificationsAffectIndex(slot->buffer.data(), transferred, slot->path,
+                                   exclusionMatcher, dataKey)) {
+        ScheduleWatchRefresh();
+      }
+      issueRead(*slot);
+    }
+
+    // Cancel and drain all in-flight overlapped reads before returning so the
+    // kernel never writes into freed WatchSlot OVERLAPPED/buffer memory.
+    for (auto& slot : rawGroup->slots) {
+      if (slot->ioPending && slot->directory != INVALID_HANDLE_VALUE) {
+        CancelIoEx(slot->directory, &slot->overlapped);
+      }
+    }
+    for (;;) {
+      bool anyPending = false;
+      for (const auto& slot : rawGroup->slots) {
+        if (slot->ioPending) {
+          anyPending = true;
+          break;
+        }
+      }
+      if (!anyPending) break;
+      DWORD transferred = 0;
+      ULONG_PTR key = 0;
+      LPOVERLAPPED overlapped = nullptr;
+      const BOOL ok = GetQueuedCompletionStatus(
+          rawGroup->iocp, &transferred, &key, &overlapped, 5000);
+      if (overlapped && key != WatcherGroup::kStopKey) {
+        reinterpret_cast<WatcherGroup::WatchSlot*>(key)->ioPending = false;
+      } else if (!ok && !overlapped) {
+        break;
+      }
+    }
+  });
+  watcherGroup_ = std::move(group);
 }
 
 void FileIndexService::StopWatchers() {
   std::lock_guard watchersLock(watchersMutex_);
-  watchers_.clear();
+  watcherGroup_.reset();
 }
 
 void FileIndexService::WorkerLoop(std::stop_token token) {
@@ -591,10 +782,22 @@ void FileIndexService::WorkerLoop(std::stop_token token) {
     std::vector<std::wstring> missingRoots;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
-        return stopping_ || token.stop_requested() || rebuildPending_ || restartWatchersPending_;
-      });
-      if (stopping_ || token.stop_requested()) return;
+      if (!stopping_ && !token.stop_requested() && !rebuildPending_ &&
+          !restartWatchersPending_) {
+        const bool woke = cv_.wait_for(lock, kWorkerIdleTimeout, [&] {
+          return stopping_ || token.stop_requested() || rebuildPending_ ||
+                 restartWatchersPending_;
+        });
+        if (!woke && !stopping_ && !token.stop_requested() &&
+            !rebuildPending_ && !restartWatchersPending_) {
+          workerActive_ = false;
+          return;
+        }
+      }
+      if (stopping_ || token.stop_requested()) {
+        workerActive_ = false;
+        return;
+      }
       if (paused_) {
         restartWatchersPending_ = false;
         lock.unlock();
@@ -603,7 +806,10 @@ void FileIndexService::WorkerLoop(std::stop_token token) {
       }
       while (rebuildPending_ && std::chrono::steady_clock::now() < rebuildAfter_) {
         cv_.wait_until(lock, rebuildAfter_);
-        if (stopping_ || token.stop_requested()) return;
+        if (stopping_ || token.stop_requested()) {
+          workerActive_ = false;
+          return;
+        }
       }
       if (!request_) continue;
       request = *request_;
@@ -706,13 +912,14 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   const long long scan = NowMilliseconds();
   const RelativePathExclusionMatcher exclusionMatcher(
       request.exclusionPatterns);
+  const bool hasExclusions = !exclusionMatcher.Empty();
   const auto dataKey = OperationalDataKey();
-  // Keep only the newest `limit` entries while traversing. The previous
-  // implementation retained every path and trimmed only after the complete
-  // recursive scan, which made a large Documents tree consume hundreds of MB.
-  std::priority_queue<storage::FileIndexEntry,
-                      std::vector<storage::FileIndexEntry>, OlderEntryFirst>
-      newest;
+  // Keep only the newest `limit` entries while traversing in a bounded vector
+  // heap so entries are moved out in-place instead of copied.
+  std::vector<storage::FileIndexEntry> discovered;
+  if (request.limit > 0) {
+    discovered.reserve(std::min<std::size_t>(request.limit, 1024));
+  }
   std::size_t interactionYieldCounter = 0;
   const auto YieldDuringInteraction = [&] {
     if (!interactive_.load(std::memory_order_acquire)) return;
@@ -728,96 +935,133 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   }
   std::set<std::wstring> walkedRoots;
 
+  struct PendingDir {
+    std::wstring path;
+    std::wstring relative;
+  };
+
   for (const auto& configured : request.roots) {
     if (token.stop_requested() || !IsCurrent(request.generation)) return status;
     YieldDuringInteraction();
     const std::wstring rootKey = filesystem_semantics::PathKey(configured);
     if (!walkedRoots.insert(rootKey).second) continue;
     const std::filesystem::path root(configured);
-    std::error_code rootError;
-    if (!FixedLocalRoot(root) ||
-        !std::filesystem::is_directory(root, rootError) || rootError) {
+    const DWORD rootAttrs = GetFileAttributesW(root.c_str());
+    if (!FixedLocalRoot(root) || rootAttrs == INVALID_FILE_ATTRIBUTES ||
+        (rootAttrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
       ++status.unavailableRoots;
       continue;
     }
-    status.availableRoots.push_back(root.lexically_normal().wstring());
-    std::deque<std::filesystem::path> pending{root};
+    const std::wstring rootNorm = root.lexically_normal().wstring();
+    status.availableRoots.push_back(rootNorm);
+
+    const bool checkDataKey = PathKeyContainsOrEquals(rootKey, dataKey);
+    bool hasNestedRoots = false;
+    for (const auto& otherKey : rootKeys) {
+      if (otherKey != rootKey && PathKeyContainsOrEquals(rootKey, otherKey)) {
+        hasNestedRoots = true;
+        break;
+      }
+    }
+
+    std::deque<PendingDir> pending;
+    pending.push_back({rootNorm, L""});
+    WIN32_FIND_DATAW findData{};
     while (!pending.empty()) {
       if (token.stop_requested() || !IsCurrent(request.generation)) return status;
-      auto directory = std::move(pending.front());
+      PendingDir directory = std::move(pending.front());
       pending.pop_front();
-      std::error_code ec;
-      for (std::filesystem::directory_iterator it(
-               directory, std::filesystem::directory_options::skip_permission_denied,
-               ec), end;
-           !ec && it != end; it.increment(ec)) {
-        if (token.stop_requested() || !IsCurrent(request.generation)) return status;
+      const std::wstring pattern = MakeFindPattern(directory.path);
+      HANDLE handle = FindFirstFileExW(
+          pattern.c_str(), FindExInfoBasic, &findData,
+          FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+      if (handle == INVALID_HANDLE_VALUE) continue;
+      do {
+        if (token.stop_requested() || !IsCurrent(request.generation)) {
+          FindClose(handle);
+          return status;
+        }
+        const wchar_t* fileName = findData.cFileName;
+        if (fileName[0] == L'.' &&
+            (fileName[1] == L'\0' ||
+             (fileName[1] == L'.' && fileName[2] == L'\0'))) {
+          continue;
+        }
         YieldDuringInteraction();
-        const auto path = it->path();
-        const auto relative = path.lexically_relative(root).generic_wstring();
-        if (exclusionMatcher.Matches(relative)) {
-          continue;
+        const DWORD attributes = findData.dwFileAttributes;
+        if ((attributes & kSkippedAttributes) != 0) continue;
+
+        const std::wstring_view nameView(fileName);
+        std::wstring relative;
+        if (hasExclusions) {
+          relative.reserve(directory.relative.size() + 1 + nameView.size());
+          if (!directory.relative.empty()) {
+            relative.append(directory.relative);
+            relative.push_back(L'/');
+          }
+          relative.append(nameView);
+          if (exclusionMatcher.Matches(relative)) continue;
         }
-        const DWORD attributes = GetFileAttributesW(path.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES ||
-            (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
-                           FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
-          continue;
+
+        const bool directoryEntry = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (directoryEntry && IsGeneratedDirectory(nameView)) continue;
+
+        std::wstring childPath;
+        childPath.reserve(directory.path.size() + 1 + nameView.size());
+        childPath.append(directory.path);
+        if (!childPath.empty() && childPath.back() != L'\\') {
+          childPath.push_back(L'\\');
         }
-        const bool directoryEntry =
-            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        childPath.append(nameView);
+
         if (directoryEntry) {
-          if (IsGeneratedDirectory(path) ||
-              IsOperationalDataDirectory(path, dataKey)) {
+          if (checkDataKey && IsOperationalDataDirectory(childPath, dataKey)) {
             continue;
           }
-          if (!rootKeys.contains(filesystem_semantics::PathKey(path.wstring()))) {
-            pending.push_back(path);
+          if (!hasNestedRoots ||
+              !rootKeys.contains(filesystem_semantics::PathKey(childPath))) {
+            pending.push_back({childPath, std::move(relative)});
           }
         }
-        const auto normalizedPath = path.lexically_normal();
+
+        ++status.discoveredEntries;
+        if (request.limit == 0) continue;
+
+        const long long writeTicks = FileTimeToTicks(findData.ftLastWriteTime);
+        const bool shouldKeep =
+            discovered.size() < request.limit ||
+            writeTicks > discovered.front().lastWriteTime ||
+            (writeTicks == discovered.front().lastWriteTime &&
+             childPath < discovered.front().path);
+        if (!shouldKeep) continue;
 
         storage::FileIndexEntry entry;
-        entry.path = normalizedPath.wstring();
-        entry.name = normalizedPath.filename().wstring();
+        entry.path = std::move(childPath);
+        entry.name.assign(nameView);
         entry.isDirectory = directoryEntry;
         entry.iconKey = entry.path;
         entry.indexedAt = scan;
         entry.scanGeneration = scan;
-        entry.root = root.lexically_normal().wstring();
-        const auto writeTime =
-            std::filesystem::last_write_time(normalizedPath, ec);
-        if (!ec) entry.lastWriteTime = writeTime.time_since_epoch().count();
-        ec.clear();
+        entry.root = rootNorm;
+        entry.lastWriteTime = writeTicks;
         if (!directoryEntry) {
-          const auto bytes = std::filesystem::file_size(normalizedPath, ec);
-          if (!ec) entry.size = static_cast<long long>(bytes);
+          entry.size = (static_cast<long long>(findData.nFileSizeHigh) << 32) |
+                       static_cast<long long>(findData.nFileSizeLow);
         }
-        ++status.discoveredEntries;
-        if (request.limit == 0) continue;
-        if (newest.size() < request.limit) {
-          newest.push(std::move(entry));
-        } else if (NewerEntry(entry, newest.top())) {
-          newest.pop();
-          newest.push(std::move(entry));
+        if (discovered.size() < request.limit) {
+          discovered.push_back(std::move(entry));
+          std::push_heap(discovered.begin(), discovered.end(), OlderEntryFirst{});
+        } else {
+          std::pop_heap(discovered.begin(), discovered.end(), OlderEntryFirst{});
+          discovered.back() = std::move(entry);
+          std::push_heap(discovered.begin(), discovered.end(), OlderEntryFirst{});
         }
-      }
+      } while (FindNextFileW(handle, &findData));
+      FindClose(handle);
     }
   }
 
-  std::vector<storage::FileIndexEntry> discovered;
-  discovered.reserve(newest.size());
-  while (!newest.empty()) {
-    discovered.push_back(newest.top());
-    newest.pop();
-  }
-  std::sort(discovered.begin(), discovered.end(), [](const auto& left,
-                                                       const auto& right) {
-    if (left.lastWriteTime != right.lastWriteTime) {
-      return left.lastWriteTime > right.lastWriteTime;
-    }
-    return left.path < right.path;
-  });
+  std::sort(discovered.begin(), discovered.end(), NewerEntry);
   if (request.contentEnabled) {
     for (auto& entry : discovered) {
       if (token.stop_requested() || !IsCurrent(request.generation)) return status;

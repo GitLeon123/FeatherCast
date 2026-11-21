@@ -3,6 +3,7 @@
 #include "app_types.hpp"
 #include "filesystem_semantics.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -18,7 +19,22 @@ constexpr std::size_t kMaxBytes = 32 * 1024 * 1024;
 
 // Versioned, Windows-local cache. Never serialize AppEntry's object layout.
 inline std::string Encode(const std::vector<app::AppEntry>& apps, long long now) {
-  std::string bytes = "FCAP0001";
+  std::size_t totalBytes = 8 + sizeof(now) + sizeof(std::uint32_t);
+  for (const auto& entry : apps) {
+    totalBytes += 14 * sizeof(std::uint32_t);
+    for (const auto* value : {&entry.id, &entry.name, &entry.path, &entry.source,
+                              &entry.launchTarget, &entry.targetPath, &entry.args,
+                              &entry.cwd, &entry.appUserModelId, &entry.iconKey,
+                              &entry.gameProvider}) {
+      totalBytes += value->size() * sizeof(wchar_t);
+    }
+    for (const auto& keyword : entry.keywords) {
+      totalBytes += sizeof(std::uint32_t) + keyword.size() * sizeof(wchar_t);
+    }
+  }
+  std::string bytes;
+  bytes.reserve(totalBytes);
+  bytes.append("FCAP0001", 8);
   auto number = [&bytes](auto value) {
     bytes.append(reinterpret_cast<const char*>(&value), sizeof(value));
   };
@@ -67,6 +83,7 @@ inline std::optional<std::vector<app::AppEntry>> Decode(std::string_view bytes,
   if (!number(savedAt) || savedAt < 0 || !number(count) || count > 50000)
     return std::nullopt;
   std::vector<app::AppEntry> apps;
+  apps.reserve((std::min)(static_cast<std::size_t>(count), std::size_t{4096}));
   for (std::uint32_t i = 0; i < count; ++i) {
     app::AppEntry entry;
     for (auto* value : {&entry.id, &entry.name, &entry.path, &entry.source,
@@ -84,6 +101,7 @@ inline std::optional<std::vector<app::AppEntry>> Decode(std::string_view bytes,
     entry.isGame = (flags & 1) != 0;
     entry.adminSupported = (flags & 2) != 0;
     entry.systemEssential = (flags & 4) != 0;
+    entry.keywords.reserve((std::min)(static_cast<std::size_t>(keywords), std::size_t{64}));
     for (std::uint32_t k = 0; k < keywords; ++k) {
       std::wstring keyword;
       if (!string(keyword)) return std::nullopt;

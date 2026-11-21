@@ -10,15 +10,15 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <optional>
-#include <regex>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace feathercast::games {
@@ -123,18 +123,77 @@ AppEntry Game(std::wstring provider, std::wstring id, std::wstring name,
   return entry;
 }
 
-std::wstring VdfValue(const std::wstring& text, std::wstring_view key) {
-  const std::wregex expression(
-      L"\\\"" + std::wstring(key) + L"\\\"\\s*\\\"([^\\\"]*)\\\"",
-      std::regex_constants::icase);
-  std::wsmatch match;
-  if (!std::regex_search(text, match, expression) || match.size() < 2) return {};
-  std::wstring value = match[1].str();
-  for (size_t pos = 0; (pos = value.find(L"\\\\", pos)) != std::wstring::npos;) {
-    value.replace(pos, 2, L"\\");
-    ++pos;
+wchar_t AsciiLowerChar(wchar_t ch) {
+  return ch >= L'A' && ch <= L'Z' ? static_cast<wchar_t>(ch - L'A' + L'a') : ch;
+}
+
+bool EqualsInsensitive(std::wstring_view left, std::wstring_view right) {
+  if (left.size() != right.size()) return false;
+  for (std::size_t i = 0; i < left.size(); ++i) {
+    const wchar_t a = left[i];
+    const wchar_t b = right[i];
+    if (a == b) continue;
+    const wchar_t la = a < 128 ? AsciiLowerChar(a) : static_cast<wchar_t>(std::towlower(a));
+    const wchar_t lb = b < 128 ? AsciiLowerChar(b) : static_cast<wchar_t>(std::towlower(b));
+    if (la != lb) return false;
   }
-  return value;
+  return true;
+}
+
+bool ContainsInsensitive(std::wstring_view value, std::wstring_view part) {
+  if (part.empty()) return true;
+  if (part.size() > value.size()) return false;
+  const std::size_t limit = value.size() - part.size();
+  for (std::size_t i = 0; i <= limit; ++i) {
+    if (EqualsInsensitive(value.substr(i, part.size()), part)) return true;
+  }
+  return false;
+}
+
+std::wstring UnescapeVdf(std::wstring_view raw) {
+  std::wstring out;
+  out.reserve(raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] == L'\\' && i + 1 < raw.size() && raw[i + 1] == L'\\') {
+      out.push_back(L'\\');
+      ++i;
+    } else {
+      out.push_back(raw[i]);
+    }
+  }
+  return out;
+}
+
+bool FindNextVdfPair(std::wstring_view text, std::wstring_view key,
+                     std::size_t& cursor, std::wstring& valueOut) {
+  while (cursor < text.size()) {
+    const std::size_t openKey = text.find(L'"', cursor);
+    if (openKey == std::wstring_view::npos) return false;
+    const std::size_t keyStart = openKey + 1;
+    if (keyStart + key.size() >= text.size()) return false;
+    if (text[keyStart + key.size()] == L'"' &&
+        EqualsInsensitive(text.substr(keyStart, key.size()), key)) {
+      std::size_t pos = keyStart + key.size() + 1;
+      while (pos < text.size() && std::iswspace(text[pos]) != 0) ++pos;
+      if (pos < text.size() && text[pos] == L'"') {
+        const std::size_t valStart = pos + 1;
+        const std::size_t valEnd = text.find(L'"', valStart);
+        if (valEnd != std::wstring_view::npos) {
+          valueOut = UnescapeVdf(text.substr(valStart, valEnd - valStart));
+          cursor = valEnd + 1;
+          return true;
+        }
+      }
+    }
+    cursor = openKey + 1;
+  }
+  return false;
+}
+
+std::wstring VdfValue(std::wstring_view text, std::wstring_view key) {
+  std::size_t cursor = 0;
+  std::wstring value;
+  return FindNextVdfPair(text, key, cursor, value) ? value : std::wstring{};
 }
 
 std::vector<fs::path> SteamLibraries(const fs::path& steamRoot) {
@@ -143,15 +202,10 @@ std::vector<fs::path> SteamLibraries(const fs::path& steamRoot) {
   const auto text = ReadText(steamRoot / L"steamapps" / L"libraryfolders.vdf");
   if (!text) return roots;
   const std::wstring wide = extensions::Utf8ToWide(*text);
-  const std::wregex pathExpression(L"\\\"path\\\"\\s*\\\"([^\\\"]+)\\\"",
-                                   std::regex_constants::icase);
-  for (std::wsregex_iterator it(wide.begin(), wide.end(), pathExpression), end;
-       it != end; ++it) {
-    std::wstring value = (*it)[1].str();
-    for (size_t pos = 0; (pos = value.find(L"\\\\", pos)) != std::wstring::npos;) {
-      value.replace(pos, 2, L"\\");
-      ++pos;
-    }
+  std::size_t cursor = 0;
+  std::wstring value;
+  while (FindNextVdfPair(wide, L"path", cursor, value)) {
+    if (value.empty()) continue;
     fs::path root(value);
     if (IsDirectory(root / L"steamapps") &&
         std::find(roots.begin(), roots.end(), root) == roots.end()) {
@@ -333,16 +387,21 @@ void DiscoverEpic(const DiscoverySources& sources, std::vector<AppEntry>& out,
 
 std::optional<AppEntry> GogGame(const UninstallRecord& record,
                                 const fs::path& galaxyExe) {
-  static const std::wregex keyPattern(LR"(^([0-9]+)_is1$)",
-                                      std::regex_constants::icase);
-  std::wsmatch match;
-  if (!std::regex_match(record.registryKeyName, match, keyPattern) ||
-      core::Lower(record.publisher) != L"gog.com") {
+  if (!EqualsInsensitive(record.publisher, L"gog.com")) {
     return std::nullopt;
+  }
+  const std::wstring_view keyName = record.registryKeyName;
+  if (keyName.size() < 5 ||
+      !EqualsInsensitive(keyName.substr(keyName.size() - 4), L"_is1")) {
+    return std::nullopt;
+  }
+  const std::wstring_view idView = keyName.substr(0, keyName.size() - 4);
+  for (const wchar_t ch : idView) {
+    if (ch < L'0' || ch > L'9') return std::nullopt;
   }
   const fs::path installDir(record.installLocation);
   if (!IsDirectory(installDir)) return std::nullopt;
-  const std::wstring gameId = match[1].str();
+  const std::wstring gameId(idView);
   auto game = Game(L"GOG", gameId, record.displayName, installDir);
 
   const auto manifestText = ReadText(installDir / (L"goggame-" + gameId + L".info"));
@@ -399,17 +458,12 @@ void DiscoverGog(const DiscoverySources& sources, std::vector<AppEntry>& out,
   }
 }
 
-bool ContainsInsensitive(std::wstring_view value, std::wstring_view part) {
-  return core::Lower(std::wstring(value)).find(core::Lower(std::wstring(part))) !=
-         std::wstring::npos;
-}
-
 void DiscoverEa(const DiscoverySources& sources, std::vector<AppEntry>& out,
                 std::stop_token token) {
   for (const auto& record : sources.uninstallRecords) {
     if (token.stop_requested()) return;
     if (!ContainsInsensitive(record.publisher, L"electronic arts") ||
-        core::Lower(record.displayName) == L"ea app") {
+        EqualsInsensitive(record.displayName, L"ea app")) {
       continue;
     }
     const fs::path installDir(record.installLocation);
@@ -447,12 +501,23 @@ void DiscoverUbisoft(const DiscoverySources& sources, std::vector<AppEntry>& out
   }
 }
 
-std::wstring BattleUid(const std::wstring& uninstallString) {
-  const std::wregex pattern(LR"(--uid=([^\s\"]+))",
-                            std::regex_constants::icase);
-  std::wsmatch match;
-  return std::regex_search(uninstallString, match, pattern) ? match[1].str()
-                                                            : std::wstring{};
+std::wstring BattleUid(std::wstring_view uninstallString) {
+  constexpr std::wstring_view kPrefix = L"--uid=";
+  if (uninstallString.size() <= kPrefix.size()) return {};
+  for (std::size_t pos = 0; pos + kPrefix.size() < uninstallString.size(); ++pos) {
+    if (EqualsInsensitive(uninstallString.substr(pos, kPrefix.size()), kPrefix)) {
+      const std::size_t start = pos + kPrefix.size();
+      std::size_t end = start;
+      while (end < uninstallString.size() &&
+             std::iswspace(uninstallString[end]) == 0 &&
+             uninstallString[end] != L'"') {
+        ++end;
+      }
+      if (end > start) return std::wstring(uninstallString.substr(start, end - start));
+      pos = end;
+    }
+  }
+  return {};
 }
 
 void AddBattleGame(std::vector<AppEntry>& out, std::set<std::wstring>& ids,
@@ -523,26 +588,36 @@ std::wstring ProtoString(std::span<const unsigned char> bytes) {
 }
 
 std::optional<std::wstring> BattleProductName(std::wstring_view code) {
-  static const std::map<std::wstring, std::wstring> names{
+  static constexpr std::pair<std::wstring_view, std::wstring_view> kNames[] = {
+      {L"auks", L"Call of Duty: Black Ops 4"},
       {L"d3", L"Diablo III"},
       {L"d4", L"Diablo IV"},
       {L"fen", L"Diablo II: Resurrected"},
       {L"hero", L"Heroes of the Storm"},
+      {L"lazr", L"Call of Duty: Modern Warfare II"},
+      {L"odin", L"Call of Duty: Modern Warfare"},
       {L"pro", L"Overwatch"},
       {L"s1", L"StarCraft"},
       {L"s2", L"StarCraft II"},
-      {L"wtcg", L"Hearthstone"},
       {L"wow", L"World of Warcraft"},
       {L"wow_classic", L"World of Warcraft Classic"},
       {L"wow_classic_era", L"World of Warcraft Classic Era"},
-      {L"odin", L"Call of Duty: Modern Warfare"},
-      {L"lazr", L"Call of Duty: Modern Warfare II"},
+      {L"wtcg", L"Hearthstone"},
       {L"zeus", L"Call of Duty: Black Ops Cold War"},
-      {L"auks", L"Call of Duty: Black Ops 4"},
   };
-  const auto found = names.find(core::Lower(std::wstring(code)));
-  return found == names.end() ? std::nullopt
-                              : std::optional<std::wstring>(found->second);
+  if (code.empty() || code.size() > 24) return std::nullopt;
+  wchar_t lowerBuf[24];
+  for (std::size_t i = 0; i < code.size(); ++i) {
+    lowerBuf[i] = AsciiLowerChar(code[i]);
+  }
+  const std::wstring_view key(lowerBuf, code.size());
+  const auto it = std::lower_bound(
+      std::begin(kNames), std::end(kNames), key,
+      [](const auto& entry, std::wstring_view target) {
+        return entry.first < target;
+      });
+  if (it == std::end(kNames) || it->first != key) return std::nullopt;
+  return std::wstring(it->second);
 }
 
 void DiscoverBattleNet(const DiscoverySources& sources,
@@ -550,10 +625,11 @@ void DiscoverBattleNet(const DiscoverySources& sources,
   std::set<std::wstring> ids;
   for (const auto& record : sources.uninstallRecords) {
     if (token.stop_requested()) return;
-    const std::wstring uid = BattleUid(record.uninstallString);
-    if (uid.empty() || !ContainsInsensitive(record.uninstallString, L"battle.net")) {
+    if (!ContainsInsensitive(record.uninstallString, L"battle.net")) {
       continue;
     }
+    const std::wstring uid = BattleUid(record.uninstallString);
+    if (uid.empty()) continue;
     AddBattleGame(out, ids, sources.battleNetExecutable, uid,
                   record.displayName, record.installLocation);
   }
@@ -561,7 +637,9 @@ void DiscoverBattleNet(const DiscoverySources& sources,
   if (token.stop_requested()) return;
   const auto database = ReadText(sources.battleNetProductDb);
   if (!database) return;
-  const std::vector<unsigned char> bytes(database->begin(), database->end());
+  const std::span<const unsigned char> bytes(
+      reinterpret_cast<const unsigned char*>(database->data()),
+      database->size());
   for (const auto& wrapper : LengthFields(bytes)) {
     if (token.stop_requested()) return;
     std::wstring uid;
@@ -590,15 +668,48 @@ void DiscoverBattleNet(const DiscoverySources& sources,
   }
 }
 
-std::wstring XmlAttribute(const std::wstring& text, std::wstring_view element,
+bool IsWordChar(wchar_t ch) {
+  return (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') ||
+         (ch >= L'0' && ch <= L'9') || ch == L'_';
+}
+
+std::wstring XmlAttribute(std::wstring_view text, std::wstring_view element,
                           std::wstring_view attribute) {
-  const std::wregex expression(
-      L"<\\s*" + std::wstring(element) + L"\\b[^>]*\\b" +
-          std::wstring(attribute) + L"\\s*=\\s*\\\"([^\\\"]+)\\\"",
-      std::regex_constants::icase);
-  std::wsmatch match;
-  return std::regex_search(text, match, expression) ? match[1].str()
-                                                    : std::wstring{};
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    const std::size_t lt = text.find(L'<', pos);
+    if (lt == std::wstring_view::npos) return {};
+    std::size_t cur = lt + 1;
+    while (cur < text.size() && std::iswspace(text[cur]) != 0) ++cur;
+    if (cur + element.size() <= text.size() &&
+        EqualsInsensitive(text.substr(cur, element.size()), element) &&
+        (cur + element.size() == text.size() ||
+         !IsWordChar(text[cur + element.size()]))) {
+      cur += element.size();
+      const std::size_t gt = text.find(L'>', cur);
+      const std::size_t tagEnd = gt == std::wstring_view::npos ? text.size() : gt;
+      for (std::size_t attrPos = cur; attrPos + attribute.size() < tagEnd; ++attrPos) {
+        if (attrPos > cur && IsWordChar(text[attrPos - 1])) continue;
+        if (!EqualsInsensitive(text.substr(attrPos, attribute.size()), attribute)) {
+          continue;
+        }
+        std::size_t after = attrPos + attribute.size();
+        if (after < tagEnd && IsWordChar(text[after])) continue;
+        while (after < tagEnd && std::iswspace(text[after]) != 0) ++after;
+        if (after >= tagEnd || text[after] != L'=') continue;
+        ++after;
+        while (after < tagEnd && std::iswspace(text[after]) != 0) ++after;
+        if (after >= tagEnd || text[after] != L'"') continue;
+        const std::size_t valStart = after + 1;
+        const std::size_t valEnd = text.find(L'"', valStart);
+        if (valEnd != std::wstring_view::npos && valEnd < tagEnd && valEnd > valStart) {
+          return std::wstring(text.substr(valStart, valEnd - valStart));
+        }
+      }
+    }
+    pos = lt + 1;
+  }
+  return {};
 }
 
 void DiscoverXbox(const DiscoverySources& sources,
@@ -659,15 +770,29 @@ void DiscoverXbox(const DiscoverySources& sources,
 
 std::wstring ReadRegistryString(HKEY key, const wchar_t* name) {
   DWORD type = 0;
-  DWORD bytes = 0;
-  if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS ||
-      (type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t)) {
-    return {};
-  }
-  std::wstring value(bytes / sizeof(wchar_t), L'\0');
-  if (RegQueryValueExW(key, name, nullptr, &type,
-                      reinterpret_cast<BYTE*>(value.data()), &bytes) !=
-      ERROR_SUCCESS) {
+  wchar_t stackBuffer[256];
+  DWORD bytes = sizeof(stackBuffer);
+  std::wstring value;
+  const LSTATUS firstStatus = RegQueryValueExW(
+      key, name, nullptr, &type, reinterpret_cast<BYTE*>(stackBuffer), &bytes);
+  if (firstStatus == ERROR_SUCCESS) {
+    if ((type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t)) {
+      return {};
+    }
+    value.assign(stackBuffer, bytes / sizeof(wchar_t));
+  } else if (firstStatus == ERROR_MORE_DATA) {
+    if ((type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t)) {
+      return {};
+    }
+    value.resize((bytes + sizeof(wchar_t) - 1) / sizeof(wchar_t));
+    DWORD bufferBytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    if (RegQueryValueExW(key, name, nullptr, &type,
+                         reinterpret_cast<BYTE*>(value.data()), &bufferBytes) !=
+        ERROR_SUCCESS) {
+      return {};
+    }
+    value.resize(bufferBytes / sizeof(wchar_t));
+  } else {
     return {};
   }
   while (!value.empty() && value.back() == L'\0') value.pop_back();
@@ -712,15 +837,20 @@ void ReadUninstallView(HKEY root, REGSAM view,
     if (RegOpenKeyExW(raw, name.data(), 0, KEY_READ | view, &child) != ERROR_SUCCESS) {
       continue;
     }
+    std::wstring displayName = ReadRegistryString(child, L"DisplayName");
+    if (displayName.empty()) {
+      RegCloseKey(child);
+      continue;
+    }
     UninstallRecord record;
     record.registryKeyName.assign(name.data(), length);
-    record.displayName = ReadRegistryString(child, L"DisplayName");
+    record.displayName = std::move(displayName);
     record.publisher = ReadRegistryString(child, L"Publisher");
     record.installLocation = ReadRegistryString(child, L"InstallLocation");
     record.displayIcon = ReadRegistryString(child, L"DisplayIcon");
     record.uninstallString = ReadRegistryString(child, L"UninstallString");
     RegCloseKey(child);
-    if (!record.displayName.empty()) out.push_back(std::move(record));
+    out.push_back(std::move(record));
   }
   RegCloseKey(raw);
 }
@@ -757,14 +887,18 @@ std::vector<fs::path> XboxRoots() {
   const DWORD drives = GetLogicalDrives();
   for (int index = 0; index < 26; ++index) {
     if ((drives & (1u << index)) == 0) continue;
-    const fs::path drive(std::wstring(1, static_cast<wchar_t>(L'A' + index)) + L":\\");
+    const wchar_t driveRoot[4] = {static_cast<wchar_t>(L'A' + index), L':', L'\\', L'\0'};
+    const UINT driveType = GetDriveTypeW(driveRoot);
+    if (driveType != DRIVE_FIXED && driveType != DRIVE_REMOVABLE) continue;
+    const fs::path drive(driveRoot);
     const fs::path conventional = drive / L"XboxGames";
     if (IsDirectory(conventional)) roots.push_back(conventional);
 
     const auto gamingRoot = ReadText(drive / L".GamingRoot");
     if (!gamingRoot) continue;
-    const std::vector<unsigned char> bytes(gamingRoot->begin(),
-                                           gamingRoot->end());
+    const std::span<const unsigned char> bytes(
+        reinterpret_cast<const unsigned char*>(gamingRoot->data()),
+        gamingRoot->size());
     for (size_t offset : {size_t{6}, size_t{8}}) {
       if (offset >= bytes.size()) continue;
       std::wstring folder;
@@ -800,13 +934,27 @@ DiscoverySources ReadLocalSources() {
   std::replace(steam.begin(), steam.end(), L'/', L'\\');
   sources.steamRoot = steam;
 
-  std::array<wchar_t, 32768> programData{};
-  if (GetEnvironmentVariableW(L"ProgramData", programData.data(),
-                              static_cast<DWORD>(programData.size())) > 0) {
+  wchar_t programDataBuf[512];
+  DWORD programDataLen = GetEnvironmentVariableW(
+      L"ProgramData", programDataBuf, static_cast<DWORD>(std::size(programDataBuf)));
+  std::wstring programData;
+  if (programDataLen > 0 && programDataLen < std::size(programDataBuf)) {
+    programData.assign(programDataBuf, programDataLen);
+  } else if (programDataLen >= std::size(programDataBuf)) {
+    programData.resize(programDataLen);
+    const DWORD written = GetEnvironmentVariableW(
+        L"ProgramData", programData.data(), programDataLen);
+    if (written > 0 && written < programDataLen) {
+      programData.resize(written);
+    } else {
+      programData.clear();
+    }
+  }
+  if (!programData.empty()) {
     sources.epicManifestDirectory =
-        fs::path(programData.data()) / L"Epic" / L"EpicGamesLauncher" /
+        fs::path(programData) / L"Epic" / L"EpicGamesLauncher" /
         L"Data" / L"Manifests";
-    sources.battleNetProductDb = fs::path(programData.data()) / L"Battle.net" /
+    sources.battleNetProductDb = fs::path(programData) / L"Battle.net" /
                                  L"Agent" / L"product.db";
   }
 

@@ -47,6 +47,7 @@ inline std::string WideToUtf8(const std::wstring& value) {
 
 inline std::string JsonEscapeUtf8(std::string_view value) {
   std::string out;
+  out.reserve(value.size());
   for (const unsigned char ch : value) {
     switch (ch) {
       case '\\': out += "\\\\"; break;
@@ -81,6 +82,7 @@ inline std::string QuoteWide(const std::wstring& value) {
 
 inline std::string UnescapeJsonString(std::string_view value) {
   std::string out;
+  out.reserve(value.size());
   bool escaped = false;
   for (size_t i = 0; i < value.size(); ++i) {
     const char ch = value[i];
@@ -581,32 +583,54 @@ inline std::optional<ActivationResponse> ParseActivationResponse(const std::stri
 
 inline std::string BuildQueryRequestJson(const Manifest& manifest, const std::filesystem::path& dataDir,
                                          const std::wstring& query, int limit) {
-  std::ostringstream json;
-  json << "{\"apiVersion\":" << kApiVersion
-       << ",\"type\":\"query\""
-       << ",\"query\":" << QuoteWide(query)
-       << ",\"limit\":" << std::max(1, limit)
-       << ",\"capabilities\":{\"detailMarkdown\":true,\"setQuery\":true}"
-       << ",\"context\":{\"pluginId\":" << QuoteWide(manifest.id)
-       << ",\"pluginDir\":" << QuoteWide(manifest.directory.wstring())
-       << ",\"dataDir\":" << QuoteWide(dataDir.wstring())
-       << "}}";
-  return json.str();
+  const std::string qQuery = QuoteWide(query);
+  const std::string qId = QuoteWide(manifest.id);
+  const std::string qPluginDir = QuoteWide(manifest.directory.wstring());
+  const std::string qDataDir = QuoteWide(dataDir.wstring());
+  const std::string limitStr = std::to_string(std::max(1, limit));
+  const std::string apiStr = std::to_string(kApiVersion);
+  std::string json;
+  json.reserve(192 + qQuery.size() + qId.size() + qPluginDir.size() + qDataDir.size());
+  json += "{\"apiVersion\":";
+  json += apiStr;
+  json += ",\"type\":\"query\",\"query\":";
+  json += qQuery;
+  json += ",\"limit\":";
+  json += limitStr;
+  json += ",\"capabilities\":{\"detailMarkdown\":true,\"setQuery\":true},\"context\":{\"pluginId\":";
+  json += qId;
+  json += ",\"pluginDir\":";
+  json += qPluginDir;
+  json += ",\"dataDir\":";
+  json += qDataDir;
+  json += "}}";
+  return json;
 }
 
 inline std::string BuildActivateRequestJson(const Manifest& manifest, const std::filesystem::path& dataDir,
                                             const QueryResultItem& item) {
-  const std::string payload = item.payloadJson.empty() ? "{}" : item.payloadJson;
-  std::ostringstream json;
-  json << "{\"apiVersion\":" << kApiVersion
-       << ",\"type\":\"activate\""
-       << ",\"itemId\":" << QuoteWide(item.id)
-       << ",\"payload\":" << payload
-       << ",\"context\":{\"pluginId\":" << QuoteWide(manifest.id)
-       << ",\"pluginDir\":" << QuoteWide(manifest.directory.wstring())
-       << ",\"dataDir\":" << QuoteWide(dataDir.wstring())
-       << "}}";
-  return json.str();
+  const std::string_view payload = item.payloadJson.empty() ? std::string_view("{}") : std::string_view(item.payloadJson);
+  const std::string qItemId = QuoteWide(item.id);
+  const std::string qId = QuoteWide(manifest.id);
+  const std::string qPluginDir = QuoteWide(manifest.directory.wstring());
+  const std::string qDataDir = QuoteWide(dataDir.wstring());
+  const std::string apiStr = std::to_string(kApiVersion);
+  std::string json;
+  json.reserve(160 + qItemId.size() + payload.size() + qId.size() + qPluginDir.size() + qDataDir.size());
+  json += "{\"apiVersion\":";
+  json += apiStr;
+  json += ",\"type\":\"activate\",\"itemId\":";
+  json += qItemId;
+  json += ",\"payload\":";
+  json += payload;
+  json += ",\"context\":{\"pluginId\":";
+  json += qId;
+  json += ",\"pluginDir\":";
+  json += qPluginDir;
+  json += ",\"dataDir\":";
+  json += qDataDir;
+  json += "}}";
+  return json;
 }
 
 inline bool ResponseSizeAllowed(size_t requiredBytes) {

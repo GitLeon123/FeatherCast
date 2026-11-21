@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <numeric>
+#include <unordered_set>
 
 namespace feathercast::library {
 namespace {
@@ -56,15 +57,18 @@ bool CanonicalAliasCollision(
 template <typename T, typename Name, typename Keyword>
 std::vector<std::size_t> SortedIndices(const T& values, Name name,
                                        Keyword keyword) {
+  std::vector<std::pair<std::wstring, std::wstring>> keys;
+  keys.reserve(values.size());
+  for (const auto& item : values) {
+    keys.emplace_back(NormalizeKeyword(name(item)),
+                      NormalizeKeyword(keyword(item)));
+  }
   std::vector<std::size_t> indices(values.size());
   std::iota(indices.begin(), indices.end(), 0);
   std::stable_sort(indices.begin(), indices.end(), [&](std::size_t left,
                                                         std::size_t right) {
-    std::wstring leftName = NormalizeKeyword(name(values[left]));
-    std::wstring rightName = NormalizeKeyword(name(values[right]));
-    if (leftName != rightName) return leftName < rightName;
-    return NormalizeKeyword(keyword(values[left])) <
-           NormalizeKeyword(keyword(values[right]));
+    if (keys[left].first != keys[right].first) return keys[left].first < keys[right].first;
+    return keys[left].second < keys[right].second;
   });
   return indices;
 }
@@ -199,16 +203,44 @@ std::optional<std::map<std::wstring, std::wstring>> ToCommandAliasMap(
     const std::vector<snippets::Snippet>& snippets,
     const std::vector<settings::Quicklink>& quicklinks,
     std::wstring* error) {
+  std::unordered_set<std::wstring> externalAliases;
+  externalAliases.reserve(appAliases.size() + snippets.size() + quicklinks.size());
+  for (const auto& item : appAliases) externalAliases.insert(core::NormalizeAlias(item.alias));
+  for (const auto& item : snippets) externalAliases.insert(core::NormalizeAlias(item.keyword));
+  for (const auto& item : quicklinks) externalAliases.insert(core::NormalizeAlias(item.keyword));
+
+  std::unordered_set<std::wstring> seenStableIds;
+  std::unordered_set<std::wstring> seenAliases;
+  seenStableIds.reserve(aliases.size());
+  seenAliases.reserve(aliases.size());
+
   std::map<std::wstring, std::wstring> result;
-  for (std::size_t index = 0; index < aliases.size(); ++index) {
-    if (const auto validation = ValidateCommandAlias(
-            aliases[index], aliases, appAliases, snippets, quicklinks,
-            index)) {
-      if (error) *error = *validation;
+  for (const auto& entry : aliases) {
+    const std::wstring trimmedId = Trim(entry.stableId);
+    if (trimmedId.empty()) {
+      if (error) *error = L"Command is required.";
       return std::nullopt;
     }
-    const auto validated = core::ValidateAlias(aliases[index].alias);
-    result[Trim(aliases[index].stableId)] = validated.value;
+    if (const auto aliasErr = ValidateAliasText(entry.alias)) {
+      if (error) *error = *aliasErr;
+      return std::nullopt;
+    }
+    const std::wstring normId = NormalizeKeyword(trimmedId);
+    if (!seenStableIds.insert(normId).second) {
+      if (error) *error = L"This command already has an alias.";
+      return std::nullopt;
+    }
+    const auto validated = core::ValidateAlias(entry.alias);
+    const std::wstring normAlias = core::NormalizeAlias(validated.value);
+    if (!seenAliases.insert(normAlias).second) {
+      if (error) *error = L"Another command already uses this alias.";
+      return std::nullopt;
+    }
+    if (externalAliases.contains(normAlias)) {
+      if (error) *error = L"An app, snippet, or quicklink already uses this alias.";
+      return std::nullopt;
+    }
+    result[trimmedId] = validated.value;
   }
   if (error) error->clear();
   return result;

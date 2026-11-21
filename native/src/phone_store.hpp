@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -73,13 +74,25 @@ class PhoneStore {
  public:
   static constexpr std::size_t kMaxNotifications = 100;
   static constexpr std::size_t kMaxNotificationIcons = 30;
+  static constexpr std::size_t kMaxPhotoThumbs = 60;
   static constexpr std::size_t kMaxClips = 50;
   static constexpr std::size_t kMaxSmsThreads = 200;
+  static constexpr std::size_t kMaxSmsMessages = 500;
   // The same phone back within this long of its disconnect is a short drop.
   static constexpr long long kQuietReconnectMs = 2 * 60 * 1000;
   static constexpr std::size_t kMaxAlertedNotifications = 256;
 
   StoreChanges Apply(const Event& event, long long nowMs) {
+    return ApplyImpl(event, nowMs);
+  }
+
+  StoreChanges Apply(Event&& event, long long nowMs) {
+    return ApplyImpl(std::move(event), nowMs);
+  }
+
+ private:
+  template <typename EventRef>
+  StoreChanges ApplyImpl(EventRef&& event, long long nowMs) {
     StoreChanges changes;
     switch (event.kind) {
       case EventKind::Connected: {
@@ -141,16 +154,22 @@ class PhoneStore {
         }
         RemoveNotification(event.notification.key);
         StoredNotification item;
-        item.info = event.notification;
+        if constexpr (std::is_rvalue_reference_v<EventRef&&>) {
+          item.info = std::move(event.notification);
+        } else {
+          item.info = event.notification;
+        }
         if (!item.info.iconPng.empty()) {
           item.icon = std::make_shared<const Bytes>(std::move(item.info.iconPng));
           item.info.iconPng = {};
         }
-        notifications_.push_front(std::move(item));
-        std::stable_sort(notifications_.begin(), notifications_.end(),
-                         [](const auto& a, const auto& b) {
-                           return a.info.time > b.info.time;
-                         });
+        // Insert in descending time order (matching push_front + stable_sort:
+        // a newly posted item with equal timestamp lands ahead of older equal ones).
+        auto pos = std::find_if(notifications_.begin(), notifications_.end(),
+                                [&](const auto& existing) {
+                                  return item.info.time >= existing.info.time;
+                                });
+        notifications_.insert(pos, std::move(item));
         while (notifications_.size() > kMaxNotifications) notifications_.pop_back();
         for (std::size_t i = kMaxNotificationIcons; i < notifications_.size(); ++i) {
           notifications_[i].icon.reset();
@@ -176,19 +195,27 @@ class PhoneStore {
       case EventKind::PhotoList: {
         photosError_ = event.text;
         photosAccess_ = event.id;
+        std::unordered_map<std::string_view, std::size_t> existingById;
+        existingById.reserve(photos_.size());
+        for (std::size_t i = 0; i < photos_.size(); ++i) {
+          existingById.emplace(photos_[i].info.id, i);
+        }
         std::vector<StoredPhoto> next;
         next.reserve(event.photos.size());
         for (const auto& info : event.photos) {
           StoredPhoto item;
           item.info = info;
           item.info.thumbJpeg = {};
-          if (const auto* existing = FindPhoto(info.id)) {
-            item.thumb = existing->thumb;
-            item.downloading = existing->downloading;
+          if (const auto found = existingById.find(info.id);
+              found != existingById.end()) {
+            const auto& existing = photos_[found->second];
+            item.thumb = existing.thumb;
+            item.downloading = existing.downloading;
           }
           next.push_back(std::move(item));
         }
         photos_ = std::move(next);
+        TrimPhotoThumbs();
         photosFetchedAt_ = nowMs;
         changes.photos = true;
         break;
@@ -196,7 +223,12 @@ class PhoneStore {
       case EventKind::PhotoThumb:
         if (auto* photo = FindPhoto(event.photo.id);
             photo && !event.photo.thumbJpeg.empty()) {
-          photo->thumb = std::make_shared<const Bytes>(event.photo.thumbJpeg);
+          if constexpr (std::is_rvalue_reference_v<EventRef&&>) {
+            photo->thumb = std::make_shared<const Bytes>(std::move(event.photo.thumbJpeg));
+          } else {
+            photo->thumb = std::make_shared<const Bytes>(event.photo.thumbJpeg);
+          }
+          TrimPhotoThumbs();
           changes.photos = true;
           changes.thumbId = event.photo.id;
         }
@@ -229,10 +261,17 @@ class PhoneStore {
         // Cover art is only sent when the track changes.
         const bool sameTrack = media_.active && event.media.title == media_.title &&
                                event.media.artist == media_.artist;
-        media_ = event.media;
+        Bytes incomingArt;
+        if constexpr (std::is_rvalue_reference_v<EventRef&&>) {
+          incomingArt = std::move(event.media.artJpeg);
+          media_ = std::move(event.media);
+        } else {
+          incomingArt = event.media.artJpeg;
+          media_ = event.media;
+        }
         media_.artJpeg = {};
-        if (!event.media.artJpeg.empty()) {
-          mediaArt_ = std::make_shared<const Bytes>(event.media.artJpeg);
+        if (!incomingArt.empty()) {
+          mediaArt_ = std::make_shared<const Bytes>(std::move(incomingArt));
         } else if (!sameTrack) {
           mediaArt_.reset();
         }
@@ -250,6 +289,7 @@ class PhoneStore {
         if (event.id == smsThread_) {
           // Keep messages sent from this PC that the phone has not listed yet.
           std::vector<StoredSms> next;
+          next.reserve(event.smsMessages.size() + smsMessages_.size());
           for (const auto& message : event.smsMessages) next.push_back(StoredSms{message});
           for (const auto& stored : smsMessages_) {
             if (stored.pending || stored.failed) next.push_back(stored);
@@ -323,6 +363,8 @@ class PhoneStore {
     return changes;
   }
 
+ public:
+
   bool RemoveNotification(const std::string& key) {
     const auto before = notifications_.size();
     std::erase_if(notifications_,
@@ -339,20 +381,27 @@ class PhoneStore {
 
   void Clear() {
     notifications_.clear();
+    notifications_.shrink_to_fit();
     alerted_.clear();
+    alerted_.shrink_to_fit();
     photos_.clear();
+    photos_.shrink_to_fit();
     clips_.clear();
+    clips_.shrink_to_fit();
     photosFetchedAt_ = 0;
     photosError_.clear();
     photosAccess_.clear();
     media_ = {};
     mediaArt_.reset();
     smsThreads_.clear();
+    smsThreads_.shrink_to_fit();
     smsMessages_.clear();
+    smsMessages_.shrink_to_fit();
     smsThread_.clear();
     smsMessagesLoaded_ = false;
     smsFetchedAt_ = 0;
     files_.clear();
+    files_.shrink_to_fit();
     filesError_.clear();
     downloadingFiles_.clear();
     filesLoading_ = false;
@@ -360,6 +409,7 @@ class PhoneStore {
     call_ = {};
     ringing_ = false;
     features_.clear();
+    features_.shrink_to_fit();
   }
 
   // ---- SMS
@@ -489,11 +539,22 @@ class PhoneStore {
     if (smsThreads_.size() > kMaxSmsThreads) smsThreads_.resize(kMaxSmsThreads);
   }
 
-  // Oldest first, like a chat.
+  // Oldest first, like a chat; retain at most kMaxSmsMessages newest messages.
   void SortMessages() {
     std::stable_sort(smsMessages_.begin(), smsMessages_.end(), [](const auto& a, const auto& b) {
       return a.message.time < b.message.time;
     });
+    if (smsMessages_.size() > kMaxSmsMessages) {
+      const auto excess = smsMessages_.size() - kMaxSmsMessages;
+      smsMessages_.erase(smsMessages_.begin(),
+                         smsMessages_.begin() + static_cast<std::ptrdiff_t>(excess));
+    }
+  }
+
+  void TrimPhotoThumbs() {
+    for (std::size_t i = kMaxPhotoThumbs; i < photos_.size(); ++i) {
+      photos_[i].thumb.reset();
+    }
   }
 
   StoredPhoto* FindPhoto(const std::string& id) {

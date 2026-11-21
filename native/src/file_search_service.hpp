@@ -68,6 +68,7 @@ class FileSearchService {
   void WorkerLoop(std::stop_token token);
   app::ResultsCollection Compute(const FileQuery& query, std::stop_token token);
   bool EnsureDatabase();
+  void CloseDatabase();
   std::vector<std::wstring> QueryContent(const FileQuery& query,
                                          std::size_t limit,
                                          std::stop_token token);
@@ -88,6 +89,8 @@ class FileSearchService {
   std::uint64_t pendingStorageFilesGeneration_ = 0;
   std::shared_ptr<const Corpus> corpus_;
   std::atomic<unsigned long long> generation_ = 0;
+  bool started_ = false;
+  bool workerActive_ = false;
   bool stopping_ = false;
 };
 

@@ -4,16 +4,18 @@
 
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <deque>
@@ -22,6 +24,10 @@
 struct IWICImagingFactory;
 
 namespace feathercast::runtime {
+
+// Returns a per-worker IWICImagingFactory when called on an IconResolver worker
+// thread; owned by the worker and released cleanly before CoUninitialize().
+::IWICImagingFactory* CurrentIconWorkerWicFactory() noexcept;
 
 struct DecodedIcon {
   std::wstring key;
@@ -157,17 +163,27 @@ class IconResolver {
   void ClearPending();
 
  private:
-  void WorkerLoop(std::stop_token stopToken);
+  struct WorkerSlot {
+    std::jthread thread;
+    bool exited = false;
+  };
+
+  void WorkerLoop(std::stop_token stopToken, WorkerSlot* slot);
+  void ReapExitedLocked(std::vector<std::unique_ptr<WorkerSlot>>& out);
 
   Completed completed_;
   Failed failed_;
   Resolve resolve_;
   std::mutex mutex_;
   std::condition_variable cv_;
-  std::set<std::wstring> pending_;
+  std::unordered_set<std::wstring> pending_;
   std::deque<std::wstring> jobs_;
-  std::vector<std::jthread> workers_;
+  std::vector<std::unique_ptr<WorkerSlot>> workers_;
   std::stop_source operationStop_;
+  std::size_t maxWorkers_ = 0;
+  std::size_t liveWorkers_ = 0;
+  std::size_t idleWorkers_ = 0;
+  bool started_ = false;
   bool stopping_ = false;
 };
 

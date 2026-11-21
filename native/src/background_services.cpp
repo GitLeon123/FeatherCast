@@ -9,6 +9,21 @@
 
 namespace feathercast::runtime {
 
+namespace {
+
+thread_local Microsoft::WRL::ComPtr<IWICImagingFactory>* g_iconWorkerWicFactory = nullptr;
+
+}  // namespace
+
+::IWICImagingFactory* CurrentIconWorkerWicFactory() noexcept {
+  if (!g_iconWorkerWicFactory) return nullptr;
+  if (!*g_iconWorkerWicFactory) {
+    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                     IID_PPV_ARGS(g_iconWorkerWicFactory->GetAddressOf()));
+  }
+  return g_iconWorkerWicFactory->Get();
+}
+
 std::optional<DecodedIcon> DecodePngIcon(
     IWICImagingFactory* factory, const std::filesystem::path& path,
     const std::wstring& key) {
@@ -140,47 +155,82 @@ IconResolver::~IconResolver() {
 
 void IconResolver::Start(std::size_t workers, Resolve resolve) {
   std::lock_guard lock(mutex_);
-  if (!workers_.empty()) return;
+  if (started_) return;
   stopping_ = false;
+  started_ = true;
   operationStop_ = std::stop_source{};
   resolve_ = std::move(resolve);
-  workers = std::max<std::size_t>(1, workers);
-  workers_.reserve(workers);
-  for (std::size_t index = 0; index < workers; ++index) {
-    workers_.emplace_back(
-        [this](std::stop_token token) { WorkerLoop(token); });
+  maxWorkers_ = std::max<std::size_t>(1, workers);
+  workers_.reserve(maxWorkers_);
+}
+
+void IconResolver::ReapExitedLocked(std::vector<std::unique_ptr<WorkerSlot>>& out) {
+  auto it = workers_.begin();
+  while (it != workers_.end()) {
+    if ((*it)->exited) {
+      out.push_back(std::move(*it));
+      it = workers_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
 void IconResolver::Stop() {
+  std::vector<std::unique_ptr<WorkerSlot>> workers;
   {
     std::lock_guard lock(mutex_);
-    if (workers_.empty()) return;
+    if (!started_ && workers_.empty()) return;
     stopping_ = true;
+    started_ = false;
     operationStop_.request_stop();
     jobs_.clear();
     pending_.clear();
-    for (auto& worker : workers_) worker.request_stop();
+    for (auto& slot : workers_) {
+      if (slot && slot->thread.joinable()) slot->thread.request_stop();
+    }
+    workers.swap(workers_);
   }
   cv_.notify_all();
-  for (auto& worker : workers_) {
-    if (worker.joinable()) worker.join();
+  for (auto& slot : workers) {
+    if (slot && slot->thread.joinable()) slot->thread.join();
   }
   std::lock_guard lock(mutex_);
-  workers_.clear();
   resolve_ = {};
+  maxWorkers_ = 0;
+  liveWorkers_ = 0;
+  idleWorkers_ = 0;
   stopping_ = false;
 }
 
 bool IconResolver::Queue(std::wstring key) {
   if (key.empty()) return false;
+  std::vector<std::unique_ptr<WorkerSlot>> exited;
+  bool notify = false;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || workers_.empty() || !resolve_) return false;
-    if (!pending_.insert(key).second) return true;
-    jobs_.push_back(std::move(key));
+    if (stopping_ || !started_ || !resolve_) return false;
+    ReapExitedLocked(exited);
+    if (!pending_.insert(key).second) {
+      // Key already queued.
+    } else {
+      jobs_.push_back(std::move(key));
+      if (idleWorkers_ == 0 && liveWorkers_ < maxWorkers_) {
+        auto slot = std::make_unique<WorkerSlot>();
+        WorkerSlot* slotPtr = slot.get();
+        ++liveWorkers_;
+        slot->thread = std::jthread(
+            [this, slotPtr](std::stop_token token) { WorkerLoop(token, slotPtr); });
+        workers_.push_back(std::move(slot));
+      } else {
+        notify = true;
+      }
+    }
   }
-  cv_.notify_one();
+  if (notify) cv_.notify_one();
+  for (auto& slot : exited) {
+    if (slot && slot->thread.joinable()) slot->thread.join();
+  }
   return true;
 }
 
@@ -192,7 +242,7 @@ void IconResolver::ClearPending() {
   pending_.clear();
 }
 
-void IconResolver::WorkerLoop(std::stop_token stopToken) {
+void IconResolver::WorkerLoop(std::stop_token stopToken, WorkerSlot* slot) {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(coResult)) {
@@ -202,8 +252,14 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
             std::runtime_error("icon worker COM initialization failed")));
       } catch (...) {}
     }
+    std::lock_guard lock(mutex_);
+    if (liveWorkers_ > 0) --liveWorkers_;
+    slot->exited = true;
     return;
   }
+  Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+  g_iconWorkerWicFactory = &wicFactory;
+  constexpr auto kIdleTimeout = std::chrono::seconds(30);
   for (;;) {
     std::wstring key;
     Resolve resolve;
@@ -211,10 +267,15 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
     std::stop_token operationToken;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
+      ++idleWorkers_;
+      const bool woke = cv_.wait_for(lock, kIdleTimeout, [&] {
         return !jobs_.empty() || stopping_ || stopToken.stop_requested();
       });
-      if (stopping_ || stopToken.stop_requested()) break;
+      --idleWorkers_;
+      if (stopping_ || stopToken.stop_requested() || (!woke && jobs_.empty())) {
+        if (liveWorkers_ > 0) --liveWorkers_;
+        break;
+      }
       key = std::move(jobs_.front());
       jobs_.pop_front();
       resolve = resolve_;
@@ -239,7 +300,12 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
       }
     }
   }
+  // Release COM factory before CoUninitialize() so COM teardown is deterministic.
+  g_iconWorkerWicFactory = nullptr;
+  wicFactory.Reset();
   CoUninitialize();
+  std::lock_guard lock(mutex_);
+  slot->exited = true;
 }
 
 }  // namespace feathercast::runtime

@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cwctype>
 #include <iterator>
 #include <sstream>
@@ -48,12 +49,9 @@ std::wstring FormatLocalFileTime(const FILETIME& fileTime) {
 }
 
 std::wstring MetadataDetail(const std::filesystem::path& path,
-                            std::uintmax_t bytes) {
-  std::wstring modified;
-  WIN32_FILE_ATTRIBUTE_DATA attributes{};
-  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
-    modified = FormatLocalFileTime(attributes.ftLastWriteTime);
-  }
+                            std::uintmax_t bytes,
+                            const FILETIME& lastWriteTime) {
+  const std::wstring modified = FormatLocalFileTime(lastWriteTime);
   std::wostringstream out;
   out << path.wstring() << L"\n" << bytes << L" bytes\nModified "
       << (modified.empty() ? std::wstring(L"unknown") : modified);
@@ -62,14 +60,14 @@ std::wstring MetadataDetail(const std::filesystem::path& path,
 
 std::wstring Excerpt(const std::wstring& text, const std::wstring& terms) {
   if (text.size() <= kMaxTextExcerptChars) return text;
-  const std::wstring lowered = core::Lower(text);
-  std::size_t match = std::wstring::npos;
   std::wstring token;
   for (const wchar_t ch : terms) {
     if (std::iswalnum(ch) || ch == L'_') token.push_back(ch);
     else if (!token.empty()) break;
   }
-  if (!token.empty()) match = lowered.find(core::Lower(token));
+  if (token.empty()) return text.substr(0, kMaxTextExcerptChars);
+  const std::wstring lowered = core::Lower(text);
+  const std::size_t match = lowered.find(core::Lower(token));
   if (match == std::wstring::npos) return text.substr(0, kMaxTextExcerptChars);
   const std::size_t before = kMaxTextExcerptChars / 3;
   const std::size_t start = match > before ? match - before : 0;
@@ -77,11 +75,19 @@ std::wstring Excerpt(const std::wstring& text, const std::wstring& terms) {
 }
 
 bool DecodeImage(const std::filesystem::path& path, Result& result,
-                 std::stop_token token) {
-  ComPtr<IWICImagingFactory> factory;
-  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                              CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) {
-    return false;
+                 std::stop_token token, IWICImagingFactory** cachedFactory) {
+  ComPtr<IWICImagingFactory> localFactory;
+  IWICImagingFactory* factory = cachedFactory ? *cachedFactory : nullptr;
+  if (!factory) {
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&localFactory)))) {
+      return false;
+    }
+    factory = localFactory.Get();
+    if (cachedFactory) {
+      *cachedFactory = localFactory.Detach();
+    }
   }
   ComPtr<IWICBitmapDecoder> decoder;
   if (FAILED(factory->CreateDecoderFromFilename(
@@ -138,33 +144,47 @@ PreviewService::~PreviewService() { Stop(); }
 
 void PreviewService::Start() {
   std::lock_guard lock(mutex_);
-  if (worker_.joinable()) return;
+  if (started_) return;
   stopping_ = false;
-  worker_ = std::jthread([this](std::stop_token token) { WorkerLoop(token); });
+  started_ = true;
 }
 
 void PreviewService::Stop() {
+  std::jthread worker;
   {
     std::lock_guard lock(mutex_);
-    if (!worker_.joinable()) return;
+    if (!started_ && !worker_.joinable()) return;
     stopping_ = true;
+    started_ = false;
     pending_.reset();
-    worker_.request_stop();
+    if (worker_.joinable()) worker_.request_stop();
+    worker = std::move(worker_);
   }
   cv_.notify_all();
-  worker_.join();
+  if (worker.joinable()) worker.join();
   std::lock_guard lock(mutex_);
+  workerActive_ = false;
   stopping_ = false;
 }
 
 bool PreviewService::Load(Request request) {
   generation_.store(request.generation, std::memory_order_release);
+  std::jthread finishedWorker;
+  bool notify = false;
   {
     std::lock_guard lock(mutex_);
-    if (stopping_ || !worker_.joinable()) return false;
+    if (stopping_ || !started_) return false;
     pending_ = std::move(request);
+    if (!workerActive_) {
+      if (worker_.joinable()) finishedWorker = std::move(worker_);
+      workerActive_ = true;
+      worker_ = std::jthread([this](std::stop_token token) { WorkerLoop(token); });
+    } else {
+      notify = true;
+    }
   }
-  cv_.notify_one();
+  if (notify) cv_.notify_one();
+  if (finishedWorker.joinable()) finishedWorker.join();
   return true;
 }
 
@@ -181,6 +201,7 @@ void PreviewService::WorkerLoop(std::stop_token token) {
   // fatal, but only a successful one may be balanced by CoUninitialize.
   const bool comInitialized =
       SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+  IWICImagingFactory* cachedFactory = nullptr;
   // An exception escaping this thread terminates the app, so neither a
   // failing preview nor a failing sink may leave the loop.
   const auto report = [this](std::exception_ptr error) noexcept {
@@ -189,20 +210,28 @@ void PreviewService::WorkerLoop(std::stop_token token) {
     } catch (...) {
     }
   };
+  constexpr auto kIdleTimeout = std::chrono::seconds(30);
   for (;;) {
     Request request;
     {
       std::unique_lock lock(mutex_);
-      cv_.wait(lock, [&] {
+      const bool woke = cv_.wait_for(lock, kIdleTimeout, [&] {
         return stopping_ || token.stop_requested() || pending_.has_value();
       });
-      if (stopping_ || token.stop_requested()) break;
+      if (stopping_ || token.stop_requested()) {
+        workerActive_ = false;
+        break;
+      }
+      if (!woke && !pending_.has_value()) {
+        workerActive_ = false;
+        break;
+      }
       request = std::move(*pending_);
       pending_.reset();
     }
     std::optional<Result> result;
     try {
-      result = Build(request, token);
+      result = Build(request, token, comInitialized ? &cachedFactory : nullptr);
     } catch (...) {
       report(std::current_exception());
       // The pane shows "Loading preview..." until a result for the current
@@ -230,26 +259,36 @@ void PreviewService::WorkerLoop(std::stop_token token) {
       report(std::current_exception());
     }
   }
+  if (cachedFactory) {
+    cachedFactory->Release();
+    cachedFactory = nullptr;
+  }
   if (comInitialized) CoUninitialize();
 }
 
 Result PreviewService::Build(const Request& request,
-                             std::stop_token token) const {
+                             std::stop_token token,
+                             IWICImagingFactory** cachedFactory) const {
   Result result;
   result.generation = request.generation;
   result.path = request.path;
   result.title = request.path.filename().wstring();
-  std::error_code ec;
-  const auto bytes = std::filesystem::is_directory(request.path, ec)
-                         ? 0
-                         : std::filesystem::file_size(request.path, ec);
-  if (ec || !std::filesystem::exists(request.path, ec)) {
+  WIN32_FILE_ATTRIBUTE_DATA attributes{};
+  if (!GetFileAttributesExW(request.path.c_str(), GetFileExInfoStandard,
+                            &attributes)) {
     result.kind = Kind::Error;
     result.detail = L"The selected file is no longer available.";
     return result;
   }
-  result.detail = MetadataDetail(request.path, bytes);
-  if (std::filesystem::is_directory(request.path, ec)) return result;
+  const bool isDirectory =
+      (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const std::uintmax_t bytes =
+      isDirectory
+          ? 0
+          : (static_cast<std::uintmax_t>(attributes.nFileSizeHigh) << 32) |
+                static_cast<std::uintmax_t>(attributes.nFileSizeLow);
+  result.detail = MetadataDetail(request.path, bytes, attributes.ftLastWriteTime);
+  if (isDirectory) return result;
   if (token.stop_requested()) return result;
 
   if (file_content::Supports(request.path)) {
@@ -264,7 +303,7 @@ Result PreviewService::Build(const Request& request,
     return result;
   }
   if (file_content::IsImage(request.path) && bytes <= kMaxImageBytes) {
-    if (DecodeImage(request.path, result, token)) {
+    if (DecodeImage(request.path, result, token, cachedFactory)) {
       result.kind = Kind::Image;
     } else {
       result.kind = Kind::Error;

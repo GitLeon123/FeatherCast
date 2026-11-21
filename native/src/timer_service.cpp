@@ -2,49 +2,82 @@
 
 namespace feathercast::timers {
 
-bool TimerService::Start() {
-  if (worker_.joinable()) return true;
-  changed_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  timer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-  if (!changed_ || !timer_) { Stop(); return false; }
-  worker_ = std::jthread([this](std::stop_token stop) {
-    const HANDLE events[] = {changed_, timer_};
-    while (!stop.stop_requested()) {
-      const DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
-      if (stop.stop_requested() || result == WAIT_FAILED) break;
-      if (result == WAIT_OBJECT_0 + 1) {
-        std::uint64_t generation;
-        {
-          std::lock_guard lock(mutex_);
-          generation = generation_;
-        }
-        sink_(Due{generation});
-      }
+void CALLBACK TimerService::OnTimer(PTP_CALLBACK_INSTANCE, PVOID context, PTP_TIMER) {
+  auto* self = static_cast<TimerService*>(context);
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard lock(self->mutex_);
+    if (self->stopping_ || !self->timer_ || !self->armed_) return;
+    FILETIME nowFt{};
+    GetSystemTimeAsFileTime(&nowFt);
+    const unsigned long long now =
+        (static_cast<unsigned long long>(nowFt.dwHighDateTime) << 32) |
+        static_cast<unsigned long long>(nowFt.dwLowDateTime);
+    if (now < self->dueFileTime_) {
+      // Either a stale callback from an earlier deadline raced with a later
+      // Schedule(), or the OS woke slightly before dueFileTime_. Re-arming for
+      // dueFileTime_ handles both safely without losing the timer.
+      FILETIME due{};
+      due.dwLowDateTime = static_cast<DWORD>(self->dueFileTime_ & 0xFFFFFFFFULL);
+      due.dwHighDateTime = static_cast<DWORD>(self->dueFileTime_ >> 32);
+      SetThreadpoolTimer(self->timer_, &due, 0, 0);
+      return;
     }
-  });
-  return true;
+    self->armed_ = false;
+    generation = self->generation_;
+  }
+  if (self->sink_) self->sink_(Due{generation});
+}
+
+bool TimerService::Start() {
+  std::lock_guard lock(mutex_);
+  if (timer_) return true;
+  stopping_ = false;
+  armed_ = false;
+  dueFileTime_ = 0;
+  timer_ = CreateThreadpoolTimer(&TimerService::OnTimer, this, nullptr);
+  return timer_ != nullptr;
 }
 
 bool TimerService::Schedule(std::optional<long long> deadline, std::uint64_t generation) {
   std::lock_guard lock(mutex_);
-  if (!timer_) return false;
+  if (!timer_ || stopping_) return false;
   generation_ = generation;
-  if (!deadline) { CancelWaitableTimer(timer_); return true; }
-  LARGE_INTEGER due{};
-  // Absolute UTC deadline includes sleep. fResume=FALSE never wakes the PC.
-  due.QuadPart = (*deadline + 11644473600000LL) * 10000LL;
-  return SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE) != FALSE;
+  if (!deadline) {
+    armed_ = false;
+    dueFileTime_ = 0;
+    SetThreadpoolTimer(timer_, nullptr, 0, 0);
+    return true;
+  }
+  // Positive absolute UTC FILETIME includes sleep and never wakes the PC.
+  const long long ticks = (*deadline + 11644473600000LL) * 10000LL;
+  const unsigned long long u = ticks <= 0 ? 1ULL : static_cast<unsigned long long>(ticks);
+  dueFileTime_ = u;
+  armed_ = true;
+  FILETIME due{};
+  due.dwLowDateTime = static_cast<DWORD>(u & 0xFFFFFFFFULL);
+  due.dwHighDateTime = static_cast<DWORD>(u >> 32);
+  SetThreadpoolTimer(timer_, &due, 0, 0);
+  return true;
 }
 
 void TimerService::Stop() {
-  if (worker_.joinable()) {
-    worker_.request_stop();
-    SetEvent(changed_);
-    worker_.join();
+  PTP_TIMER timer = nullptr;
+  {
+    std::lock_guard lock(mutex_);
+    if (!timer_) return;
+    stopping_ = true;
+    armed_ = false;
+    dueFileTime_ = 0;
+    timer = timer_;
+    timer_ = nullptr;
+    SetThreadpoolTimer(timer, nullptr, 0, 0);
   }
-  if (timer_) CloseHandle(timer_);
-  if (changed_) CloseHandle(changed_);
-  timer_ = changed_ = nullptr;
+  // Wait outside mutex_ so any in-flight OnTimer callback cannot deadlock.
+  WaitForThreadpoolTimerCallbacks(timer, TRUE);
+  CloseThreadpoolTimer(timer);
+  std::lock_guard lock(mutex_);
+  stopping_ = false;
 }
 
 }  // namespace feathercast::timers

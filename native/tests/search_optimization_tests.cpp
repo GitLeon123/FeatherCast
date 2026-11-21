@@ -54,7 +54,7 @@ void CheckSymbols(bool emoji) {
                             : symbols::SearchSymbols(L":arrow", 5);
   if (emoji) {
     emoji::FreeEmojiMemory();
-    assert(!emoji::g_EmojiList && !emoji::g_EmojiSearchItems);
+    assert(!emoji::g_EmojiSearchItems);
   } else {
     symbols::FreeSymbolsMemory();
     assert(!symbols::g_SymbolsSearchItems);

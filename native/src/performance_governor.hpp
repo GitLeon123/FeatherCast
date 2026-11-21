@@ -1,5 +1,16 @@
 #pragma once
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <malloc.h>
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -7,6 +18,25 @@
 #include <thread>
 
 namespace feathercast::performance {
+
+// Compact CRT/process heaps and optionally ask Windows to trim paged working
+// set when the launcher transitions to hidden idle. Uses kernel32 only (no
+// psapi dependency) so every test target links cleanly.
+inline void TrimIdleMemory(bool trimWorkingSet) noexcept {
+#ifdef _WIN32
+  ::_heapmin();
+  if (HANDLE heap = ::GetProcessHeap()) {
+    ::HeapCompact(heap, 0);
+  }
+  if (trimWorkingSet) {
+    ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(),
+                                 static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1), 0);
+  }
+#else
+  (void)trimWorkingSet;
+#endif
+}
 
 // Quality is deliberately ordered from cheapest to most expensive.  The
 // governor never changes the user's persisted animation preference; it only

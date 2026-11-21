@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace feathercast::library_ui {
 namespace {
@@ -1443,6 +1444,11 @@ class ManagerWindow {
   void Refresh(std::optional<std::size_t> select = std::nullopt) {
     ListView_DeleteAllItems(list_);
     if (kind_ == library::ItemKind::Snippet) {
+      std::unordered_map<std::wstring, std::size_t> keywordCounts;
+      keywordCounts.reserve(data_.snippets.size());
+      for (const auto& item : data_.snippets) {
+        ++keywordCounts[library::NormalizeKeyword(item.keyword)];
+      }
       int row = 0;
       for (const auto index : library::SortedSnippetIndices(data_.snippets)) {
         auto preview = data_.snippets[index].text;
@@ -1450,29 +1456,26 @@ class ManagerWindow {
         std::replace(preview.begin(), preview.end(), L'\r', L' ');
         const auto keyword =
             library::NormalizeKeyword(data_.snippets[index].keyword);
-        const auto duplicates = std::count_if(
-            data_.snippets.begin(), data_.snippets.end(), [&](const auto& item) {
-              return library::NormalizeKeyword(item.keyword) == keyword;
-            });
-        if (duplicates > 1) preview = L"[Duplicate keyword] " + preview;
+        if (keywordCounts[keyword] > 1) preview = L"[Duplicate keyword] " + preview;
         InsertRow(row++, index, data_.snippets[index].name,
                   data_.snippets[index].keyword, preview);
       }
     } else if (IsLaunchItem(kind_)) {
+      const auto& launchItems = LaunchItems();
+      std::unordered_map<std::wstring, std::size_t> keywordCounts;
+      keywordCounts.reserve(launchItems.size());
+      for (const auto& item : launchItems) {
+        ++keywordCounts[library::NormalizeKeyword(item.keyword)];
+      }
       int row = 0;
       for (const auto index :
-           library::SortedQuicklinkIndices(LaunchItems())) {
-        const auto& link = LaunchItems()[index];
+           library::SortedQuicklinkIndices(launchItems)) {
+        const auto& link = launchItems[index];
         std::wstring detail = link.target;
         std::replace(detail.begin(), detail.end(), L'\n', L' ');
         std::replace(detail.begin(), detail.end(), L'\r', L' ');
         const auto keyword = library::NormalizeKeyword(link.keyword);
-        const auto duplicates = std::count_if(
-            LaunchItems().begin(), LaunchItems().end(),
-            [&](const auto& item) {
-              return library::NormalizeKeyword(item.keyword) == keyword;
-            });
-        if (duplicates > 1) detail = L"[Duplicate keyword] " + detail;
+        if (keywordCounts[keyword] > 1) detail = L"[Duplicate keyword] " + detail;
         InsertRow(row++, index, link.name.empty() ? link.keyword : link.name,
                   link.keyword, detail);
       }

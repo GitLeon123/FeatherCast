@@ -366,6 +366,8 @@ struct PhoneService::Session {
   Bytes pcNonce;
   Bytes sendKey;
   Bytes recvKey;
+  crypto::AesGcmKey sendCipher;
+  crypto::AesGcmKey recvCipher;
   std::uint64_t recvCounter = 0;
   std::string screenId;
   std::uint32_t address = 0;  // IPv4 peer, network byte order
@@ -479,7 +481,9 @@ struct PhoneService::Session {
       } else {
         Bytes payload = PackPayload(item.json, item.binary);
         item.binary = {};
-        const auto sealed = crypto::AesGcmEncrypt(sendKey, CounterNonce(counter), payload);
+        const auto sealed = sendCipher
+            ? sendCipher.Encrypt(CounterNonce(counter), payload)
+            : crypto::AesGcmEncrypt(sendKey, CounterNonce(counter), payload);
         payload = {};
         ok = sealed && SendFrame(socket, *sealed);
       }
@@ -522,8 +526,12 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
     RemoveStaleTempFiles(config_.downloadsDir);
     transfer::RemoveAbandonedPartials(config_.downloadsDir);
   }
+  bool needsSave = false;
   switch (LoadState()) {
     case StateLoad::Loaded:
+      break;
+    case StateLoad::LoadedNeedsSave:
+      needsSave = true;
       break;
     case StateLoad::Missing: {
       auto pair = crypto::EcdhKeyPair::Generate();
@@ -533,6 +541,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
       pcPublicKey_ = pair->PublicKey();
       pcId_ = HexEncode(crypto::RandomBytes(8));
       devices_.clear();
+      needsSave = true;
       break;
     }
     case StateLoad::Failed:
@@ -543,7 +552,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
                   "damaged, delete it and pair your phones again.");
   }
   stateReady_ = true;
-  if (!SaveState()) return fail("Could not save the phone link identity.");
+  if (needsSave && !SaveState()) return fail("Could not save the phone link identity.");
 
   const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (listener == INVALID_SOCKET) return fail("Could not create a network socket.");
@@ -581,7 +590,7 @@ bool PhoneService::Start(ServiceConfig config, std::string* error) {
   running_ = true;
   acceptThread_ = std::jthread([this](std::stop_token stop) { AcceptLoop(stop); });
   beaconThread_ = std::jthread([this](std::stop_token stop) { BeaconLoop(stop); });
-  screenSendThread_ = std::jthread([this](std::stop_token stop) { ScreenSendLoop(stop); });
+  // screenSendThread_ is spawned lazily on first StartScreen() call.
   return true;
 }
 
@@ -590,8 +599,7 @@ void PhoneService::Stop() {
   acceptThread_.request_stop();
   if (acceptEvent_) WSASetEvent(acceptEvent_);
   beaconThread_.request_stop();
-  screenSendThread_.request_stop();
-  screenWake_.notify_all();
+  beaconWake_.notify_all();
   // The accept loop checks running_ before adding workers. Join it before
   // collecting workers or closing the listener it is still using.
   if (acceptThread_.joinable()) acceptThread_.join();
@@ -600,14 +608,20 @@ void PhoneService::Stop() {
   if (acceptEvent_) WSACloseEvent(acceptEvent_);
   acceptEvent_ = nullptr;
   std::vector<Worker> workers;
+  std::jthread screenSend;
   {
     std::lock_guard lock(mutex_);
     for (const auto& session : sessions_) session->Close();
     workers = std::move(workers_);
     workers_.clear();
+    screenSend = std::move(screenSendThread_);
   }
   if (beaconThread_.joinable()) beaconThread_.join();
-  if (screenSendThread_.joinable()) screenSendThread_.join();
+  if (screenSend.joinable()) {
+    screenSend.request_stop();
+    screenWake_.notify_all();
+    screenSend.join();
+  }
   workers.clear();  // joins
   // Sessions are released outside the lock; their destructors join writers.
   std::vector<std::shared_ptr<Session>> ended;
@@ -670,11 +684,12 @@ PhoneService::StateLoad PhoneService::LoadState() {
   }
   std::lock_guard lock(mutex_);
   pcId_ = JsonString(*root, "pcId");
-  if (pcId_.empty()) pcId_ = HexEncode(crypto::RandomBytes(8));
+  const bool generatedId = pcId_.empty();
+  if (generatedId) pcId_ = HexEncode(crypto::RandomBytes(8));
   pcPrivateKey_ = *privateKey;
   pcPublicKey_ = pair->PublicKey();
   devices_ = std::move(devices);
-  return StateLoad::Loaded;
+  return generatedId ? StateLoad::LoadedNeedsSave : StateLoad::Loaded;
 }
 
 bool PhoneService::SaveState() {
@@ -728,12 +743,16 @@ std::string PhoneService::CreatePairingUri() {
   // The phone cannot use an invite without an address; no token is issued.
   if (invite.hosts.empty()) return {};
   if (invite.hosts.size() > 4) invite.hosts.resize(4);
-  std::lock_guard lock(mutex_);
-  pairingToken_ = crypto::RandomBytes(16);
-  pairingExpiresAt_ = NowMs() + kPairingLifetimeMs;
-  invite.pcId = pcId_;
-  invite.pcPublicKey = pcPublicKey_;
-  invite.token = pairingToken_;
+  {
+    std::lock_guard lock(mutex_);
+    pairingToken_ = crypto::RandomBytes(16);
+    pairingExpiresAt_ = NowMs() + kPairingLifetimeMs;
+    invite.pcId = pcId_;
+    invite.pcPublicKey = pcPublicKey_;
+    invite.token = pairingToken_;
+    ++beaconRevision_;
+  }
+  beaconWake_.notify_all();
   return BuildPairingUri(invite);
 }
 
@@ -756,7 +775,9 @@ void PhoneService::Forget(const std::string& deviceId) {
     for (const auto& session : sessions_) {
       if (session->deviceId == deviceId) session->Close();
     }
+    ++beaconRevision_;
   }
+  beaconWake_.notify_all();
   if (!SaveState()) {
     Event event;
     event.text = "Could not save the removed pairing. It may return after restarting FeatherCast.";
@@ -826,7 +847,9 @@ bool PhoneService::RequestPhoto(const std::string& id) {
   {
     std::lock_guard lock(mutex_);
     pendingPhotos_[id] = SteadyMs() + kRequestTimeoutMs;
+    ++beaconRevision_;
   }
+  beaconWake_.notify_all();
   if (Send(message::PhotoRequest(id))) return true;
   std::lock_guard lock(mutex_);
   pendingPhotos_.erase(id);
@@ -1035,7 +1058,9 @@ bool PhoneService::RequestFile(const std::string& remotePath) {
     std::lock_guard lock(mutex_);
     pendingFiles_[remotePath] = PendingFile{
         NormalizeStoragePath(remotePath).value_or(remotePath), SteadyMs() + kRequestTimeoutMs};
+    ++beaconRevision_;
   }
+  beaconWake_.notify_all();
   if (Send(message::FileRequest(remotePath))) return true;
   std::lock_guard lock(mutex_);
   pendingFiles_.erase(remotePath);
@@ -1137,6 +1162,9 @@ std::string PhoneService::StartScreen(bool audio) {
   {
     std::lock_guard lock(mutex_);
     if (!running_ || !active_ || screenCommands_.size() >= 8) return {};
+    if (!screenSendThread_.joinable()) {
+      screenSendThread_ = std::jthread([this](std::stop_token stop) { ScreenSendLoop(stop); });
+    }
     screenId_ = id;
     screenKey_ = crypto::RandomBytes(32);
     if (screenKey_.size() != 32) { screenId_.clear(); return {}; }
@@ -1305,46 +1333,124 @@ void PhoneService::AcceptLoop(std::stop_token stop) {
   }
 }
 
+void PhoneService::PruneFinishedWorkers() {
+  std::vector<Worker> finished;
+  {
+    std::lock_guard lock(mutex_);
+    auto it = workers_.begin();
+    while (it != workers_.end()) {
+      if (it->done->load()) {
+        finished.push_back(std::move(*it));
+        it = workers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // Destructors join outside mutex_.
+}
+
 void PhoneService::BeaconLoop(std::stop_token stop) {
   // Without a socket the loop keeps running: it also expires timed-out
-  // photo and file requests.
-  const SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (udp != INVALID_SOCKET) {
-    BOOL broadcast = TRUE;
-    setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
-               reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
-  }
-  std::mutex waitMutex;
-  std::condition_variable_any wake;
+  // photo and file requests and sends keep-alive pings.
+  SOCKET udp = INVALID_SOCKET;
+  HANDLE interfaceNotify = nullptr;
+  std::atomic<bool> adaptersDirty{true};
+  std::vector<ULONG> cachedTargets;
+  long long lastAdapterRefreshMs = 0;
+
+  const auto onInterfaceChange = [](PVOID context, PMIB_IPINTERFACE_ROW,
+                                    MIB_NOTIFICATION_TYPE) {
+    static_cast<std::atomic<bool>*>(context)->store(true, std::memory_order_release);
+  };
+
   while (!stop.stop_requested()) {
-    bool anyDevice = false;
+    PruneFinishedWorkers();
+    bool needBeacon = false;
+    bool connected = false;
     std::string pcId;
+    long long earliestDeadlineMs = 0;  // SteadyMs() timestamp, 0 = none
+    std::uint64_t revision = 0;
     {
       std::lock_guard lock(mutex_);
-      anyDevice = !devices_.empty() ||
-                  (!pairingToken_.empty() && NowMs() <= pairingExpiresAt_);
+      revision = beaconRevision_;
+      const bool hasPairing = !pairingToken_.empty() && NowMs() <= pairingExpiresAt_;
+      connected = active_ != nullptr;
+      // Only broadcast UDP beacons when pairing or at least one paired phone is offline.
+      needBeacon = hasPairing || (!devices_.empty() && (!connected || devices_.size() > 1));
       pcId = pcId_;
-    }
-    if (anyDevice && udp != INVALID_SOCKET) {
-      const std::string beacon = BuildBeacon(pcId, port_);
-      std::vector<ULONG> targets{htonl(INADDR_BROADCAST)};
-      for (const auto& adapter : EnumerateAdapters()) {
-        targets.push_back(adapter.broadcast);
+      const long long nowSteady = SteadyMs();
+      const auto trackDeadline = [&](long long deadline) {
+        if (earliestDeadlineMs == 0 || deadline < earliestDeadlineMs) {
+          earliestDeadlineMs = deadline;
+        }
+      };
+      for (const auto& [unused, deadline] : pendingPhotos_) trackDeadline(deadline);
+      for (const auto& [unused, pending] : pendingFiles_) trackDeadline(pending.deadline);
+      if (connected) {
+        const long long lastActivity =
+            std::max(active_->lastReceivedMs.load(), active_->lastPingMs.load());
+        trackDeadline(lastActivity > 0 ? lastActivity + kKeepAliveAfterMs
+                                       : nowSteady + kKeepAliveAfterMs);
       }
-      for (const ULONG target : targets) {
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_port = htons(kBeaconPort);
-        address.sin_addr.s_addr = target;
-        sendto(udp, beacon.data(), static_cast<int>(beacon.size()), 0,
-               reinterpret_cast<sockaddr*>(&address), sizeof(address));
+      if (needBeacon) {
+        trackDeadline(nowSteady + std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      kBeaconInterval)
+                                      .count());
       }
     }
+
+    if (needBeacon) {
+      if (udp == INVALID_SOCKET) {
+        udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (udp != INVALID_SOCKET) {
+          BOOL broadcast = TRUE;
+          setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
+                     reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+        }
+      }
+      if (!interfaceNotify) {
+        NotifyIpInterfaceChange(AF_INET, onInterfaceChange, &adaptersDirty,
+                                FALSE, &interfaceNotify);
+      }
+      const long long nowSteady = SteadyMs();
+      if (adaptersDirty.exchange(false, std::memory_order_acq_rel) ||
+          nowSteady - lastAdapterRefreshMs >= 60'000) {
+        cachedTargets.clear();
+        cachedTargets.push_back(htonl(INADDR_BROADCAST));
+        for (const auto& adapter : EnumerateAdapters()) {
+          cachedTargets.push_back(adapter.broadcast);
+        }
+        lastAdapterRefreshMs = nowSteady;
+      }
+      if (udp != INVALID_SOCKET) {
+        const std::string beacon = BuildBeacon(pcId, port_);
+        for (const ULONG target : cachedTargets) {
+          sockaddr_in address{};
+          address.sin_family = AF_INET;
+          address.sin_port = htons(kBeaconPort);
+          address.sin_addr.s_addr = target;
+          sendto(udp, beacon.data(), static_cast<int>(beacon.size()), 0,
+                 reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        }
+      }
+    }
+
     ExpireRequests();
     KeepAlive();
-    std::unique_lock lock(waitMutex);
-    wake.wait_for(lock, stop, kBeaconInterval, [] { return false; });
+
+    std::unique_lock lock(mutex_);
+    const auto woken = [&] { return beaconRevision_ != revision; };
+    if (earliestDeadlineMs == 0) {
+      // Unpaired, no active invite, not connected: sleep indefinitely (0 wakeups).
+      beaconWake_.wait(lock, stop, woken);
+    } else {
+      const long long waitMs = std::max<long long>(250, earliestDeadlineMs - SteadyMs());
+      beaconWake_.wait_for(lock, stop, std::chrono::milliseconds(waitMs), woken);
+    }
   }
+  // Cancel outside mutex_ so any Windows IP notification callback finishes cleanly.
+  if (interfaceNotify) CancelMibChangeNotify2(interfaceNotify);
   if (udp != INVALID_SOCKET) closesocket(udp);
 }
 
@@ -1385,7 +1491,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t addr
   const auto handshakeDeadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
 
   FrameDecoder decoder;
-  std::uint8_t buffer[64 * 1024];
+  std::vector<std::uint8_t> buffer(16 * 1024);
   bool first = true;
   Bytes firstBytes;
   bool open = true;
@@ -1395,11 +1501,12 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t addr
       if (left == 0) break;
       SetTimeout(socket, left);
     }
-    const int received = recv(socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+    const int received = recv(socket, reinterpret_cast<char*>(buffer.data()),
+                              static_cast<int>(buffer.size()), 0);
     if (received <= 0) break;
     session->lastReceivedMs = SteadyMs();
     if (first) {
-      firstBytes.insert(firstBytes.end(), buffer, buffer + received);
+      firstBytes.insert(firstBytes.end(), buffer.data(), buffer.data() + received);
       if (firstBytes.size() < 4) continue;
       first = false;
       if (LooksLikeHttp(firstBytes.data(), firstBytes.size())) {
@@ -1410,7 +1517,7 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t addr
       decoder.Push(firstBytes.data(), firstBytes.size());
       firstBytes.clear();
     } else {
-      decoder.Push(buffer, static_cast<size_t>(received));
+      decoder.Push(buffer.data(), static_cast<size_t>(received));
     }
     while (open) {
       auto frame = decoder.Next(session->state == Session::State::Open
@@ -1452,7 +1559,9 @@ void PhoneService::HandleConnection(std::uintptr_t rawSocket, std::uint32_t addr
       deviceName = session->deviceName;
       unanswered = TakeExpiredLocked(true);  // answers would have come over this connection
     }
+    ++beaconRevision_;
   }
+  beaconWake_.notify_all();
   session->Close();
   if (!endedScreen.empty()) screenWake_.notify_all();
   if (!endedScreen.empty() && running_) EmitScreenState(endedScreen, "stopped", "The screen connection was lost. Start a new session to reconnect.");
@@ -1546,9 +1655,11 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
         }
         devices_.push_back(device);
         consumed = true;
+        ++beaconRevision_;
       }
     }
     if (!consumed) return reject("expired", "This pairing code has already been used or replaced.");
+    beaconWake_.notify_all();
     if (!SaveState()) {
       {
         // reject() takes mutex_ itself, so release it first.
@@ -1643,9 +1754,13 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
     session->sendKey = crypto::Hkdf(session->linkKey, salt, kPcToPhoneInfo, 32);
     const Bytes pcMac = crypto::HmacSha256(
         session->linkKey, Concat({&pcLabel, &session->phoneNonce, &session->pcNonce}));
-    if (session->recvKey.size() != 32 || session->sendKey.size() != 32 || pcMac.empty()) {
+    auto recvCipher = crypto::AesGcmKey::Create(session->recvKey);
+    auto sendCipher = crypto::AesGcmKey::Create(session->sendKey);
+    if (!recvCipher || !sendCipher || pcMac.empty()) {
       return reject("bad-auth", "Authentication failed. Pair the phone again.");
     }
+    session->recvCipher = std::move(*recvCipher);
+    session->sendCipher = std::move(*sendCipher);
     // Session::Open queues the welcome as the first frame and only then makes
     // the session sendable, so no sealed frame can precede it. Senders find the
     // session (active_ or screen_) only after that.
@@ -1692,7 +1807,9 @@ bool PhoneService::HandlePlainFrame(const std::shared_ptr<Session>& session,
         endedScreen = std::exchange(screenId_, {});
         screenInputs_.clear();
       }
+      ++beaconRevision_;
     }
+    beaconWake_.notify_all();
     if (previous && previous != session) previous->Close();
     if (!endedScreen.empty()) screenWake_.notify_all();
     EmitAll(std::move(unanswered));
@@ -1720,16 +1837,17 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
           return device.id == session->deviceId && device.linkKey == session->linkKey;
         })) return;
   }
-  const auto plain = crypto::AesGcmDecrypt(
-      session->recvKey, CounterNonce(session->recvCounter++), frame);
+  auto plain = session->recvCipher
+      ? session->recvCipher.Decrypt(CounterNonce(session->recvCounter++), frame)
+      : crypto::AesGcmDecrypt(session->recvKey, CounterNonce(session->recvCounter++), frame);
   if (!plain) {
     session->Close();
     return;
   }
-  const auto payload = UnpackPayload(*plain);
+  auto payload = UnpackPayload(std::move(*plain));
   if (!payload) return;
   if (!session->screenId.empty()) {
-    auto packet = ParseScreenPacket(*payload);
+    auto packet = ParseScreenPacket(std::move(*payload));
     if (!packet || packet->sessionId != session->screenId) {
       session->Close();
       return;
@@ -1740,22 +1858,22 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
   const auto root = json::Parse(payload->json);
   if (!root || root->type != json::Value::Type::Object) return;
   if (const auto receiver = session->incomingTransfers.load()) receiver->Maintain();
-  if (JsonString(*root, "type") == "ping") {
+  const auto type = JsonString(*root, "type");
+  if (type == "ping") {
     SendToSession(session, Json("pong").Int("time", NowMs()).Build());
     return;
   }
-  if (JsonString(*root, "type") == "screen.state") {
-    auto packet = ParseScreenPacket(*payload);
+  if (type == "screen.state") {
+    auto packet = ParseScreenPacket(std::move(*payload));
     bool matches = false;
     {
       std::lock_guard lock(mutex_);
       matches = packet && packet->sessionId == screenId_ && screenOwner_.lock() == session;
     }
     if (matches && (packet->state == "stopped" || packet->state == "error")) StopScreen(false);
-    if (matches && config_.onScreenPacket) config_.onScreenPacket(*packet);
+    if (matches && config_.onScreenPacket) config_.onScreenPacket(std::move(*packet));
     return;
   }
-  const auto type = JsonString(*root, "type");
   if (type == "file.cancel") {
     const auto id = JsonString(*root, "id");
     if (id.empty()) ++session->transferEpoch;
@@ -1855,7 +1973,10 @@ void PhoneService::HandleSessionFrame(const std::shared_ptr<Session>& session,
     }
     return;
   }
-  auto parsed = ParseSessionMessage(*root, payload->binary, NowMs());
+  const bool keepRawBinary =
+      type == "photo.full" || type == "file.send" || type == "file.data";
+  auto parsed = ParseSessionMessage(
+      *root, keepRawBinary ? Bytes{} : std::move(payload->binary), NowMs());
   if (!parsed) return;  // unknown message types are ignored for forward compatibility
   Event event = std::move(*parsed);
   const std::string reportedName = std::move(event.deviceName);
